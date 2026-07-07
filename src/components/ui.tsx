@@ -1,6 +1,8 @@
 import React from 'react';
 import { cn } from '../utils/cn';
 
+// Note: All icons passed as props should come from '../utils/icons' for better tree-shaking
+
 export function Card({ children, className = '', onClick }: { children: React.ReactNode; className?: string; onClick?: () => void }) {
   return (
     <div onClick={onClick} className={cn('bg-white rounded-xl border border-slate-200 shadow-sm', onClick && 'cursor-pointer', className)}>{children}</div>

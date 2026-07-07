@@ -1,23 +1,16 @@
-import {
-  LayoutDashboard,
-  Users,
-  ClipboardList,
-  CalendarCheck,
-  Wallet,
-  FileText,
-  BarChart3,
-  Settings,
-  LogOut,
-  Shield,
-  ChevronRight,
-  DollarSign,
-  Calculator,
-  Menu,
-  X,
-} from "lucide-react";
+import { 
+  LayoutDashboard, Users, UserCheck, Calendar, DollarSign, 
+  FileText, CreditCard, Receipt, FileBarChart, Settings, 
+  Shield, Sparkles, History, LogOut, Menu, X, ChevronDown, 
+  Building2, MapPin, User, Briefcase, Wallet, Clock, 
+  CheckCircle, AlertCircle, Calculator, ClipboardList, 
+  CalendarCheck, BarChart3
+} from '../utils/icons';
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
-import { useEffect, useState } from "react";
+import { useState, useEffect } from "react";
+import { ChevronRight } from 'lucide-react';
+
 
 export type NavKey =
   | "dashboard"
@@ -34,6 +27,7 @@ export type NavKey =
   | "features"
   | "auditlogs";
 
+// ===== ALL NAV ITEMS - NO DUPLICATES =====
 export const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "employees", label: "Employees", icon: Users },
@@ -45,8 +39,11 @@ export const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "payments", label: "Payments", icon: DollarSign },
   { id: "reports", label: "Reports", icon: BarChart3 },
   { id: "settings", label: "Settings", icon: Settings },
+  // ===== ADD auditlogs HERE (ONLY ONCE) =====
+  { id: "auditlogs", label: "Audit Logs", icon: History },
 ];
 
+// Define which menu items each role can see
 const roleMenuItems: Record<number, NavKey[]> = {
   1: [
     "dashboard",
@@ -61,7 +58,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "settings",
     "security",
     "features",
-    "auditlogs",
+    "auditlogs", // ← Super Admin can see auditlogs
   ],
   2: [
     "dashboard",
@@ -91,6 +88,43 @@ export function Sidebar({
   const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
   const [loading, setLoading] = useState(true);
   const [userName, setUserName] = useState<string>("User");
+  const [userEmail, setUserEmail] = useState<string>("");
+  const [isMobile, setIsMobile] = useState(false);
+
+  // Check if mobile
+  useEffect(() => {
+    const checkMobile = () => {
+      setIsMobile(window.innerWidth < 1024);
+    };
+    
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  // Prevent body scroll when sidebar is open on mobile
+  useEffect(() => {
+    if (open && isMobile) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = 'unset';
+    }
+    return () => {
+      document.body.style.overflow = 'unset';
+    };
+  }, [open, isMobile]);
+
+  // Close sidebar on escape key
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && open) {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, [open, onClose]);
 
   useEffect(() => {
     const getUserInfo = async () => {
@@ -99,6 +133,7 @@ export function Sidebar({
           data: { user },
         } = await supabase.auth.getUser();
         if (user) {
+          setUserEmail(user.email || "");
           const { data: profile, error } = await supabase
             .from("profiles")
             .select("full_name, role_level")
@@ -115,6 +150,7 @@ export function Sidebar({
             );
             setUserRoleLevel(profile?.role_level || 4);
           }
+          console.log("User role level in sidebar:", userRoleLevel);
         }
       } catch (err) {
         console.error("Failed to get user info:", err);
@@ -149,7 +185,9 @@ export function Sidebar({
       <button
         onClick={() => {
           onNavigate(item.id);
-          onClose(); // Close sidebar on navigation
+          if (isMobile) {
+            onClose();
+          }
         }}
         className={cn(
           "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all group",
@@ -165,6 +203,7 @@ export function Sidebar({
     );
   };
 
+  // Sidebar content
   const content = (
     <>
       <div className="p-5 border-b border-slate-200 flex items-center justify-between">
@@ -180,13 +219,15 @@ export function Sidebar({
           </div>
         </div>
         {/* Close button for mobile */}
-        <button
-          onClick={onClose}
-          className="lg:hidden p-2 rounded-lg hover:bg-slate-100 transition-colors text-slate-500 hover:text-slate-700"
-          aria-label="Close menu"
-        >
-          <X size={24} />
-        </button>
+        {isMobile && (
+          <button
+            onClick={onClose}
+            className="p-2 rounded-lg hover:bg-slate-100 transition-colors text-slate-500 hover:text-slate-700"
+            aria-label="Close menu"
+          >
+            <X size={24} />
+          </button>
+        )}
       </div>
 
       <div className="p-3 flex-1 overflow-y-auto space-y-1">
@@ -199,6 +240,7 @@ export function Sidebar({
           <div className="px-3 py-2 text-sm text-slate-500">Loading...</div>
         )}
 
+        {/* Security and Features - only show for Admin (level 1) */}
         {!loading && userRoleLevel === 1 && (
           <>
             <p className="px-3 py-2 mt-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -207,7 +249,9 @@ export function Sidebar({
             <button
               onClick={() => {
                 onNavigate("security");
-                onClose();
+                if (isMobile) {
+                  onClose();
+                }
               }}
               className={cn(
                 "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
@@ -225,7 +269,9 @@ export function Sidebar({
             <button
               onClick={() => {
                 onNavigate("features");
-                onClose();
+                if (isMobile) {
+                  onClose();
+                }
               }}
               className={cn(
                 "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
@@ -299,6 +345,7 @@ export function Sidebar({
   );
 }
 
+// ===== BOTTOM NAV =====
 export function BottomNav({
   active,
   onNavigate,
@@ -333,7 +380,7 @@ export function BottomNav({
   }, []);
 
   const roleBottomItems: Record<number, NavKey[]> = {
-    1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings"],
+    1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings", "auditlogs"],
     2: ["dashboard", "employees", "terminal-dues", "attendance", "reports"],
     3: ["dashboard", "employees", "attendance","terminal-dues", "reports"],
     4: ["dashboard", "employees", "payments", "payslips", "reports"],
@@ -353,6 +400,7 @@ export function BottomNav({
     { id: "reports", label: "Reports", icon: BarChart3 },
     { id: "security", label: "Security", icon: Shield },
     { id: "payslips", label: "Payslips", icon: FileText },
+    { id: "auditlogs", label: "Audit Logs", icon: History },
   ];
 
   const items = allItems.filter((item) =>
@@ -384,6 +432,7 @@ export function BottomNav({
   );
 }
 
+// ===== TOP BAR =====
 export function TopBar({
   onMenuClick,
   title,
@@ -426,7 +475,7 @@ export function TopBar({
             System Online
           </div>
           <div className="w-10 h-10 rounded-full bg-[#D4A017] flex items-center justify-center text-white font-bold text-sm">
-            WB
+            SFG
           </div>
         </div>
       </div>

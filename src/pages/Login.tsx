@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { Shield, Lock, User, Eye, EyeOff } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { checkRateLimit } from '../utils/rateLimiter';
+// ===== Import audit logger =====
+import { logAudit } from '../utils/auditLogger';
 
 export function LoginPage({ onLogin }: { onLogin: () => void }) {
   const [username, setUsername] = useState('');
@@ -25,6 +27,18 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
       setError('Please enter your password');
       setLoading(false);
       return;
+    }
+
+    // ===== CLEAR ANY EXISTING SESSION BEFORE LOGIN =====
+    try {
+      // Clear any stale session from localStorage
+      const keysToRemove = Object.keys(localStorage).filter(key => key.startsWith('sb-'));
+      keysToRemove.forEach(key => localStorage.removeItem(key));
+      
+      // Also try to sign out any existing session
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.error('Error clearing existing session:', err);
     }
 
     // Check rate limit
@@ -54,12 +68,26 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
       });
 
       if (signInError) {
+        // ===== Log failed login attempt =====
+        await logAudit({
+          action: 'LOGIN',
+          entity_type: 'auth',
+          new_data: {
+            success: false,
+            email: username.trim(),
+            error: signInError.message,
+            timestamp: new Date().toISOString()
+          }
+        });
+
         if (signInError.message.includes('Invalid login credentials')) {
           setError('Invalid email or password. Please try again.');
         } else if (signInError.message.includes('Email not confirmed')) {
           setError('Please verify your email address before logging in.');
         } else if (signInError.message.includes('rate limit')) {
           setError('Too many attempts. Please try again later.');
+        } else if (signInError.message.includes('refresh_token_not_found')) {
+          setError('Session expired. Please login again.');
         } else {
           setError(signInError.message);
         }
@@ -70,7 +98,15 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
       if (data?.user) {
         const { data: profile, error: profileError } = await supabase
           .from("profiles")
-          .select("role_level, full_name, is_super_admin, region_id")
+          .select(`
+            role_level, 
+            full_name, 
+            is_super_admin, 
+            region_id,
+            regions:region_id (
+              name
+            )
+          `)
           .eq("id", data.user.id)
           .single();
 
@@ -78,16 +114,51 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
           console.error("Error fetching profile:", profileError);
         }
 
+        // Get region name
+        const regionName = profile?.regions?.name || null;
+
         console.log("Login successful:", {
           email: data.user.email,
           role: profile?.role_level,
           isSuperAdmin: profile?.is_super_admin,
+          region: regionName
+        });
+
+        // ===== Log successful login with region name =====
+        await logAudit({
+          action: 'LOGIN',
+          entity_type: 'auth',
+          entity_id: data.user.id,
+          new_data: {
+            success: true,
+            email: data.user.email,
+            role_level: profile?.role_level,
+            is_super_admin: profile?.is_super_admin,
+            full_name: profile?.full_name,
+            region_id: profile?.region_id,
+            region_name: regionName,
+            timestamp: new Date().toISOString()
+          },
+          region_id: profile?.region_id
         });
 
         onLogin();
       }
     } catch (err: any) {
       console.error('Login error:', err);
+      
+      // ===== Log login error =====
+      await logAudit({
+        action: 'LOGIN',
+        entity_type: 'auth',
+        new_data: {
+          success: false,
+          email: username.trim(),
+          error: err.message || 'Unexpected error',
+          timestamp: new Date().toISOString()
+        }
+      });
+      
       setError('An unexpected error occurred. Please try again.');
     } finally {
       setLoading(false);

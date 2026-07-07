@@ -1,13 +1,41 @@
-﻿import { useState, useEffect } from 'react';
-import { Users, Wallet, UserMinus, ClipboardList, CheckCircle2, TrendingUp, ArrowRight, Bell, ShieldCheck, Calendar, Shield, MapPin } from 'lucide-react';
-import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
+﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { 
+  Users, Wallet, UserMinus, ClipboardList, CheckCircle2, TrendingUp, 
+  ArrowRight, Bell, ShieldCheck, Calendar, Shield, MapPin, 
+  ChevronLeft, ChevronRight, RefreshCw 
+} from '../utils/icons';
 import { Card, StatCard, Button, Badge, Table, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
+import { 
+  getSystemCurrentMonth, 
+  getMonthLabel, 
+  getNextMonth, 
+  getPreviousMonth,
+  getAvailableMonthsFromSystem
+} from '../utils/currentMonth';
+import { showNotification } from '../utils/clickHandlers';
+
+// ===== IMPORT CHARTS DIRECTLY (no lazy loading) =====
+import {
+  LineChart,
+  Line,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  ResponsiveContainer,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid
+} from 'recharts';
 
 const COLORS = ['#081C3A', '#D4A017', '#3B82F6', '#10B981', '#EF4444', '#8B5CF6', '#F59E0B', '#64748B', '#06B6D4'];
 
 export function Dashboard() {
+  // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<any[]>([]);
   const [applicantsCount, setApplicantsCount] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -15,6 +43,11 @@ export function Dashboard() {
   const [userInitials, setUserInitials] = useState('');
   const [greeting, setGreeting] = useState('Good morning');
   const [userProfile, setUserProfile] = useState<any>(null);
+  const [selectedMonth, setSelectedMonth] = useState('');
+  const [systemMonth, setSystemMonth] = useState('');
+  const [availableMonths, setAvailableMonths] = useState<string[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+
   const [stats, setStats] = useState({
     total: 0,
     activeGuards: 0,
@@ -33,12 +66,33 @@ export function Dashboard() {
   const [recent, setRecent] = useState<any[]>([]);
   const [growthData, setGrowthData] = useState<any[]>([]);
 
-  const getTimeBasedGreeting = () => {
+  // ===== MEMOIZED PENDING TASKS =====
+  const pendingTasks = useMemo(() => [
+    { title: 'Approve Payroll', due: 'Today', priority: 'high', icon: Wallet },
+    { title: 'Review Job Applications', due: 'Tomorrow', priority: 'medium', icon: ClipboardList },
+    { title: 'Process Leave Requests', due: '2 days', priority: 'medium', icon: Calendar },
+    { title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high', icon: Shield }
+  ], []);
+
+  // ===== CALLBACKS =====
+  const getTimeBasedGreeting = useCallback(() => {
     const hour = new Date().getHours();
     if (hour < 12) return 'Good morning';
     if (hour < 18) return 'Good afternoon';
     return 'Good evening';
-  };
+  }, []);
+
+  // Initialize with system month
+  useEffect(() => {
+    const init = async () => {
+      const month = await getSystemCurrentMonth();
+      setSystemMonth(month);
+      setSelectedMonth(month);
+      const months = getAvailableMonthsFromSystem(month);
+      setAvailableMonths(months);
+    };
+    init();
+  }, []);
 
   useEffect(() => {
     const getUserInfo = async () => {
@@ -64,22 +118,58 @@ export function Dashboard() {
     }, 60000);
     
     return () => clearInterval(interval);
-  }, []);
+  }, [getTimeBasedGreeting]);
 
   useEffect(() => {
-    if (userProfile) {
+    if (userProfile && selectedMonth) {
       fetchDashboardData();
     }
-  }, [userProfile]);
+  }, [userProfile, selectedMonth]);
 
-  const fetchDashboardData = async () => {
+  // ===== Month Navigation =====
+  const goToPreviousMonth = useCallback(() => {
+    const prevMonth = getPreviousMonth(selectedMonth);
+    if (prevMonth) {
+      setSelectedMonth(prevMonth);
+    }
+  }, [selectedMonth]);
+
+  const goToNextMonth = useCallback(() => {
+    const nextMonth = getNextMonth(selectedMonth);
+    if (nextMonth && availableMonths.includes(nextMonth)) {
+      setSelectedMonth(nextMonth);
+    } else {
+      showNotification('Cannot go beyond 24 months from current month.', 'error');
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToCurrentMonth = useCallback(() => {
+    if (systemMonth && systemMonth !== selectedMonth) {
+      setSelectedMonth(systemMonth);
+      showNotification(`Switched to ${getMonthLabel(systemMonth)}`, 'success');
+    }
+  }, [systemMonth, selectedMonth]);
+
+  const handleMonthSelect = useCallback((month: string) => {
+    if (month !== selectedMonth) {
+      setSelectedMonth(month);
+    }
+  }, [selectedMonth]);
+
+  const refreshData = useCallback(async () => {
+    setRefreshing(true);
+    await fetchDashboardData();
+    showNotification('Dashboard updated', 'success');
+    setRefreshing(false);
+  }, []);
+
+  // ===== MEMOIZED FETCH FUNCTION =====
+  const fetchDashboardData = useCallback(async () => {
     setLoading(true);
     
     try {
-      // Build employees query with region filter
       let employeesQuery = supabase.from('employees').select('*');
       
-      // ✅ CRITICAL: Apply region filter for non-super admins
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
       }
@@ -92,7 +182,6 @@ export function Dashboard() {
       const employeesData = employeesRes.data || [];
       setEmployees(employeesData);
       
-      // Calculate stats from filtered employees
       const activeGuards = employeesData.filter((e: any) => 
         (e.position?.toLowerCase().includes('guard') || 
          e.position?.toLowerCase().includes('security') ||
@@ -111,15 +200,18 @@ export function Dashboard() {
       const totalPayroll = employeesData.reduce((sum: number, e: any) => sum + (e.basic_salary || 0), 0);
       const onLeave = employeesData.filter((e: any) => e.status === 'On Leave').length;
       
-      // Calculate attendance rate
       let attendanceRate = 0;
       if (employeesData.length > 0) {
         const employeeIds = employeesData.map(e => e.id);
+        const monthStart = `${selectedMonth}-01`;
+        const lastDay = new Date(parseInt(selectedMonth.split('-')[0]), parseInt(selectedMonth.split('-')[1]), 0).getDate();
+        const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
         
         let attendanceQuery = supabase
           .from('attendance')
           .select('status')
-          .gte('date', new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0]);
+          .gte('date', monthStart)
+          .lte('date', monthEnd);
         
         if (employeeIds.length > 0) {
           attendanceQuery = attendanceQuery.in('employee_id', employeeIds);
@@ -155,7 +247,6 @@ export function Dashboard() {
         notifications
       });
       
-      // Department distribution
       const deptCount: Record<string, number> = {};
       employeesData.forEach((emp: any) => {
         if (emp.department) {
@@ -164,10 +255,8 @@ export function Dashboard() {
       });
       setPieData(Object.entries(deptCount).map(([name, value]) => ({ name, value })));
       
-      // Recent employees
       setRecent(employeesData.slice(0, 6));
       
-      // Employee growth
       const growth: { year: string; employees: number }[] = [];
       const years = ['2022', '2023', '2024', '2025'];
       let cumulative = 0;
@@ -178,22 +267,39 @@ export function Dashboard() {
       }
       setGrowthData(growth);
       
-      // Payroll history
-      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'];
-      setPayrollHistory(months.map((month, i) => ({
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const currentMonthIndex = parseInt(selectedMonth.split('-')[1]) - 1;
+      const historyMonths = [];
+      for (let i = 5; i >= 0; i--) {
+        let monthIndex = currentMonthIndex - i;
+        let yearOffset = 0;
+        if (monthIndex < 0) {
+          monthIndex += 12;
+          yearOffset = -1;
+        }
+        const year = parseInt(selectedMonth.split('-')[0]) + yearOffset;
+        historyMonths.push(`${monthNames[monthIndex]} ${year}`);
+      }
+      
+      setPayrollHistory(historyMonths.map((month, i) => ({
         month,
         amount: totalPayroll > 0 ? totalPayroll * (0.7 + (i * 0.06)) : 0
       })));
       
-      // Attendance data
       const attendanceDataTemp = [];
       for (let i = 5; i >= 0; i--) {
-        const date = new Date();
-        date.setMonth(date.getMonth() - i);
-        const monthName = date.toLocaleString('default', { month: 'short' });
+        let monthIndex = currentMonthIndex - i;
+        let yearOffset = 0;
+        if (monthIndex < 0) {
+          monthIndex += 12;
+          yearOffset = -1;
+        }
+        const year = parseInt(selectedMonth.split('-')[0]) + yearOffset;
+        const monthName = `${monthNames[monthIndex]} ${year}`;
         
-        const startDate = new Date(date.getFullYear(), date.getMonth(), 1).toISOString().split('T')[0];
-        const endDate = new Date(date.getFullYear(), date.getMonth() + 1, 0).toISOString().split('T')[0];
+        const startDate = `${year}-${String(monthIndex + 1).padStart(2, '0')}-01`;
+        const lastDay = new Date(year, monthIndex + 1, 0).getDate();
+        const endDate = `${year}-${String(monthIndex + 1).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
         
         let recordsQuery = supabase
           .from('attendance')
@@ -226,23 +332,74 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  };
-
-  const pendingTasks = [
-    { title: 'Approve Payroll', due: 'Today', priority: 'high', icon: Wallet },
-    { title: 'Review Job Applications', due: 'Tomorrow', priority: 'medium', icon: ClipboardList },
-    { title: 'Process Leave Requests', due: '2 days', priority: 'medium', icon: Calendar },
-    { title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high', icon: Shield }
-  ];
+  }, [selectedMonth, userProfile]);
 
   const isSuperAdmin = userProfile?.is_super_admin;
   const userRegion = userProfile?.regions;
+  const isCurrentMonth = selectedMonth === systemMonth;
+  const monthLabel = getMonthLabel(selectedMonth);
+
+  // ===== RENDER CHARTS DIRECTLY =====
+  const renderPayrollChart = () => {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={payrollHistory.map(d => ({ ...d, amount: d.amount / 1000000 }))} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+          <XAxis dataKey="month" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
+          <YAxis tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} tickFormatter={(v) => `${v}M`} />
+          <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`MK ${v}M`, 'Payroll']} />
+          <Line type="monotone" dataKey="amount" stroke="#D4A017" strokeWidth={3} dot={{ fill: '#D4A017', strokeWidth: 2, r: 4, stroke: '#fff' }} activeDot={{ r: 6, fill: '#081C3A' }} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  };
+
+  const renderAttendanceChart = () => {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={attendanceData} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+          <XAxis dataKey="month" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
+          <YAxis domain={[0, 100]} tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} tickFormatter={(v) => `${v}%`} />
+          <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`${v}%`, 'Attendance']} />
+          <Bar dataKey="rate" fill="#081C3A" radius={[6, 6, 0, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  };
+
+  const renderPieChart = () => {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <PieChart>
+          <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={45} outerRadius={80} paddingAngle={1}>
+            {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+          </Pie>
+          <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} />
+        </PieChart>
+      </ResponsiveContainer>
+    );
+  };
+
+  const renderGrowthChart = () => {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={growthData} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+          <XAxis dataKey="year" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
+          <YAxis tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} />
+          <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`${v} employees`, 'Workforce']} />
+          <Line type="monotone" dataKey="employees" stroke="#D4A017" strokeWidth={3} dot={{ fill: '#081C3A', strokeWidth: 2, r: 4, stroke: '#fff' }} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  };
 
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
         <div className="text-center">
-          <div className="w-12 h-12 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <div className="w-12 h-12 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin mx-auto mb-4" />
           <p className="text-slate-500">Loading dashboard...</p>
         </div>
       </div>
@@ -265,11 +422,73 @@ export function Dashboard() {
             </p>
           </div>
           <div className="flex gap-3">
-            <Button variant="secondary" className="font-semibold"><Wallet size={16} /> Run Payroll</Button>
-            <Button variant="ghost" className="bg-white/10 text-white hover:bg-white/20">View Reports</Button>
+            {/* Month Selector */}
+            <div className="flex items-center gap-2 bg-white/10 rounded-lg px-2 py-1">
+              <button
+                onClick={goToPreviousMonth}
+                className="p-1.5 rounded hover:bg-white/20 text-white disabled:opacity-50"
+                disabled={loading}
+                title="Previous Month"
+              >
+                <ChevronLeft size={16} />
+              </button>
+              
+              <select
+                value={selectedMonth}
+                onChange={(e) => handleMonthSelect(e.target.value)}
+                className="bg-transparent border-none text-sm font-medium text-white focus:ring-0 py-1 min-w-[120px] text-center cursor-pointer"
+              >
+                {availableMonths.map((month) => (
+                  <option key={month} value={month}>
+                    {getMonthLabel(month)} {month === systemMonth ? '●' : ''}
+                  </option>
+                ))}
+              </select>
+              
+              <button
+                onClick={goToNextMonth}
+                className="p-1.5 rounded hover:bg-white/20 text-white disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getNextMonth(selectedMonth))}
+                title="Next Month"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </div>
+            
+            {!isCurrentMonth && (
+              <button
+                onClick={goToCurrentMonth}
+                className="text-xs text-[#D4A017] hover:underline px-2 py-1 bg-white/10 rounded-lg"
+              >
+                Jump to Current
+              </button>
+            )}
+            
+            <Button 
+              variant="secondary" 
+              className="font-semibold"
+              onClick={refreshData}
+              disabled={refreshing}
+            >
+              <RefreshCw size={16} className={`mr-1 ${refreshing ? 'animate-spin' : ''}`} />
+              Refresh
+            </Button>
           </div>
         </div>
       </Card>
+
+      {/* Month indicator */}
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-slate-500">
+          Showing data for <strong className="text-slate-700">{monthLabel}</strong>
+          {isCurrentMonth ? ' (Current Month)' : ''}
+        </p>
+        {!isCurrentMonth && (
+          <Badge color={selectedMonth > systemMonth ? 'blue' : 'amber'}>
+            {selectedMonth > systemMonth ? 'Future Month' : 'Past Month'}
+          </Badge>
+        )}
+      </div>
 
       {/* Region indicator for non-admin */}
       {!isSuperAdmin && userRegion && (
@@ -283,7 +502,7 @@ export function Dashboard() {
       {/* Main stats */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard title="Total Employees" value={String(stats.total)} icon={Users} accent="navy" change="↑ from last month" sub={`${stats.activeGuards} Active Guards`} />
-        <StatCard title="Monthly Payroll" value={stats.totalPayroll > 0 ? formatKwacha(stats.totalPayroll) : 'MK 0'} icon={Wallet} accent="gold" change="↑ from last month" sub="Period: Current Month" />
+        <StatCard title="Monthly Payroll" value={stats.totalPayroll > 0 ? formatKwacha(stats.totalPayroll) : 'MK 0'} icon={Wallet} accent="gold" change="↑ from last month" sub={`Period: ${monthLabel}`} />
         <StatCard title="Absent Employees" value={String(stats.onLeave)} icon={UserMinus} accent="red" change="↓ from yesterday" sub="On leave today" />
         <StatCard title="Pending Recruitment" value={String(stats.pendingRecruitment)} icon={ClipboardList} accent="blue" change="3 shortlisted today" sub="5 Interviews Scheduled" />
       </div>
@@ -293,7 +512,7 @@ export function Dashboard() {
         <StatCard title="Active Guards" value={String(stats.activeGuards)} icon={Shield} accent="green" sub="On duty now" />
         <StatCard title="Sites Covered" value={String(stats.sitesCount)} icon={MapPin} accent="navy" sub="Across region" />
         <StatCard title="Supervisors on Duty" value={String(stats.supervisorsOnDuty)} icon={ShieldCheck} accent="blue" sub="Active monitoring" />
-        <StatCard title="Attendance Rate" value={`${stats.attendanceRate}%`} icon={CheckCircle2} accent="gold" sub="This month" />
+        <StatCard title="Attendance Rate" value={`${stats.attendanceRate}%`} icon={CheckCircle2} accent="gold" sub={`${monthLabel}`} />
       </div>
 
       {/* Quick status */}
@@ -321,18 +540,10 @@ export function Dashboard() {
         <Card className="p-5 lg:col-span-2">
           <div className="flex items-center justify-between mb-4">
             <div><h3 className="font-semibold text-slate-800">Monthly Payroll Trend</h3><p className="text-xs text-slate-500">Last 6 months payroll expenditure</p></div>
-            <Badge color="gold">MK Millions</Badge>
+            <Badge color="gold">{monthLabel}</Badge>
           </div>
           <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={payrollHistory.map(d => ({ ...d, amount: d.amount / 1000000 }))} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                <XAxis dataKey="month" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
-                <YAxis tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} tickFormatter={(v) => `${v}M`} />
-                <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`MK ${v}M`, 'Payroll']} />
-                <Line type="monotone" dataKey="amount" stroke="#D4A017" strokeWidth={3} dot={{ fill: '#D4A017', strokeWidth: 2, r: 4, stroke: '#fff' }} activeDot={{ r: 6, fill: '#081C3A' }} />
-              </LineChart>
-            </ResponsiveContainer>
+            {renderPayrollChart()}
           </div>
         </Card>
 
@@ -341,14 +552,7 @@ export function Dashboard() {
             <div><h3 className="font-semibold text-slate-800">Department Distribution</h3><p className="text-xs text-slate-500">Employees by department</p></div>
           </div>
           <div className="h-48">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={45} outerRadius={80} paddingAngle={1}>
-                  {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                </Pie>
-                <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} />
-              </PieChart>
-            </ResponsiveContainer>
+            {renderPieChart()}
           </div>
           <div className="grid grid-cols-2 gap-1 mt-2">
             {pieData.slice(0, 4).map((d, i) => (
@@ -369,15 +573,7 @@ export function Dashboard() {
             <Badge color="green">+2.0%</Badge>
           </div>
           <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={attendanceData} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                <XAxis dataKey="month" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
-                <YAxis domain={[0, 100]} tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} tickFormatter={(v) => `${v}%`} />
-                <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`${v}%`, 'Attendance']} />
-                <Bar dataKey="rate" fill="#081C3A" radius={[6, 6, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+            {renderAttendanceChart()}
           </div>
         </Card>
 
@@ -387,15 +583,7 @@ export function Dashboard() {
             <Badge color="navy">Scaling to 1000+</Badge>
           </div>
           <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={growthData} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                <XAxis dataKey="year" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
-                <YAxis tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} />
-                <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`${v} employees`, 'Workforce']} />
-                <Line type="monotone" dataKey="employees" stroke="#D4A017" strokeWidth={3} dot={{ fill: '#081C3A', strokeWidth: 2, r: 4, stroke: '#fff' }} fill="#FFF1CC" />
-              </LineChart>
-            </ResponsiveContainer>
+            {renderGrowthChart()}
           </div>
         </Card>
       </div>
@@ -464,7 +652,4 @@ export function Dashboard() {
   );
 }
 
-// ==============================================
-// ✅ ADD THIS LINE AT THE VERY END
-// ==============================================
 export default Dashboard;

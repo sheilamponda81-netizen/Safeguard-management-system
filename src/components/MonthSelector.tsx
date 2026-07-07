@@ -1,63 +1,97 @@
-﻿// src/components/MonthSelector.tsx
-import { useState } from 'react';
-import { Calendar, Loader2, AlertCircle } from 'lucide-react';
+﻿import { useState, useEffect } from 'react';
+import { ChevronLeft, ChevronRight, Calendar } from 'lucide-react';
+import { getSystemCurrentMonth, getMonthLabel, getAvailableMonthsFromSystem } from '../utils/currentMonth';
 
 interface MonthSelectorProps {
   selectedMonth: string;
-  onMonthChange: (month: string) => Promise<void>;
-  availableMonths: string[];
+  onMonthChange: (month: string) => void;
+  availableMonths?: string[];
   isLoading?: boolean;
 }
 
-export function MonthSelector({ selectedMonth, onMonthChange, availableMonths, isLoading }: MonthSelectorProps) {
-  const [isChanging, setIsChanging] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+export function MonthSelector({ 
+  selectedMonth, 
+  onMonthChange, 
+  availableMonths: propMonths,
+  isLoading 
+}: MonthSelectorProps) {
+  const [availableMonths, setAvailableMonths] = useState<string[]>(propMonths || []);
+  const [systemMonth, setSystemMonth] = useState<string>('');
 
-  const handleChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const newMonth = e.target.value;
-    if (newMonth === selectedMonth) return;
-    
-    setIsChanging(true);
-    setError(null);
-    
-    try {
-      await onMonthChange(newMonth);
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setIsChanging(false);
+  useEffect(() => {
+    const fetchSystemMonth = async () => {
+      const month = await getSystemCurrentMonth();
+      setSystemMonth(month);
+    };
+    fetchSystemMonth();
+  }, []);
+
+  useEffect(() => {
+    if (!propMonths) {
+      setAvailableMonths(getAvailableMonthsFromSystem());
+    } else {
+      setAvailableMonths(propMonths);
+    }
+  }, [propMonths]);
+
+  const currentIndex = availableMonths.indexOf(selectedMonth);
+  const canGoBack = currentIndex > 0;
+  const canGoForward = currentIndex < availableMonths.length - 1;
+
+  const goToPrevious = () => {
+    if (canGoBack) {
+      onMonthChange(availableMonths[currentIndex - 1]);
     }
   };
 
+  const goToNext = () => {
+    if (canGoForward) {
+      onMonthChange(availableMonths[currentIndex + 1]);
+    }
+  };
+
+  const goToCurrent = () => {
+    if (systemMonth) {
+      onMonthChange(systemMonth);
+    }
+  };
+
+  const isCurrentMonth = selectedMonth === systemMonth;
+
   return (
     <div className="flex items-center gap-2">
-      <div className="relative">
-        <select
-          value={selectedMonth}
-          onChange={handleChange}
-          disabled={isChanging || isLoading}
-          className="px-3 py-2 pr-8 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] outline-none bg-white disabled:opacity-50"
-        >
-          {availableMonths.map(month => (
-            <option key={month} value={month}>{month}</option>
-          ))}
-        </select>
-        <Calendar size={14} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+      <button
+        onClick={goToPrevious}
+        disabled={!canGoBack || isLoading}
+        className="p-1.5 rounded-lg hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
+        title="Previous Month"
+      >
+        <ChevronLeft size={18} />
+      </button>
+      
+      <div className="flex items-center gap-2 min-w-[140px] justify-center">
+        <Calendar size={16} className="text-[#D4A017]" />
+        <span className="text-sm font-medium text-slate-700">
+          {getMonthLabel(selectedMonth)}
+        </span>
+        {!isCurrentMonth && (
+          <button
+            onClick={goToCurrent}
+            className="text-xs text-[#D4A017] hover:underline ml-1"
+          >
+            (Current)
+          </button>
+        )}
       </div>
       
-      {isChanging && (
-        <div className="flex items-center gap-2 text-sm text-slate-500">
-          <Loader2 size={14} className="animate-spin" />
-          Loading...
-        </div>
-      )}
-      
-      {error && (
-        <div className="flex items-center gap-2 text-sm text-red-500">
-          <AlertCircle size={14} />
-          {error}
-        </div>
-      )}
+      <button
+        onClick={goToNext}
+        disabled={!canGoForward || isLoading}
+        className="p-1.5 rounded-lg hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
+        title="Next Month"
+      >
+        <ChevronRight size={18} />
+      </button>
     </div>
   );
 }

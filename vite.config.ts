@@ -1,15 +1,37 @@
-﻿import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import path from 'path'
+﻿import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+import { visualizer } from 'rollup-plugin-visualizer';
+import compression from 'vite-plugin-compression';
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react({
+      fastRefresh: true,
+    }),
+    compression({
+      algorithm: 'gzip',
+      ext: '.gz',
+      threshold: 10240,
+    }),
+    compression({
+      algorithm: 'brotliCompress',
+      ext: '.br',
+      threshold: 10240,
+    }),
+    visualizer({
+      filename: 'dist/stats.html',
+      open: true,
+      gzipSize: true,
+      brotliSize: true,
+      template: 'treemap',
+    }),
+  ],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
       'lodash': 'lodash-es',
-      // ===== FIX: Alias react-is correctly =====
-      'react-is': 'react-is/index.js',
+      'react-is': path.resolve(__dirname, './node_modules/react-is/index.js'),
     },
   },
   server: {
@@ -20,28 +42,32 @@ export default defineConfig({
       'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'strict-origin-when-cross-origin',
     },
+    hmr: {
+      overlay: true,
+    },
   },
   build: {
     sourcemap: false,
     minify: 'esbuild',
     target: 'es2020',
+    chunkSizeWarningLimit: 500,
     rollupOptions: {
       output: {
         manualChunks: {
-          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
-          'vendor-ui': ['lucide-react', 'sonner'],
-          'vendor-charts': ['recharts'],
+          'vendor-react': ['react', 'react-dom', 'react-router-dom', 'react-is'],
+          'vendor-supabase-core': ['@supabase/supabase-js'],
+          'vendor-supabase-auth': ['@supabase/auth-js'],
+          'vendor-supabase-storage': ['@supabase/storage-js'],
+          'vendor-supabase-functions': ['@supabase/functions-js'],
+          'vendor-charts-core': ['recharts', 'use-sync-external-store'],
+          'vendor-ui-core': ['lucide-react', 'sonner'],
+          'vendor-ui-utils': ['class-variance-authority', 'clsx', 'tailwind-merge'],
+          'vendor-utils': ['lodash-es', 'es-toolkit'],
           'vendor-pdf': ['jspdf', 'jspdf-autotable', 'html2canvas'],
-          'vendor-supabase': ['@supabase/supabase-js'],
         },
         chunkFileNames: 'assets/[name]-[hash].js',
         entryFileNames: 'assets/[name]-[hash].js',
       },
-    },
-    chunkSizeWarningLimit: 500,
-    // ===== FIX: Add commonjs options =====
-    commonjsOptions: {
-      include: [/react-is/, /node_modules/],
     },
   },
   optimizeDeps: {
@@ -50,16 +76,21 @@ export default defineConfig({
       'react-dom',
       'react-router-dom',
       '@supabase/supabase-js',
+      '@supabase/auth-js',
       'lucide-react',
       'sonner',
       'lodash-es',
-      'react-is',
       'es-toolkit',
+      'react-is',
+      // ===== FIX: Add these for recharts =====
       'recharts',
+      'use-sync-external-store',
+      'use-sync-external-store/shim/with-selector',
     ],
     exclude: ['jspdf', 'html2canvas'],
-    esbuildOptions: {
-      target: 'es2020',
-    },
   },
-})
+  esbuild: {
+    drop: process.env.NODE_ENV === 'production' ? ['console', 'debugger'] : [],
+    target: 'es2020',
+  },
+});

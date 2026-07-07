@@ -1,13 +1,18 @@
-import { useState, useEffect, useRef } from 'react';
-import { 
-  Calculator, Users, Search, Download, Printer, FileText,
-  Calendar, Clock, AlertCircle, CheckCircle, XCircle,
-  User, Building2, Wallet, Percent, Receipt, Briefcase, Eye, Edit2, Save, X, ChevronDown
-} from 'lucide-react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Calculator, Users, Search, Download, Printer, FileText, Calendar, Clock, AlertCircle, CheckCircle, XCircle, User, Building2, Wallet, Percent, Receipt, Briefcase, Eye, Edit2, Save, X, ChevronDown, ChevronLeft, ChevronRight } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { showNotification } from '../utils/clickHandlers';
+import { logAudit } from '../utils/auditLogger';
+import { 
+  getSystemCurrentMonth, 
+  getMonthLabel, 
+  getNextMonth, 
+  getPreviousMonth,
+  getAvailableMonthsFromSystem
+} from '../utils/currentMonth';
+import { Pagination } from '../components/Pagination';
 
 interface Employee {
   id: string;
@@ -70,6 +75,7 @@ const terminationTypes = [
 ];
 
 export function TerminalDuesPage() {
+  // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [selectedEmployee, setSelectedEmployee] = useState<Employee | null>(null);
   const [calculations, setCalculations] = useState<TerminalDue[]>([]);
@@ -80,7 +86,12 @@ export function TerminalDuesPage() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [editingCalculation, setEditingCalculation] = useState<TerminalDue | null>(null);
   const [userProfile, setUserProfile] = useState<any>(null);
+  const [filterStatus, setFilterStatus] = useState('all');
   
+  // ===== PAGINATION STATES =====
+  const [duesPage, setDuesPage] = useState(1);
+  const [duesItemsPerPage, setDuesItemsPerPage] = useState(20);
+
   // Searchable employee selector states
   const [employeeSearch, setEmployeeSearch] = useState('');
   const [showEmployeeDropdown, setShowEmployeeDropdown] = useState(false);
@@ -88,7 +99,7 @@ export function TerminalDuesPage() {
   const dropdownRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   
-  // Form data with correct default values
+  // Form data
   const [formData, setFormData] = useState({
     employee_id: '',
     date_left: new Date().toISOString().split('T')[0],
@@ -102,80 +113,55 @@ export function TerminalDuesPage() {
   // Preview calculation state
   const [previewCalculation, setPreviewCalculation] = useState<TerminalDue | null>(null);
 
-  const [filterStatus, setFilterStatus] = useState('all');
+  // ===== MEMOIZED VALUES =====
+  const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
+  const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
 
-  // ===== FIXED: Filter employees based on search with proper null safety =====
-  useEffect(() => {
-    if (employeeSearch.trim() === '') {
-      setFilteredEmployees([]);
-      return;
+  const displayedCalculations = useMemo(() => {
+    let result = calculations;
+    
+    if (filterStatus !== 'all') {
+      result = result.filter(c => c.status === filterStatus);
     }
     
-    const searchLower = employeeSearch.toLowerCase().trim();
-    
-    // Filter through all employees (not just the first 20)
-    const filtered = employees.filter(emp => {
-      // Get safe values with fallbacks
-      const fullName = (emp?.fullName || '').toLowerCase();
-      const employeeNumber = (emp?.employeeNumber || '').toLowerCase();
-      const position = (emp?.position || '').toLowerCase();
-      
-      // Check if any field matches the search
-      return fullName.includes(searchLower) ||
-             employeeNumber.includes(searchLower) ||
-             position.includes(searchLower);
-    });
-    
-    // Limit results for display (show up to 20 matches)
-    setFilteredEmployees(filtered.slice(0, 20));
-  }, [employeeSearch, employees]);
-
-  // Close dropdown when clicking outside
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
-        setShowEmployeeDropdown(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
-
-  // Select employee from dropdown
-  const selectEmployee = (employee: Employee) => {
-    setSelectedEmployee(employee);
-    setFormData({ ...formData, employee_id: employee.id });
-    setEmployeeSearch(employee.fullName || '');
-    setShowEmployeeDropdown(false);
-    setPreviewCalculation(null);
-  };
-
-  // Fetch user profile
-  useEffect(() => {
-    const fetchUserProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .single();
-        setUserProfile(profile);
-      }
-    };
-    fetchUserProfile();
-  }, []);
-
-  // Fetch employees and calculations
-  useEffect(() => {
-    if (userProfile) {
-      fetchEmployees();
-      fetchCalculations();
+    if (search) {
+      const searchLower = search.toLowerCase();
+      result = result.filter(c => {
+        const name = (c.employee_name || '').toLowerCase();
+        const number = (c.employee_number || '').toLowerCase();
+        return name.includes(searchLower) || number.includes(searchLower);
+      });
     }
-  }, [userProfile]);
+    
+    return result;
+  }, [calculations, filterStatus, search]);
 
-  // ===== FIXED: Fetch employees with proper data mapping =====
-  const fetchEmployees = async () => {
+  // ===== PAGINATED DUES =====
+  const paginatedDues = useMemo(() => {
+    const startIndex = (duesPage - 1) * duesItemsPerPage;
+    const endIndex = Math.min(startIndex + duesItemsPerPage, displayedCalculations.length);
+    return displayedCalculations.slice(startIndex, endIndex);
+  }, [displayedCalculations, duesPage, duesItemsPerPage]);
+
+  // ===== RESET PAGE WHEN SEARCH OR FILTER CHANGES =====
+  useEffect(() => {
+    setDuesPage(1);
+  }, [search, filterStatus]);
+
+  // ===== CALLBACKS =====
+  const fetchUserProfile = useCallback(async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*, regions(*)')
+        .eq('id', user.id)
+        .single();
+      setUserProfile(profile);
+    }
+  }, []);
+
+  const fetchEmployees = useCallback(async () => {
     try {
       let query = supabase
         .from('employees')
@@ -189,7 +175,6 @@ export function TerminalDuesPage() {
       const { data, error } = await query.order('full_name');
       if (error) throw error;
       
-      // ===== FIXED: Properly map the employee data =====
       const mappedEmployees = (data || []).map((emp: any) => ({
         id: emp.id,
         employeeNumber: emp.employee_number || '',
@@ -204,15 +189,14 @@ export function TerminalDuesPage() {
         status: emp.status || 'Active'
       }));
       
-      console.log('Fetched employees:', mappedEmployees.length);
       setEmployees(mappedEmployees);
     } catch (err) {
       console.error('Error fetching employees:', err);
       showNotification('Failed to load employees', 'error');
     }
-  };
+  }, [userProfile]);
 
-  const fetchCalculations = async () => {
+  const fetchCalculations = useCallback(async () => {
     setLoading(true);
     try {
       let query = supabase
@@ -241,10 +225,67 @@ export function TerminalDuesPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [userProfile]);
 
-  // Calculate Terminal Dues with correct formulas
-  const calculateTerminalDues = () => {
+  // ===== INITIALIZATION =====
+  useEffect(() => {
+    const init = async () => {
+      await fetchUserProfile();
+    };
+    init();
+  }, [fetchUserProfile]);
+
+  useEffect(() => {
+    if (userProfile) {
+      fetchEmployees();
+      fetchCalculations();
+    }
+  }, [userProfile, fetchEmployees, fetchCalculations]);
+
+  // ===== SEARCHABLE EMPLOYEE DROPDOWN =====
+  useEffect(() => {
+    if (employeeSearch.trim() === '') {
+      setFilteredEmployees([]);
+      return;
+    }
+    
+    const searchLower = employeeSearch.toLowerCase().trim();
+    
+    const filtered = employees.filter(emp => {
+      const fullName = (emp?.fullName || '').toLowerCase();
+      const employeeNumber = (emp?.employeeNumber || '').toLowerCase();
+      const position = (emp?.position || '').toLowerCase();
+      
+      return fullName.includes(searchLower) ||
+             employeeNumber.includes(searchLower) ||
+             position.includes(searchLower);
+    });
+    
+    setFilteredEmployees(filtered.slice(0, 20));
+  }, [employeeSearch, employees]);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setShowEmployeeDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // ===== SELECT EMPLOYEE =====
+  const selectEmployee = useCallback((employee: Employee) => {
+    setSelectedEmployee(employee);
+    setFormData({ ...formData, employee_id: employee.id });
+    setEmployeeSearch(employee.fullName || '');
+    setShowEmployeeDropdown(false);
+    setPreviewCalculation(null);
+  }, [formData]);
+
+  // ===== CALCULATE TERMINAL DUES =====
+  const calculateTerminalDues = useCallback(() => {
     if (!selectedEmployee) {
       showNotification('Please select an employee', 'error');
       return null;
@@ -253,34 +294,19 @@ export function TerminalDuesPage() {
     const dateJoined = new Date(selectedEmployee.hire_date);
     const dateLeft = new Date(formData.date_left);
     
-    // Calculate period in months
     let monthsDiff = (dateLeft.getFullYear() - dateJoined.getFullYear()) * 12 + 
                      (dateLeft.getMonth() - dateJoined.getMonth());
     
-    // Ensure at least 1 month
     const periodMonths = Math.max(1, monthsDiff);
     
     const basicSalary = selectedEmployee.basicSalary || 150000;
     
-    // ===== FORMULA 1: Pension Arrears / Gratuity =====
     const gratuity = Math.round((periodMonths * basicSalary * 10) / 100);
-    
-    // ===== FORMULA 2: Annual Leave =====
     const annualLeave = Math.round((26 * basicSalary * 1) / 26);
-    
-    // ===== FORMULA 3: Uniform Refund =====
     const uniformRefund = Number(formData.uniform_refund) || 0;
-    
-    // ===== FORMULA 4: Other Benefits =====
     const otherBenefits = Number(formData.other_benefits) || 0;
-    
-    // ===== FORMULA 5: Subtotal =====
     const subtotal = gratuity + annualLeave + uniformRefund + otherBenefits;
-    
-    // ===== FORMULA 6: Deductions =====
     const deductions = Number(formData.deductions) || 0;
-    
-    // ===== FORMULA 7: Total Payable =====
     const totalPayable = subtotal - deductions;
 
     const calculation: TerminalDue = {
@@ -308,10 +334,10 @@ export function TerminalDuesPage() {
 
     setPreviewCalculation(calculation);
     return calculation;
-  };
+  }, [selectedEmployee, formData]);
 
-  // Save calculation to database
-  const saveCalculation = async () => {
+  // ===== SAVE CALCULATION =====
+  const saveCalculation = useCallback(async () => {
     if (!selectedEmployee) {
       showNotification('Please select an employee', 'error');
       return;
@@ -331,6 +357,26 @@ export function TerminalDuesPage() {
       showNotification('Error saving calculation: ' + error.message, 'error');
       console.error('Error:', error);
     } else {
+      await logAudit({
+        action: 'CREATE',
+        entity_type: 'terminal_due',
+        entity_id: data?.[0]?.id || 'new',
+        new_data: {
+          employee_name: calculation.employee_name,
+          employee_number: calculation.employee_number,
+          position: calculation.position,
+          total_payable: calculation.total_payable,
+          gratuity: calculation.gratuity,
+          annual_leave: calculation.annual_leave,
+          uniform_refund: calculation.uniform_refund,
+          deductions: calculation.deductions,
+          termination_type: calculation.termination_type,
+          reason: calculation.reason_for_termination,
+          period_months: calculation.period_months
+        },
+        region_id: userProfile?.region_id
+      });
+
       showNotification('Terminal dues calculated successfully', 'success');
       setPreviewCalculation(null);
       setShowCalculateModal(false);
@@ -338,9 +384,18 @@ export function TerminalDuesPage() {
       setSelectedEmployee(null);
       await fetchCalculations();
     }
-  };
+  }, [selectedEmployee, calculateTerminalDues, userProfile, fetchCalculations]);
 
-  const updateStatus = async (id: string, status: string) => {
+  // ===== UPDATE STATUS =====
+  const updateStatus = useCallback(async (id: string, status: string) => {
+    const existingCalc = calculations.find(c => c.id === id);
+    if (!existingCalc) {
+      showNotification('Calculation not found', 'error');
+      return;
+    }
+
+    const oldStatus = existingCalc.status;
+
     const { error } = await supabase
       .from('terminal_dues')
       .update({ status, updated_at: new Date().toISOString() })
@@ -349,14 +404,36 @@ export function TerminalDuesPage() {
     if (error) {
       showNotification('Error updating status', 'error');
     } else {
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'terminal_due',
+        entity_id: id,
+        old_data: {
+          employee_name: existingCalc.employee_name,
+          employee_number: existingCalc.employee_number,
+          status: oldStatus,
+          total_payable: existingCalc.total_payable
+        },
+        new_data: {
+          employee_name: existingCalc.employee_name,
+          employee_number: existingCalc.employee_number,
+          status: status,
+          total_payable: existingCalc.total_payable
+        },
+        region_id: userProfile?.region_id
+      });
+
       showNotification(`Status updated to ${status}`, 'success');
       fetchCalculations();
     }
-  };
+  }, [calculations, userProfile, fetchCalculations]);
 
-  const updateCalculation = async () => {
+  // ===== UPDATE CALCULATION =====
+  const updateCalculation = useCallback(async () => {
     if (!editingCalculation) return;
 
+    const existingCalc = calculations.find(c => c.id === editingCalculation.id);
+    
     const subtotal = editingCalculation.gratuity + editingCalculation.annual_leave + 
                      editingCalculation.uniform_refund + editingCalculation.other_benefits;
     const totalPayable = subtotal - editingCalculation.deductions;
@@ -379,45 +456,71 @@ export function TerminalDuesPage() {
     if (error) {
       showNotification('Error updating: ' + error.message, 'error');
     } else {
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'terminal_due',
+        entity_id: editingCalculation.id,
+        old_data: {
+          employee_name: existingCalc?.employee_name || editingCalculation.employee_name,
+          employee_number: existingCalc?.employee_number || editingCalculation.employee_number,
+          deductions: existingCalc?.deductions || 0,
+          uniform_refund: existingCalc?.uniform_refund || 0,
+          other_benefits: existingCalc?.other_benefits || 0,
+          total_payable: existingCalc?.total_payable || 0,
+          status: existingCalc?.status || 'pending',
+          reason: existingCalc?.reason_for_termination || '',
+          termination_type: existingCalc?.termination_type || ''
+        },
+        new_data: {
+          employee_name: editingCalculation.employee_name,
+          employee_number: editingCalculation.employee_number,
+          deductions: editingCalculation.deductions,
+          uniform_refund: editingCalculation.uniform_refund,
+          other_benefits: editingCalculation.other_benefits,
+          total_payable: totalPayable,
+          status: editingCalculation.status,
+          reason: editingCalculation.reason_for_termination,
+          termination_type: editingCalculation.termination_type
+        },
+        region_id: userProfile?.region_id
+      });
+
       showNotification('Calculation updated successfully', 'success');
       setShowEditModal(false);
       setEditingCalculation(null);
       fetchCalculations();
     }
-  };
+  }, [editingCalculation, calculations, userProfile, fetchCalculations]);
 
-  // Apply filters
-  const getFilteredCalculations = () => {
-    let result = calculations;
+  // ===== VIEW DETAIL =====
+  const handleViewDetail = useCallback(async (calc: TerminalDue) => {
+    setShowDetailModal(calc);
     
-    if (filterStatus !== 'all') {
-      result = result.filter(c => c.status === filterStatus);
-    }
-    
-    if (search) {
-      const searchLower = search.toLowerCase();
-      result = result.filter(c => {
-        const name = (c.employee_name || '').toLowerCase();
-        const number = (c.employee_number || '').toLowerCase();
-        return name.includes(searchLower) || number.includes(searchLower);
-      });
-    }
-    
-    return result;
-  };
+    await logAudit({
+      action: 'VIEW',
+      entity_type: 'terminal_due',
+      entity_id: calc.id,
+      new_data: {
+        employee_name: calc.employee_name,
+        employee_number: calc.employee_number,
+        total_payable: calc.total_payable,
+        status: calc.status
+      },
+      region_id: userProfile?.region_id
+    });
+  }, [userProfile]);
 
-  const displayedCalculations = getFilteredCalculations();
-
-  const getStatusColor = (status: string) => {
+  // ===== GET STATUS COLOR =====
+  const getStatusColor = useCallback((status: string) => {
     switch (status) {
       case 'approved': return 'green';
       case 'paid': return 'blue';
       case 'pending': return 'yellow';
       default: return 'gray';
     }
-  };
+  }, []);
 
-  const getTypeColor = (type: string) => {
+  const getTypeColor = useCallback((type: string) => {
     switch (type) {
       case 'disciplinary': return 'red';
       case 'redundancy': return 'orange';
@@ -426,14 +529,14 @@ export function TerminalDuesPage() {
       case 'medical': return 'purple';
       default: return 'gray';
     }
-  };
+  }, []);
 
-  const isSuperAdmin = userProfile?.is_super_admin;
-  const userRegion = userProfile?.regions;
-
+  // ===== RENDER =====
   if (loading) {
     return <div className="flex justify-center py-12"><div className="w-8 h-8 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin"></div></div>;
   }
+
+  const totalPages = Math.ceil(displayedCalculations.length / duesItemsPerPage);
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -512,6 +615,7 @@ export function TerminalDuesPage() {
           <Button variant="outline" onClick={() => {
             setSearch('');
             setFilterStatus('all');
+            setDuesPage(1);
           }} className="text-sm">
             Clear Filters
           </Button>
@@ -534,7 +638,7 @@ export function TerminalDuesPage() {
               </TR>
             </THead>
             <TBody>
-              {displayedCalculations.length === 0 ? (
+              {paginatedDues.length === 0 ? (
                 <TR>
                   <TD colSpan={7} className="text-center py-8 text-slate-500">
                     <Calculator size={32} className="mx-auto mb-2 text-slate-300" />
@@ -542,7 +646,7 @@ export function TerminalDuesPage() {
                   </TD>
                 </TR>
               ) : (
-                displayedCalculations.map((calc) => (
+                paginatedDues.map((calc) => (
                   <TR key={calc.id} className="hover:bg-slate-50">
                     <TD>
                       <div>
@@ -568,7 +672,7 @@ export function TerminalDuesPage() {
                     <TD className="text-right">
                       <div className="flex items-center justify-end gap-1">
                         <button
-                          onClick={() => setShowDetailModal(calc)}
+                          onClick={() => handleViewDetail(calc)}
                           className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
                         >
                           <Eye size={14} />
@@ -615,6 +719,15 @@ export function TerminalDuesPage() {
           </table>
         </div>
       </div>
+
+      <Pagination
+        currentPage={duesPage}
+        totalPages={totalPages}
+        totalItems={displayedCalculations.length}
+        itemsPerPage={duesItemsPerPage}
+        onPageChange={setDuesPage}
+        onItemsPerPageChange={setDuesItemsPerPage}
+      />
 
       {/* Calculate Modal with Searchable Employee Selector */}
       <Modal open={showCalculateModal} onClose={() => {

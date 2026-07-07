@@ -1,27 +1,46 @@
-// src/utils/reactIsPatch.ts
+// ============================================
+// FIX: react-is patch for jsPDF compatibility
+// ============================================
 
-// This is a patch to fix the react-is import issue with recharts
-
-// @ts-ignore - ignore type errors
-import * as reactIs from 'react-is';
-
-// Make sure the named exports exist on the imported object
-// @ts-ignore
-if (typeof reactIs.isFragment === 'undefined') {
-  // @ts-ignore
-  reactIs.isFragment = function isFragment() { return false; };
+// Define types for the react-is patch
+interface ReactIsPatch {
+  isElement: (value: any) => boolean;
+  isValidElementType: (type: any) => boolean;
+  isFragment: (value: any) => boolean;
 }
 
-// @ts-ignore
-if (typeof reactIs.isElement === 'undefined') {
-  // @ts-ignore
-  reactIs.isElement = function isElement() { return false; };
+// Check if react-is already exists on window
+const existingReactIs = (window as any).reactIs;
+
+// Only apply patch if react-is is missing
+if (!existingReactIs || typeof existingReactIs.isElement !== 'function') {
+  const patch: ReactIsPatch = {
+    isElement: (value: any): boolean => {
+      return value && 
+             typeof value === 'object' && 
+             value.$$typeof === Symbol.for('react.element');
+    },
+    isValidElementType: (type: any): boolean => {
+      return typeof type === 'function' || 
+             typeof type === 'string' ||
+             (type && typeof type === 'object' && type.$$typeof === Symbol.for('react.memo'));
+    },
+    isFragment: (value: any): boolean => {
+      return value && 
+             value.$$typeof === Symbol.for('react.fragment');
+    },
+  };
+
+  // Assign the patch to window
+  (window as any).reactIs = patch;
+  console.log('✅ react-is patch applied successfully');
+} else {
+  console.log('✅ react-is already present, skipping patch');
 }
 
-// @ts-ignore
-if (typeof reactIs.isValidElementType === 'undefined') {
-  // @ts-ignore
-  reactIs.isValidElementType = function isValidElementType() { return false; };
-}
+// Export a no-op function for compatibility
+export const reactIsPatch = (): void => {
+  // Patch already applied, nothing to do
+};
 
 export default reactIs;

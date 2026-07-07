@@ -1,12 +1,14 @@
-﻿import { useState, useEffect } from 'react';
-import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, Sparkles } from 'lucide-react';
+﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, Sparkles, ChevronLeft, ChevronRight } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { supabase } from '../lib/supabase';
-import { getAvailableMonths, getCurrentMonth, getDateRangeFromMonth, isFutureMonth } from '../utils/dateUtils';
-import { MonthSelector } from '../components/MonthSelector';
+import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
 import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
 import { sanitizeInput } from '../utils/securityHeaders';
+import { logAudit } from '../utils/auditLogger';
+import { showNotification } from '../utils/clickHandlers';
+import { Pagination } from '../components/Pagination';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -16,6 +18,7 @@ const statusColors: Record<string, string> = {
   SL: 'bg-purple-500', 
   '-': 'bg-slate-200'
 };
+
 const statusLabels: Record<string, string> = { 
   P: 'Present', 
   A: 'Absent', 
@@ -53,17 +56,19 @@ interface DeductionSettings {
 }
 
 export function AttendancePage() {
+  // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [selectedMonth, setSelectedMonth] = useState(getCurrentMonth());
+  const [selectedMonth, setSelectedMonth] = useState('');
+  const [systemMonth, setSystemMonth] = useState('');
+  const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [selectedEmployee, setSelectedEmployee] = useState<Employee | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showCopyModal, setShowCopyModal] = useState(false);
-  const [hasData, setHasData] = useState(true);
+  const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<any>(null);
-  const availableMonths = getAvailableMonths();
   
   const [deductionSettings, setDeductionSettings] = useState<DeductionSettings>({
     absentDeduction: 4200,
@@ -73,28 +78,24 @@ export function AttendancePage() {
     appearanceDeduction: 2000
   });
 
-  useEffect(() => {
-    const fetchUserProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .single();
-        console.log('User Profile:', profile);
-        console.log('User Region ID:', profile?.region_id);
-        console.log('User Tenant ID:', profile?.tenant_id);
-        console.log('Is Super Admin:', profile?.is_super_admin);
-        setUserProfile(profile);
-      }
-    };
-    fetchUserProfile();
-    
-    loadDeductionSettings();
+  // ===== PAGINATION STATES =====
+  const [attendancePage, setAttendancePage] = useState(1);
+  const [attendanceItemsPerPage, setAttendanceItemsPerPage] = useState(20);
+
+  // ===== HELPER FUNCTIONS =====
+  const getDatesForMonth = useCallback((monthYear: string) => {
+    if (!monthYear) return [];
+    const [year, month] = monthYear.split('-').map(Number);
+    const daysInMonth = new Date(year, month, 0).getDate();
+    const datesArr = [];
+    for (let i = 1; i <= daysInMonth; i++) {
+      const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(i).padStart(2, '0')}`;
+      datesArr.push(dateStr);
+    }
+    return datesArr;
   }, []);
 
-  const loadDeductionSettings = async () => {
+  const loadDeductionSettings = useCallback(async () => {
     try {
       const saved = localStorage.getItem('attendanceDeductionSettings');
       if (saved) {
@@ -104,27 +105,80 @@ export function AttendancePage() {
     } catch (err) {
       console.error('Error loading deduction settings:', err);
     }
-  };
+  }, []);
 
-  function getDatesForMonth(monthYear: string) {
-    const { startDate, daysInMonth } = getDateRangeFromMonth(monthYear);
-    const dates = [];
-    for (let i = 1; i <= daysInMonth; i++) {
-      const dateStr = `${startDate.slice(0, 8)}${String(i).padStart(2, '0')}`;
-      dates.push(dateStr);
+  // ===== MEMOIZED VALUES =====
+  const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
+  const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
+  const dates = useMemo(() => getDatesForMonth(selectedMonth), [selectedMonth, getDatesForMonth]);
+  
+  const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
+  const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
+
+  // ===== FETCH USER PROFILE =====
+  const fetchUserProfile = useCallback(async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*, regions(*)')
+        .eq('id', user.id)
+        .single();
+      setUserProfile(profile);
     }
-    return dates;
-  }
+  }, []);
 
-  const checkDataExists = async (month: string) => {
-    const dates = getDatesForMonth(month);
-    if (dates.length === 0) return false;
+  // ===== FETCH DATA =====
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      let employeesQuery = supabase
+        .from('employees')
+        .select('id, employee_number, full_name, position, department, status, region_id');
+      
+      if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+      }
+      
+      const { data: employeesData, error: empError } = await employeesQuery;
+      if (empError) throw empError;
+      
+      setEmployees(employeesData || []);
+      
+      const datesArr = getDatesForMonth(selectedMonth);
+      if (datesArr.length > 0 && employeesData && employeesData.length > 0) {
+        const employeeIds = employeesData.map(e => e.id);
+        
+        let attendanceQuery = supabase
+          .from('attendance')
+          .select('*')
+          .gte('date', datesArr[0])
+          .lte('date', datesArr[datesArr.length - 1])
+          .in('employee_id', employeeIds);
+        
+        const { data: attendanceData, error: attError } = await attendanceQuery;
+        if (attError) throw attError;
+        setAttendance(attendanceData || []);
+      }
+    } catch (err: any) {
+      console.error('Error fetching data:', err);
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedMonth, userProfile, getDatesForMonth]);
+
+  // ===== CHECK DATA EXISTS =====
+  const checkDataExists = useCallback(async (month: string) => {
+    const datesArr = getDatesForMonth(month);
+    if (datesArr.length === 0) return false;
     
     let query = supabase
       .from('attendance')
       .select('id', { count: 'exact', head: true })
-      .gte('date', dates[0])
-      .lte('date', dates[dates.length - 1]);
+      .gte('date', datesArr[0])
+      .lte('date', datesArr[datesArr.length - 1]);
     
     if (!userProfile?.is_super_admin && userProfile?.region_id) {
       const { data: regionEmployees } = await supabase
@@ -143,29 +197,307 @@ export function AttendancePage() {
       return false;
     }
     return (count || 0) > 0;
-  };
+  }, [userProfile, getDatesForMonth]);
 
-  const handleMonthChange = async (newMonth: string) => {
-    if (isFutureMonth(newMonth)) {
-      setError('Cannot load future months. Please select a current or past month.');
+  // ===== INITIALIZATION =====
+  useEffect(() => {
+    const init = async () => {
+      const month = await getSystemCurrentMonth();
+      setSystemMonth(month);
+      setSelectedMonth(month);
+      
+      const months = getAvailableMonthsFromSystem(month);
+      setAvailableMonths(months);
+      
+      await fetchUserProfile();
+    };
+    init();
+    loadDeductionSettings();
+  }, [fetchUserProfile, loadDeductionSettings]);
+
+  useEffect(() => {
+    if (userProfile && selectedMonth) {
+      fetchData();
+    }
+  }, [selectedMonth, userProfile, fetchData]);
+
+  // ===== MONTH NAVIGATION =====
+  const goToPreviousMonth = useCallback(async () => {
+    const prevMonth = getPreviousMonth(selectedMonth);
+    if (prevMonth && availableMonths.includes(prevMonth)) {
+      setSelectedMonth(prevMonth);
+      setAttendancePage(1);
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToNextMonth = useCallback(async () => {
+    const nextMonth = getNextMonth(selectedMonth);
+    if (nextMonth && availableMonths.includes(nextMonth)) {
+      setSelectedMonth(nextMonth);
+      setAttendancePage(1);
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToCurrentMonth = useCallback(async () => {
+    if (systemMonth && systemMonth !== selectedMonth) {
+      setSelectedMonth(systemMonth);
+      setAttendancePage(1);
+    }
+  }, [systemMonth, selectedMonth]);
+
+  const handleMonthSelect = useCallback(async (month: string) => {
+    if (month !== selectedMonth) {
+      setSelectedMonth(month);
+      setAttendancePage(1);
+    }
+  }, [selectedMonth]);
+
+  // ===== UPDATE ATTENDANCE =====
+  const updateAttendance = useCallback(async (employeeId: string, date: string, currentStatus: string) => {
+    const employee = employees.find(e => e.id === employeeId);
+    if (!userProfile?.is_super_admin && employee?.region_id !== userProfile?.region_id) {
+      alert('You can only edit attendance for employees in your region');
       return;
     }
-    setSelectedMonth(newMonth);
-    setLoading(true);
-    setError(null);
-    try {
-      const exists = await checkDataExists(newMonth);
-      setHasData(exists);
-      if (!exists && newMonth < getCurrentMonth()) {
-        setShowCopyModal(true);
-      }
-      await fetchData();
-    } finally {
-      setLoading(false);
+    
+    if (selectedMonth !== systemMonth) {
+      alert('You can only edit attendance for the current month.');
+      return;
     }
-  };
+    
+    const currentIndex = statusCycle.indexOf(currentStatus);
+    const nextIndex = (currentIndex + 1) % statusCycle.length;
+    const nextStatus = statusCycle[nextIndex];
+    
+    try {
+      const tenantId = userProfile?.tenant_id;
+      
+      const dateObj = new Date(date);
+      const currentMonthStr = selectedMonth;
+      const dateMonthStr = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
+      
+      if (dateMonthStr !== currentMonthStr) {
+        alert('You can only edit attendance for the current month.');
+        return;
+      }
+      
+      const { data: existingRecord, error: checkError } = await supabase
+        .from('attendance')
+        .select('id')
+        .eq('employee_id', employeeId)
+        .eq('date', date)
+        .maybeSingle();
+      
+      if (checkError) throw checkError;
+      
+      let result;
+      let oldStatus = currentStatus;
+      let newStatus = nextStatus;
+      
+      if (existingRecord) {
+        result = await supabase
+          .from('attendance')
+          .update({ status: nextStatus })
+          .eq('id', existingRecord.id);
+      } else {
+        oldStatus = '-';
+        result = await supabase
+          .from('attendance')
+          .insert({ 
+            employee_id: employeeId, 
+            date: date, 
+            status: nextStatus,
+            tenant_id: tenantId || null
+          });
+      }
+      
+      if (result.error) throw result.error;
+      
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'attendance',
+        entity_id: existingRecord?.id || employeeId,
+        old_data: { 
+          status: oldStatus,
+          employee_name: employee?.full_name || 'Unknown',
+          employee_number: employee?.employee_number || 'N/A'
+        },
+        new_data: { 
+          status: newStatus, 
+          employee_id: employeeId,
+          employee_name: employee?.full_name || 'Unknown',
+          employee_number: employee?.employee_number || 'N/A',
+          date: date,
+          month: selectedMonth
+        },
+        region_id: userProfile?.region_id
+      });
+      
+      await fetchData();
+      
+    } catch (err: any) {
+      console.error('Error updating attendance:', err);
+      alert('Failed to update attendance: ' + err.message);
+    }
+  }, [employees, userProfile, selectedMonth, systemMonth, fetchData]);
 
-  const copyFromPreviousMonth = async (sourceMonth: string) => {
+  // ===== GET ATTENDANCE STATUS =====
+  const getAttendanceStatus = useCallback((employeeId: string, date: string): string => {
+    const record = attendance.find(a => a.employee_id === employeeId && a.date === date);
+    return record?.status || '-';
+  }, [attendance]);
+
+  // ===== GET EMPLOYEE STATS =====
+  const getEmployeeStats = useCallback((employeeId: string) => {
+    const employeeAttendance = attendance.filter(a => a.employee_id === employeeId);
+    const counts = { P: 0, A: 0, L: 0, LV: 0, SL: 0 };
+    employeeAttendance.forEach(record => {
+      if (record.status && counts[record.status as keyof typeof counts] !== undefined) {
+        counts[record.status as keyof typeof counts]++;
+      }
+    });
+    const total = counts.P + counts.A + counts.L + counts.LV + counts.SL;
+    return { ...counts, total };
+  }, [attendance]);
+
+  // ===== CALCULATE DEDUCTIONS =====
+  const calculateEmployeeDeductions = useCallback((employeeId: string) => {
+    const employeeAttendance = attendance.filter(a => a.employee_id === employeeId);
+    const counts = { A: 0, L: 0 };
+    let lectureMissedCount = 0;
+    
+    employeeAttendance.forEach(record => {
+      if (record.status === 'A') counts.A++;
+      if (record.status === 'L') counts.L++;
+    });
+    
+    const datesArr = getDatesForMonth(selectedMonth);
+    datesArr.forEach(date => {
+      const dateObj = new Date(date);
+      const dayOfWeek = dateObj.getDay();
+      if (dayOfWeek === 3 || dayOfWeek === 4) {
+        const status = getAttendanceStatus(employeeId, date);
+        if (status === 'A') {
+          lectureMissedCount++;
+        }
+      }
+    });
+    
+    const absentDeduction = counts.A * deductionSettings.absentDeduction;
+    const lateDeduction = counts.L * deductionSettings.lateDeduction;
+    const attendanceDeduction = absentDeduction + lateDeduction;
+    
+    let lectureDeduction = 0;
+    if (lectureMissedCount > 0) {
+      const totalLectures = datesArr.filter(d => {
+        const dayOfWeek = new Date(d).getDay();
+        return dayOfWeek === 3 || dayOfWeek === 4;
+      }).length;
+      
+      if (lectureMissedCount === totalLectures && totalLectures > 0) {
+        lectureDeduction = deductionSettings.lectureFullMonthDeduction;
+      } else {
+        lectureDeduction = lectureMissedCount * deductionSettings.lectureDeduction;
+      }
+    }
+    
+    const appearanceDeduction = deductionSettings.appearanceDeduction;
+    const totalDeductions = attendanceDeduction + lectureDeduction + appearanceDeduction;
+    
+    return {
+      absentDays: counts.A,
+      lateDays: counts.L,
+      absentDeduction,
+      lateDeduction,
+      attendanceDeduction,
+      lectureMissedCount,
+      lectureDeduction,
+      appearanceDeduction,
+      totalDeductions
+    };
+  }, [attendance, selectedMonth, deductionSettings, getDatesForMonth, getAttendanceStatus]);
+
+  // ===== FILTER EMPLOYEES =====
+  const filteredEmployees = useMemo(() => {
+    const safeSearch = sanitizeInput(search).toLowerCase();
+    return employees.filter(e => 
+      e.full_name?.toLowerCase().includes(safeSearch) ||
+      e.employee_number?.toLowerCase().includes(safeSearch)
+    );
+  }, [employees, search]);
+
+  // ===== PAGINATED EMPLOYEES =====
+  const paginatedEmployees = useMemo(() => {
+    const startIndex = (attendancePage - 1) * attendanceItemsPerPage;
+    const endIndex = Math.min(startIndex + attendanceItemsPerPage, filteredEmployees.length);
+    return filteredEmployees.slice(startIndex, endIndex);
+  }, [filteredEmployees, attendancePage, attendanceItemsPerPage]);
+
+  // ===== RESET PAGE WHEN SEARCH CHANGES =====
+  useEffect(() => {
+    setAttendancePage(1);
+  }, [search]);
+
+  // ===== CALCULATE METRICS =====
+  const metrics = useMemo(() => {
+    let totalDays = 0;
+    let presentDays = 0;
+    let absentDays = 0;
+    let lateDays = 0;
+    let leaveDays = 0;
+    attendance.forEach(record => {
+      if (record.status !== '-') {
+        totalDays++;
+        if (record.status === 'P') presentDays++;
+        if (record.status === 'A') absentDays++;
+        if (record.status === 'L') lateDays++;
+        if (record.status === 'LV') leaveDays++;
+      }
+    });
+    const attendanceRate = totalDays > 0 ? (presentDays / totalDays) * 100 : 0;
+    const absenteeism = totalDays > 0 ? (absentDays / totalDays) * 100 : 0;
+    return { attendanceRate: attendanceRate.toFixed(1), absenteeism: absenteeism.toFixed(1), late: lateDays, leaveRequests: leaveDays };
+  }, [attendance]);
+
+  // ===== EXPORT REPORT =====
+  const exportReport = useCallback(() => {
+    let csv = 'Employee,Position,Department,';
+    dates.forEach((_, i) => { csv += `Day ${i + 1},`; });
+    csv += 'Present,Absent,Late,Leave,Sick,Absent Deduction,Late Deduction,Lecture Deduction,Appearance Deduction,Total Deductions\n';
+    filteredEmployees.forEach(emp => {
+      const stats = getEmployeeStats(emp.id);
+      const deductions = calculateEmployeeDeductions(emp.id);
+      csv += `"${emp.full_name}","${emp.position}","${emp.department}",`;
+      dates.forEach(date => {
+        const status = getAttendanceStatus(emp.id, date);
+        csv += `${status},`;
+      });
+      csv += `${stats.P},${stats.A},${stats.L},${stats.LV},${stats.SL},`;
+      csv += `${deductions.absentDeduction},${deductions.lateDeduction},${deductions.lectureDeduction},${deductions.appearanceDeduction},${deductions.totalDeductions}\n`;
+    });
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `attendance_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    
+    logAudit({
+      action: 'EXPORT',
+      entity_type: 'attendance',
+      new_data: { 
+        month: selectedMonth,
+        employeeCount: filteredEmployees.length
+      },
+      region_id: userProfile?.region_id
+    });
+    
+    alert('Attendance report exported!');
+  }, [filteredEmployees, dates, selectedMonth, userProfile, getEmployeeStats, calculateEmployeeDeductions, getAttendanceStatus]);
+
+  // ===== COPY FROM PREVIOUS MONTH =====
+  const copyFromPreviousMonth = useCallback(async (sourceMonth: string) => {
     const sourceDates = getDatesForMonth(sourceMonth);
     const targetDates = getDatesForMonth(selectedMonth);
     
@@ -217,257 +549,31 @@ export function AttendancePage() {
       
       if (insertError) {
         console.error('Error copying data:', insertError);
+        alert('Failed to copy data: ' + insertError.message);
       } else {
+        await logAudit({
+          action: 'CREATE',
+          entity_type: 'attendance',
+          new_data: {
+            sourceMonth: sourceMonth,
+            targetMonth: selectedMonth,
+            recordsCopied: newRecords.length
+          },
+          region_id: userProfile?.region_id
+        });
+        
         await fetchData();
         setHasData(true);
+        alert(`Attendance data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}`);
+        setShowCopyModal(false);
       }
+    } else {
+      alert('No attendance data found in the source month.');
     }
-  };
+  }, [selectedMonth, userProfile, getDatesForMonth, fetchData]);
 
-  const fetchData = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      let employeesQuery = supabase
-        .from('employees')
-        .select('id, employee_number, full_name, position, department, status, region_id');
-      
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        console.log('Filtering employees by region:', userProfile.region_id);
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
-      }
-      
-      const { data: employeesData, error: empError } = await employeesQuery;
-      if (empError) throw empError;
-      
-      console.log('Employees fetched:', employeesData?.length);
-      setEmployees(employeesData || []);
-      
-      const dates = getDatesForMonth(selectedMonth);
-      if (dates.length > 0 && employeesData && employeesData.length > 0) {
-        const employeeIds = employeesData.map(e => e.id);
-        
-        let attendanceQuery = supabase
-          .from('attendance')
-          .select('*')
-          .gte('date', dates[0])
-          .lte('date', dates[dates.length - 1])
-          .in('employee_id', employeeIds);
-        
-        const { data: attendanceData, error: attError } = await attendanceQuery;
-        if (attError) throw attError;
-        setAttendance(attendanceData || []);
-      }
-    } catch (err: any) {
-      console.error('Error fetching data:', err);
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (userProfile) {
-      fetchData();
-    }
-  }, [selectedMonth, userProfile]);
-
-  const getAttendanceStatus = (employeeId: string, date: string): string => {
-    const record = attendance.find(a => a.employee_id === employeeId && a.date === date);
-    return record?.status || '-';
-  };
-
-  const updateAttendance = async (employeeId: string, date: string, currentStatus: string) => {
-    const employee = employees.find(e => e.id === employeeId);
-    if (!userProfile?.is_super_admin && employee?.region_id !== userProfile?.region_id) {
-      alert('You can only edit attendance for employees in your region');
-      return;
-    }
-    
-    const currentIndex = statusCycle.indexOf(currentStatus);
-    const nextIndex = (currentIndex + 1) % statusCycle.length;
-    const nextStatus = statusCycle[nextIndex];
-    
-    try {
-      const tenantId = userProfile?.tenant_id;
-      
-      if (!tenantId) {
-        console.error('No tenant_id found for user');
-        alert('Unable to update attendance: Missing tenant information');
-        return;
-      }
-      
-      const { data: existingRecord, error: checkError } = await supabase
-        .from('attendance')
-        .select('id')
-        .eq('employee_id', employeeId)
-        .eq('date', date)
-        .maybeSingle();
-      
-      if (checkError) throw checkError;
-      
-      let result;
-      if (existingRecord) {
-        result = await supabase
-          .from('attendance')
-          .update({ 
-            status: nextStatus,
-            tenant_id: tenantId
-          })
-          .eq('id', existingRecord.id);
-      } else {
-        result = await supabase
-          .from('attendance')
-          .insert({ 
-            employee_id: employeeId, 
-            date, 
-            status: nextStatus,
-            tenant_id: tenantId
-          });
-      }
-      
-      if (result.error) throw result.error;
-      await fetchData();
-    } catch (err: any) {
-      console.error('Error updating attendance:', err);
-      alert('Failed to update attendance: ' + err.message);
-    }
-  };
-
-  const getEmployeeStats = (employeeId: string) => {
-    const employeeAttendance = attendance.filter(a => a.employee_id === employeeId);
-    const counts = { P: 0, A: 0, L: 0, LV: 0, SL: 0 };
-    employeeAttendance.forEach(record => {
-      if (record.status && counts[record.status as keyof typeof counts] !== undefined) {
-        counts[record.status as keyof typeof counts]++;
-      }
-    });
-    const total = counts.P + counts.A + counts.L + counts.LV + counts.SL;
-    return { ...counts, total };
-  };
-
-  const calculateEmployeeDeductions = (employeeId: string) => {
-    const employeeAttendance = attendance.filter(a => a.employee_id === employeeId);
-    const counts = { A: 0, L: 0 };
-    let lectureMissedCount = 0;
-    
-    employeeAttendance.forEach(record => {
-      if (record.status === 'A') counts.A++;
-      if (record.status === 'L') counts.L++;
-    });
-    
-    const dates = getDatesForMonth(selectedMonth);
-    dates.forEach(date => {
-      const dateObj = new Date(date);
-      const dayOfWeek = dateObj.getDay();
-      if (dayOfWeek === 3 || dayOfWeek === 4) {
-        const status = getAttendanceStatus(employeeId, date);
-        if (status === 'A') {
-          lectureMissedCount++;
-        }
-      }
-    });
-    
-    const absentDeduction = counts.A * deductionSettings.absentDeduction;
-    const lateDeduction = counts.L * deductionSettings.lateDeduction;
-    const attendanceDeduction = absentDeduction + lateDeduction;
-    
-    let lectureDeduction = 0;
-    if (lectureMissedCount > 0) {
-      const totalLectures = dates.filter(d => {
-        const dayOfWeek = new Date(d).getDay();
-        return dayOfWeek === 3 || dayOfWeek === 4;
-      }).length;
-      
-      if (lectureMissedCount === totalLectures && totalLectures > 0) {
-        lectureDeduction = deductionSettings.lectureFullMonthDeduction;
-      } else {
-        lectureDeduction = lectureMissedCount * deductionSettings.lectureDeduction;
-      }
-    }
-    
-    const appearanceDeduction = deductionSettings.appearanceDeduction;
-    const totalDeductions = attendanceDeduction + lectureDeduction + appearanceDeduction;
-    
-    return {
-      absentDays: counts.A,
-      lateDays: counts.L,
-      absentDeduction,
-      lateDeduction,
-      attendanceDeduction,
-      lectureMissedCount,
-      lectureDeduction,
-      appearanceDeduction,
-      totalDeductions
-    };
-  };
-
-  const calculateMetrics = () => {
-    let totalDays = 0;
-    let presentDays = 0;
-    let absentDays = 0;
-    let lateDays = 0;
-    let leaveDays = 0;
-    attendance.forEach(record => {
-      if (record.status !== '-') {
-        totalDays++;
-        if (record.status === 'P') presentDays++;
-        if (record.status === 'A') absentDays++;
-        if (record.status === 'L') lateDays++;
-        if (record.status === 'LV') leaveDays++;
-      }
-    });
-    const attendanceRate = totalDays > 0 ? (presentDays / totalDays) * 100 : 0;
-    const absenteeism = totalDays > 0 ? (absentDays / totalDays) * 100 : 0;
-    return { attendanceRate: attendanceRate.toFixed(1), absenteeism: absenteeism.toFixed(1), late: lateDays, leaveRequests: leaveDays };
-  };
-
-  const metrics = calculateMetrics();
-  const dates = getDatesForMonth(selectedMonth);
-  
-  const filteredEmployees = employees.filter(e => {
-    const safeSearch = sanitizeInput(search).toLowerCase();
-    return e.full_name?.toLowerCase().includes(safeSearch) ||
-           e.employee_number?.toLowerCase().includes(safeSearch);
-  });
-
-  const exportReport = () => {
-    let csv = 'Employee,Position,Department,';
-    dates.forEach((_, i) => { csv += `Day ${i + 1},`; });
-    csv += 'Present,Absent,Late,Leave,Sick,Absent Deduction,Late Deduction,Lecture Deduction,Appearance Deduction,Total Deductions\n';
-    filteredEmployees.forEach(emp => {
-      const stats = getEmployeeStats(emp.id);
-      const deductions = calculateEmployeeDeductions(emp.id);
-      csv += `"${emp.full_name}","${emp.position}","${emp.department}",`;
-      dates.forEach(date => {
-        const status = getAttendanceStatus(emp.id, date);
-        csv += `${status},`;
-      });
-      csv += `${stats.P},${stats.A},${stats.L},${stats.LV},${stats.SL},`;
-      csv += `${deductions.absentDeduction},${deductions.lateDeduction},${deductions.lectureDeduction},${deductions.appearanceDeduction},${deductions.totalDeductions}\n`;
-    });
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `attendance_${selectedMonth.replace(/\s/g, '_')}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-    alert('Attendance report exported!');
-  };
-
-  const isSuperAdmin = userProfile?.is_super_admin;
-  const userRegion = userProfile?.regions;
-
-  if (loading) {
-    return <div className="flex justify-center py-12"><div className="w-8 h-8 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin"></div></div>;
-  }
-
-  if (error) {
-    return <div className="text-center py-12 text-red-500">{error}</div>;
-  }
-
-  const EmployeeModal = () => {
+  // ===== EMPLOYEE MODAL =====
+  const EmployeeModal = useCallback(() => {
     if (!selectedEmployee) return null;
     const stats = getEmployeeStats(selectedEmployee.id);
     const deductions = calculateEmployeeDeductions(selectedEmployee.id);
@@ -497,7 +603,7 @@ export function AttendancePage() {
         totalDeductions: newDeductions.totalDeductions
       });
       setSavedSuccess(false);
-    }, [selectedEmployee, attendance]);
+    }, [selectedEmployee, attendance, calculateEmployeeDeductions]);
 
     const handleDeductionChange = (field: string, value: number) => {
       const safeValue = Math.max(0, Number(value) || 0);
@@ -526,6 +632,17 @@ export function AttendancePage() {
           .maybeSingle();
 
         if (checkError) throw checkError;
+
+        const oldData = existingRecord ? {
+          absent_days: existingRecord.absent_days || 0,
+          late_days: existingRecord.late_days || 0,
+          absent_deduction: existingRecord.absent_deduction || 0,
+          late_deduction: existingRecord.late_deduction || 0,
+          lecture_missed: existingRecord.lecture_missed || 0,
+          lecture_deduction: existingRecord.lecture_deduction || 0,
+          appearance_deduction: existingRecord.appearance_deduction || 0,
+          total_deductions: existingRecord.total_deductions || 0
+        } : null;
 
         const deductionData = {
           employee_id: selectedEmployee.id,
@@ -557,6 +674,15 @@ export function AttendancePage() {
         }
 
         if (result.error) throw result.error;
+
+        await logAudit({
+          action: existingRecord ? 'UPDATE' : 'CREATE',
+          entity_type: 'employee_deductions',
+          entity_id: existingRecord?.id || selectedEmployee.id,
+          old_data: oldData,
+          new_data: deductionData,
+          region_id: userProfile?.region_id
+        });
 
         setSavedSuccess(true);
         alert(`Deductions saved for ${selectedEmployee.full_name}`);
@@ -779,7 +905,18 @@ export function AttendancePage() {
         </div>
       </Modal>
     );
-  };
+  }, [selectedEmployee, getEmployeeStats, calculateEmployeeDeductions, selectedMonth, userProfile, fetchData]);
+
+  // ===== RENDER =====
+  if (loading) {
+    return <div className="flex justify-center py-12"><div className="w-8 h-8 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin"></div></div>;
+  }
+
+  if (error) {
+    return <div className="text-center py-12 text-red-500">{error}</div>;
+  }
+
+  const totalPages = Math.ceil(filteredEmployees.length / attendanceItemsPerPage);
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -788,16 +925,77 @@ export function AttendancePage() {
         subtitle={isSuperAdmin ? "Monthly attendance tracker for all security personnel" : `${userRegion?.name || ''} Region - Attendance Tracker`}
         actions={
           <div className="flex gap-2">
-            <MonthSelector
-              selectedMonth={selectedMonth}
-              onMonthChange={handleMonthChange}
-              availableMonths={availableMonths}
-              isLoading={loading}
-            />
+            <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-2 py-1">
+              <button
+                onClick={goToPreviousMonth}
+                className="p-1.5 rounded hover:bg-slate-100 disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getPreviousMonth(selectedMonth))}
+                title="Previous Month"
+              >
+                <ChevronLeft size={16} />
+              </button>
+              
+              <select
+                value={selectedMonth}
+                onChange={(e) => handleMonthSelect(e.target.value)}
+                className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1 min-w-[140px] text-center cursor-pointer"
+              >
+                {availableMonths.map((month, index) => (
+                  <option key={`month-${month}-${index}`} value={month}>
+                    {getMonthLabel(month)} {month === systemMonth ? '●' : ''}
+                  </option>
+                ))}
+              </select>
+              
+              <button
+                onClick={goToNextMonth}
+                className="p-1.5 rounded hover:bg-slate-100 disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getNextMonth(selectedMonth))}
+                title="Next Month"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </div>
+
+            {!isCurrentMonth && (
+              <button
+                onClick={goToCurrentMonth}
+                className="text-xs text-[#D4A017] hover:underline px-2 py-1"
+              >
+                Jump to Current
+              </button>
+            )}
+
             <Button variant="secondary" onClick={exportReport}><FileText size={16} /> Export Report</Button>
           </div>
         }
       />
+
+      {!isCurrentMonth && (
+        <Card className={`p-3 border ${isFutureMonthSelected ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
+          <div className="flex items-start gap-3">
+            <Calendar size={18} className={`shrink-0 mt-0.5 ${isFutureMonthSelected ? 'text-blue-600' : 'text-amber-600'}`} />
+            <div>
+              <p className={`text-sm font-medium ${isFutureMonthSelected ? 'text-blue-800' : 'text-amber-800'}`}>
+                {isFutureMonthSelected ? 'Viewing Future Month' : 'Viewing Past Month'}
+              </p>
+              <p className={`text-sm ${isFutureMonthSelected ? 'text-blue-700' : 'text-amber-700'}`}>
+                {isFutureMonthSelected 
+                  ? 'You are viewing a future month. Attendance can only be edited for the current month.' 
+                  : 'You are viewing a past month. Attendance can only be edited for the current month.'}
+                {!isCurrentMonth && (
+                  <button 
+                    onClick={goToCurrentMonth}
+                    className="ml-2 text-[#D4A017] hover:underline font-medium"
+                  >
+                    Switch to {getMonthLabel(systemMonth)}
+                  </button>
+                )}
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
 
       {!isSuperAdmin && userRegion && (
         <Card className="p-3 bg-gradient-to-r from-[#081C3A]/5 to-transparent border-[#081C3A]/20">
@@ -808,8 +1006,8 @@ export function AttendancePage() {
       )}
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Attendance Rate</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.attendanceRate}%</p><Badge color="green">↑ Excellent</Badge></div><div className="w-12 h-12 rounded-xl bg-emerald-100 text-emerald-600 flex items-center justify-center"><CheckCircle2 size={22} /></div></div></Card>
-        <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Absenteeism</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.absenteeism}%</p><Badge color="yellow">Manageable</Badge></div><div className="w-12 h-12 rounded-xl bg-red-100 text-red-600 flex items-center justify-center"><XCircle size={22} /></div></div></Card>
+        <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Attendance Rate</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.attendanceRate}%</p><Badge color={parseFloat(metrics.attendanceRate) > 80 ? 'green' : parseFloat(metrics.attendanceRate) > 60 ? 'yellow' : 'red'}>↑ {parseFloat(metrics.attendanceRate) > 80 ? 'Excellent' : parseFloat(metrics.attendanceRate) > 60 ? 'Good' : 'Needs Improvement'}</Badge></div><div className="w-12 h-12 rounded-xl bg-emerald-100 text-emerald-600 flex items-center justify-center"><CheckCircle2 size={22} /></div></div></Card>
+        <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Absenteeism</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.absenteeism}%</p><Badge color={parseFloat(metrics.absenteeism) < 20 ? 'green' : parseFloat(metrics.absenteeism) < 40 ? 'yellow' : 'red'}>Manageable</Badge></div><div className="w-12 h-12 rounded-xl bg-red-100 text-red-600 flex items-center justify-center"><XCircle size={22} /></div></div></Card>
         <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Late Arrivals</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.late}</p><p className="text-xs text-slate-500 mt-1">this month</p></div><div className="w-12 h-12 rounded-xl bg-[#FFF1CC] text-[#D4A017] flex items-center justify-center"><Clock size={22} /></div></div></Card>
         <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Leave Requests</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.leaveRequests}</p><Badge color="blue">3 Approved</Badge></div><div className="w-12 h-12 rounded-xl bg-blue-100 text-blue-600 flex items-center justify-center"><Plane size={22} /></div></div></Card>
       </div>
@@ -832,69 +1030,88 @@ export function AttendancePage() {
             className="w-full pl-10 pr-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
           />
         </div>
+        <div className="text-sm text-slate-500">{filteredEmployees.length} employees</div>
+        {!isCurrentMonth && (
+          <Badge color={isFutureMonthSelected ? 'blue' : 'amber'} className="text-xs">
+            {isFutureMonthSelected ? '🔮 View Only' : '📅 View Only'}
+          </Badge>
+        )}
       </Card>
 
-      {!hasData && dates.length > 0 ? (
-        <EmptyState
-          title="No Attendance Records"
-          message={`No attendance data found for ${selectedMonth}. Would you like to copy from a previous month?`}
-          actionLabel="Copy from Previous Month"
-          onAction={() => setShowCopyModal(true)}
-        />
-      ) : (
-        <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <THead>
-                <TR hover={false}>
-                  <TH className="sticky left-0 bg-[#F8FAFC] z-10">Employee</TH>
-                  <TH className="hidden md:table-cell">Position</TH>
-                  {dates.map((_, i) => (<TH key={i} className="text-center text-[10px]">{i + 1}</TH>))}
-                  <TH className="text-center bg-emerald-50">P</TH>
-                  <TH className="text-center bg-red-50">A</TH>
-                  <TH className="text-center bg-yellow-50">L</TH>
-                  <TH className="text-center">Total</TH>
-                </TR>
-              </THead>
-              <TBody>
-                {filteredEmployees.slice(0, 30).map(emp => {
-                  const stats = getEmployeeStats(emp.id);
-                  return (
-                    <TR key={emp.id} onClick={() => setSelectedEmployee(emp)} className="cursor-pointer">
-                      <TD className="sticky left-0 bg-white z-10">
-                        <div className="flex items-center gap-2">
-                          <div className="w-7 h-7 rounded-full bg-[#081C3A] text-white text-[10px] font-bold flex items-center justify-center">
-                            {emp.full_name?.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
-                          </div>
-                          <div>
-                            <p className="text-sm font-medium text-slate-800">{emp.full_name}</p>
-                            <p className="text-[10px] text-slate-500">{emp.employee_number}</p>
-                          </div>
+      <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <THead>
+              <TR hover={false}>
+                <TH className="sticky left-0 bg-[#F8FAFC] z-10">Employee</TH>
+                <TH className="hidden md:table-cell">Position</TH>
+                {dates.map((_, i) => (<TH key={i} className="text-center text-[10px]">{i + 1}</TH>))}
+                <TH className="text-center bg-emerald-50">P</TH>
+                <TH className="text-center bg-red-50">A</TH>
+                <TH className="text-center bg-yellow-50">L</TH>
+                <TH className="text-center">Total</TH>
+              </TR>
+            </THead>
+            <TBody>
+              {paginatedEmployees.map(emp => {
+                const stats = getEmployeeStats(emp.id);
+                const isEditable = isCurrentMonth;
+                return (
+                  <TR key={emp.id} onClick={() => setSelectedEmployee(emp)} className="cursor-pointer">
+                    <TD className="sticky left-0 bg-white z-10">
+                      <div className="flex items-center gap-2">
+                        <div className="w-7 h-7 rounded-full bg-[#081C3A] text-white text-[10px] font-bold flex items-center justify-center">
+                          {emp.full_name?.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
                         </div>
-                      </TD>
-                      <TD className="hidden md:table-cell text-xs">{emp.position}</TD>
-                      {dates.map((date, i) => {
-                        const status = getAttendanceStatus(emp.id, date);
-                        return (
-                          <td key={i} className="px-1 py-3 text-center" onClick={(e) => { e.stopPropagation(); updateAttendance(emp.id, date, status); }}>
-                            <div className={`w-6 h-6 mx-auto rounded text-[10px] font-semibold text-white flex items-center justify-center cursor-pointer hover:opacity-80 transition-opacity ${statusColors[status]}`}>
-                              {status}
-                            </div>
-                          </td>
-                        );
-                      })}
-                      <td className="px-4 py-3 text-center font-semibold text-emerald-700 bg-emerald-50/50">{stats.P}</td>
-                      <td className="px-4 py-3 text-center font-semibold text-red-700 bg-red-50/50">{stats.A}</td>
-                      <td className="px-4 py-3 text-center font-semibold text-yellow-700 bg-yellow-50/50">{stats.L}</td>
-                      <td className="px-4 py-3 text-center font-bold text-slate-800">{stats.total} days</td>
-                    </TR>
-                  );
-                })}
-              </TBody>
-            </table>
-          </div>
+                        <div>
+                          <p className="text-sm font-medium text-slate-800">{emp.full_name}</p>
+                          <p className="text-[10px] text-slate-500">{emp.employee_number}</p>
+                          {emp.status !== 'Active' && (
+                            <Badge color={emp.status === 'On Leave' ? 'yellow' : 'red'} className="text-[8px] mt-0.5">
+                              {emp.status}
+                            </Badge>
+                          )}
+                        </div>
+                      </div>
+                    </TD>
+                    <TD className="hidden md:table-cell text-xs">{emp.position}</TD>
+                    {dates.map((date, i) => {
+                      const status = getAttendanceStatus(emp.id, date);
+                      return (
+                        <td key={i} className="px-1 py-3 text-center" onClick={(e) => { 
+                          e.stopPropagation(); 
+                          if (isEditable) {
+                            updateAttendance(emp.id, date, status);
+                          } else {
+                            showNotification('Attendance can only be edited for the current month.', 'info');
+                          }
+                        }}>
+                          <div className={`w-6 h-6 mx-auto rounded text-[10px] font-semibold text-white flex items-center justify-center ${!isEditable ? 'cursor-not-allowed opacity-70' : 'cursor-pointer hover:opacity-80'} transition-opacity ${statusColors[status]}`}>
+                            {status}
+                          </div>
+                        </td>
+                      );
+                    })}
+                    <td className="px-4 py-3 text-center font-semibold text-emerald-700 bg-emerald-50/50">{stats.P}</td>
+                    <td className="px-4 py-3 text-center font-semibold text-red-700 bg-red-50/50">{stats.A}</td>
+                    <td className="px-4 py-3 text-center font-semibold text-yellow-700 bg-yellow-50/50">{stats.L}</td>
+                    <td className="px-4 py-3 text-center font-bold text-slate-800">{stats.total} days</td>
+                  </TR>
+                );
+              })}
+            </TBody>
+          </table>
         </div>
-      )}
+      </div>
+
+      <Pagination
+        currentPage={attendancePage}
+        totalPages={totalPages}
+        totalItems={filteredEmployees.length}
+        itemsPerPage={attendanceItemsPerPage}
+        onPageChange={setAttendancePage}
+        onItemsPerPageChange={setAttendanceItemsPerPage}
+      />
 
       <EmployeeModal />
       <CopyFromPreviousModal
@@ -902,11 +1119,10 @@ export function AttendancePage() {
         onClose={() => setShowCopyModal(false)}
         onConfirm={copyFromPreviousMonth}
         currentMonth={selectedMonth}
-        availableMonths={availableMonths}
+        availableMonths={availableMonths.filter(m => m < selectedMonth)}
       />
     </div>
   );
 }
-
 
 export default AttendancePage;

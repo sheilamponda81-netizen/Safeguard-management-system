@@ -1,20 +1,29 @@
-import { useState, useEffect } from 'react';
-import { 
-  Search, Download, DollarSign, CheckCircle, XCircle, Clock, 
-  Banknote, Smartphone, CreditCard, Edit2, Save, X, Filter,
-  Building2, MapPin, Wallet, RefreshCw, AlertCircle, Undo, Repeat
-} from 'lucide-react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Search, Download, DollarSign, CheckCircle, XCircle, Clock, Banknote, Smartphone, CreditCard, Edit2, Save, X, Filter, Building2, MapPin, Wallet, RefreshCw, AlertCircle, Undo, Repeat, ChevronLeft, ChevronRight, Calendar, Lock } from '../utils/icons';
+
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input } from '../components/ui';
 import { supabase } from '../lib/supabase';
 import { formatKwacha } from '../data';
 import { showNotification } from '../utils/clickHandlers';
+import { logAudit } from '../utils/auditLogger';
+import { 
+  getSystemCurrentMonth, 
+  getMonthLabel, 
+  getNextMonth, 
+  getPreviousMonth,
+  getAvailableMonthsFromSystem
+} from '../utils/currentMonth';
+import { Pagination } from '../components/Pagination';
 
 export function PaymentsPage() {
+  // ===== ALL HOOKS AT TOP LEVEL =====
   const [payments, setPayments] = useState<any[]>([]);
   const [employees, setEmployees] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [selectedMonth, setSelectedMonth] = useState('');
+  const [systemMonth, setSystemMonth] = useState('');
+  const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [filterStatus, setFilterStatus] = useState('all');
   const [filterRegion, setFilterRegion] = useState('all');
   const [filterCompany, setFilterCompany] = useState('');
@@ -28,55 +37,66 @@ export function PaymentsPage() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [selectedEmployees, setSelectedEmployees] = useState<string[]>([]);
   const [processingBulk, setProcessingBulk] = useState(false);
-  const [showStatusModal, setShowStatusModal] = useState(false);
-  const [statusToChange, setStatusToChange] = useState<{ employeeId: string; currentStatus: string; newStatus: string } | null>(null);
+
+  // ===== PAGINATION STATES =====
+  const [paymentsPage, setPaymentsPage] = useState(1);
+  const [paymentsItemsPerPage, setPaymentsItemsPerPage] = useState(20);
 
   const statusOptions = ['all', 'pending', 'processing', 'paid', 'confirmed', 'failed'];
   const payPointOptions = ['all', 'national_bank', 'standard_bank', 'nbs_bank', 'centenary_bank', 'fdh_bank', 'first_capital_bank', 'airtel_money', 'tnm_mpamba'];
-
-  // Status order for progression
   const statusOrder = ['pending', 'processing', 'paid', 'confirmed'];
-  const statusColors: Record<string, string> = {
-    pending: 'bg-yellow-100 text-yellow-800 border-yellow-200',
-    processing: 'bg-blue-100 text-blue-800 border-blue-200',
-    paid: 'bg-indigo-100 text-indigo-800 border-indigo-200',
-    confirmed: 'bg-emerald-100 text-emerald-800 border-emerald-200',
-    failed: 'bg-red-100 text-red-800 border-red-200',
-  };
 
-  // Fetch user profile
-  useEffect(() => {
-    const fetchUserProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .single();
-        setUserProfile(profile);
-      }
-    };
-    fetchUserProfile();
-  }, []);
+  // ===== MEMOIZED VALUES =====
+  const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
+  const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
+  const canEdit = useMemo(() => isCurrentMonth, [isCurrentMonth]);
+  const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
+  const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
 
-  // Fetch regions
-  useEffect(() => {
-    const fetchRegions = async () => {
-      const { data } = await supabase.from('regions').select('*');
-      setRegions(data || []);
-    };
-    fetchRegions();
-  }, []);
+  const stats = useMemo(() => ({
+    total: payments.length,
+    pending: payments.filter(p => p.status === 'pending').length,
+    processing: payments.filter(p => p.status === 'processing').length,
+    paid: payments.filter(p => p.status === 'paid').length,
+    confirmed: payments.filter(p => p.status === 'confirmed').length,
+    failed: payments.filter(p => p.status === 'failed').length,
+    totalAmount: payments.reduce((sum, p) => sum + p.net_pay, 0)
+  }), [payments]);
 
-  // Fetch payment data
+  const monthDisplayLabel = useMemo(() => getMonthLabel(selectedMonth), [selectedMonth]);
+
+  // ===== PAGINATED PAYMENTS =====
+  const paginatedPayments = useMemo(() => {
+    const startIndex = (paymentsPage - 1) * paymentsItemsPerPage;
+    const endIndex = Math.min(startIndex + paymentsItemsPerPage, payments.length);
+    return payments.slice(startIndex, endIndex);
+  }, [payments, paymentsPage, paymentsItemsPerPage]);
+
+  // ===== RESET PAGE WHEN SEARCH OR FILTERS CHANGE =====
   useEffect(() => {
-    if (userProfile) {
-      fetchPaymentData();
+    setPaymentsPage(1);
+  }, [search, filterStatus, filterRegion, filterCompany, filterWorkstation, filterPayPoint]);
+
+  // ===== CALLBACKS =====
+  const fetchUserProfile = useCallback(async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*, regions(*)')
+        .eq('id', user.id)
+        .single();
+      setUserProfile(profile);
     }
-  }, [userProfile, selectedMonth, filterStatus, filterRegion, filterCompany, filterWorkstation, filterPayPoint]);
+  }, []);
 
-  const fetchPaymentData = async () => {
+  const fetchRegions = useCallback(async () => {
+    const { data } = await supabase.from('regions').select('*');
+    setRegions(data || []);
+  }, []);
+
+  // ===== FETCH PAYMENT DATA =====
+  const fetchPaymentData = useCallback(async () => {
     setLoading(true);
     try {
       let employeesQuery = supabase.from('employees').select('*');
@@ -113,10 +133,11 @@ export function PaymentsPage() {
       const uniqueWorkstations = [...new Set(employeesWithPay.map(e => e.workstation).filter(Boolean))];
       setWorkstations(uniqueWorkstations);
 
+      const monthParam = `${selectedMonth}-01`;
       const { data: paymentData, error: payError } = await supabase
         .from('payment_status')
         .select('*')
-        .eq('month', `${selectedMonth}-01`);
+        .eq('month', monthParam);
 
       if (payError && payError.code !== '42P01') {
         console.error('Payment table error:', payError);
@@ -161,11 +182,74 @@ export function PaymentsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [userProfile, selectedMonth, filterStatus, filterRegion, filterCompany, filterWorkstation, filterPayPoint, search]);
 
-  const updatePaymentStatus = async (employeeId: string, newStatus: string) => {
+  // ===== INITIALIZATION =====
+  useEffect(() => {
+    const init = async () => {
+      const month = await getSystemCurrentMonth();
+      setSystemMonth(month);
+      setSelectedMonth(month);
+      
+      const months = getAvailableMonthsFromSystem(month);
+      setAvailableMonths(months);
+      
+      await fetchUserProfile();
+      await fetchRegions();
+    };
+    init();
+  }, [fetchUserProfile, fetchRegions]);
+
+  useEffect(() => {
+    if (userProfile && selectedMonth) {
+      fetchPaymentData();
+    }
+  }, [userProfile, selectedMonth, filterStatus, filterRegion, filterCompany, filterWorkstation, filterPayPoint, fetchPaymentData]);
+
+  // ===== MONTH NAVIGATION =====
+  const goToPreviousMonth = useCallback(() => {
+    const prevMonth = getPreviousMonth(selectedMonth);
+    if (prevMonth && availableMonths.includes(prevMonth)) {
+      setSelectedMonth(prevMonth);
+      setPaymentsPage(1);
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToNextMonth = useCallback(() => {
+    const nextMonth = getNextMonth(selectedMonth);
+    if (nextMonth && availableMonths.includes(nextMonth)) {
+      setSelectedMonth(nextMonth);
+      setPaymentsPage(1);
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToCurrentMonth = useCallback(() => {
+    if (systemMonth && systemMonth !== selectedMonth) {
+      setSelectedMonth(systemMonth);
+      setPaymentsPage(1);
+      showNotification(`Switched to ${getMonthLabel(systemMonth)}`, 'success');
+    }
+  }, [systemMonth, selectedMonth]);
+
+  const handleMonthSelect = useCallback((month: string) => {
+    if (month !== selectedMonth) {
+      setSelectedMonth(month);
+      setPaymentsPage(1);
+    }
+  }, [selectedMonth]);
+
+  // ===== UPDATE PAYMENT STATUS =====
+  const updatePaymentStatus = useCallback(async (employeeId: string, newStatus: string) => {
+    if (!canEdit) {
+      showNotification('Payments can only be edited for the current month.', 'error');
+      return;
+    }
+
     try {
       const existing = payments.find(p => p.employee_id === employeeId);
+      const oldStatus = existing?.status || 'pending';
+      const employeeName = existing?.full_name || 'Unknown';
+      const employeeNumber = existing?.employee_number || 'N/A';
       
       const updateData: any = {
         status: newStatus,
@@ -175,6 +259,24 @@ export function PaymentsPage() {
       if (newStatus === 'paid' && existing?.status !== 'paid') {
         updateData.payment_date = new Date().toISOString().split('T')[0];
       }
+      
+      const oldData = {
+        status: oldStatus,
+        payment_date: existing?.payment_date || null,
+        transaction_id: existing?.transaction_id || null,
+        account_number: existing?.account_number || null,
+        employee_name: employeeName,
+        employee_number: employeeNumber
+      };
+      
+      const newData = {
+        status: newStatus,
+        payment_date: updateData.payment_date || null,
+        employee_id: employeeId,
+        month: selectedMonth,
+        employee_name: employeeName,
+        employee_number: employeeNumber
+      };
       
       if (existing?.id) {
         await supabase
@@ -193,6 +295,15 @@ export function PaymentsPage() {
           }]);
       }
       
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'payment_status',
+        entity_id: existing?.id || employeeId,
+        old_data: oldData,
+        new_data: newData,
+        region_id: userProfile?.region_id
+      });
+      
       const statusMessages: Record<string, string> = {
         pending: 'marked as Pending',
         processing: 'moved to Processing',
@@ -207,11 +318,23 @@ export function PaymentsPage() {
       console.error('Error updating status:', err);
       showNotification('Failed to update status', 'error');
     }
-  };
+  }, [canEdit, payments, selectedMonth, userProfile, fetchPaymentData]);
 
-  const updatePaymentDetails = async (payment: any) => {
+  // ===== UPDATE PAYMENT DETAILS =====
+  const updatePaymentDetails = useCallback(async (payment: any) => {
+    if (!canEdit) {
+      showNotification('Payments can only be edited for the current month.', 'error');
+      return;
+    }
+
     try {
       const existing = payments.find(p => p.employee_id === payment.employee_id);
+      
+      const oldData = existing ? { 
+        account_number: existing.account_number, 
+        notes: existing.notes, 
+        transaction_id: existing.transaction_id 
+      } : null;
       
       const updateData = {
         account_number: payment.account_number,
@@ -220,12 +343,18 @@ export function PaymentsPage() {
         updated_at: new Date().toISOString()
       };
       
+      let entityId;
+      let action: 'CREATE' | 'UPDATE' = 'UPDATE';
+      
       if (existing?.id) {
+        entityId = existing.id;
         await supabase
           .from('payment_status')
           .update(updateData)
           .eq('id', existing.id);
       } else {
+        action = 'CREATE';
+        entityId = payment.employee_id;
         await supabase
           .from('payment_status')
           .insert([{
@@ -239,6 +368,15 @@ export function PaymentsPage() {
           }]);
       }
       
+      await logAudit({
+        action: action,
+        entity_type: 'payment_status',
+        entity_id: entityId,
+        old_data: oldData,
+        new_data: updateData,
+        region_id: userProfile?.region_id
+      });
+      
       showNotification('Payment details updated', 'success');
       setShowEditModal(false);
       setEditingPayment(null);
@@ -247,9 +385,15 @@ export function PaymentsPage() {
       console.error('Error updating:', err);
       showNotification('Failed to update payment details', 'error');
     }
-  };
+  }, [canEdit, payments, selectedMonth, userProfile, fetchPaymentData]);
 
-  const bulkUpdateStatus = async (newStatus: string) => {
+  // ===== BULK UPDATE STATUS =====
+  const bulkUpdateStatus = useCallback(async (newStatus: string) => {
+    if (!canEdit) {
+      showNotification('Payments can only be edited for the current month.', 'error');
+      return;
+    }
+
     if (selectedEmployees.length === 0) {
       showNotification('Please select employees to process', 'error');
       return;
@@ -257,9 +401,14 @@ export function PaymentsPage() {
     
     setProcessingBulk(true);
     let successCount = 0;
+    const updatedEmployees: any[] = [];
     
     for (const employeeId of selectedEmployees) {
       const payment = payments.find(p => p.employee_id === employeeId);
+      const oldStatus = payment?.status || 'pending';
+      const employeeName = payment?.full_name || 'Unknown';
+      const employeeNumber = payment?.employee_number || 'N/A';
+      
       try {
         const updateData: any = { status: newStatus, updated_at: new Date().toISOString() };
         if (newStatus === 'paid' && payment?.status !== 'paid') {
@@ -283,18 +432,39 @@ export function PaymentsPage() {
             }]);
         }
         successCount++;
+        updatedEmployees.push({
+          employee_id: employeeId,
+          employee_name: employeeName,
+          employee_number: employeeNumber,
+          old_status: oldStatus,
+          new_status: newStatus
+        });
       } catch (err) {
         console.error('Error in bulk update:', err);
       }
     }
     
+    await logAudit({
+      action: 'UPDATE',
+      entity_type: 'payment_status',
+      new_data: {
+        bulk_update: true,
+        count: successCount,
+        employees: updatedEmployees,
+        new_status: newStatus,
+        month: selectedMonth
+      },
+      region_id: userProfile?.region_id
+    });
+    
     showNotification(`Updated ${successCount} of ${selectedEmployees.length} employees`, 'success');
     setSelectedEmployees([]);
     fetchPaymentData();
     setProcessingBulk(false);
-  };
+  }, [canEdit, selectedEmployees, payments, selectedMonth, userProfile, fetchPaymentData]);
 
-  const exportPayments = () => {
+  // ===== EXPORT PAYMENTS =====
+  const exportPayments = useCallback(() => {
     const csv = [
       ['Employee Name', 'Employee #', 'Region', 'Company', 'Workstation', 'Pay Point', 'Account Number', 'Transaction ID', 'Net Pay', 'Status', 'Payment Date', 'Notes'],
       ...payments.map(p => [
@@ -320,26 +490,46 @@ export function PaymentsPage() {
     a.download = `payments_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
+    
+    logAudit({
+      action: 'EXPORT',
+      entity_type: 'payment_status',
+      new_data: { 
+        month: selectedMonth,
+        employeeCount: payments.length,
+        filters: { 
+          filterStatus, 
+          filterRegion, 
+          filterCompany, 
+          filterWorkstation, 
+          filterPayPoint 
+        }
+      },
+      region_id: userProfile?.region_id
+    });
+    
     showNotification('Payments exported successfully', 'success');
-  };
+  }, [payments, regions, selectedMonth, userProfile]);
 
-  const toggleSelectAll = () => {
+  // ===== TOGGLE SELECT =====
+  const toggleSelectAll = useCallback(() => {
     if (selectedEmployees.length === payments.length) {
       setSelectedEmployees([]);
     } else {
       setSelectedEmployees(payments.map(p => p.employee_id));
     }
-  };
+  }, [selectedEmployees, payments]);
 
-  const toggleSelectEmployee = (employeeId: string) => {
+  const toggleSelectEmployee = useCallback((employeeId: string) => {
     if (selectedEmployees.includes(employeeId)) {
       setSelectedEmployees(selectedEmployees.filter(id => id !== employeeId));
     } else {
       setSelectedEmployees([...selectedEmployees, employeeId]);
     }
-  };
+  }, [selectedEmployees]);
 
-  const getStatusBadge = (status: string) => {
+  // ===== GET STATUS BADGE =====
+  const getStatusBadge = useCallback((status: string) => {
     const statusIcons: Record<string, string> = {
       pending: '⏰',
       processing: '⏳',
@@ -366,61 +556,102 @@ export function PaymentsPage() {
         {statusIcons[status]} {statusLabels[status]}
       </Badge>
     );
-  };
+  }, []);
 
-  const getPaymentMethodIcon = (method: string) => {
+  const getPaymentMethodIcon = useCallback((method: string) => {
     if (!method) return <Wallet size={14} className="text-gray-400" />;
     if (method.includes('bank')) return <Banknote size={14} className="text-blue-500" />;
     if (method.includes('money')) return <Smartphone size={14} className="text-green-500" />;
     return <CreditCard size={14} className="text-purple-500" />;
-  };
+  }, []);
 
-  const canGoBack = (currentStatus: string) => {
-    const currentIndex = statusOrder.indexOf(currentStatus);
-    return currentIndex > 0;
-  };
-
-  const canGoForward = (currentStatus: string) => {
-    const currentIndex = statusOrder.indexOf(currentStatus);
-    return currentIndex < statusOrder.length - 1 && currentStatus !== 'failed';
-  };
-
-  const stats = {
-    total: payments.length,
-    pending: payments.filter(p => p.status === 'pending').length,
-    processing: payments.filter(p => p.status === 'processing').length,
-    paid: payments.filter(p => p.status === 'paid').length,
-    confirmed: payments.filter(p => p.status === 'confirmed').length,
-    failed: payments.filter(p => p.status === 'failed').length,
-    totalAmount: payments.reduce((sum, p) => sum + p.net_pay, 0)
-  };
-
-  const isSuperAdmin = userProfile?.is_super_admin;
-  const userRegion = userProfile?.regions;
-
+  // ===== RENDER =====
   if (loading) {
     return <div className="flex justify-center py-12"><div className="w-8 h-8 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin"></div></div>;
   }
+
+  const totalPages = Math.ceil(payments.length / paymentsItemsPerPage);
 
   return (
     <div className="space-y-6 animate-fade-in">
       <PageHeader 
         title="Payment Management" 
-        subtitle={isSuperAdmin ? "Process and track employee payments" : `${userRegion?.name || ''} Region - Payment Management`}
+        subtitle={`${monthDisplayLabel} ${isCurrentMonth ? '● Current Month' : ''} · ${payments.length} payment records`}
         actions={
           <div className="flex gap-2">
-            <input
-              type="month"
-              value={selectedMonth}
-              onChange={(e) => setSelectedMonth(e.target.value)}
-              className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
-            />
+            <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-2 py-1">
+              <button
+                onClick={goToPreviousMonth}
+                className="p-1.5 rounded hover:bg-slate-100 disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getPreviousMonth(selectedMonth))}
+                title="Previous Month"
+              >
+                <ChevronLeft size={16} />
+              </button>
+              
+              <select
+                value={selectedMonth}
+                onChange={(e) => handleMonthSelect(e.target.value)}
+                className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1 min-w-[140px] text-center cursor-pointer"
+              >
+                {availableMonths.map((month, index) => (
+                  <option key={`month-${month}-${index}`} value={month}>
+                    {getMonthLabel(month)} {month === systemMonth ? '●' : ''}
+                  </option>
+                ))}
+              </select>
+              
+              <button
+                onClick={goToNextMonth}
+                className="p-1.5 rounded hover:bg-slate-100 disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getNextMonth(selectedMonth))}
+                title="Next Month"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </div>
+
+            {!isCurrentMonth && (
+              <button
+                onClick={goToCurrentMonth}
+                className="text-xs text-[#D4A017] hover:underline px-2 py-1"
+              >
+                Jump to Current
+              </button>
+            )}
+
             <Button variant="secondary" onClick={exportPayments}>
               <Download size={16} className="mr-1" /> Export
             </Button>
           </div>
         }
       />
+
+      {!isCurrentMonth && (
+        <Card className={`p-3 border ${selectedMonth > systemMonth ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
+          <div className="flex items-start gap-3">
+            <Calendar size={18} className={`shrink-0 mt-0.5 ${selectedMonth > systemMonth ? 'text-blue-600' : 'text-amber-600'}`} />
+            <div>
+              <p className={`text-sm font-medium ${selectedMonth > systemMonth ? 'text-blue-800' : 'text-amber-800'}`}>
+                {selectedMonth > systemMonth ? 'Viewing Future Month' : 'Viewing Past Month'}
+              </p>
+              <p className={`text-sm ${selectedMonth > systemMonth ? 'text-blue-700' : 'text-amber-700'}`}>
+                {selectedMonth > systemMonth 
+                  ? 'You are viewing a future month. Payments can only be edited for the current month.' 
+                  : 'You are viewing a past month. Payments can only be edited for the current month.'}
+                {!isCurrentMonth && (
+                  <button 
+                    onClick={goToCurrentMonth}
+                    className="ml-2 text-[#D4A017] hover:underline font-medium"
+                  >
+                    Switch to {getMonthLabel(systemMonth)}
+                  </button>
+                )}
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
 
       {!isSuperAdmin && userRegion && (
         <Card className="p-3 bg-gradient-to-r from-[#081C3A]/5 to-transparent border-[#081C3A]/20">
@@ -520,14 +751,27 @@ export function PaymentsPage() {
             setFilterPayPoint('all');
             if (isSuperAdmin) setFilterRegion('all');
             setSearch('');
+            setPaymentsPage(1);
           }} className="text-sm">
             <RefreshCw size={14} className="mr-1" /> Clear
           </Button>
         </div>
       </Card>
 
-      {/* Bulk Actions */}
-      {selectedEmployees.length > 0 && (
+      {/* Edit Mode Indicator */}
+      {!canEdit && payments.length > 0 && (
+        <Card className="p-3 bg-amber-50 border-amber-200 border">
+          <div className="flex items-center gap-2">
+            <Lock size={16} className="text-amber-600" />
+            <p className="text-sm text-amber-700">
+              <strong>View Only Mode:</strong> Payments can only be edited for the current month ({getMonthLabel(systemMonth)}).
+            </p>
+          </div>
+        </Card>
+      )}
+
+      {/* Bulk Actions - Only show for current month */}
+      {selectedEmployees.length > 0 && canEdit && (
         <Card className="p-3 bg-blue-50 border-blue-200">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <span className="text-sm font-medium text-blue-700">
@@ -557,9 +801,10 @@ export function PaymentsPage() {
                 <TH className="w-8">
                   <input
                     type="checkbox"
-                    checked={selectedEmployees.length === payments.length && payments.length > 0}
+                    checked={selectedEmployees.length === payments.length && payments.length > 0 && canEdit}
                     onChange={toggleSelectAll}
-                    className="w-4 h-4 rounded border-slate-300"
+                    disabled={!canEdit}
+                    className="w-4 h-4 rounded border-slate-300 disabled:opacity-50"
                   />
                 </TH>
                 <TH>Employee</TH>
@@ -572,14 +817,15 @@ export function PaymentsPage() {
               </TR>
             </THead>
             <TBody>
-              {payments.map((p) => (
+              {paginatedPayments.map((p) => (
                 <TR key={p.employee_id} className="hover:bg-slate-50">
                   <TD className="w-8">
                     <input
                       type="checkbox"
                       checked={selectedEmployees.includes(p.employee_id)}
                       onChange={() => toggleSelectEmployee(p.employee_id)}
-                      className="w-4 h-4 rounded border-slate-300"
+                      disabled={!canEdit}
+                      className="w-4 h-4 rounded border-slate-300 disabled:opacity-50"
                     />
                   </TD>
                   <TD>
@@ -609,20 +855,22 @@ export function PaymentsPage() {
                   <TD>{getStatusBadge(p.status)}</TD>
                   <TD className="text-right">
                     <div className="flex items-center justify-end gap-1">
-                      {/* Edit button - always visible */}
-                      <button
-                        onClick={() => {
-                          setEditingPayment(p);
-                          setShowEditModal(true);
-                        }}
-                        className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
-                        title="Edit Details"
-                      >
-                        <Edit2 size={14} />
-                      </button>
+                      {/* Edit button - only visible for current month */}
+                      {canEdit && (
+                        <button
+                          onClick={() => {
+                            setEditingPayment(p);
+                            setShowEditModal(true);
+                          }}
+                          className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
+                          title="Edit Details"
+                        >
+                          <Edit2 size={14} />
+                        </button>
+                      )}
                       
-                      {/* Status change buttons */}
-                      {p.status === 'pending' && (
+                      {/* Status change buttons - only for current month */}
+                      {canEdit && p.status === 'pending' && (
                         <button
                           onClick={() => updatePaymentStatus(p.employee_id, 'processing')}
                           className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
@@ -632,7 +880,7 @@ export function PaymentsPage() {
                         </button>
                       )}
                       
-                      {p.status === 'processing' && (
+                      {canEdit && p.status === 'processing' && (
                         <>
                           <button
                             onClick={() => updatePaymentStatus(p.employee_id, 'pending')}
@@ -651,7 +899,7 @@ export function PaymentsPage() {
                         </>
                       )}
                       
-                      {p.status === 'paid' && (
+                      {canEdit && p.status === 'paid' && (
                         <>
                           <button
                             onClick={() => updatePaymentStatus(p.employee_id, 'processing')}
@@ -670,7 +918,7 @@ export function PaymentsPage() {
                         </>
                       )}
                       
-                      {p.status === 'confirmed' && (
+                      {canEdit && p.status === 'confirmed' && (
                         <>
                           <button
                             onClick={() => updatePaymentStatus(p.employee_id, 'paid')}
@@ -690,7 +938,7 @@ export function PaymentsPage() {
                       )}
                       
                       {/* Failed status - can reset */}
-                      {p.status === 'failed' && (
+                      {canEdit && p.status === 'failed' && (
                         <button
                           onClick={() => updatePaymentStatus(p.employee_id, 'pending')}
                           className="w-7 h-7 rounded-lg hover:bg-yellow-100 text-yellow-600"
@@ -698,6 +946,11 @@ export function PaymentsPage() {
                         >
                           <Repeat size={14} />
                         </button>
+                      )}
+
+                      {/* View Only indicator */}
+                      {!canEdit && (
+                        <span className="text-xs text-slate-400">🔒</span>
                       )}
                     </div>
                   </TD>
@@ -709,76 +962,87 @@ export function PaymentsPage() {
         {payments.length === 0 && (
           <div className="text-center py-8 text-slate-500">
             <Wallet size={32} className="mx-auto mb-2 text-slate-300" />
-            No payment records found
+            No payment records found for {getMonthLabel(selectedMonth)}
           </div>
         )}
       </div>
 
-      {/* Edit Payment Modal */}
-      <Modal open={showEditModal} onClose={() => { setShowEditModal(false); setEditingPayment(null); }} title="Edit Payment Details" size="md">
-        {editingPayment && (
-          <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-4">
+      <Pagination
+        currentPage={paymentsPage}
+        totalPages={totalPages}
+        totalItems={payments.length}
+        itemsPerPage={paymentsItemsPerPage}
+        onPageChange={setPaymentsPage}
+        onItemsPerPageChange={setPaymentsItemsPerPage}
+      />
+
+      {/* Edit Payment Modal - Only show for current month */}
+      {canEdit && (
+        <Modal open={showEditModal} onClose={() => { setShowEditModal(false); setEditingPayment(null); }} title="Edit Payment Details" size="md">
+          {editingPayment && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">Employee</label>
+                  <input
+                    type="text"
+                    value={editingPayment.full_name}
+                    disabled
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">Employee #</label>
+                  <input
+                    type="text"
+                    value={editingPayment.employee_number}
+                    disabled
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-slate-50"
+                  />
+                </div>
+              </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Employee</label>
+                <label className="block text-sm font-medium text-slate-700 mb-1">Account Number</label>
                 <input
                   type="text"
-                  value={editingPayment.full_name}
-                  disabled
-                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-slate-50"
+                  value={editingPayment.account_number || ''}
+                  onChange={(e) => setEditingPayment({...editingPayment, account_number: e.target.value})}
+                  placeholder="Enter bank account number or mobile money number"
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Employee #</label>
+                <label className="block text-sm font-medium text-slate-700 mb-1">Transaction ID (Optional)</label>
                 <input
                   type="text"
-                  value={editingPayment.employee_number}
-                  disabled
-                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-slate-50"
+                  value={editingPayment.transaction_id || ''}
+                  onChange={(e) => setEditingPayment({...editingPayment, transaction_id: e.target.value})}
+                  placeholder="Enter bank transaction reference"
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">Notes</label>
+                <textarea
+                  value={editingPayment.notes || ''}
+                  onChange={(e) => setEditingPayment({...editingPayment, notes: e.target.value})}
+                  placeholder="Add notes about this payment..."
+                  rows={3}
+                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-4">
+                <Button variant="outline" onClick={() => { setShowEditModal(false); setEditingPayment(null); }}>
+                  Cancel
+                </Button>
+                <Button variant="secondary" onClick={() => updatePaymentDetails(editingPayment)}>
+                  <Save size={14} className="mr-1" /> Save Changes
+                </Button>
+              </div>
             </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">Account Number</label>
-              <input
-                type="text"
-                value={editingPayment.account_number || ''}
-                onChange={(e) => setEditingPayment({...editingPayment, account_number: e.target.value})}
-                placeholder="Enter bank account number or mobile money number"
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">Transaction ID (Optional)</label>
-              <input
-                type="text"
-                value={editingPayment.transaction_id || ''}
-                onChange={(e) => setEditingPayment({...editingPayment, transaction_id: e.target.value})}
-                placeholder="Enter bank transaction reference"
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">Notes</label>
-              <textarea
-                value={editingPayment.notes || ''}
-                onChange={(e) => setEditingPayment({...editingPayment, notes: e.target.value})}
-                placeholder="Add notes about this payment..."
-                rows={3}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-4">
-              <Button variant="outline" onClick={() => { setShowEditModal(false); setEditingPayment(null); }}>
-                Cancel
-              </Button>
-              <Button variant="secondary" onClick={() => updatePaymentDetails(editingPayment)}>
-                <Save size={14} className="mr-1" /> Save Changes
-              </Button>
-            </div>
-          </div>
-        )}
-      </Modal>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }

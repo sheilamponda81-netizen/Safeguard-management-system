@@ -1,10 +1,13 @@
-﻿import { useState, useMemo, useEffect } from 'react';
-import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus } from 'lucide-react';
+﻿import { useState, useMemo, useEffect, useCallback } from 'react';
+import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, User, Phone, MapPin, Heart, ChevronLeft, ChevronRight } from '../utils/icons';
+
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { showNotification } from '../utils/clickHandlers';
 import { sanitizeInput } from '../utils/securityHeaders';
+import { logAudit } from '../utils/auditLogger';
+import { getEmployeeAuditData, getChanges } from '../utils/auditHelpers';
 
 interface Employee {
   id: string;
@@ -31,6 +34,14 @@ interface Employee {
   pay_point?: string;
   account_number?: string;
   uniform_deduction?: number;
+  next_of_kin_name?: string;
+  next_of_kin_relationship?: string;
+  next_of_kin_phone?: string;
+  next_of_kin_address?: string;
+  is_deleted?: boolean;
+  deleted_at?: string;
+  deleted_reason?: string;
+  created_at?: string;
 }
 
 const departmentOptions = [
@@ -41,6 +52,16 @@ const departmentOptions = [
   'Building',
   'Marketing',
   'Technical'
+];
+
+const relationshipOptions = [
+  'Spouse',
+  'Parent',
+  'Child',
+  'Sibling',
+  'Relative',
+  'Friend',
+  'Other'
 ];
 
 const formatText = (value: string) => {
@@ -64,6 +85,7 @@ const calculateAge = (dob: string): number => {
 };
 
 export function EmployeesPage() {
+  // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -77,45 +99,71 @@ export function EmployeesPage() {
   const [filterCompany, setFilterCompany] = useState<string>('');
   const [filterWorkstation, setFilterWorkstation] = useState<string>('');
   const [filterPayPoint, setFilterPayPoint] = useState<string>('');
-  
   const [userProfile, setUserProfile] = useState<any>(null);
   const [userLoading, setUserLoading] = useState(true);
+  
+  // ===== PAGINATION =====
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage, setItemsPerPage] = useState(20);
 
-  useEffect(() => {
-    const fetchUserProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .single();
-        setUserProfile(profile);
+  // ===== MEMOIZED VALUES =====
+  const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
+  const userRegion = useMemo(() => regions.find(r => r.id === userProfile?.region_id), [regions, userProfile]);
+
+  const filtered = useMemo(() => {
+    return employees.filter(e => {
+      const matchesSearch = e.fullName.toLowerCase().includes(search.toLowerCase()) || 
+                           e.employeeNumber.toLowerCase().includes(search.toLowerCase()) || 
+                           e.position.toLowerCase().includes(search.toLowerCase());
+      
+      let matchesFilter = true;
+      
+      if (statusFilter === 'all') {
+        matchesFilter = true;
+      } else if (statusFilter === 'deleted') {
+        matchesFilter = e.is_deleted === true;
+      } else {
+        matchesFilter = e.status === statusFilter && e.is_deleted !== true;
       }
-      setUserLoading(false);
-    };
-    fetchUserProfile();
-  }, []);
+      
+      return matchesSearch && matchesFilter;
+    });
+  }, [employees, search, statusFilter]);
 
-  useEffect(() => {
-    fetchRegions();
-  }, []);
+  const totalPages = useMemo(() => Math.ceil(filtered.length / itemsPerPage), [filtered, itemsPerPage]);
+  
+  const currentItems = useMemo(() => {
+    const startIndex = (currentPage - 1) * itemsPerPage;
+    const endIndex = Math.min(startIndex + itemsPerPage, filtered.length);
+    return filtered.slice(startIndex, endIndex);
+  }, [filtered, currentPage, itemsPerPage]);
 
-  useEffect(() => {
-    if (!userLoading) {
-      fetchEmployees();
-    }
-  }, [filterRegionId, filterCompany, filterWorkstation, filterPayPoint, userProfile, userLoading]);
+  const activeEmployees = useMemo(() => employees.filter(e => !e.is_deleted), [employees]);
+  const deletedEmployees = useMemo(() => employees.filter(e => e.is_deleted === true), [employees]);
 
-  const fetchRegions = async () => {
+  // ===== CALLBACKS =====
+  const fetchRegions = useCallback(async () => {
     const { data } = await supabase.from('regions').select('*');
     setRegions(data || []);
-  };
+  }, []);
 
-  const fetchEmployees = async () => {
+  const fetchUserProfile = useCallback(async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*, regions(*)')
+        .eq('id', user.id)
+        .single();
+      setUserProfile(profile);
+    }
+    setUserLoading(false);
+  }, []);
+
+  const fetchEmployees = useCallback(async () => {
     setLoading(true);
     try {
-      let query = supabase.from('employees').select('*').eq('status', 'Active');
+      let query = supabase.from('employees').select('*');
       
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         query = query.eq('region_id', userProfile.region_id);
@@ -155,7 +203,15 @@ export function EmployeesPage() {
         workstation: emp.workstation,
         pay_point: emp.pay_point,
         account_number: emp.account_number,
-        uniform_deduction: emp.uniform_deduction || 0
+        uniform_deduction: emp.uniform_deduction || 0,
+        next_of_kin_name: emp.next_of_kin_name || '',
+        next_of_kin_relationship: emp.next_of_kin_relationship || '',
+        next_of_kin_phone: emp.next_of_kin_phone || '',
+        next_of_kin_address: emp.next_of_kin_address || '',
+        is_deleted: emp.is_deleted || false,
+        deleted_at: emp.deleted_at || null,
+        deleted_reason: emp.deleted_reason || null,
+        created_at: emp.created_at || null,
       }));
       setEmployees(mappedEmployees);
     } catch (err: any) {
@@ -164,19 +220,48 @@ export function EmployeesPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [userProfile, filterRegionId, filterCompany, filterWorkstation, filterPayPoint]);
 
-  const filtered = useMemo(() => {
-    return employees.filter(e => {
-      const matchesSearch = e.fullName.toLowerCase().includes(search.toLowerCase()) || 
-                           e.employeeNumber.toLowerCase().includes(search.toLowerCase()) || 
-                           e.position.toLowerCase().includes(search.toLowerCase());
-      const matchesFilter = statusFilter === 'all' || e.status === statusFilter;
-      return matchesSearch && matchesFilter;
-    });
-  }, [employees, search, statusFilter]);
+  // ===== CHECK DUPLICATES =====
+  const checkDuplicates = useCallback(async (phone: string, accountNumber: string, employeeId?: string) => {
+    let phoneExists = false;
+    let accountExists = false;
+    
+    if (phone) {
+      let query = supabase
+        .from('employees')
+        .select('id')
+        .eq('phone', phone)
+        .eq('is_deleted', false);
+      
+      if (employeeId) {
+        query = query.neq('id', employeeId);
+      }
+      
+      const { data: phoneData } = await query;
+      phoneExists = (phoneData && phoneData.length > 0);
+    }
+    
+    if (accountNumber) {
+      let query = supabase
+        .from('employees')
+        .select('id')
+        .eq('account_number', accountNumber)
+        .eq('is_deleted', false);
+      
+      if (employeeId) {
+        query = query.neq('id', employeeId);
+      }
+      
+      const { data: accountData } = await query;
+      accountExists = (accountData && accountData.length > 0);
+    }
+    
+    return { phoneExists, accountExists };
+  }, []);
 
-  const addEmployee = async (emp: any) => {
+  // ===== ADD EMPLOYEE =====
+  const addEmployee = useCallback(async (emp: any) => {
     const safeEmp = {
       ...emp,
       fullName: sanitizeInput(emp.fullName),
@@ -188,6 +273,10 @@ export function EmployeesPage() {
       workstation: sanitizeInput(emp.workstation),
       nationalId: sanitizeInput(emp.nationalId),
       phone: sanitizeInput(emp.phone),
+      next_of_kin_name: sanitizeInput(emp.next_of_kin_name),
+      next_of_kin_relationship: sanitizeInput(emp.next_of_kin_relationship),
+      next_of_kin_phone: sanitizeInput(emp.next_of_kin_phone),
+      next_of_kin_address: sanitizeInput(emp.next_of_kin_address),
     };
     
     let assignedRegionId = safeEmp.region_id;
@@ -208,6 +297,18 @@ export function EmployeesPage() {
     
     if (existing) {
       showNotification(`Employee number ${safeEmp.employeeNumber} already exists!`, 'error');
+      return;
+    }
+    
+    const { phoneExists, accountExists } = await checkDuplicates(safeEmp.phone, safeEmp.account_number);
+    
+    if (phoneExists) {
+      showNotification(`Phone number ${safeEmp.phone} is already in use by another employee!`, 'error');
+      return;
+    }
+    
+    if (accountExists) {
+      showNotification(`Account number ${safeEmp.account_number} is already in use by another employee!`, 'error');
       return;
     }
     
@@ -241,7 +342,14 @@ export function EmployeesPage() {
         workstation: formattedWorkstation,
         pay_point: safeEmp.pay_point,
         account_number: safeEmp.account_number,
-        uniform_deduction: uniformDeduction
+        uniform_deduction: uniformDeduction,
+        next_of_kin_name: safeEmp.next_of_kin_name,
+        next_of_kin_relationship: safeEmp.next_of_kin_relationship,
+        next_of_kin_phone: safeEmp.next_of_kin_phone,
+        next_of_kin_address: safeEmp.next_of_kin_address,
+        is_deleted: false,
+        deleted_at: null,
+        deleted_reason: null,
       }])
       .select();
     
@@ -271,25 +379,36 @@ export function EmployeesPage() {
         workstation: data[0].workstation,
         pay_point: data[0].pay_point,
         account_number: data[0].account_number,
-        uniform_deduction: data[0].uniform_deduction || 0
+        uniform_deduction: data[0].uniform_deduction || 0,
+        next_of_kin_name: data[0].next_of_kin_name || '',
+        next_of_kin_relationship: data[0].next_of_kin_relationship || '',
+        next_of_kin_phone: data[0].next_of_kin_phone || '',
+        next_of_kin_address: data[0].next_of_kin_address || '',
+        is_deleted: data[0].is_deleted || false,
+        deleted_at: data[0].deleted_at || null,
+        deleted_reason: data[0].deleted_reason || null,
+        created_at: data[0].created_at || null,
       };
       setEmployees([newEmployee, ...employees]);
+      
+      await logAudit({
+        action: 'CREATE',
+        entity_type: 'employee',
+        entity_id: newEmployee.id,
+        new_data: getEmployeeAuditData(newEmployee),
+        region_id: assignedRegionId
+      });
+      
       showNotification(`${safeEmp.fullName} has been added`, 'success');
     }
     setShowAdd(false);
-  };
+  }, [userProfile, employees, checkDuplicates]);
 
-  const handleEdit = (employee: Employee) => {
-    if (!userProfile?.is_super_admin && employee.region_id !== userProfile?.region_id) {
-      showNotification('You cannot edit employees from other regions', 'error');
-      return;
-    }
-    setEditingEmployee(employee);
-    setShowEdit(true);
-  };
-
-  const updateEmployee = async (emp: any) => {
+  // ===== UPDATE EMPLOYEE =====
+  const updateEmployee = useCallback(async (emp: any) => {
     if (!editingEmployee) return;
+    
+    const oldEmployeeData = { ...editingEmployee };
     
     const safeEmp = {
       ...emp,
@@ -302,7 +421,23 @@ export function EmployeesPage() {
       workstation: sanitizeInput(emp.workstation),
       nationalId: sanitizeInput(emp.nationalId),
       phone: sanitizeInput(emp.phone),
+      next_of_kin_name: sanitizeInput(emp.next_of_kin_name),
+      next_of_kin_relationship: sanitizeInput(emp.next_of_kin_relationship),
+      next_of_kin_phone: sanitizeInput(emp.next_of_kin_phone),
+      next_of_kin_address: sanitizeInput(emp.next_of_kin_address),
     };
+    
+    const { phoneExists, accountExists } = await checkDuplicates(safeEmp.phone, safeEmp.account_number, editingEmployee.id);
+    
+    if (phoneExists) {
+      showNotification(`Phone number ${safeEmp.phone} is already in use by another employee!`, 'error');
+      return;
+    }
+    
+    if (accountExists) {
+      showNotification(`Account number ${safeEmp.account_number} is already in use by another employee!`, 'error');
+      return;
+    }
     
     const formattedCompany = safeEmp.company ? formatText(safeEmp.company) : null;
     const formattedWorkstation = safeEmp.workstation ? formatText(safeEmp.workstation) : null;
@@ -333,7 +468,11 @@ export function EmployeesPage() {
         workstation: formattedWorkstation,
         pay_point: safeEmp.pay_point,
         account_number: safeEmp.account_number,
-        uniform_deduction: uniformDeduction
+        uniform_deduction: uniformDeduction,
+        next_of_kin_name: safeEmp.next_of_kin_name,
+        next_of_kin_relationship: safeEmp.next_of_kin_relationship,
+        next_of_kin_phone: safeEmp.next_of_kin_phone,
+        next_of_kin_address: safeEmp.next_of_kin_address,
       })
       .eq('id', editingEmployee.id)
       .select();
@@ -363,42 +502,166 @@ export function EmployeesPage() {
         workstation: data[0].workstation,
         pay_point: data[0].pay_point,
         account_number: data[0].account_number,
-        uniform_deduction: data[0].uniform_deduction || 0
+        uniform_deduction: data[0].uniform_deduction || 0,
+        next_of_kin_name: data[0].next_of_kin_name || '',
+        next_of_kin_relationship: data[0].next_of_kin_relationship || '',
+        next_of_kin_phone: data[0].next_of_kin_phone || '',
+        next_of_kin_address: data[0].next_of_kin_address || '',
       };
       setEmployees(employees.map(e => e.id === updatedEmployee.id ? updatedEmployee : e));
+      
+      const oldAuditData = getEmployeeAuditData(oldEmployeeData);
+      const newAuditData = getEmployeeAuditData(updatedEmployee);
+      const changes = getChanges(oldAuditData, newAuditData);
+      
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'employee',
+        entity_id: updatedEmployee.id,
+        old_data: {
+          ...oldAuditData,
+          _changes: changes.changed
+        },
+        new_data: {
+          ...newAuditData,
+          _changes: changes.changed
+        },
+        region_id: updatedEmployee.region_id
+      });
+      
       showNotification(`${safeEmp.fullName} has been updated`, 'success');
     }
     setShowEdit(false);
     setEditingEmployee(null);
-  };
+  }, [editingEmployee, employees, checkDuplicates]);
 
-  const handleDelete = async (employee: Employee) => {
+  // ===== DELETE EMPLOYEE =====
+  const handleDelete = useCallback(async (employee: Employee) => {
     if (!userProfile?.is_super_admin && employee.region_id !== userProfile?.region_id) {
       showNotification('You cannot delete employees from other regions', 'error');
       return;
     }
     
-    if (confirm(`Are you sure you want to delete ${employee.fullName}?`)) {
+    if (employee.is_deleted) {
+      showNotification('This employee is already deleted.', 'error');
+      return;
+    }
+    
+    const reason = prompt(`Are you sure you want to delete ${employee.fullName}?\n\nPlease enter the reason for deletion (or click Cancel to abort):`);
+    
+    if (reason === null) {
+      return;
+    }
+    
+    if (reason.trim() === '') {
+      showNotification('Please provide a reason for deletion', 'error');
+      return;
+    }
+    
+    const employeeData = { ...employee };
+    
+    const { error } = await supabase
+      .from('employees')
+      .update({
+        status: 'Deleted',
+        is_deleted: true,
+        deleted_at: new Date().toISOString(),
+        deleted_reason: reason.trim(),
+      })
+      .eq('id', employee.id);
+      
+    if (error) {
+      showNotification('Error deleting employee: ' + error.message, 'error');
+    } else {
+      const updatedEmployees = employees.map(e => {
+        if (e.id === employee.id) {
+          return {
+            ...e,
+            status: 'Deleted',
+            is_deleted: true,
+            deleted_at: new Date().toISOString(),
+            deleted_reason: reason.trim(),
+          };
+        }
+        return e;
+      });
+      setEmployees(updatedEmployees);
+      
+      await logAudit({
+        action: 'DELETE',
+        entity_type: 'employee',
+        entity_id: employee.id,
+        old_data: getEmployeeAuditData(employeeData),
+        new_data: { deleted_reason: reason.trim(), deleted_at: new Date().toISOString() },
+        region_id: employee.region_id
+      });
+      
+      showNotification(`${employee.fullName} has been marked as deleted. Records preserved.`, 'success');
+    }
+  }, [userProfile, employees]);
+
+  // ===== RESTORE EMPLOYEE =====
+  const restoreEmployee = useCallback(async (employee: Employee) => {
+    if (!userProfile?.is_super_admin && employee.region_id !== userProfile?.region_id) {
+      showNotification('You cannot restore employees from other regions', 'error');
+      return;
+    }
+    
+    if (confirm(`Are you sure you want to restore ${employee.fullName}?`)) {
       const { error } = await supabase
         .from('employees')
-        .delete()
+        .update({
+          status: 'Active',
+          is_deleted: false,
+          deleted_at: null,
+          deleted_reason: null,
+        })
         .eq('id', employee.id);
+        
       if (error) {
-        showNotification('Error deleting employee: ' + error.message, 'error');
+        showNotification('Error restoring employee: ' + error.message, 'error');
       } else {
-        setEmployees(employees.filter(e => e.id !== employee.id));
-        showNotification(`${employee.fullName} has been deleted`, 'success');
+        const updatedEmployees = employees.map(e => {
+          if (e.id === employee.id) {
+            return {
+              ...e,
+              status: 'Active',
+              is_deleted: false,
+              deleted_at: null,
+              deleted_reason: null,
+            };
+          }
+          return e;
+        });
+        setEmployees(updatedEmployees);
+        
+        await logAudit({
+          action: 'UPDATE',
+          entity_type: 'employee',
+          entity_id: employee.id,
+          old_data: { is_deleted: true, status: 'Deleted' },
+          new_data: { is_deleted: false, status: 'Active' },
+          region_id: employee.region_id
+        });
+        
+        setStatusFilter('all');
+        showNotification(`${employee.fullName} has been restored`, 'success');
       }
     }
-  };
+  }, [userProfile, employees]);
 
-  const handleExport = () => {
+  // ===== EXPORT EMPLOYEES =====
+  const handleExport = useCallback(() => {
     const csv = [
-      ['Employee ID', 'Full Name', 'Company', 'Workstation', 'Account Number', 'Gender', 'Age', 'Phone', 'Position', 'Department', 'Basic Salary', 'Status', 'Pay Point', 'Uniform Deduction'],
+      ['Employee ID', 'Full Name', 'Company', 'Workstation', 'Account Number', 'Gender', 'Age', 'Phone', 'Position', 'Department', 'Basic Salary', 'Status', 'Pay Point', 'Uniform Deduction', 'Next of Kin', 'Relationship', 'NOK Phone', 'Deleted'],
       ...filtered.map(e => [
         e.employeeNumber, e.fullName, e.company || '', e.workstation || '',
         e.account_number || '', e.gender, e.age, e.phone, e.position, e.department, e.basicSalary, e.status, e.pay_point || '',
-        e.uniform_deduction || 0
+        e.uniform_deduction || 0,
+        e.next_of_kin_name || '',
+        e.next_of_kin_relationship || '',
+        e.next_of_kin_phone || '',
+        e.is_deleted ? 'Yes' : 'No'
       ])
     ].map(row => row.join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -409,20 +672,50 @@ export function EmployeesPage() {
     a.click();
     URL.revokeObjectURL(url);
     showNotification(`Exported ${filtered.length} employees`, 'success');
-  };
+  }, [filtered]);
 
-  const clearFilters = () => {
+  const clearFilters = useCallback(() => {
     setFilterRegionId('');
     setFilterCompany('');
     setFilterWorkstation('');
     setFilterPayPoint('');
-  };
+  }, []);
 
+  const handleEdit = useCallback((employee: Employee) => {
+    if (!userProfile?.is_super_admin && employee.region_id !== userProfile?.region_id) {
+      showNotification('You cannot edit employees from other regions', 'error');
+      return;
+    }
+    if (employee.is_deleted) {
+      showNotification('Cannot edit deleted employees. Please restore first.', 'error');
+      return;
+    }
+    setEditingEmployee(employee);
+    setShowEdit(true);
+  }, [userProfile]);
+
+  // ===== PAGINATION =====
+  const goToPage = useCallback((page: number) => {
+    if (page >= 1 && page <= totalPages) {
+      setCurrentPage(page);
+    }
+  }, [totalPages]);
+
+  // ===== EFFECTS =====
+  useEffect(() => {
+    fetchUserProfile();
+    fetchRegions();
+  }, [fetchUserProfile, fetchRegions]);
+
+  useEffect(() => {
+    if (!userLoading && userProfile) {
+      fetchEmployees();
+    }
+  }, [fetchEmployees, userLoading, userProfile]);
+
+  // ===== RENDER =====
   if (userLoading || loading) return <div className="text-center py-8">Loading...</div>;
   if (selected) return <EmployeeProfile employee={selected} onBack={() => setSelected(null)} />;
-
-  const isSuperAdmin = userProfile?.is_super_admin;
-  const userRegion = regions.find(r => r.id === userProfile?.region_id);
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -518,10 +811,10 @@ export function EmployeesPage() {
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {[
-          { label: 'Total', n: employees.length },
-          { label: 'Active', n: employees.filter(e => e.status === 'Active').length },
-          { label: 'On Leave', n: employees.filter(e => e.status === 'On Leave').length },
-          { label: 'Suspended', n: employees.filter(e => e.status === 'Suspended').length }
+          { label: 'Total Active', n: activeEmployees.length },
+          { label: 'Active', n: activeEmployees.filter(e => e.status === 'Active').length },
+          { label: 'On Leave', n: activeEmployees.filter(e => e.status === 'On Leave').length },
+          { label: '🗑️ Deleted', n: deletedEmployees.length }
         ].map((s, i) => (
           <Card key={i} className="p-4">
             <p className="text-xs text-slate-500">{s.label}</p>
@@ -541,8 +834,26 @@ export function EmployeesPage() {
           />
         </div>
         <div className="flex gap-2 flex-wrap">
-          {[{ v: 'all', l: 'All' }, { v: 'Active', l: 'Active' }, { v: 'On Leave', l: 'On Leave' }, { v: 'Suspended', l: 'Suspended' }].map(f => (
-            <button key={f.v} onClick={() => setStatusFilter(f.v)} className={`px-3 py-2 text-xs font-medium rounded-lg transition-colors ${statusFilter === f.v ? 'bg-[#081C3A] text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>{f.l}</button>
+          {[
+            { v: 'all', l: 'All' },
+            { v: 'Active', l: 'Active' },
+            { v: 'On Leave', l: 'On Leave' },
+            { v: 'Suspended', l: 'Suspended' },
+            { v: 'deleted', l: '🗑️ Deleted' }
+          ].map(f => (
+            <button
+              key={f.v}
+              onClick={() => setStatusFilter(f.v)}
+              className={`px-3 py-2 text-xs font-medium rounded-lg transition-colors ${
+                statusFilter === f.v 
+                  ? 'bg-[#081C3A] text-white' 
+                  : f.v === 'deleted' 
+                    ? 'bg-red-50 text-red-600 hover:bg-red-100' 
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              }`}
+            >
+              {f.l}
+            </button>
           ))}
         </div>
       </Card>
@@ -555,7 +866,6 @@ export function EmployeesPage() {
                 <TH>Employee</TH>
                 <TH className="hidden lg:table-cell">Company</TH>
                 <TH className="hidden xl:table-cell">Workstation</TH>
-                <TH className="hidden md:table-cell">Account</TH>
                 <TH className="hidden md:table-cell">Phone</TH>
                 <TH>Position</TH>
                 <TH className="hidden lg:table-cell">Basic Salary</TH>
@@ -564,7 +874,7 @@ export function EmployeesPage() {
               </TR>
             </THead>
             <TBody>
-              {filtered.slice(0, 50).map(emp => (
+              {currentItems.map(emp => (
                 <TR key={emp.id} onClick={() => setSelected(emp)}>
                   <TD>
                     <div className="flex items-center gap-3">
@@ -579,16 +889,32 @@ export function EmployeesPage() {
                   </TD>
                   <TD className="hidden lg:table-cell">{emp.company || '-'}</TD>
                   <TD className="hidden xl:table-cell">{emp.workstation || '-'}</TD>
-                  <TD className="hidden md:table-cell text-xs font-mono">{emp.account_number || '-'}</TD>
                   <TD className="hidden md:table-cell">{emp.phone || '-'}</TD>
                   <TD>{emp.position}</TD>
                   <TD className="hidden lg:table-cell font-medium">{formatKwacha(emp.basicSalary)}</TD>
-                  <TD><Badge color={emp.status === 'Active' ? 'green' : emp.status === 'On Leave' ? 'yellow' : 'red'}>{emp.status}</Badge></TD>
+                  <TD>
+                    {emp.is_deleted ? (
+                      <Badge color="red">🗑️ Deleted</Badge>
+                    ) : (
+                      <Badge color={emp.status === 'Active' ? 'green' : emp.status === 'On Leave' ? 'yellow' : 'red'}>
+                        {emp.status}
+                      </Badge>
+                    )}
+                  </TD>
                   <td className="px-4 py-3 text-right">
                     <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
                       <button onClick={() => setSelected(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Eye size={14} /></button>
-                      <button onClick={() => handleEdit(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Edit2 size={14} /></button>
-                      <button onClick={() => handleDelete(emp)} className="w-8 h-8 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"><Trash2 size={14} /></button>
+                      {!emp.is_deleted && (
+                        <>
+                          <button onClick={() => handleEdit(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Edit2 size={14} /></button>
+                          <button onClick={() => handleDelete(emp)} className="w-8 h-8 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"><Trash2 size={14} /></button>
+                        </>
+                      )}
+                      {emp.is_deleted && (
+                        <button onClick={() => restoreEmployee(emp)} className="w-8 h-8 rounded-lg hover:bg-emerald-50 text-emerald-600 flex items-center justify-center" title="Restore Employee">
+                          <UserPlus size={14} />
+                        </button>
+                      )}
                     </div>
                   </td>
                 </TR>
@@ -596,12 +922,68 @@ export function EmployeesPage() {
             </TBody>
           </table>
         </div>
-        <div className="px-4 py-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
-          <span>Showing {Math.min(50, filtered.length)} of {filtered.length} employees</span>
+        
+        {/* Pagination */}
+        <div className="px-4 py-3 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500">
+          <span>
+            Showing {filtered.length === 0 ? 0 : (currentPage - 1) * itemsPerPage + 1} to {Math.min(currentPage * itemsPerPage, filtered.length)} of {filtered.length} employees
+          </span>
           <div className="flex items-center gap-1">
-            <button className="px-3 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50">Previous</button>
-            <button className="px-3 py-1.5 rounded-md bg-[#081C3A] text-white">1</button>
-            <button className="px-3 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50">Next</button>
+            <button
+              onClick={() => goToPage(currentPage - 1)}
+              disabled={currentPage === 1 || filtered.length === 0}
+              className="px-3 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+            >
+              <ChevronLeft size={14} /> Previous
+            </button>
+            
+            <div className="flex items-center gap-1">
+              {Array.from({ length: Math.min(totalPages, 5) }, (_, i) => {
+                let pageNum: number;
+                if (totalPages <= 5) {
+                  pageNum = i + 1;
+                } else if (currentPage <= 3) {
+                  pageNum = i + 1;
+                } else if (currentPage >= totalPages - 2) {
+                  pageNum = totalPages - 4 + i;
+                } else {
+                  pageNum = currentPage - 2 + i;
+                }
+                
+                return (
+                  <button
+                    key={pageNum}
+                    onClick={() => goToPage(pageNum)}
+                    className={`px-3 py-1.5 rounded-md transition-colors ${
+                      currentPage === pageNum
+                        ? 'bg-[#081C3A] text-white'
+                        : 'border border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    {pageNum}
+                  </button>
+                );
+              })}
+              {totalPages > 5 && currentPage < totalPages - 2 && (
+                <>
+                  <span className="px-1">...</span>
+                  <button
+                    onClick={() => goToPage(totalPages)}
+                    className="px-3 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50"
+                  >
+                    {totalPages}
+                  </button>
+                </>
+              )}
+            </div>
+            
+            <button
+              onClick={() => goToPage(currentPage + 1)}
+              disabled={currentPage === totalPages || filtered.length === 0}
+              className="px-3 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+            >
+              Next <ChevronRight size={14} />
+            </button>
           </div>
         </div>
       </div>
@@ -615,6 +997,7 @@ export function EmployeesPage() {
           userRegionId={userProfile?.region_id}
           isSuperAdmin={isSuperAdmin}
           userRegionName={userRegion?.name}
+          relationshipOptions={relationshipOptions}
         />
       </Modal>
 
@@ -627,6 +1010,7 @@ export function EmployeesPage() {
             departments={departmentOptions} 
             regions={regions}
             isSuperAdmin={isSuperAdmin}
+            relationshipOptions={relationshipOptions}
           />
         )}
       </Modal>
@@ -634,7 +1018,7 @@ export function EmployeesPage() {
   );
 }
 
-// AddEmployeeForm Component
+// ===== AddEmployeeForm =====
 function AddEmployeeForm({
   onSubmit,
   onCancel,
@@ -643,6 +1027,7 @@ function AddEmployeeForm({
   userRegionId,
   isSuperAdmin,
   userRegionName,
+  relationshipOptions,
 }: {
   onSubmit: (e: any) => void;
   onCancel: () => void;
@@ -651,6 +1036,7 @@ function AddEmployeeForm({
   userRegionId?: string;
   isSuperAdmin?: boolean;
   userRegionName?: string;
+  relationshipOptions: string[];
 }) {
   const [form, setForm] = useState<any>({
     employeeNumber: "",
@@ -674,6 +1060,10 @@ function AddEmployeeForm({
     pay_point: "",
     account_number: "",
     uniform_deduction: 10000,
+    next_of_kin_name: "",
+    next_of_kin_relationship: "",
+    next_of_kin_phone: "",
+    next_of_kin_address: "",
   });
 
   const [positions, setPositions] = useState<any[]>([]);
@@ -1020,6 +1410,62 @@ function AddEmployeeForm({
         </div>
       </div>
 
+      {/* Next of Kin Section */}
+      <div>
+        <h4 className="font-semibold text-slate-800 mb-3 text-sm">Next of Kin</h4>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Full Name</label>
+            <input
+              type="text"
+              value={form.next_of_kin_name || ""}
+              onChange={(e) => update("next_of_kin_name", e.target.value)}
+              placeholder="Enter next of kin full name"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Relationship</label>
+            <select
+              value={form.next_of_kin_relationship || ""}
+              onChange={(e) => update("next_of_kin_relationship", e.target.value)}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
+            >
+              <option value="">Select Relationship</option>
+              {relationshipOptions.map((rel) => (
+                <option key={rel} value={rel}>
+                  {rel}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number</label>
+            <input
+              type="tel"
+              value={form.next_of_kin_phone || ""}
+              onChange={(e) => update("next_of_kin_phone", e.target.value)}
+              placeholder="Enter next of kin phone number"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Address</label>
+            <input
+              type="text"
+              value={form.next_of_kin_address || ""}
+              onChange={(e) => update("next_of_kin_address", e.target.value)}
+              placeholder="Enter next of kin address"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+        </div>
+        <p className="text-xs text-slate-400 mt-2">
+          <Heart size={12} className="inline mr-1 text-red-500" />
+          Emergency contact information for the employee
+        </p>
+      </div>
+
       <div>
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Bank Account</h4>
         <div className="grid grid-cols-1 gap-4">
@@ -1085,14 +1531,15 @@ function AddEmployeeForm({
   );
 }
 
-// EditEmployeeForm Component
-function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, isSuperAdmin }: { 
+// ===== EditEmployeeForm =====
+function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, isSuperAdmin, relationshipOptions }: { 
   employee: Employee;
   onSubmit: (e: any) => void; 
   onCancel: () => void; 
   departments: string[]; 
   regions: any[];
   isSuperAdmin?: boolean;
+  relationshipOptions: string[];
 }) {
   const [form, setForm] = useState<any>({
     employeeNumber: employee.employeeNumber,
@@ -1116,6 +1563,10 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
     pay_point: employee.pay_point || '',
     account_number: employee.account_number || '',
     uniform_deduction: employee.uniform_deduction || 0,
+    next_of_kin_name: employee.next_of_kin_name || '',
+    next_of_kin_relationship: employee.next_of_kin_relationship || '',
+    next_of_kin_phone: employee.next_of_kin_phone || '',
+    next_of_kin_address: employee.next_of_kin_address || '',
   });
   
   const [positions, setPositions] = useState<any[]>([]);
@@ -1342,6 +1793,62 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
         </div>
       </div>
 
+      {/* Next of Kin Section */}
+      <div>
+        <h4 className="font-semibold text-slate-800 mb-3 text-sm">Next of Kin</h4>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Full Name</label>
+            <input
+              type="text"
+              value={form.next_of_kin_name || ""}
+              onChange={(e) => update("next_of_kin_name", e.target.value)}
+              placeholder="Enter next of kin full name"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Relationship</label>
+            <select
+              value={form.next_of_kin_relationship || ""}
+              onChange={(e) => update("next_of_kin_relationship", e.target.value)}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
+            >
+              <option value="">Select Relationship</option>
+              {relationshipOptions.map((rel) => (
+                <option key={rel} value={rel}>
+                  {rel}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number</label>
+            <input
+              type="tel"
+              value={form.next_of_kin_phone || ""}
+              onChange={(e) => update("next_of_kin_phone", e.target.value)}
+              placeholder="Enter next of kin phone number"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Address</label>
+            <input
+              type="text"
+              value={form.next_of_kin_address || ""}
+              onChange={(e) => update("next_of_kin_address", e.target.value)}
+              placeholder="Enter next of kin address"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+        </div>
+        <p className="text-xs text-slate-400 mt-2">
+          <Heart size={12} className="inline mr-1 text-red-500" />
+          Emergency contact information for the employee
+        </p>
+      </div>
+
       <div>
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Bank Account</h4>
         <div className="grid grid-cols-1 gap-4">
@@ -1367,7 +1874,7 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
   );
 }
 
-// EmployeeProfile Component
+// ===== EmployeeProfile =====
 function EmployeeProfile({ employee, onBack }: { employee: Employee; onBack: () => void }) {
   const [tab, setTab] = useState('profile');
   
@@ -1388,7 +1895,11 @@ function EmployeeProfile({ employee, onBack }: { employee: Employee; onBack: () 
           <div className="flex-1">
             <div className="flex flex-wrap items-center gap-2 mb-2">
               <h2 className="text-2xl font-bold">{employee.fullName}</h2>
-              <Badge color={employee.status === 'Active' ? 'green' : 'yellow'}>{employee.status}</Badge>
+              {employee.is_deleted ? (
+                <Badge color="red">🗑️ Deleted</Badge>
+              ) : (
+                <Badge color={employee.status === 'Active' ? 'green' : 'yellow'}>{employee.status}</Badge>
+              )}
               <Badge color="gold">{employee.contractType || 'Permanent'}</Badge>
             </div>
             <p className="text-white/70 mb-4">{employee.position} · {employee.department} · {employee.employeeNumber}</p>
@@ -1430,6 +1941,10 @@ function EmployeeProfile({ employee, onBack }: { employee: Employee; onBack: () 
                 ['Company', employee.company || '-'], ['Workstation', employee.workstation || '-'],
                 ['Pay Point', employee.pay_point || '-'], ['Bank Account', employee.account_number || '-'],
                 ['Uniform Deduction', formatKwacha(employee.uniform_deduction || 0)],
+                ['Next of Kin', employee.next_of_kin_name || 'Not provided'],
+                ['Relationship', employee.next_of_kin_relationship || 'Not provided'],
+                ['NOK Phone', employee.next_of_kin_phone || 'Not provided'],
+                ['NOK Address', employee.next_of_kin_address || 'Not provided'],
                 ['Status', employee.status]
               ].map(([k, v]) => (
                 <div key={k} className="flex justify-between border-b border-slate-100 pb-2">

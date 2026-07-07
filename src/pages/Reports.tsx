@@ -1,13 +1,12 @@
-﻿import { useState, useEffect } from 'react';
-import { FileDown, FileSpreadsheet, FileText, TrendingUp, Users, DollarSign, Calendar, UserCheck, Building2, Briefcase, MapPin, PieChart } from 'lucide-react';
+﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { FileDown, FileSpreadsheet, FileText, TrendingUp, Users, DollarSign, Calendar, UserCheck, Building2, Briefcase, MapPin, PieChart, ChevronLeft, ChevronRight } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
-import { getAvailableMonths, getCurrentMonth, isFutureMonth } from '../utils/dateUtils';
-import { MonthSelector } from '../components/MonthSelector';
+import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
-// ===== NEW: Import sanitization =====
 import { sanitizeInput } from '../utils/securityHeaders';
+import { logAudit } from '../utils/auditLogger';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
 
@@ -59,122 +58,25 @@ interface WorkstationStats {
 }
 
 export function ReportsPage() {
+  // ===== ALL HOOKS AT TOP LEVEL =====
   const [activeReport, setActiveReport] = useState<ReportType>('company');
   const [loading, setLoading] = useState(true);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [payrollRecords, setPayrollRecords] = useState<PayrollRecord[]>([]);
   const [applicants, setApplicants] = useState<Applicant[]>([]);
-  const [selectedMonth, setSelectedMonth] = useState(getCurrentMonth());
+  const [selectedMonth, setSelectedMonth] = useState('');
+  const [systemMonth, setSystemMonth] = useState('');
+  const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [hasData, setHasData] = useState(true);
   const [userProfile, setUserProfile] = useState<any>(null);
-  const availableMonths = getAvailableMonths();
 
-  // Fetch user profile for region access
-  useEffect(() => {
-    const fetchUserProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .single();
-        setUserProfile(profile);
-      }
-    };
-    fetchUserProfile();
-  }, []);
+  // ===== MEMOIZED VALUES =====
+  const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
+  const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
+  const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
 
-  useEffect(() => {
-    if (userProfile) {
-      fetchData();
-    }
-  }, [selectedMonth, activeReport, userProfile]);
-
-  const checkDataExists = async () => {
-    if (activeReport === 'payroll') {
-      let query = supabase
-        .from('payroll')
-        .select('id', { count: 'exact', head: true })
-        .eq('month', selectedMonth);
-      
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        const { data: regionEmployees } = await supabase
-          .from('employees')
-          .select('id')
-          .eq('region_id', userProfile.region_id);
-        const employeeIds = regionEmployees?.map(e => e.id) || [];
-        if (employeeIds.length > 0) {
-          query = query.in('employee_id', employeeIds);
-        }
-      }
-      
-      const { count } = await query;
-      setHasData((count || 0) > 0);
-    } else if (activeReport === 'employee') {
-      setHasData(employees.length > 0);
-    } else if (activeReport === 'recruitment') {
-      setHasData(applicants.length > 0);
-    } else {
-      setHasData(true);
-    }
-  };
-
-  const handleMonthChange = async (newMonth: string) => {
-    if (isFutureMonth(newMonth) && activeReport === 'payroll') {
-      alert('Cannot view future months. Please select a current or past month.');
-      return;
-    }
-    // ===== NEW: Sanitize month input =====
-    const safeMonth = sanitizeInput(newMonth);
-    setSelectedMonth(safeMonth);
-    setLoading(true);
-    await fetchData();
-  };
-
-  const fetchData = async () => {
-    setLoading(true);
-    try {
-      // Fetch employees with region filter
-      let employeesQuery = supabase.from('employees').select('*');
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
-      }
-      
-      const { data: employeesData, error: empError } = await employeesQuery;
-      if (empError) throw empError;
-      setEmployees(employeesData || []);
-      
-      // Fetch payroll records with region filter
-      let payrollQuery = supabase.from('payroll').select('*').eq('month', selectedMonth);
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        const employeeIds = (employeesData || []).map(e => e.id);
-        if (employeeIds.length > 0) {
-          payrollQuery = payrollQuery.in('employee_id', employeeIds);
-        }
-      }
-      
-      const { data: payrollData, error: payError } = await payrollQuery;
-      if (payError) throw payError;
-      setPayrollRecords(payrollData || []);
-      
-      // Fetch applicants
-      const { data: applicantsData, error: appError } = await supabase
-        .from('applicants')
-        .select('*')
-        .order('created_at', { ascending: false });
-      if (appError) throw appError;
-      setApplicants(applicantsData || []);
-      
-      await checkDataExists();
-    } catch (err: any) {
-      console.error('Error fetching data:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const getDepartmentData = () => {
+  // ===== COMPUTED DATA =====
+  const departmentData = useMemo(() => {
     const deptMap: Record<string, { count: number; totalPayroll: number }> = {};
     employees.forEach(emp => {
       const deptName = emp.department || 'Other';
@@ -192,14 +94,12 @@ export function ReportsPage() {
       average: data.totalPayroll / data.count,
       attendance: (94 + Math.random() * 5).toFixed(1)
     }));
-  };
+  }, [employees, payrollRecords]);
 
-  // Get Company Statistics
-  const getCompanyData = (): CompanyStats[] => {
+  const companyData = useMemo(() => {
     const companyMap: Record<string, CompanyStats> = {};
     
     employees.forEach(emp => {
-      // ===== NEW: Sanitize company name =====
       const companyName = emp.company ? sanitizeInput(emp.company) : 'Unassigned';
       if (!companyMap[companyName]) {
         companyMap[companyName] = {
@@ -219,8 +119,6 @@ export function ReportsPage() {
       const payroll = payrollRecords.find(p => p.employee_id === emp.id);
       companyMap[companyName].totalPayroll += payroll?.net_pay || emp.basic_salary || 0;
       
-      // Track workstations per company
-      // ===== NEW: Sanitize workstation name =====
       const workstationName = emp.workstation ? sanitizeInput(emp.workstation) : 'Unassigned';
       if (!companyMap[companyName].workstations[workstationName]) {
         companyMap[companyName].workstations[workstationName] = {
@@ -237,21 +135,17 @@ export function ReportsPage() {
       companyMap[companyName].workstations[workstationName].payrollTotal += payroll?.net_pay || emp.basic_salary || 0;
     });
     
-    // Convert workstations object to array
     return Object.values(companyMap).map(company => ({
       ...company,
       workstations: Object.values(company.workstations)
     }));
-  };
+  }, [employees, payrollRecords]);
 
-  // Get Workstation Statistics (across all companies)
-  const getWorkstationData = () => {
+  const workstationData = useMemo(() => {
     const workstationMap: Record<string, { count: number; activeCount: number; payrollTotal: number; companies: Record<string, number> }> = {};
     
     employees.forEach(emp => {
-      // ===== NEW: Sanitize workstation name =====
       const workstationName = emp.workstation ? sanitizeInput(emp.workstation) : 'Unassigned';
-      // ===== NEW: Sanitize company name =====
       const companyName = emp.company ? sanitizeInput(emp.company) : 'Unassigned';
       
       if (!workstationMap[workstationName]) {
@@ -280,9 +174,9 @@ export function ReportsPage() {
       totalPayroll: data.payrollTotal,
       companies: data.companies
     })).sort((a, b) => b.totalEmployees - a.totalEmployees);
-  };
+  }, [employees, payrollRecords]);
 
-  const getPayrollSummary = () => {
+  const payrollSummary = useMemo(() => {
     let totalGross = 0, totalNet = 0, totalPAYE = 0, totalPension = 0;
     payrollRecords.forEach(record => {
       totalGross += record.gross_pay || 0;
@@ -297,21 +191,142 @@ export function ReportsPage() {
       });
     }
     return { totalGross, totalNet, totalPAYE, totalPension };
-  };
+  }, [payrollRecords, employees]);
 
-  const departmentData = getDepartmentData();
-  const companyData = getCompanyData();
-  const workstationData = getWorkstationData();
-  const payrollSummary = getPayrollSummary();
+  const totalCompanies = useMemo(() => companyData.length, [companyData]);
+  const totalWorkstations = useMemo(() => workstationData.length, [workstationData]);
+  const totalCompanyPayroll = useMemo(() => companyData.reduce((sum, c) => sum + c.totalPayroll, 0), [companyData]);
 
-  const getCurrentReportData = () => {
+  // ===== CALLBACKS =====
+  const fetchUserProfile = useCallback(async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*, regions(*)')
+        .eq('id', user.id)
+        .single();
+      setUserProfile(profile);
+    }
+  }, []);
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      let employeesQuery = supabase.from('employees').select('*');
+      if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+      }
+      
+      const { data: employeesData, error: empError } = await employeesQuery;
+      if (empError) throw empError;
+      setEmployees(employeesData || []);
+      
+      let payrollQuery = supabase.from('payroll').select('*').eq('month', selectedMonth);
+      if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        const employeeIds = (employeesData || []).map(e => e.id);
+        if (employeeIds.length > 0) {
+          payrollQuery = payrollQuery.in('employee_id', employeeIds);
+        }
+      }
+      
+      const { data: payrollData, error: payError } = await payrollQuery;
+      if (payError) throw payError;
+      setPayrollRecords(payrollData || []);
+      
+      const { data: applicantsData, error: appError } = await supabase
+        .from('applicants')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (appError) throw appError;
+      setApplicants(applicantsData || []);
+      
+      // Check data exists for payroll
+      if (activeReport === 'payroll') {
+        setHasData((payrollData?.length || 0) > 0);
+      } else if (activeReport === 'employee') {
+        setHasData((employeesData?.length || 0) > 0);
+      } else if (activeReport === 'recruitment') {
+        setHasData((applicantsData?.length || 0) > 0);
+      } else {
+        setHasData(true);
+      }
+    } catch (err: any) {
+      console.error('Error fetching data:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, [userProfile, selectedMonth, activeReport]);
+
+  // ===== INITIALIZATION =====
+  useEffect(() => {
+    const init = async () => {
+      const month = await getSystemCurrentMonth();
+      setSystemMonth(month);
+      setSelectedMonth(month);
+      
+      const months = getAvailableMonthsFromSystem(month);
+      setAvailableMonths(months);
+      
+      await fetchUserProfile();
+    };
+    init();
+  }, [fetchUserProfile]);
+
+  useEffect(() => {
+    if (userProfile && selectedMonth) {
+      fetchData();
+    }
+  }, [selectedMonth, activeReport, userProfile, fetchData]);
+
+  // ===== MONTH NAVIGATION =====
+  const goToPreviousMonth = useCallback(() => {
+    const prevMonth = getPreviousMonth(selectedMonth);
+    if (prevMonth && availableMonths.includes(prevMonth)) {
+      setSelectedMonth(prevMonth);
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToNextMonth = useCallback(() => {
+    const nextMonth = getNextMonth(selectedMonth);
+    if (nextMonth && availableMonths.includes(nextMonth)) {
+      setSelectedMonth(nextMonth);
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToCurrentMonth = useCallback(() => {
+    if (systemMonth && systemMonth !== selectedMonth) {
+      setSelectedMonth(systemMonth);
+    }
+  }, [systemMonth, selectedMonth]);
+
+  const handleMonthSelect = useCallback((month: string) => {
+    if (month !== selectedMonth) {
+      setSelectedMonth(month);
+    }
+  }, [selectedMonth]);
+
+  const handleReportTabChange = useCallback(async (tabId: ReportType) => {
+    const oldReport = activeReport;
+    setActiveReport(tabId);
+    
+    await logAudit({
+      action: 'VIEW',
+      entity_type: 'report_view',
+      old_data: { report_type: oldReport },
+      new_data: { report_type: tabId, month: selectedMonth },
+      region_id: userProfile?.region_id
+    });
+  }, [activeReport, selectedMonth, userProfile]);
+
+  // ===== GET CURRENT REPORT DATA =====
+  const currentData = useMemo(() => {
     switch(activeReport) {
       case 'employee':
         return {
           title: 'Employee Report',
           headers: ['Name', 'Employee ID', 'Company', 'Workstation', 'Position', 'Department', 'Status', 'Salary'],
           rows: employees.map(emp => [
-            // ===== NEW: Sanitize all employee data for display =====
             sanitizeInput(emp.full_name),
             sanitizeInput(emp.employee_number),
             sanitizeInput(emp.company || '-'),
@@ -400,10 +415,14 @@ export function ReportsPage() {
           ])
         };
     }
-  };
+  }, [activeReport, employees, payrollRecords, applicants, companyData, workstationData, departmentData]);
 
-  const exportReport = () => {
-    const reportData = getCurrentReportData();
+  // ===== EXPORT REPORT =====
+  const exportReport = useCallback(async () => {
+    const reportData = currentData;
+    const reportType = activeReport;
+    const recordCount = reportData.rows.length;
+    
     let csvContent = `${reportData.title}\nGenerated: ${new Date().toLocaleString()}\n\n${reportData.headers.join(',')}\n`;
     reportData.rows.forEach(row => {
       csvContent += row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',') + '\n';
@@ -427,10 +446,25 @@ export function ReportsPage() {
     a.download = `${activeReport}_report_${new Date().toISOString().split('T')[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
+    
+    await logAudit({
+      action: 'EXPORT',
+      entity_type: 'report_export',
+      new_data: {
+        report_type: reportType,
+        report_title: reportData.title,
+        record_count: recordCount,
+        month: selectedMonth,
+        region: userProfile?.region_id || null
+      },
+      region_id: userProfile?.region_id
+    });
+    
     alert(`${activeReport.toUpperCase()} Report exported!`);
-  };
+  }, [currentData, activeReport, selectedMonth, userProfile, payrollSummary, departmentData, employees, companyData, workstationData]);
 
-  const reportTabs = [
+  // ===== REPORT TABS =====
+  const reportTabs = useMemo(() => [
     { id: 'employee', label: 'Employees', icon: Users },
     { id: 'company', label: 'Companies', icon: Building2 },
     { id: 'workstation', label: 'Workstations', icon: MapPin },
@@ -438,17 +472,9 @@ export function ReportsPage() {
     { id: 'attendance', label: 'Attendance', icon: Calendar },
     { id: 'recruitment', label: 'Recruitment', icon: UserCheck },
     { id: 'department', label: 'Departments', icon: PieChart }
-  ];
+  ], []);
 
-  const currentData = getCurrentReportData();
-  const isSuperAdmin = userProfile?.is_super_admin;
-  const userRegion = userProfile?.regions;
-
-  // Summary statistics for Company report
-  const totalCompanies = companyData.length;
-  const totalWorkstations = workstationData.length;
-  const totalCompanyPayroll = companyData.reduce((sum, c) => sum + c.totalPayroll, 0);
-
+  // ===== RENDER =====
   if (loading) {
     return (
       <div className="flex justify-center py-12">
@@ -461,17 +487,50 @@ export function ReportsPage() {
     <div className="space-y-6 animate-fade-in">
       <PageHeader
         title="Reports & Analytics"
-        subtitle={isSuperAdmin ? "Comprehensive business intelligence dashboard" : `${userRegion?.name || ''} Region - Reports`}
+        subtitle={`${getMonthLabel(selectedMonth)} Reports ${isCurrentMonth ? '● Current' : ''}`}
         actions={
           <div className="flex gap-2">
-            {activeReport === 'payroll' && (
-              <MonthSelector
-                selectedMonth={selectedMonth}
-                onMonthChange={handleMonthChange}
-                availableMonths={availableMonths}
-                isLoading={loading}
-              />
+            <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-2 py-1">
+              <button
+                onClick={goToPreviousMonth}
+                className="p-1.5 rounded hover:bg-slate-100 disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getPreviousMonth(selectedMonth))}
+                title="Previous Month"
+              >
+                <ChevronLeft size={16} />
+              </button>
+              
+              <select
+  value={selectedMonth}
+  onChange={(e) => handleMonthSelect(e.target.value)}
+  className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1 min-w-[140px] text-center cursor-pointer"
+>
+  {availableMonths.map((month, index) => (
+    <option key={`${month}-${index}`} value={month}>
+      {getMonthLabel(month)} {month === systemMonth ? '●' : ''}
+    </option>
+  ))}
+</select>
+              
+              <button
+                onClick={goToNextMonth}
+                className="p-1.5 rounded hover:bg-slate-100 disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getNextMonth(selectedMonth))}
+                title="Next Month"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </div>
+
+            {!isCurrentMonth && (
+              <button
+                onClick={goToCurrentMonth}
+                className="text-xs text-[#D4A017] hover:underline px-2 py-1"
+              >
+                Jump to Current
+              </button>
             )}
+
             <Button variant="outline" onClick={exportReport}>
               <FileDown size={14} className="mr-1" /> Export
             </Button>
@@ -487,6 +546,31 @@ export function ReportsPage() {
           <p className="text-sm text-slate-600">
             Viewing reports for <strong className="text-[#081C3A]">{userRegion.name}</strong> region only
           </p>
+        </Card>
+      )}
+
+      {/* Month Status Banner */}
+      {!isCurrentMonth && (
+        <Card className={`p-3 border ${selectedMonth > systemMonth ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
+          <div className="flex items-start gap-3">
+            <Calendar size={18} className={`shrink-0 mt-0.5 ${selectedMonth > systemMonth ? 'text-blue-600' : 'text-amber-600'}`} />
+            <div>
+              <p className={`text-sm font-medium ${selectedMonth > systemMonth ? 'text-blue-800' : 'text-amber-800'}`}>
+                {selectedMonth > systemMonth ? 'Viewing Future Month' : 'Viewing Past Month'}
+              </p>
+              <p className={`text-sm ${selectedMonth > systemMonth ? 'text-blue-700' : 'text-amber-700'}`}>
+                Showing reports for {getMonthLabel(selectedMonth)}.
+                {!isCurrentMonth && (
+                  <button 
+                    onClick={goToCurrentMonth}
+                    className="ml-2 text-[#D4A017] hover:underline font-medium"
+                  >
+                    Switch to {getMonthLabel(systemMonth)}
+                  </button>
+                )}
+              </p>
+            </div>
+          </div>
         </Card>
       )}
 
@@ -544,7 +628,7 @@ export function ReportsPage() {
         </div>
       )}
 
-      {/* Company Breakdown Cards (when viewing Company report) */}
+      {/* Company Breakdown Cards */}
       {activeReport === 'company' && companyData.length > 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {companyData.slice(0, 6).map(company => (
@@ -589,7 +673,7 @@ export function ReportsPage() {
         </div>
       )}
 
-      {/* Top Workstations Cards (when viewing Workstation report) */}
+      {/* Top Workstations Cards */}
       {activeReport === 'workstation' && workstationData.length > 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {workstationData.slice(0, 6).map(ws => (
@@ -635,7 +719,7 @@ export function ReportsPage() {
           return (
             <button
               key={tab.id}
-              onClick={() => setActiveReport(tab.id as ReportType)}
+              onClick={() => handleReportTabChange(tab.id as ReportType)}
               className={`flex items-center gap-2 px-5 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
                 isActive
                   ? 'border-[#D4A017] text-[#081C3A]'
@@ -652,12 +736,12 @@ export function ReportsPage() {
       {!hasData && activeReport === 'payroll' ? (
         <EmptyState
           title="No Payroll Data"
-          message={`No payroll records found for ${selectedMonth}. Please process payroll for this month first.`}
+          message={`No payroll records found for ${getMonthLabel(selectedMonth)}. Please process payroll for this month first.`}
         />
       ) : (
         <Card className="overflow-hidden">
           <div className="p-4 border-b border-slate-100 bg-slate-50/50">
-            <h3 className="font-semibold text-slate-800">{currentData.title} — {selectedMonth}</h3>
+            <h3 className="font-semibold text-slate-800">{currentData.title} — {getMonthLabel(selectedMonth)}</h3>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -690,4 +774,4 @@ export function ReportsPage() {
   );
 }
 
-	export default ReportsPage;
+export default ReportsPage;

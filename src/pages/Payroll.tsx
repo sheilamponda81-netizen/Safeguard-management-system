@@ -1,14 +1,15 @@
-﻿import { useState, useEffect } from 'react';
-import { Search, Wallet, Calculator, Check, FileText, CheckCircle2, ChevronRight, Save, TrendingUp, Users, DollarSign, AlertCircle } from 'lucide-react';
+﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Search, Wallet, Calculator, Check, FileText, CheckCircle2, ChevronRight, Save, TrendingUp, Users, DollarSign, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
-import { getAvailableMonths, getCurrentMonth, isFutureMonth } from '../utils/dateUtils';
-import { MonthSelector } from '../components/MonthSelector';
+import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
 import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
-// ===== NEW: Import sanitization =====
 import { sanitizeInput } from '../utils/securityHeaders';
+import { logAudit } from '../utils/auditLogger';
+import { showNotification } from '../utils/clickHandlers';
+import { Pagination } from '../components/Pagination';
 
 interface Employee {
   id: string;
@@ -36,7 +37,6 @@ interface PayrollRecord {
   processed_at: string;
 }
 
-// NEW: Interface for employee deductions
 interface EmployeeDeduction {
   id: string;
   employee_id: string;
@@ -52,114 +52,101 @@ interface EmployeeDeduction {
 }
 
 export function PayrollPage() {
+  // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [payrollRecords, setPayrollRecords] = useState<PayrollRecord[]>([]);
   const [employeeDeductions, setEmployeeDeductions] = useState<EmployeeDeduction[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [selectedMonth, setSelectedMonth] = useState(getCurrentMonth());
+  const [selectedMonth, setSelectedMonth] = useState('');
+  const [systemMonth, setSystemMonth] = useState('');
+  const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [processed, setProcessed] = useState(false);
   const [editingValues, setEditingValues] = useState<Record<string, Partial<PayrollRecord>>>({});
   const [showCopyModal, setShowCopyModal] = useState(false);
-  const [hasData, setHasData] = useState(true);
-  const availableMonths = getAvailableMonths();
+  const [hasData, setHasData] = useState(false);
+  const [userProfile, setUserProfile] = useState<any>(null);
+  const [copySourceMonths, setCopySourceMonths] = useState<string[]>([]);
+  const [processedMonths, setProcessedMonths] = useState<string[]>([]);
+  const [processingStatus, setProcessingStatus] = useState('');
+  const [canProcessPayroll, setCanProcessPayroll] = useState(false);
+  const [canEditPayroll, setCanEditPayroll] = useState(false);
+  const [canViewPayroll, setCanViewPayroll] = useState(false);
 
+  // ===== PAGINATION STATES =====
+  const [payrollPage, setPayrollPage] = useState(1);
+  const [payrollItemsPerPage, setPayrollItemsPerPage] = useState(20);
+
+  // ===== MEMOIZED VALUES =====
+  const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
+  const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
+  const isMonthProcessed = useMemo(() => processedMonths.includes(selectedMonth), [processedMonths, selectedMonth]);
+
+  // ===== FILTER EMPLOYEES =====
+  const filteredEmployees = useMemo(() => {
+    const safeSearch = sanitizeInput(search).toLowerCase();
+    return employees.filter(e => 
+      e.full_name?.toLowerCase().includes(safeSearch) ||
+      e.employee_number?.toLowerCase().includes(safeSearch)
+    );
+  }, [employees, search]);
+
+  // ===== PAGINATED EMPLOYEES =====
+  const paginatedEmployees = useMemo(() => {
+    const startIndex = (payrollPage - 1) * payrollItemsPerPage;
+    const endIndex = Math.min(startIndex + payrollItemsPerPage, filteredEmployees.length);
+    return filteredEmployees.slice(startIndex, endIndex);
+  }, [filteredEmployees, payrollPage, payrollItemsPerPage]);
+
+  // ===== RESET PAGE WHEN SEARCH CHANGES =====
   useEffect(() => {
-    fetchData();
-  }, [selectedMonth]);
+    setPayrollPage(1);
+  }, [search]);
 
-  const checkDataExists = async (month: string) => {
-    const { count, error } = await supabase
-      .from('payroll')
-      .select('id', { count: 'exact', head: true })
-      .eq('month', month);
-    if (error) {
-      console.error('Error checking payroll data:', error);
-      return false;
-    }
-    return (count || 0) > 0;
-  };
-
-  const handleMonthChange = async (newMonth: string) => {
-    if (isFutureMonth(newMonth)) {
-      alert('Cannot view future months. Please select a current or past month.');
-      return;
-    }
-    setSelectedMonth(newMonth);
-    setLoading(true);
-    try {
-      const exists = await checkDataExists(newMonth);
-      setHasData(exists);
-      if (!exists && newMonth < getCurrentMonth()) {
-        setShowCopyModal(true);
-      }
-      await fetchData();
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const copyFromPreviousMonth = async (sourceMonth: string) => {
-    const { data: sourceData, error: sourceError } = await supabase
-      .from('payroll')
-      .select('*')
-      .eq('month', sourceMonth);
-    
-    if (sourceError) {
-      console.error('Error fetching source data:', sourceError);
-      return;
-    }
-    
-    if (sourceData && sourceData.length > 0) {
-      const newRecords = sourceData.map(record => ({
-        employee_id: record.employee_id,
-        month: selectedMonth,
-        basic_salary: record.basic_salary,
-        allowances: record.allowances,
-        overtime: record.overtime,
-        bonus: record.bonus,
-        gross_pay: record.gross_pay,
-        paye: record.paye,
-        pension: record.pension,
-        uniform_deduction: record.uniform_deduction || 0,
-        net_pay: record.net_pay,
-        processed_at: new Date().toISOString()
-      }));
+  // ===== FETCH USER PROFILE =====
+  const fetchUserProfile = useCallback(async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*, regions(*)')
+        .eq('id', user.id)
+        .single();
+      setUserProfile(profile);
       
-      const { error: insertError } = await supabase
-        .from('payroll')
-        .insert(newRecords);
+      const isSuperAdmin = profile?.is_super_admin || false;
+      const roleLevel = profile?.role_level || 4;
       
-      if (insertError) {
-        console.error('Error copying data:', insertError);
-        alert('Failed to copy data: ' + insertError.message);
-      } else {
-        await fetchData();
-        setHasData(true);
-        alert(`Payroll data copied from ${sourceMonth} to ${selectedMonth}`);
-      }
+      setCanProcessPayroll(isSuperAdmin || roleLevel === 1);
+      setCanEditPayroll(isSuperAdmin || roleLevel <= 2);
+      setCanViewPayroll(isSuperAdmin || roleLevel <= 3);
     }
-  };
+  }, []);
 
-  const fetchEmployeeDeductions = async () => {
-    try {
-      const { data, error } = await supabase
-        .from('employee_deductions')
-        .select('*')
-        .eq('month', selectedMonth);
+ // ===== FETCH PROCESSED MONTHS (DEDUPLICATED) =====
+const fetchProcessedMonths = useCallback(async () => {
+  try {
+    const { data, error } = await supabase
+      .from('payroll')
+      .select('month')
+      .order('month', { ascending: false });
+    
+    if (error) throw error;
+    
+    // ===== CRITICAL FIX: Remove duplicate months =====
+    const uniqueMonths = [...new Set(data?.map(r => r.month) || [])];
+    setProcessedMonths(uniqueMonths);
+    
+    console.log('📊 Processed months (deduplicated):', uniqueMonths);
+  } catch (err) {
+    console.error('Error fetching processed months:', err);
+  }
+}, []);
 
-      if (error) throw error;
-      setEmployeeDeductions(data || []);
-      return data || [];
-    } catch (err) {
-      console.error('Error fetching employee deductions:', err);
-      return [];
-    }
-  };
-
-  const fetchData = async () => {
+  // ===== FETCH DATA =====
+  const fetchData = useCallback(async () => {
     setLoading(true);
     try {
       const { data: employeesData, error: empError } = await supabase
@@ -178,27 +165,35 @@ export function PayrollPage() {
       if (payError) throw payError;
       setPayrollRecords(payrollData || []);
       
-      await fetchEmployeeDeductions();
+      const { data: deductionsData, error: dedError } = await supabase
+        .from('employee_deductions')
+        .select('*')
+        .eq('month', selectedMonth);
+      
+      if (dedError) throw dedError;
+      setEmployeeDeductions(deductionsData || []);
       
       setHasData((payrollData?.length || 0) > 0);
       
     } catch (err: any) {
       console.error('Error fetching data:', err);
-      alert('Failed to load payroll data: ' + err.message);
+      showNotification('Failed to load payroll data: ' + err.message, 'error');
     } finally {
       setLoading(false);
     }
-  };
+  }, [selectedMonth]);
 
-  const getPayrollForEmployee = (employeeId: string): PayrollRecord | null => {
+  // ===== GET EMPLOYEE DATA =====
+  const getPayrollForEmployee = useCallback((employeeId: string): PayrollRecord | null => {
     return payrollRecords.find(p => p.employee_id === employeeId) || null;
-  };
+  }, [payrollRecords]);
 
-  const getEmployeeDeduction = (employeeId: string): EmployeeDeduction | null => {
+  const getEmployeeDeduction = useCallback((employeeId: string): EmployeeDeduction | null => {
     return employeeDeductions.find(d => d.employee_id === employeeId) || null;
-  };
+  }, [employeeDeductions]);
 
-  const calculatePayroll = (employee: Employee, customValues?: Partial<PayrollRecord>): PayrollRecord => {
+  // ===== CALCULATE PAYROLL =====
+  const calculatePayroll = useCallback((employee: Employee, customValues?: Partial<PayrollRecord>): PayrollRecord => {
     const basicSalary = customValues?.basic_salary ?? employee.basic_salary;
     const allowances = customValues?.allowances ?? Math.round(basicSalary * 0.10);
     const overtime = customValues?.overtime ?? Math.round(basicSalary * 0.05);
@@ -227,112 +222,17 @@ export function PayrollPage() {
       net_pay: netPay,
       processed_at: new Date().toISOString()
     };
-  };
+  }, [selectedMonth, getEmployeeDeduction]);
 
-  const getDisplayPayroll = (employee: Employee): PayrollRecord => {
+  const getDisplayPayroll = useCallback((employee: Employee): PayrollRecord => {
     const existing = getPayrollForEmployee(employee.id);
     if (existing) return existing;
     const edited = editingValues[employee.id];
     return calculatePayroll(employee, edited);
-  };
+  }, [getPayrollForEmployee, editingValues, calculatePayroll]);
 
-  // ===== UPDATED: updateField with sanitization =====
-  const updateField = (employeeId: string, field: keyof PayrollRecord, value: number) => {
-    // Sanitize the value - ensure it's a valid non-negative number
-    const safeValue = Math.max(0, Number(value) || 0);
-    
-    setEditingValues(prev => ({
-      ...prev,
-      [employeeId]: { ...prev[employeeId], [field]: safeValue }
-    }));
-  };
-
-  // ===== UPDATED: processPayroll with sanitization =====
-  const processPayroll = async () => {
-    setProcessing(true);
-    try {
-      await fetchEmployeeDeductions();
-      
-      // Sanitize all editing values before processing
-      const sanitizedEditingValues: Record<string, Partial<PayrollRecord>> = {};
-      Object.keys(editingValues).forEach(key => {
-        const values = editingValues[key];
-        const sanitized: Partial<PayrollRecord> = {};
-        Object.keys(values).forEach(field => {
-          const value = values[field as keyof PayrollRecord];
-          sanitized[field as keyof PayrollRecord] = typeof value === 'number' 
-            ? Math.max(0, value) 
-            : value;
-        });
-        sanitizedEditingValues[key] = sanitized;
-      });
-      
-      const payrollToSave: any[] = [];
-      for (const employee of employees) {
-        const existing = getPayrollForEmployee(employee.id);
-        const edited = sanitizedEditingValues[employee.id];
-        
-        const deduction = getEmployeeDeduction(employee.id);
-        const uniformDeduction = edited?.uniform_deduction ?? (deduction?.total_deductions || 0);
-        
-        const payroll = calculatePayroll(employee, { ...edited, uniform_deduction: uniformDeduction });
-        
-        if (existing) {
-          payrollToSave.push({
-            id: existing.id,
-            employee_id: employee.id,
-            month: selectedMonth,
-            basic_salary: payroll.basic_salary,
-            allowances: payroll.allowances,
-            overtime: payroll.overtime,
-            bonus: payroll.bonus,
-            gross_pay: payroll.gross_pay,
-            paye: payroll.paye,
-            pension: payroll.pension,
-            uniform_deduction: payroll.uniform_deduction,
-            net_pay: payroll.net_pay,
-            processed_at: new Date().toISOString()
-          });
-        } else {
-          payrollToSave.push({
-            employee_id: employee.id,
-            month: selectedMonth,
-            basic_salary: payroll.basic_salary,
-            allowances: payroll.allowances,
-            overtime: payroll.overtime,
-            bonus: payroll.bonus,
-            gross_pay: payroll.gross_pay,
-            paye: payroll.paye,
-            pension: payroll.pension,
-            uniform_deduction: payroll.uniform_deduction,
-            net_pay: payroll.net_pay,
-            processed_at: new Date().toISOString()
-          });
-        }
-      }
-      
-      for (const record of payrollToSave) {
-        if (record.id) {
-          await supabase.from('payroll').update(record).eq('id', record.id);
-        } else {
-          await supabase.from('payroll').insert(record);
-        }
-      }
-      
-      setProcessed(true);
-      setShowConfirmModal(false);
-      setEditingValues({});
-      await fetchData();
-      setTimeout(() => setProcessed(false), 5000);
-    } catch (err: any) {
-      console.error('Error processing payroll:', err);
-      alert('Failed to process payroll: ' + err.message);
-    } finally {
-      setProcessing(false);
-    }
-  };
-
-  const getTotals = () => {
+  // ===== GET TOTALS =====
+  const totals = useMemo(() => {
     let gross = 0, net = 0, paye = 0, pension = 0, uniformDeductions = 0;
     employees.forEach(emp => {
       const p = getDisplayPayroll(emp);
@@ -343,55 +243,463 @@ export function PayrollPage() {
       uniformDeductions += p.uniform_deduction || 0;
     });
     return { gross, net, paye, pension, uniformDeductions };
-  };
+  }, [employees, getDisplayPayroll]);
 
-  const totals = getTotals();
-  
-  // ===== UPDATED: Filter employees with sanitized search =====
-  const filteredEmployees = employees.filter(e => {
-    const safeSearch = sanitizeInput(search).toLowerCase();
-    return e.full_name?.toLowerCase().includes(safeSearch) ||
-           e.employee_number?.toLowerCase().includes(safeSearch);
-  });
+  const employeesWithDeductions = useMemo(() => {
+    return employees.filter(emp => {
+      const deduction = getEmployeeDeduction(emp.id);
+      return deduction && deduction.total_deductions > 0;
+    });
+  }, [employees, getEmployeeDeduction]);
 
-  const employeesWithDeductions = employees.filter(emp => {
-    const deduction = getEmployeeDeduction(emp.id);
-    return deduction && deduction.total_deductions > 0;
-  });
+  // ===== UPDATE FIELD =====
+  const updateField = useCallback((employeeId: string, field: keyof PayrollRecord, value: number) => {
+    if (!canEditPayroll) {
+      showNotification('You do not have permission to edit payroll values', 'error');
+      return;
+    }
+    const safeValue = Math.max(0, Number(value) || 0);
+    setEditingValues(prev => ({
+      ...prev,
+      [employeeId]: { ...prev[employeeId], [field]: safeValue }
+    }));
+  }, [canEditPayroll]);
+
+  // ===== INITIALIZATION =====
+  useEffect(() => {
+    const init = async () => {
+      const month = await getSystemCurrentMonth();
+      setSystemMonth(month);
+      setSelectedMonth(month);
+      
+      const months = getAvailableMonthsFromSystem(month);
+      setAvailableMonths(months);
+      
+      const pastMonths = months.filter(m => m < month);
+      setCopySourceMonths(pastMonths);
+      
+      await fetchUserProfile();
+      await fetchProcessedMonths();
+    };
+    init();
+  }, [fetchUserProfile, fetchProcessedMonths]);
+
+  useEffect(() => {
+    if (userProfile && selectedMonth) {
+      fetchData();
+      fetchProcessedMonths();
+    }
+  }, [selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
+
+  // ===== MONTH NAVIGATION =====
+  const goToPreviousMonth = useCallback(async () => {
+    const prevMonth = getPreviousMonth(selectedMonth);
+    if (prevMonth && availableMonths.includes(prevMonth)) {
+      setSelectedMonth(prevMonth);
+      setPayrollPage(1);
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToNextMonth = useCallback(async () => {
+    const nextMonth = getNextMonth(selectedMonth);
+    if (nextMonth && availableMonths.includes(nextMonth)) {
+      setSelectedMonth(nextMonth);
+      setPayrollPage(1);
+    }
+  }, [selectedMonth, availableMonths]);
+
+  const goToCurrentMonth = useCallback(async () => {
+    if (systemMonth && systemMonth !== selectedMonth) {
+      setSelectedMonth(systemMonth);
+      setPayrollPage(1);
+    }
+  }, [systemMonth, selectedMonth]);
+
+  const handleMonthSelect = useCallback(async (month: string) => {
+    if (month !== selectedMonth) {
+      setSelectedMonth(month);
+      setPayrollPage(1);
+    }
+  }, [selectedMonth]);
+
+  // ===== COPY FROM PREVIOUS MONTH =====
+  const copyFromPreviousMonth = useCallback(async (sourceMonth: string) => {
+    if (!canProcessPayroll) {
+      alert('You do not have permission to copy payroll data.');
+      return;
+    }
+    
+    setProcessingStatus('Copying data from ' + getMonthLabel(sourceMonth) + '...');
+    
+    try {
+      const { error: deleteError } = await supabase
+        .from('payroll')
+        .delete()
+        .eq('month', selectedMonth);
+      
+      if (deleteError) {
+        console.error('Error deleting existing data:', deleteError);
+      }
+      
+      const { data: sourceData, error: sourceError } = await supabase
+        .from('payroll')
+        .select('*')
+        .eq('month', sourceMonth);
+      
+      if (sourceError) {
+        console.error('Error fetching source data:', sourceError);
+        alert('Failed to fetch source data: ' + sourceError.message);
+        return;
+      }
+      
+      if (!sourceData || sourceData.length === 0) {
+        alert('No data found in the selected source month.');
+        return;
+      }
+      
+      const newRecords = sourceData.map(record => ({
+        employee_id: record.employee_id,
+        month: selectedMonth,
+        basic_salary: record.basic_salary,
+        allowances: record.allowances || 0,
+        overtime: record.overtime || 0,
+        bonus: record.bonus || 0,
+        gross_pay: record.gross_pay,
+        paye: record.paye || 0,
+        pension: record.pension || 0,
+        uniform_deduction: record.uniform_deduction || 0,
+        net_pay: record.net_pay,
+        processed_at: new Date().toISOString()
+      }));
+      
+      const { data: inserted, error: insertError } = await supabase
+        .from('payroll')
+        .insert(newRecords)
+        .select();
+      
+      if (insertError) {
+        console.error('Error inserting records:', insertError);
+        alert('Failed to copy data: ' + insertError.message);
+        return;
+      }
+      
+      await logAudit({
+        action: 'CREATE',
+        entity_type: 'payroll',
+        new_data: {
+          sourceMonth: sourceMonth,
+          targetMonth: selectedMonth,
+          recordsCopied: inserted?.length || 0
+        },
+        region_id: userProfile?.region_id
+      });
+      
+      await fetchData();
+      await fetchProcessedMonths();
+      setHasData(true);
+      setShowCopyModal(false);
+      alert(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${inserted?.length || 0} records copied.`);
+    } catch (err: any) {
+      console.error('Error copying data:', err);
+      alert('Failed to copy data: ' + err.message);
+    } finally {
+      setProcessingStatus('');
+    }
+  }, [canProcessPayroll, selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
+
+  // ===== PROCESS PAYROLL =====
+  const processPayroll = useCallback(async () => {
+    if (!isCurrentMonth) {
+      if (isFutureMonthSelected) {
+        alert('Cannot process payroll for future months. Please wait until the month arrives.');
+      } else {
+        alert('Cannot process payroll for past months. Please switch to the current month.');
+      }
+      return;
+    }
+
+    if (!canProcessPayroll) {
+      alert('You do not have permission to process payroll. Only Super Admins can process payroll.');
+      return;
+    }
+    
+    setProcessing(true);
+    setProcessingStatus('Preparing payroll data...');
+    
+    try {
+      const payrollToSave = [];
+      let totalGross = 0;
+      let totalNet = 0;
+      let totalDeductions = 0;
+      
+      setProcessingStatus(`Calculating payroll for ${employees.length} employees...`);
+      
+      for (const employee of employees) {
+        const edited = editingValues[employee.id];
+        const deduction = getEmployeeDeduction(employee.id);
+        const uniformDeduction = edited?.uniform_deduction ?? (deduction?.total_deductions || 0);
+        
+        const payroll = calculatePayroll(employee, { ...edited, uniform_deduction: uniformDeduction });
+        
+        totalGross += payroll.gross_pay;
+        totalNet += payroll.net_pay;
+        totalDeductions += (payroll.paye + payroll.pension + payroll.uniform_deduction);
+        
+        payrollToSave.push({
+          employee_id: employee.id,
+          month: selectedMonth,
+          basic_salary: payroll.basic_salary,
+          allowances: payroll.allowances,
+          overtime: payroll.overtime,
+          bonus: payroll.bonus,
+          gross_pay: payroll.gross_pay,
+          paye: payroll.paye,
+          pension: payroll.pension,
+          uniform_deduction: payroll.uniform_deduction,
+          net_pay: payroll.net_pay,
+          processed_at: new Date().toISOString()
+        });
+      }
+      
+      setProcessingStatus('Clearing existing data...');
+      const { error: deleteError } = await supabase
+        .from('payroll')
+        .delete()
+        .eq('month', selectedMonth);
+      
+      if (deleteError) {
+        console.error('Error deleting existing records:', deleteError);
+      }
+      
+      setProcessingStatus(`Saving ${payrollToSave.length} records...`);
+      const { data: insertedData, error: insertError } = await supabase
+        .from('payroll')
+        .insert(payrollToSave)
+        .select();
+      
+      if (insertError) {
+        console.error('❌ Error inserting records:', insertError);
+        alert('Failed to save payroll: ' + insertError.message);
+        setProcessing(false);
+        setProcessingStatus('');
+        return;
+      }
+      
+      await logAudit({
+        action: 'CREATE',
+        entity_type: 'payroll',
+        new_data: {
+          month: selectedMonth,
+          employeeCount: employees.length,
+          totalGross: totalGross,
+          totalNet: totalNet,
+          totalDeductions: totalDeductions,
+          recordsSaved: insertedData?.length || 0
+        },
+        region_id: userProfile?.region_id
+      });
+      
+      await fetchData();
+      await fetchProcessedMonths();
+      
+      setProcessed(true);
+      setShowConfirmModal(false);
+      setEditingValues({});
+      
+      setTimeout(() => setProcessed(false), 5000);
+      
+      alert(`✅ Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${insertedData?.length || 0} employees processed.`);
+      
+    } catch (err: any) {
+      console.error('❌ Error processing payroll:', err);
+      alert('Failed to process payroll: ' + err.message);
+    } finally {
+      setProcessing(false);
+      setProcessingStatus('');
+    }
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, editingValues, getEmployeeDeduction, calculatePayroll, selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
+
+  // ===== RENDER =====
+  if (!canViewPayroll && !loading) {
+    return (
+      <div className="text-center py-12">
+        <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-red-100 flex items-center justify-center">
+          <Lock size={32} className="text-red-500" />
+        </div>
+        <h2 className="text-xl font-semibold text-slate-800 mb-2">Access Denied</h2>
+        <p className="text-slate-500">You do not have permission to view payroll information.</p>
+        <p className="text-slate-400 text-sm mt-2">Please contact your administrator.</p>
+      </div>
+    );
+  }
 
   if (loading) {
     return <div className="flex justify-center py-12"><div className="w-8 h-8 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin"></div></div>;
   }
 
+  const totalPages = Math.ceil(filteredEmployees.length / payrollItemsPerPage);
+
   return (
     <div className="space-y-6 animate-fade-in">
       <PageHeader
         title="Payroll Management"
-        subtitle={`${selectedMonth} Payroll Run · Editable payroll engine with real-time calculations`}
+        subtitle={`${getMonthLabel(selectedMonth)} Payroll Run · ${isCurrentMonth ? 'Current Month' : isFutureMonthSelected ? 'Future Month (View Only)' : 'Past Month (View Only)'}${isMonthProcessed ? ' ✅ Processed' : ''}`}
         actions={
-          <div className="flex gap-2">
-            <MonthSelector
-              selectedMonth={selectedMonth}
-              onMonthChange={handleMonthChange}
-              availableMonths={availableMonths}
-              isLoading={loading}
-            />
-            <Button variant="secondary" onClick={() => setShowConfirmModal(true)}>
-              <Check size={16} /> Process Payroll
-            </Button>
+          <div className="flex gap-2 items-center">
+            <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-2 py-1">
+              <button
+                onClick={goToPreviousMonth}
+                className="p-1.5 rounded hover:bg-slate-100 disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getPreviousMonth(selectedMonth))}
+                title="Previous Month"
+              >
+                <ChevronLeft size={16} />
+              </button>
+              
+            <select
+  value={selectedMonth}
+  onChange={(e) => handleMonthSelect(e.target.value)}
+  className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1 min-w-[140px] text-center cursor-pointer"
+>
+  {availableMonths.map((month, index) => (
+    <option key={`month-${month}-${index}`} value={month}>
+      {getMonthLabel(month)} {month === systemMonth ? '●' : ''} {processedMonths.includes(month) ? '✅' : ''}
+    </option>
+  ))}
+</select>
+              
+              <button
+                onClick={goToNextMonth}
+                className="p-1.5 rounded hover:bg-slate-100 disabled:opacity-50"
+                disabled={loading || !availableMonths.includes(getNextMonth(selectedMonth))}
+                title="Next Month"
+              >
+                <ChevronRightIcon size={16} />
+              </button>
+            </div>
+
+            {!isCurrentMonth && (
+              <button
+                onClick={goToCurrentMonth}
+                className="text-xs text-[#D4A017] hover:underline px-2 py-1"
+              >
+                Jump to Current
+              </button>
+            )}
+
+            {canProcessPayroll && isCurrentMonth && (
+              <Button 
+                variant={isMonthProcessed ? "outline" : "secondary"} 
+                onClick={() => setShowConfirmModal(true)}
+                disabled={processing}
+              >
+                {processing ? (
+                  <span className="flex items-center gap-2">
+                    <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    Processing...
+                  </span>
+                ) : (
+                  <>
+                    <Check size={16} /> 
+                    {isMonthProcessed ? 'Reprocess Payroll' : 'Process Payroll'}
+                  </>
+                )}
+              </Button>
+            )}
+            {canProcessPayroll && !isCurrentMonth && (
+              <Button variant="outline" disabled className="opacity-50 cursor-not-allowed">
+                <Lock size={16} className="mr-1" /> {isFutureMonthSelected ? 'Future Month' : 'Past Month'}
+              </Button>
+            )}
+            {!canProcessPayroll && (
+              <Button variant="outline" disabled className="opacity-50 cursor-not-allowed">
+                <Lock size={16} className="mr-1" /> Read Only
+              </Button>
+            )}
           </div>
         }
       />
 
-      {employeesWithDeductions.length > 0 && (
-        <Card className="p-4 bg-amber-50 border-amber-200 border">
+      {processing && processingStatus && (
+        <Card className="p-4 bg-blue-50 border-blue-200 border">
+          <div className="flex items-center gap-3">
+            <div className="w-5 h-5 border-2 border-[#D4A017] border-t-transparent rounded-full animate-spin" />
+            <span className="text-sm text-slate-700">{processingStatus}</span>
+          </div>
+        </Card>
+      )}
+
+      {!isCurrentMonth && (
+        <Card className={`p-3 border ${isFutureMonthSelected ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
           <div className="flex items-start gap-3">
-            <AlertCircle size={20} className="text-amber-600 shrink-0 mt-0.5" />
+            {isFutureMonthSelected ? (
+              <Calendar size={18} className="text-blue-600 shrink-0 mt-0.5" />
+            ) : (
+              <AlertCircle size={18} className="text-amber-600 shrink-0 mt-0.5" />
+            )}
             <div>
-              <p className="text-sm font-medium text-amber-800">
+              <p className={`text-sm font-medium ${isFutureMonthSelected ? 'text-blue-800' : 'text-amber-800'}`}>
+                {isFutureMonthSelected ? 'Future Month - View Only' : 'Past Month - View Only'}
+              </p>
+              <p className={`text-sm ${isFutureMonthSelected ? 'text-blue-700' : 'text-amber-700'}`}>
+                {isFutureMonthSelected 
+                  ? 'You are viewing a future month. Payroll can only be processed for the current month.' 
+                  : 'You are viewing a past month. Payroll can only be processed for the current month.'}
+                {!isCurrentMonth && (
+                  <button 
+                    onClick={goToCurrentMonth}
+                    className="ml-2 text-[#D4A017] hover:underline font-medium"
+                  >
+                    Switch to {getMonthLabel(systemMonth)}
+                  </button>
+                )}
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+{processedMonths.length > 0 && (
+  <Card className="p-3 bg-emerald-50 border-emerald-200 border">
+    <div className="flex items-center gap-4 flex-wrap">
+      <span className="text-sm font-medium text-emerald-700 flex items-center gap-2">
+        <CheckCircle2 size={16} /> Processed Months:
+      </span>
+      {processedMonths.slice(0, 6).map((month, index) => (
+        <Badge key={`processed-${month}-${index}`} color="green" className="text-xs">
+          {getMonthLabel(month)}
+        </Badge>
+      ))}
+      {processedMonths.length > 6 && (
+        <span className="text-xs text-slate-500">+{processedMonths.length - 6} more</span>
+      )}
+    </div>
+  </Card>
+)}
+
+      {!canProcessPayroll && isCurrentMonth && (
+        <Card className="p-3 bg-amber-50 border-amber-200 border">
+          <div className="flex items-start gap-3">
+            <Shield size={18} className="text-amber-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-amber-800">View Only Mode</p>
+              <p className="text-sm text-amber-700">
+                You are viewing payroll in read-only mode. Only Super Admins can process payroll.
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {employeesWithDeductions.length > 0 && (
+        <Card className="p-4 bg-red-50 border-red-200 border">
+          <div className="flex items-start gap-3">
+            <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-red-800">
                 Attendance Deductions Applied
               </p>
-              <p className="text-sm text-amber-700">
+              <p className="text-sm text-red-700">
                 {employeesWithDeductions.length} employee(s) have attendance/uniform deductions for this month. 
                 These will be automatically included in the payroll calculation.
               </p>
@@ -474,7 +782,6 @@ export function PayrollPage() {
       <Card className="p-4 flex flex-col md:flex-row items-stretch md:items-center gap-3">
         <div className="relative flex-1">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-          {/* ===== UPDATED: Search input with sanitization ===== */}
           <input 
             value={search} 
             onChange={e => setSearch(sanitizeInput(e.target.value))} 
@@ -483,14 +790,31 @@ export function PayrollPage() {
           />
         </div>
         <div className="text-sm text-slate-500">{filteredEmployees.length} employees</div>
+        {!canEditPayroll && (
+          <Badge color="gray" className="text-xs">🔒 Read Only</Badge>
+        )}
+        {!isCurrentMonth && (
+          <Badge color={isFutureMonthSelected ? 'blue' : 'amber'} className="text-xs">
+            {isFutureMonthSelected ? '🔮 Future' : '📅 Past'}
+          </Badge>
+        )}
+        {isMonthProcessed && (
+          <Badge color="green" className="text-xs">✅ Processed</Badge>
+        )}
       </Card>
 
       {!hasData && (
         <EmptyState
           title="No Payroll Records"
-          message={`No payroll data found for ${selectedMonth}. Would you like to copy from a previous month or process payroll?`}
-          actionLabel="Copy from Previous Month"
-          onAction={() => setShowCopyModal(true)}
+          message={`No payroll data found for ${getMonthLabel(selectedMonth)}.`}
+          actionLabel={copySourceMonths.length > 0 ? "Copy from Previous Month" : ""}
+          onAction={() => {
+            if (copySourceMonths.length === 0) {
+              alert('No previous months available to copy from.');
+              return;
+            }
+            setShowCopyModal(true);
+          }}
         />
       )}
 
@@ -511,10 +835,11 @@ export function PayrollPage() {
               </TR>
             </THead>
             <TBody>
-              {filteredEmployees.slice(0, 50).map(emp => {
+              {paginatedEmployees.map(emp => {
                 const p = getDisplayPayroll(emp);
                 const deduction = getEmployeeDeduction(emp.id);
                 const hasDeduction = deduction && deduction.total_deductions > 0;
+                const isEditable = canEditPayroll && !payrollRecords.find(r => r.employee_id === emp.id) && isCurrentMonth && !isMonthProcessed;
                 
                 return (
                   <TR key={emp.id}>
@@ -529,41 +854,60 @@ export function PayrollPage() {
                           {hasDeduction && (
                             <Badge color="red" className="text-[10px] mt-0.5">Deductions</Badge>
                           )}
+                          {!isEditable && payrollRecords.find(r => r.employee_id === emp.id) && (
+                            <Badge color="gray" className="text-[10px] mt-0.5">Processed</Badge>
+                          )}
                         </div>
                       </div>
                     </TD>
                     <TD className="text-xs">{emp.position}</TD>
                     <TD className="text-right">
-                      <input 
-                        type="number" 
-                        value={p.basic_salary} 
-                        onChange={e => updateField(emp.id, 'basic_salary', Number(e.target.value))} 
-                        className="w-24 text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]" 
-                      />
+                      {isEditable ? (
+                        <input 
+                          type="number" 
+                          value={p.basic_salary} 
+                          onChange={e => updateField(emp.id, 'basic_salary', Number(e.target.value))} 
+                          className="w-24 text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]" 
+                        />
+                      ) : (
+                        <span className="font-mono">{formatKwacha(p.basic_salary)}</span>
+                      )}
                     </TD>
                     <TD className="text-right">
-                      <input 
-                        type="number" 
-                        value={p.allowances} 
-                        onChange={e => updateField(emp.id, 'allowances', Number(e.target.value))} 
-                        className="w-20 text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]" 
-                      />
+                      {isEditable ? (
+                        <input 
+                          type="number" 
+                          value={p.allowances} 
+                          onChange={e => updateField(emp.id, 'allowances', Number(e.target.value))} 
+                          className="w-20 text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]" 
+                        />
+                      ) : (
+                        <span className="font-mono">{formatKwacha(p.allowances)}</span>
+                      )}
                     </TD>
                     <TD className="text-right">
-                      <input 
-                        type="number" 
-                        value={p.overtime} 
-                        onChange={e => updateField(emp.id, 'overtime', Number(e.target.value))} 
-                        className="w-20 text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]" 
-                      />
+                      {isEditable ? (
+                        <input 
+                          type="number" 
+                          value={p.overtime} 
+                          onChange={e => updateField(emp.id, 'overtime', Number(e.target.value))} 
+                          className="w-20 text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]" 
+                        />
+                      ) : (
+                        <span className="font-mono">{formatKwacha(p.overtime)}</span>
+                      )}
                     </TD>
                     <TD className="text-right">
-                      <input 
-                        type="number" 
-                        value={p.bonus} 
-                        onChange={e => updateField(emp.id, 'bonus', Number(e.target.value))} 
-                        className="w-20 text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]" 
-                      />
+                      {isEditable ? (
+                        <input 
+                          type="number" 
+                          value={p.bonus} 
+                          onChange={e => updateField(emp.id, 'bonus', Number(e.target.value))} 
+                          className="w-20 text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]" 
+                        />
+                      ) : (
+                        <span className="font-mono">{formatKwacha(p.bonus)}</span>
+                      )}
                     </TD>
                     <TD className="text-right font-mono font-semibold text-emerald-700 bg-emerald-50/50">
                       {formatKwacha(p.gross_pay)}
@@ -587,12 +931,25 @@ export function PayrollPage() {
         </div>
       </div>
 
-      <Modal open={showConfirmModal} onClose={() => setShowConfirmModal(false)} title={`Process Payroll — ${selectedMonth}`} size="lg">
+      <Pagination
+        currentPage={payrollPage}
+        totalPages={totalPages}
+        totalItems={filteredEmployees.length}
+        itemsPerPage={payrollItemsPerPage}
+        onPageChange={setPayrollPage}
+        onItemsPerPageChange={setPayrollItemsPerPage}
+      />
+
+      <Modal open={showConfirmModal} onClose={() => setShowConfirmModal(false)} title={`${isMonthProcessed ? 'Reprocess' : 'Process'} Payroll — ${getMonthLabel(selectedMonth)}`} size="lg">
         <div className="space-y-4">
-          <div className="p-4 rounded-lg bg-[#E8EDF5] text-sm text-slate-700 flex items-start gap-3">
-            <CheckCircle2 size={18} className="text-[#081C3A] shrink-0 mt-0.5" />
+          <div className={`p-4 rounded-lg text-sm flex items-start gap-3 ${isMonthProcessed ? 'bg-amber-50' : 'bg-[#E8EDF5]'}`}>
+            <CheckCircle2 size={18} className={`shrink-0 mt-0.5 ${isMonthProcessed ? 'text-amber-600' : 'text-[#081C3A]'}`} />
             <div>
-              <strong>Confirmation:</strong> You are about to process payroll for <strong>{employees.length} employees</strong> for the period <strong>{selectedMonth}</strong>.
+              <strong>{isMonthProcessed ? '⚠️ Warning: Reprocessing' : 'Confirmation:'}</strong> 
+              {isMonthProcessed 
+                ? ` You are about to reprocess payroll for ${getMonthLabel(selectedMonth)}. This will overwrite all existing payroll data for this month.`
+                : ` You are about to process payroll for ${employees.length} employees for the period ${getMonthLabel(selectedMonth)}.`
+              }
             </div>
           </div>
           
@@ -644,7 +1001,8 @@ export function PayrollPage() {
           <div className="flex items-center justify-end gap-2 pt-4 border-t border-slate-100">
             <Button variant="outline" onClick={() => setShowConfirmModal(false)}>Cancel</Button>
             <Button variant="secondary" onClick={processPayroll} disabled={processing}>
-              <Save size={14} /> {processing ? 'Processing...' : 'Process & Save Payroll'}
+              <Save size={14} /> 
+              {processing ? 'Processing...' : isMonthProcessed ? 'Reprocess Payroll' : 'Process & Save Payroll'}
             </Button>
           </div>
         </div>
@@ -656,7 +1014,7 @@ export function PayrollPage() {
             <CheckCircle2 size={22} />
             <div>
               <p className="font-semibold">Payroll Processed</p>
-              <p className="text-sm opacity-90">{employees.length} payroll records saved for {selectedMonth}</p>
+              <p className="text-sm opacity-90">{employees.length} payroll records saved for {getMonthLabel(selectedMonth)}</p>
               {totals.uniformDeductions > 0 && (
                 <p className="text-sm opacity-80 mt-1">Including {formatKwacha(totals.uniformDeductions)} in deductions</p>
               )}
@@ -671,7 +1029,7 @@ export function PayrollPage() {
         onClose={() => setShowCopyModal(false)} 
         onConfirm={copyFromPreviousMonth} 
         currentMonth={selectedMonth} 
-        availableMonths={availableMonths} 
+        availableMonths={copySourceMonths}
       />
     </div>
   );

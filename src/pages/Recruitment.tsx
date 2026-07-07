@@ -1,9 +1,19 @@
-﻿import { useState, useEffect } from 'react';
-import { Search, UserCheck, XCircle, CheckCircle2, Eye, UserPlus, FileText } from 'lucide-react';
+﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Search, UserCheck, XCircle, CheckCircle2, Eye, UserPlus, FileText, ChevronLeft, ChevronRight, Calendar } from '../utils/icons';
+
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input } from '../components/ui';
 import { formatKwacha } from '../data';
 import { showNotification } from '../utils/clickHandlers';
 import { supabase } from '../lib/supabase';
+import { logAudit } from '../utils/auditLogger';
+import { 
+  getSystemCurrentMonth, 
+  getMonthLabel, 
+  getNextMonth, 
+  getPreviousMonth,
+  getAvailableMonthsFromSystem
+} from '../utils/currentMonth';
+import { Pagination } from '../components/Pagination';
 
 interface Applicant {
   id: string;
@@ -22,6 +32,7 @@ interface Applicant {
 }
 
 export function RecruitmentPage() {
+  // ===== ALL HOOKS AT TOP LEVEL =====
   const [applicants, setApplicants] = useState<Applicant[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -30,41 +41,61 @@ export function RecruitmentPage() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [userProfile, setUserProfile] = useState<any>(null);
 
-  // Fetch user profile for region access
+  // ===== PAGINATION STATES =====
+  const [recruitmentPage, setRecruitmentPage] = useState(1);
+  const [recruitmentItemsPerPage, setRecruitmentItemsPerPage] = useState(20);
+
+  // ===== MEMOIZED VALUES =====
+  const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
+  const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
+
+  const filtered = useMemo(() => {
+    return applicants.filter(a =>
+      (a.name.toLowerCase().includes(search.toLowerCase()) || a.position.toLowerCase().includes(search.toLowerCase())) &&
+      (filter === 'all' || a.interview_status.toLowerCase().includes(filter.toLowerCase()))
+    );
+  }, [applicants, search, filter]);
+
+  // ===== PAGINATED APPLICANTS =====
+  const paginatedApplicants = useMemo(() => {
+    const startIndex = (recruitmentPage - 1) * recruitmentItemsPerPage;
+    const endIndex = Math.min(startIndex + recruitmentItemsPerPage, filtered.length);
+    return filtered.slice(startIndex, endIndex);
+  }, [filtered, recruitmentPage, recruitmentItemsPerPage]);
+
+  // ===== RESET PAGE WHEN SEARCH OR FILTER CHANGES =====
   useEffect(() => {
-    const fetchUserProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .single();
-        setUserProfile(profile);
-      }
-    };
-    fetchUserProfile();
+    setRecruitmentPage(1);
+  }, [search, filter]);
+
+  const counts = useMemo(() => ({
+    total: applicants.length,
+    shortlisted: applicants.filter(a => a.interview_status === 'Shortlisted').length,
+    interviewed: applicants.filter(a => a.interview_status === 'Interviewed').length,
+    accepted: applicants.filter(a => a.interview_status === 'Accepted').length,
+    rejected: applicants.filter(a => a.interview_status === 'Rejected').length
+  }), [applicants]);
+
+  // ===== CALLBACKS =====
+  const fetchUserProfile = useCallback(async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*, regions(*)')
+        .eq('id', user.id)
+        .single();
+      setUserProfile(profile);
+    }
   }, []);
 
-  // Fetch applicants from Supabase
-  useEffect(() => {
-    if (userProfile) {
-      fetchApplicants();
-    }
-  }, [userProfile]);
-
-  const fetchApplicants = async () => {
+  const fetchApplicants = useCallback(async () => {
     setLoading(true);
     let query = supabase.from('applicants').select('*').order('created_at', { ascending: false });
     
-    // Apply region filter if applicants have region_id
-    // If applicants table doesn't have region_id, super admins see all, others see none
     if (!userProfile?.is_super_admin && userProfile?.region_id) {
       // If applicants table has region_id column, uncomment below
       // query = query.eq('region_id', userProfile.region_id);
-      
-      // For now, non-super admins see all applicants but can only edit those from their region
-      // This is a placeholder - you may want to add region_id to applicants table
     }
     
     const { data, error } = await query;
@@ -76,20 +107,34 @@ export function RecruitmentPage() {
       setApplicants(data || []);
     }
     setLoading(false);
-  };
+  }, [userProfile]);
 
-  const filtered = applicants.filter(a =>
-    (a.name.toLowerCase().includes(search.toLowerCase()) || a.position.toLowerCase().includes(search.toLowerCase())) &&
-    (filter === 'all' || a.interview_status.toLowerCase().includes(filter.toLowerCase()))
-  );
+  // ===== INITIALIZATION =====
+  useEffect(() => {
+    const init = async () => {
+      await fetchUserProfile();
+    };
+    init();
+  }, [fetchUserProfile]);
 
-  const update = async (id: string, status: string, decision: string = 'Pending') => {
-    // Check if user has permission (for future region-based control)
-    // const applicant = applicants.find(a => a.id === id);
-    // if (!userProfile?.is_super_admin && applicant?.region_id !== userProfile?.region_id) {
-    //   showNotification('You can only edit applicants from your region', 'error');
-    //   return;
-    // }
+  useEffect(() => {
+    if (userProfile) {
+      fetchApplicants();
+    }
+  }, [userProfile, fetchApplicants]);
+
+  // ===== UPDATE APPLICANT =====
+  const update = useCallback(async (id: string, status: string, decision: string = 'Pending') => {
+    const applicant = applicants.find(a => a.id === id);
+    if (!applicant) return;
+    
+    const oldStatus = applicant.interview_status;
+    const oldDecision = applicant.decision;
+    
+    if (!userProfile?.is_super_admin && applicant?.region_id && applicant.region_id !== userProfile?.region_id) {
+      showNotification('You can only edit applicants from your region', 'error');
+      return;
+    }
     
     const { error } = await supabase
       .from('applicants')
@@ -100,11 +145,32 @@ export function RecruitmentPage() {
       showNotification('Error updating status: ' + error.message, 'error');
     } else {
       setApplicants(applicants.map(a => a.id === id ? { ...a, interview_status: status, decision } : a));
+      
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'applicant',
+        entity_id: id,
+        old_data: {
+          name: applicant.name,
+          position: applicant.position,
+          interview_status: oldStatus,
+          decision: oldDecision
+        },
+        new_data: {
+          name: applicant.name,
+          position: applicant.position,
+          interview_status: status,
+          decision: decision
+        },
+        region_id: userProfile?.region_id
+      });
+      
       showNotification(`Applicant status updated to ${status}`, 'success');
     }
-  };
+  }, [applicants, userProfile]);
 
-  const addApplicant = async (newApplicant: any) => {
+  // ===== ADD APPLICANT =====
+  const addApplicant = useCallback(async (newApplicant: any) => {
     const { data, error } = await supabase
       .from('applicants')
       .insert([{
@@ -126,23 +192,49 @@ export function RecruitmentPage() {
       showNotification('Error adding applicant: ' + error.message, 'error');
     } else if (data && data[0]) {
       setApplicants([data[0], ...applicants]);
+      
+      await logAudit({
+        action: 'CREATE',
+        entity_type: 'applicant',
+        entity_id: data[0].id,
+        new_data: {
+          name: newApplicant.name,
+          position: newApplicant.position,
+          qualification: newApplicant.qualification,
+          phone: newApplicant.phone,
+          email: newApplicant.email,
+          experience: newApplicant.experience,
+          interview_status: 'Pending',
+          decision: 'Pending',
+          region_id: userProfile?.region_id || null
+        },
+        region_id: userProfile?.region_id
+      });
+      
       showNotification(`${newApplicant.name} has been added to recruitment pipeline`, 'success');
     }
     setShowAddModal(false);
-  };
+  }, [applicants, userProfile]);
 
-  const counts = {
-    total: applicants.length,
-    shortlisted: applicants.filter(a => a.interview_status === 'Shortlisted').length,
-    interviewed: applicants.filter(a => a.interview_status === 'Interviewed').length,
-    accepted: applicants.filter(a => a.interview_status === 'Accepted').length,
-    rejected: applicants.filter(a => a.interview_status === 'Rejected').length
-  };
+  // ===== VIEW APPLICANT =====
+  const handleViewApplicant = useCallback(async (applicant: Applicant) => {
+    setView(applicant);
+    
+    await logAudit({
+      action: 'VIEW',
+      entity_type: 'applicant',
+      entity_id: applicant.id,
+      new_data: {
+        name: applicant.name,
+        position: applicant.position,
+        interview_status: applicant.interview_status
+      },
+      region_id: userProfile?.region_id
+    });
+  }, [userProfile]);
 
-  const isSuperAdmin = userProfile?.is_super_admin;
-  const userRegion = userProfile?.regions;
-
-  const AddApplicantModal = () => {
+  // ===== ADD APPLICANT MODAL =====
+  const AddApplicantModal = useCallback(() => {
     const [formData, setFormData] = useState({
       name: '',
       position: '',
@@ -208,11 +300,14 @@ export function RecruitmentPage() {
         </div>
       </Modal>
     );
-  };
+  }, [showAddModal, isSuperAdmin, userRegion, addApplicant]);
 
+  // ===== RENDER =====
   if (loading) {
     return <div className="text-center py-8">Loading applicants...</div>;
   }
+
+  const totalPages = Math.ceil(filtered.length / recruitmentItemsPerPage);
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -291,7 +386,7 @@ export function RecruitmentPage() {
               </TR>
             </THead>
             <TBody>
-              {filtered.slice(0, 50).map(app => (
+              {paginatedApplicants.map(app => (
                 <TR key={app.id}>
                   <TD>
                     <div className="flex items-center gap-3">
@@ -309,7 +404,7 @@ export function RecruitmentPage() {
                   <TD className="hidden lg:table-cell"><Badge color={app.decision === 'Hire' ? 'green' : app.decision === 'Reject' ? 'red' : 'gray'}>{app.decision}</Badge></TD>
                   <TD className="text-right">
                     <div className="flex items-center justify-end gap-1">
-                      <button onClick={() => setView(app)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Eye size={14} /></button>
+                      <button onClick={() => handleViewApplicant(app)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Eye size={14} /></button>
                       <button onClick={() => update(app.id, 'Shortlisted')} disabled={app.interview_status === 'Shortlisted'} className="px-2 py-1 text-xs rounded-md bg-blue-50 text-blue-700 hover:bg-blue-100 disabled:opacity-50">Shortlist</button>
                       <button onClick={() => update(app.id, 'Interviewed')} disabled={app.interview_status === 'Interviewed'} className="px-2 py-1 text-xs rounded-md bg-[#FFF1CC] text-[#8B6F0F] hover:bg-[#F9E4B3] disabled:opacity-50">Interview</button>
                       <button onClick={() => update(app.id, 'Accepted', 'Hire')} className="px-2 py-1 text-xs rounded-md bg-emerald-50 text-emerald-700 hover:bg-emerald-100">✓ Hire</button>
@@ -322,6 +417,15 @@ export function RecruitmentPage() {
           </table>
         </div>
       </div>
+
+      <Pagination
+        currentPage={recruitmentPage}
+        totalPages={totalPages}
+        totalItems={filtered.length}
+        itemsPerPage={recruitmentItemsPerPage}
+        onPageChange={setRecruitmentPage}
+        onItemsPerPageChange={setRecruitmentItemsPerPage}
+      />
 
       {/* View Applicant Modal */}
       <Modal open={!!view} onClose={() => setView(null)} title="Applicant Details">

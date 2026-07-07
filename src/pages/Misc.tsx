@@ -1,9 +1,19 @@
 import { useState, useMemo, useEffect } from 'react';
-import { Shield, FileDown, FileText, FileSpreadsheet, Download, Printer, Plus, Trash2, Edit2, Search, MapPin, CheckCircle, Map, Building2, Car, Sparkles, Bot, Percent, CreditCard, Camera, ClipboardList } from 'lucide-react';
+import { 
+  Shield, FileDown, FileText, FileSpreadsheet, Download, Printer, 
+  Plus, Trash2, Edit2, Search, MapPin, CheckCircle, Map, Building2, 
+  Car, Sparkles, Bot, Percent, CreditCard, Camera, ClipboardList,
+  Calendar  // <-- ADDED Calendar here
+} from 'lucide-react';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, Input } from '../components/ui';
 import { generateEmployees, formatKwacha, computePayroll, netPay, grossPay, Employee } from '../data';
 import { UserManagement } from '../components/UserManagement';
 import { supabase } from '../lib/supabase';
+// ===== Import audit logger =====
+import { logAudit } from '../utils/auditLogger';
+// ===== IMPORT MonthSettings =====
+import { MonthSettings } from '../components/MonthSettings';
+import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
 
 /* ----------------- PAYSLIPS PAGE ----------------- */
 export function PayslipsPage() {
@@ -96,6 +106,9 @@ export function SettingsPage() {
     default_salary: 150000,
     is_active: true
   });
+  
+  // Month settings state
+  const [currentMonth, setCurrentMonth] = useState<string>('');
 
   const colorOptions = [
     { value: 'navy', label: 'Navy Blue', class: 'bg-[#081C3A]' },
@@ -116,10 +129,10 @@ export function SettingsPage() {
   const [companyForm, setCompanyForm] = useState({
     companyName: 'Safeguard Security Services Ltd.',
     registration: 'REG-123456-MW',
-    address: 'Area 11, Capital Hill, Lilongwe, Malawi',
-    phone: '+265 1 234 567',
-    email: 'info@safeguard.mw',
-    website: 'www.safeguard.mw',
+    address: 'Head Office , Tikumbe, Building - Naperi',
+    phone: '+265 882 014 775',
+    email: 'headoffice@safeguardsecurity.mw',
+    website: 'www.safeguardsecurities.co',
     taxId: 'MW-12345678',
     pensionReg: 'NBS-123456'
   });
@@ -161,11 +174,21 @@ export function SettingsPage() {
     { id: 'tax', label: 'Tax Settings' },
     { id: 'pension', label: 'Pension' },
     { id: 'payroll', label: 'Payroll' },
+    { id: 'month', label: 'Month Settings' },  // <-- ADDED THIS TAB
     { id: 'positions', label: 'Positions' },
     { id: 'users', label: 'User Management' },
     { id: 'roles', label: 'User Roles' },
     { id: 'system', label: 'System' }
   ];
+
+  // Load current month
+  useEffect(() => {
+    const loadCurrentMonth = async () => {
+      const month = await getSystemCurrentMonth();
+      setCurrentMonth(month);
+    };
+    loadCurrentMonth();
+  }, []);
 
   // Load positions from database
   const loadPositions = async () => {
@@ -181,7 +204,7 @@ export function SettingsPage() {
     }
   };
 
-  // Save position (create or update)
+  // ===== UPDATED: Save position with audit logging =====
   const handleSavePosition = async () => {
     if (!positionForm.name.trim()) {
       alert('Please enter a position name');
@@ -189,6 +212,9 @@ export function SettingsPage() {
     }
     
     try {
+      const action = editingPosition ? 'UPDATE' : 'CREATE';
+      const entityId = editingPosition?.id || 'new';
+      
       if (editingPosition) {
         const { error } = await supabase
           .from('positions')
@@ -201,17 +227,42 @@ export function SettingsPage() {
           })
           .eq('id', editingPosition.id);
         if (error) throw error;
+        
+        // Audit log for update
+        await logAudit({
+          action: 'UPDATE',
+          entity_type: 'positions',
+          entity_id: editingPosition.id,
+          old_data: {
+            name: editingPosition.name,
+            category: editingPosition.category,
+            default_salary: editingPosition.default_salary,
+            is_active: editingPosition.is_active
+          },
+          new_data: positionForm
+        });
+        
         alert('Position updated successfully');
       } else {
-        const { error } = await supabase
+        const { data, error } = await supabase
           .from('positions')
           .insert([{
             name: positionForm.name,
             category: positionForm.category,
             default_salary: positionForm.default_salary,
             is_active: positionForm.is_active
-          }]);
+          }])
+          .select();
         if (error) throw error;
+        
+        // Audit log for create
+        await logAudit({
+          action: 'CREATE',
+          entity_type: 'positions',
+          entity_id: data?.[0]?.id || 'new',
+          new_data: positionForm
+        });
+        
         alert('Position added successfully');
       }
       
@@ -225,7 +276,7 @@ export function SettingsPage() {
     }
   };
 
-  // Delete position
+  // ===== UPDATED: Delete position with audit logging =====
   const handleDeletePosition = async (position: any) => {
     if (confirm(`Are you sure you want to delete "${position.name}"? This may affect existing employees.`)) {
       try {
@@ -234,6 +285,20 @@ export function SettingsPage() {
           .delete()
           .eq('id', position.id);
         if (error) throw error;
+        
+        // Audit log for delete
+        await logAudit({
+          action: 'DELETE',
+          entity_type: 'positions',
+          entity_id: position.id,
+          old_data: {
+            name: position.name,
+            category: position.category,
+            default_salary: position.default_salary,
+            is_active: position.is_active
+          }
+        });
+        
         await loadPositions();
         alert('Position deleted successfully');
       } catch (error: any) {
@@ -273,44 +338,108 @@ export function SettingsPage() {
     }
   };
 
-  const handleSaveCompany = () => {
+  // ===== UPDATED: Save Company with audit logging =====
+  const handleSaveCompany = async () => {
     setSaving(true);
-    localStorage.setItem('companySettings', JSON.stringify(companyForm));
-    setTimeout(() => {
+    try {
+      const oldData = JSON.parse(localStorage.getItem('companySettings') || '{}');
+      localStorage.setItem('companySettings', JSON.stringify(companyForm));
+      
+      // Audit log
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'company_settings',
+        old_data: Object.keys(oldData).length > 0 ? oldData : null,
+        new_data: companyForm
+      });
+      
+      setTimeout(() => {
+        setSaving(false);
+        setShowSuccess(true);
+        setTimeout(() => setShowSuccess(false), 3000);
+      }, 500);
+    } catch (error) {
+      console.error('Error saving company settings:', error);
       setSaving(false);
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
-    }, 500);
+    }
   };
 
-  const handleSaveTax = () => {
+  // ===== UPDATED: Save Tax with audit logging =====
+  const handleSaveTax = async () => {
     setSaving(true);
-    localStorage.setItem('taxSettings', JSON.stringify(taxForm));
-    setTimeout(() => {
+    try {
+      const oldData = JSON.parse(localStorage.getItem('taxSettings') || '{}');
+      localStorage.setItem('taxSettings', JSON.stringify(taxForm));
+      
+      // Audit log
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'tax_settings',
+        old_data: Object.keys(oldData).length > 0 ? oldData : null,
+        new_data: taxForm
+      });
+      
+      setTimeout(() => {
+        setSaving(false);
+        setShowSuccess(true);
+        setTimeout(() => setShowSuccess(false), 3000);
+      }, 500);
+    } catch (error) {
+      console.error('Error saving tax settings:', error);
       setSaving(false);
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
-    }, 500);
+    }
   };
 
-  const handleSavePension = () => {
+  // ===== UPDATED: Save Pension with audit logging =====
+  const handleSavePension = async () => {
     setSaving(true);
-    localStorage.setItem('pensionSettings', JSON.stringify(pensionForm));
-    setTimeout(() => {
+    try {
+      const oldData = JSON.parse(localStorage.getItem('pensionSettings') || '{}');
+      localStorage.setItem('pensionSettings', JSON.stringify(pensionForm));
+      
+      // Audit log
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'pension_settings',
+        old_data: Object.keys(oldData).length > 0 ? oldData : null,
+        new_data: pensionForm
+      });
+      
+      setTimeout(() => {
+        setSaving(false);
+        setShowSuccess(true);
+        setTimeout(() => setShowSuccess(false), 3000);
+      }, 500);
+    } catch (error) {
+      console.error('Error saving pension settings:', error);
       setSaving(false);
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
-    }, 500);
+    }
   };
 
-  const handleSavePayroll = () => {
+  // ===== UPDATED: Save Payroll with audit logging =====
+  const handleSavePayroll = async () => {
     setSaving(true);
-    localStorage.setItem('payrollSettings', JSON.stringify(payrollForm));
-    setTimeout(() => {
+    try {
+      const oldData = JSON.parse(localStorage.getItem('payrollSettings') || '{}');
+      localStorage.setItem('payrollSettings', JSON.stringify(payrollForm));
+      
+      // Audit log
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'payroll_settings',
+        old_data: Object.keys(oldData).length > 0 ? oldData : null,
+        new_data: payrollForm
+      });
+      
+      setTimeout(() => {
+        setSaving(false);
+        setShowSuccess(true);
+        setTimeout(() => setShowSuccess(false), 3000);
+      }, 500);
+    } catch (error) {
+      console.error('Error saving payroll settings:', error);
       setSaving(false);
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
-    }, 500);
+    }
   };
 
   const handleCancel = () => {
@@ -318,10 +447,26 @@ export function SettingsPage() {
     if (savedCompany) setCompanyForm(JSON.parse(savedCompany));
   };
 
-  const handleToggleSetting = (index: number) => {
+  // ===== UPDATED: System settings toggle with audit logging =====
+  const handleToggleSetting = async (index: number) => {
     const settingKeys = ['emailNotifications', 'smsNotifications', 'autoAttendanceSync', 'twoFactorAuth', 'auditLogging', 'dataEncryption'];
     const setting = settingKeys[index];
-    setSystemSettings(prev => ({ ...prev, [setting]: !prev[setting as keyof typeof prev] }));
+    const oldValue = systemSettings[setting as keyof typeof systemSettings];
+    const newValue = !oldValue;
+    
+    setSystemSettings(prev => ({ ...prev, [setting]: newValue }));
+    
+    // Audit log for system setting change
+    try {
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'system_settings',
+        old_data: { [setting]: oldValue },
+        new_data: { [setting]: newValue }
+      });
+    } catch (error) {
+      console.error('Error logging system setting change:', error);
+    }
   };
 
   // Role Functions
@@ -341,11 +486,27 @@ export function SettingsPage() {
     setShowRoleModal(true);
   };
 
+  // ===== UPDATED: Delete role with audit logging =====
   const handleDeleteRole = async (roleId: number, roleName: string) => {
     if (confirm(`Are you sure you want to delete "${roleName}"?`)) {
       try {
+        const { data: roleData } = await supabase
+          .from('user_roles')
+          .select('*')
+          .eq('id', roleId)
+          .single();
+          
         const { error } = await supabase.from('user_roles').delete().eq('id', roleId);
         if (error) throw error;
+        
+        // Audit log
+        await logAudit({
+          action: 'DELETE',
+          entity_type: 'user_roles',
+          entity_id: String(roleId),
+          old_data: roleData
+        });
+        
         await loadRoles();
         setShowSuccess(true);
         setTimeout(() => setShowSuccess(false), 3000);
@@ -357,6 +518,7 @@ export function SettingsPage() {
     }
   };
 
+  // ===== UPDATED: Save role with audit logging =====
   const handleSaveRole = async () => {
     if (!roleForm.name.trim()) {
       alert('Please enter a role name');
@@ -372,15 +534,35 @@ export function SettingsPage() {
     
     try {
       if (editingRole) {
+        const oldData = {...editingRole};
         const { error } = await supabase
           .from('user_roles')
           .update(newRole)
           .eq('id', editingRole.id);
         if (error) throw error;
+        
+        // Audit log for update
+        await logAudit({
+          action: 'UPDATE',
+          entity_type: 'user_roles',
+          entity_id: String(editingRole.id),
+          old_data: oldData,
+          new_data: newRole
+        });
+        
         alert('Role updated successfully');
       } else {
-        const { error } = await supabase.from('user_roles').insert([newRole]);
+        const { data, error } = await supabase.from('user_roles').insert([newRole]).select();
         if (error) throw error;
+        
+        // Audit log for create
+        await logAudit({
+          action: 'CREATE',
+          entity_type: 'user_roles',
+          entity_id: data?.[0]?.id ? String(data[0].id) : 'new',
+          new_data: newRole
+        });
+        
         alert('Role created successfully');
       }
       
@@ -625,6 +807,33 @@ export function SettingsPage() {
         </Card>
       )}
       
+      {/* ===== MONTH SETTINGS TAB ===== */}
+      {tab === 'month' && (
+        <Card className="p-6">
+          <h3 className="font-semibold text-slate-800 mb-2">Current Month Settings</h3>
+          <p className="text-sm text-slate-600 mb-6">
+            Set the current payroll month. This will be the default month shown across the system 
+            (Payroll, Payments, Reports, and other modules).
+          </p>
+          
+          <div className="p-4 bg-[#E8EDF5] rounded-lg mb-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-slate-600">Currently Active Month</p>
+                <p className="text-xl font-bold text-[#081C3A]">
+                  {currentMonth ? getMonthLabel(currentMonth) : 'Loading...'}
+                </p>
+              </div>
+              <div className="w-10 h-10 rounded-lg bg-[#081C3A] text-[#D4A017] flex items-center justify-center">
+                <Calendar size={20} />
+              </div>
+            </div>
+          </div>
+          
+          <MonthSettings />
+        </Card>
+      )}
+      
       {/* Positions Tab */}
       {tab === 'positions' && (
         <Card className="p-6">
@@ -774,7 +983,6 @@ export function SettingsPage() {
   );
 }
 
-
 /* ----------------- SECURITY PERSONNEL ----------------- */
 
 export function SecurityPage() {
@@ -852,6 +1060,7 @@ export function SecurityPage() {
     }
   }, [userProfile]);
 
+  // ===== UPDATED: Add/Update guard with audit logging =====
   const handleAddGuard = async () => {
     if (!guardForm.full_name) {
       alert('Please enter guard name');
@@ -864,6 +1073,15 @@ export function SecurityPage() {
     
     try {
       if (editingGuard) {
+        const oldData = {
+          full_name: editingGuard.full_name,
+          employee_number: editingGuard.employee_number,
+          position: editingGuard.position,
+          phone: editingGuard.phone,
+          status: editingGuard.status,
+          workstation: editingGuard.deployment_site
+        };
+        
         const { error } = await supabase
           .from('employees')
           .update({
@@ -876,9 +1094,19 @@ export function SecurityPage() {
           })
           .eq('id', editingGuard.id);
         if (error) throw error;
+        
+        // Audit log for update
+        await logAudit({
+          action: 'UPDATE',
+          entity_type: 'security_personnel',
+          entity_id: editingGuard.id,
+          old_data: oldData,
+          new_data: guardForm
+        });
+        
         alert(`${guardForm.full_name} updated successfully`);
       } else {
-        const { error } = await supabase
+        const { data, error } = await supabase
           .from('employees')
           .insert([{
             full_name: guardForm.full_name,
@@ -890,8 +1118,18 @@ export function SecurityPage() {
             workstation: guardForm.deployment_site,
             hire_date: new Date().toISOString().split('T')[0],
             department: 'Operations'
-          }]);
+          }])
+          .select();
         if (error) throw error;
+        
+        // Audit log for create
+        await logAudit({
+          action: 'CREATE',
+          entity_type: 'security_personnel',
+          entity_id: data?.[0]?.id || 'new',
+          new_data: guardForm
+        });
+        
         alert(`${guardForm.full_name} added to security personnel`);
       }
       
@@ -925,17 +1163,37 @@ export function SecurityPage() {
     setShowAddGuard(true);
   };
 
+  // ===== UPDATED: Delete guard with audit logging =====
   const handleDelete = async (guard: any) => {
     if (confirm(`Are you sure you want to remove ${guard.full_name}?`)) {
-      const { error } = await supabase
-        .from('employees')
-        .delete()
-        .eq('id', guard.id);
-      if (error) {
-        alert('Error deleting guard: ' + error.message);
-      } else {
+      try {
+        const oldData = {
+          full_name: guard.full_name,
+          employee_number: guard.employee_number,
+          position: guard.position,
+          phone: guard.phone,
+          status: guard.status,
+          deployment_site: guard.deployment_site
+        };
+        
+        const { error } = await supabase
+          .from('employees')
+          .delete()
+          .eq('id', guard.id);
+        if (error) throw error;
+        
+        // Audit log for delete
+        await logAudit({
+          action: 'DELETE',
+          entity_type: 'security_personnel',
+          entity_id: guard.id,
+          old_data: oldData
+        });
+        
         alert(`${guard.full_name} removed`);
         fetchSecurityData();
+      } catch (err: any) {
+        alert('Error deleting guard: ' + err.message);
       }
     }
   };
@@ -1005,7 +1263,6 @@ export function SecurityPage() {
           <table className="w-full text-sm">
             <THead>
               <TR hover={false}> 
-                <img> </img>
                 <TH>Guard</TH>
                 <TH>ID</TH>
                 <TH className="hidden md:table-cell">Site</TH>
