@@ -190,123 +190,126 @@ export function SettingsPage() {
     loadCurrentMonth();
   }, []);
 
-  // Load positions from database
-  const loadPositions = async () => {
-    try {
+ // ===== UPDATED: loadPositions with proper select =====
+const loadPositions = async () => {
+  try {
+    const { data, error } = await supabase
+      .from('positions')
+      .select('*')
+      .order('name');
+    if (error) throw error;
+    setPositions(data || []);
+  } catch (error) {
+    console.error('Error loading positions:', error);
+  }
+};
+
+  // ===== UPDATED: handleSavePosition with proper tenant handling =====
+const handleSavePosition = async () => {
+  if (!positionForm.name.trim()) {
+    alert('Please enter a position name');
+    return;
+  }
+  
+  try {
+    const action = editingPosition ? 'UPDATE' : 'CREATE';
+    const entityId = editingPosition?.id || 'new';
+    
+    if (editingPosition) {
+      const { error } = await supabase
+        .from('positions')
+        .update({
+          name: positionForm.name,
+          category: positionForm.category,
+          default_salary: positionForm.default_salary,
+          is_active: positionForm.is_active,
+          updated_at: new Date().toISOString()
+          // Remove tenant_id from update
+        })
+        .eq('id', editingPosition.id);
+      if (error) throw error;
+      
+      // Audit log for update
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'positions',
+        entity_id: editingPosition.id,
+        old_data: {
+          name: editingPosition.name,
+          category: editingPosition.category,
+          default_salary: editingPosition.default_salary,
+          is_active: editingPosition.is_active
+        },
+        new_data: positionForm
+      });
+      
+      alert('Position updated successfully');
+    } else {
+      // ===== FIX: Don't include tenant_id in insert =====
       const { data, error } = await supabase
         .from('positions')
-        .select('*')
-        .order('name');
+        .insert([{
+          name: positionForm.name,
+          category: positionForm.category,
+          default_salary: positionForm.default_salary,
+          is_active: positionForm.is_active
+          // tenant_id is omitted - let it default to NULL
+        }])
+        .select();
       if (error) throw error;
-      setPositions(data || []);
-    } catch (error) {
-      console.error('Error loading positions:', error);
-    }
-  };
-
-  // ===== UPDATED: Save position with audit logging =====
-  const handleSavePosition = async () => {
-    if (!positionForm.name.trim()) {
-      alert('Please enter a position name');
-      return;
+      
+      // Audit log for create
+      await logAudit({
+        action: 'CREATE',
+        entity_type: 'positions',
+        entity_id: data?.[0]?.id || 'new',
+        new_data: positionForm
+      });
+      
+      alert('Position added successfully');
     }
     
+    await loadPositions();
+    setShowPositionModal(false);
+    setEditingPosition(null);
+    setPositionForm({ name: '', category: 'security', default_salary: 150000, is_active: true });
+  } catch (error: any) {
+    console.error('Error saving position:', error);
+    alert(`Failed to save position: ${error.message || 'Unknown error'}`);
+  }
+};
+
+  // ===== UPDATED: handleDeletePosition =====
+const handleDeletePosition = async (position: any) => {
+  if (confirm(`Are you sure you want to delete "${position.name}"? This may affect existing employees.`)) {
     try {
-      const action = editingPosition ? 'UPDATE' : 'CREATE';
-      const entityId = editingPosition?.id || 'new';
+      const { error } = await supabase
+        .from('positions')
+        .delete()
+        .eq('id', position.id);
+      if (error) throw error;
       
-      if (editingPosition) {
-        const { error } = await supabase
-          .from('positions')
-          .update({
-            name: positionForm.name,
-            category: positionForm.category,
-            default_salary: positionForm.default_salary,
-            is_active: positionForm.is_active,
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', editingPosition.id);
-        if (error) throw error;
-        
-        // Audit log for update
-        await logAudit({
-          action: 'UPDATE',
-          entity_type: 'positions',
-          entity_id: editingPosition.id,
-          old_data: {
-            name: editingPosition.name,
-            category: editingPosition.category,
-            default_salary: editingPosition.default_salary,
-            is_active: editingPosition.is_active
-          },
-          new_data: positionForm
-        });
-        
-        alert('Position updated successfully');
-      } else {
-        const { data, error } = await supabase
-          .from('positions')
-          .insert([{
-            name: positionForm.name,
-            category: positionForm.category,
-            default_salary: positionForm.default_salary,
-            is_active: positionForm.is_active
-          }])
-          .select();
-        if (error) throw error;
-        
-        // Audit log for create
-        await logAudit({
-          action: 'CREATE',
-          entity_type: 'positions',
-          entity_id: data?.[0]?.id || 'new',
-          new_data: positionForm
-        });
-        
-        alert('Position added successfully');
-      }
+      // Audit log for delete
+      await logAudit({
+        action: 'DELETE',
+        entity_type: 'positions',
+        entity_id: position.id,
+        old_data: {
+          name: position.name,
+          category: position.category,
+          default_salary: position.default_salary,
+          is_active: position.is_active
+        }
+      });
       
       await loadPositions();
-      setShowPositionModal(false);
-      setEditingPosition(null);
-      setPositionForm({ name: '', category: 'security', default_salary: 150000, is_active: true });
+      alert('Position deleted successfully');
     } catch (error: any) {
-      console.error('Error saving position:', error);
-      alert(`Failed to save position: ${error.message || 'Unknown error'}`);
+      console.error('Error deleting position:', error);
+      alert(`Failed to delete position: ${error.message || 'Unknown error'}`);
     }
-  };
-
-  // ===== UPDATED: Delete position with audit logging =====
-  const handleDeletePosition = async (position: any) => {
-    if (confirm(`Are you sure you want to delete "${position.name}"? This may affect existing employees.`)) {
-      try {
-        const { error } = await supabase
-          .from('positions')
-          .delete()
-          .eq('id', position.id);
-        if (error) throw error;
-        
-        // Audit log for delete
-        await logAudit({
-          action: 'DELETE',
-          entity_type: 'positions',
-          entity_id: position.id,
-          old_data: {
-            name: position.name,
-            category: position.category,
-            default_salary: position.default_salary,
-            is_active: position.is_active
-          }
-        });
-        
-        await loadPositions();
-        alert('Position deleted successfully');
-      } catch (error: any) {
-        console.error('Error deleting position:', error);
-        alert(`Failed to delete position: ${error.message || 'Unknown error'}`);
-      }
-    }
-  };
+  }
+};
 
   // Edit position
   const handleEditPosition = (position: any) => {

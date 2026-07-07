@@ -72,14 +72,20 @@ export function Badge({ children, color = 'navy' }: { children: React.ReactNode;
   return <span className={cn('inline-flex items-center px-2 py-1 text-xs font-medium rounded-md', map[color])}>{children}</span>;
 }
 
-export function Input({ label, type = 'text', value, defaultValue, onChange, placeholder, className = '', required, icon: Icon }:
-  { label?: string; type?: string; value?: any; defaultValue?: any; onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void; placeholder?: string; className?: string; required?: boolean; icon?: any }) {
+export function Input({ label, type = 'text', value, defaultValue, onChange, placeholder, className = '', required, icon: Icon, id, name }:
+  { label?: string; type?: string; value?: any; defaultValue?: any; onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void; placeholder?: string; className?: string; required?: boolean; icon?: any; id?: string; name?: string }) {
+  // Generate a unique ID if not provided
+  const inputId = id || `input-${Math.random().toString(36).substr(2, 9)}`;
+  const inputName = name || inputId;
+  
   return (
     <div className={className}>
-      {label && <label className="block text-sm font-medium text-slate-700 mb-1.5">{label}{required && <span className="text-red-500 ml-1">*</span>}</label>}
+      {label && <label htmlFor={inputId} className="block text-sm font-medium text-slate-700 mb-1.5">{label}{required && <span className="text-red-500 ml-1">*</span>}</label>}
       <div className="relative">
         {Icon && <div className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"><Icon size={16} /></div>}
         <input
+          id={inputId}
+          name={inputName}
           type={type}
           value={value}
           defaultValue={defaultValue}
