@@ -20,6 +20,7 @@ interface Employee {
   basic_salary: number;
   status: string;
   is_deleted?: boolean;
+  uniform_deduction?: number;
 }
 
 interface PayrollRecord {
@@ -84,6 +85,7 @@ export function PayrollPage() {
   const [approvalNotes, setApprovalNotes] = useState('');
   const [approvalStatus, setApprovalStatus] = useState<'approved' | 'rejected' | null>(null);
   const [isApproved, setIsApproved] = useState(false);
+  const [approverName, setApproverName] = useState('');
 
   // ===== PAGINATION STATES =====
   const [payrollPage, setPayrollPage] = useState(1);
@@ -94,14 +96,11 @@ export function PayrollPage() {
   const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
   const isMonthProcessed = useMemo(() => processedMonths.includes(selectedMonth), [processedMonths, selectedMonth]);
 
-  // Check if the current month's payroll is approved
   const isMonthApproved = useMemo(() => {
     if (payrollRecords.length === 0) return false;
-    // Check if all payroll records for this month are approved
     return payrollRecords.every(record => record.approval_status === 'approved');
   }, [payrollRecords]);
 
-  // Check if payroll has been processed (has records) but not yet approved
   const isPendingApproval = useMemo(() => {
     if (payrollRecords.length === 0) return false;
     return !isMonthApproved && payrollRecords.some(record => record.approval_status !== 'approved');
@@ -128,6 +127,30 @@ export function PayrollPage() {
     setPayrollPage(1);
   }, [search]);
 
+  // ===== FETCH APPROVER NAME =====
+  useEffect(() => {
+    if (isApproved && payrollRecords.length > 0 && payrollRecords[0]?.approved_by) {
+      const fetchApproverName = async () => {
+        try {
+          const { data, error } = await supabase
+            .from('profiles')
+            .select('full_name')
+            .eq('id', payrollRecords[0].approved_by)
+            .maybeSingle();
+          
+          if (error) throw error;
+          setApproverName(data?.full_name || payrollRecords[0].approved_by.slice(0, 8) + '...');
+        } catch (err) {
+          console.error('Error fetching approver name:', err);
+          setApproverName(payrollRecords[0].approved_by.slice(0, 8) + '...');
+        }
+      };
+      fetchApproverName();
+    } else {
+      setApproverName('');
+    }
+  }, [isApproved, payrollRecords]);
+
   // ===== FETCH USER PROFILE =====
   const fetchUserProfile = useCallback(async () => {
     const { data: { user } } = await supabase.auth.getUser();
@@ -136,7 +159,7 @@ export function PayrollPage() {
         .from('profiles')
         .select('*, regions(*)')
         .eq('id', user.id)
-        .single();
+        .maybeSingle();
       setUserProfile(profile);
       
       const isSuperAdmin = profile?.is_super_admin || false;
@@ -145,43 +168,39 @@ export function PayrollPage() {
       setCanProcessPayroll(isSuperAdmin || roleLevel === 1);
       setCanEditPayroll(isSuperAdmin || roleLevel <= 2);
       setCanViewPayroll(isSuperAdmin || roleLevel <= 3);
-      // Approvers: Super Admins and role level 1 (Managers)
       setCanApprovePayroll(isSuperAdmin || roleLevel === 1);
     }
   }, []);
 
- // ===== FETCH PROCESSED MONTHS (DEDUPLICATED) =====
-const fetchProcessedMonths = useCallback(async () => {
-  try {
-    const { data, error } = await supabase
-      .from('payroll')
-      .select('month')
-      .order('month', { ascending: false });
-    
-    if (error) throw error;
-    
-    // ===== CRITICAL FIX: Remove duplicate months =====
-    const uniqueMonths = [...new Set(data?.map(r => r.month) || [])];
-    setProcessedMonths(uniqueMonths);
-    
-    console.log('📊 Processed months (deduplicated):', uniqueMonths);
-  } catch (err) {
-    console.error('Error fetching processed months:', err);
-  }
-}, []);
+  // ===== FETCH PROCESSED MONTHS =====
+  const fetchProcessedMonths = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from('payroll')
+        .select('month')
+        .order('month', { ascending: false });
+      
+      if (error) throw error;
+      
+      const uniqueMonths = [...new Set(data?.map(r => r.month) || [])];
+      setProcessedMonths(uniqueMonths);
+      
+      console.log('📊 Processed months (deduplicated):', uniqueMonths);
+    } catch (err) {
+      console.error('Error fetching processed months:', err);
+    }
+  }, []);
 
   // ===== FETCH DATA =====
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      // CRITICAL: Only fetch active employees (not deleted)
       const { data: employeesData, error: empError } = await supabase
         .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted')
+        .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction')
         .eq('is_deleted', false)
         .eq('status', 'Active');
         
-      
       if (empError) throw empError;
       setEmployees(employeesData || []);
       
@@ -193,7 +212,6 @@ const fetchProcessedMonths = useCallback(async () => {
       if (payError) throw payError;
       setPayrollRecords(payrollData || []);
       
-      // Check approval status
       if (payrollData && payrollData.length > 0) {
         const allApproved = payrollData.every(r => r.approval_status === 'approved');
         setIsApproved(allApproved);
@@ -231,17 +249,29 @@ const fetchProcessedMonths = useCallback(async () => {
   // ===== CALCULATE PAYROLL =====
   const calculatePayroll = useCallback((employee: Employee, customValues?: Partial<PayrollRecord>): PayrollRecord => {
     const basicSalary = customValues?.basic_salary ?? employee.basic_salary;
-    const allowances = customValues?.allowances ?? Math.round(basicSalary * 0.10);
-    const overtime = customValues?.overtime ?? Math.round(basicSalary * 0.05);
+    // Allowances default to 0
+    const allowances = customValues?.allowances ?? 0;
+    // Overtime default to 0
+    const overtime = customValues?.overtime ?? 0;
     const bonus = customValues?.bonus ?? 0;
     const grossPay = basicSalary + allowances + overtime + bonus;
+    
     const paye = customValues?.paye ?? Math.round(grossPay * 0.30);
     const pension = customValues?.pension ?? Math.round(grossPay * 0.05);
     
-    const deduction = getEmployeeDeduction(employee.id);
-    const uniformDeduction = customValues?.uniform_deduction ?? (deduction?.total_deductions || 0);
+    const uniformDeductionValue = employee.uniform_deduction || 10000;
     
-    const netPay = grossPay - paye - pension - uniformDeduction;
+    const deduction = getEmployeeDeduction(employee.id);
+    const absentDays = deduction?.absent_days || 0;
+    const lateDays = deduction?.late_days || 0;
+    const absentDeduction = absentDays * 4200;
+    const lateDeduction = lateDays * 4200;
+    const lectureDeduction = deduction?.lecture_deduction || 0;
+    const appearanceDeduction = deduction?.appearance_deduction || 0;
+    const totalAttendanceDeductions = absentDeduction + lateDeduction + lectureDeduction + appearanceDeduction;
+    const totalUniformDeduction = uniformDeductionValue + totalAttendanceDeductions;
+    
+    const netPay = grossPay - paye - pension - totalUniformDeduction;
     
     return {
       id: '',
@@ -254,7 +284,7 @@ const fetchProcessedMonths = useCallback(async () => {
       gross_pay: grossPay,
       paye,
       pension,
-      uniform_deduction: uniformDeduction,
+      uniform_deduction: totalUniformDeduction,
       net_pay: netPay,
       processed_at: new Date().toISOString(),
       approval_status: 'pending',
@@ -288,7 +318,9 @@ const fetchProcessedMonths = useCallback(async () => {
   const employeesWithDeductions = useMemo(() => {
     return employees.filter(emp => {
       const deduction = getEmployeeDeduction(emp.id);
-      return deduction && deduction.total_deductions > 0;
+      const hasDeduction = deduction && deduction.total_deductions > 0;
+      const hasUniform = (emp.uniform_deduction || 0) > 0;
+      return hasDeduction || hasUniform;
     });
   }, [employees, getEmployeeDeduction]);
 
@@ -481,7 +513,8 @@ const fetchProcessedMonths = useCallback(async () => {
         approval_status: status,
         approved_by: userProfile?.id || null,
         approved_at: new Date().toISOString(),
-        approval_notes: approvalNotes || null
+        approval_notes: approvalNotes || null,
+        updated_at: new Date().toISOString()
       };
 
       // Update all payroll records for this month
@@ -558,9 +591,22 @@ const fetchProcessedMonths = useCallback(async () => {
       for (const employee of employees) {
         const edited = editingValues[employee.id];
         const deduction = getEmployeeDeduction(employee.id);
-        const uniformDeduction = edited?.uniform_deduction ?? (deduction?.total_deductions || 0);
         
-        const payroll = calculatePayroll(employee, { ...edited, uniform_deduction: uniformDeduction });
+        const uniformDeductionValue = employee.uniform_deduction || 10000;
+        
+        const absentDays = deduction?.absent_days || 0;
+        const lateDays = deduction?.late_days || 0;
+        const absentDeduction = absentDays * 4200;
+        const lateDeduction = lateDays * 4200;
+        const lectureDeduction = deduction?.lecture_deduction || 0;
+        const appearanceDeduction = deduction?.appearance_deduction || 0;
+        const totalAttendanceDeductions = absentDeduction + lateDeduction + lectureDeduction + appearanceDeduction;
+        const totalUniformDeduction = uniformDeductionValue + totalAttendanceDeductions;
+        
+        const payroll = calculatePayroll(employee, { 
+          ...edited, 
+          uniform_deduction: totalUniformDeduction 
+        });
         
         totalGross += payroll.gross_pay;
         totalNet += payroll.net_pay;
@@ -714,7 +760,6 @@ const fetchProcessedMonths = useCallback(async () => {
               </button>
             )}
 
-            {/* Approval Button - Show when payroll is processed and pending approval */}
             {canApprovePayroll && isMonthProcessed && !isApproved && isCurrentMonth && (
               <Button 
                 variant="secondary" 
@@ -730,7 +775,6 @@ const fetchProcessedMonths = useCallback(async () => {
               </Button>
             )}
 
-            {/* Show approval status badge */}
             {isApproved && (
               <Badge color="green" className="text-sm px-3 py-1">
                 <CheckCircle2 size={14} className="mr-1" /> Approved
@@ -785,7 +829,7 @@ const fetchProcessedMonths = useCallback(async () => {
         </Card>
       )}
 
-      {/* Approval Status Banner */}
+      {/* ===== UPDATED: Approval Banner with Approver Name ===== */}
       {isApproved && (
         <Card className="p-4 bg-emerald-50 border-emerald-200 border">
           <div className="flex items-start gap-3">
@@ -796,7 +840,7 @@ const fetchProcessedMonths = useCallback(async () => {
                 This payroll has been approved and is ready for payment processing.
                 {payrollRecords[0]?.approved_by && (
                   <span className="block text-xs text-emerald-600 mt-1">
-                    Approved by: {payrollRecords[0]?.approved_by} at {payrollRecords[0]?.approved_at ? new Date(payrollRecords[0].approved_at).toLocaleString() : ''}
+                    Approved by: {approverName || payrollRecords[0]?.approved_by} at {payrollRecords[0]?.approved_at ? new Date(payrollRecords[0].approved_at).toLocaleString() : ''}
                   </span>
                 )}
                 {payrollRecords[0]?.approval_notes && (
@@ -866,23 +910,23 @@ const fetchProcessedMonths = useCallback(async () => {
         </Card>
       )}
 
-{processedMonths.length > 0 && (
-  <Card className="p-3 bg-emerald-50 border-emerald-200 border">
-    <div className="flex items-center gap-4 flex-wrap">
-      <span className="text-sm font-medium text-emerald-700 flex items-center gap-2">
-        <CheckCircle2 size={16} /> Processed Months:
-      </span>
-      {processedMonths.slice(0, 6).map((month, index) => (
-        <Badge key={`processed-${month}-${index}`} color="green" className="text-xs">
-          {getMonthLabel(month)}
-        </Badge>
-      ))}
-      {processedMonths.length > 6 && (
-        <span className="text-xs text-slate-500">+{processedMonths.length - 6} more</span>
+      {processedMonths.length > 0 && (
+        <Card className="p-3 bg-emerald-50 border-emerald-200 border">
+          <div className="flex items-center gap-4 flex-wrap">
+            <span className="text-sm font-medium text-emerald-700 flex items-center gap-2">
+              <CheckCircle2 size={16} /> Processed Months:
+            </span>
+            {processedMonths.slice(0, 6).map((month, index) => (
+              <Badge key={`processed-${month}-${index}`} color="green" className="text-xs">
+                {getMonthLabel(month)}
+              </Badge>
+            ))}
+            {processedMonths.length > 6 && (
+              <span className="text-xs text-slate-500">+{processedMonths.length - 6} more</span>
+            )}
+          </div>
+        </Card>
       )}
-    </div>
-  </Card>
-)}
 
       {!canProcessPayroll && isCurrentMonth && (
         <Card className="p-3 bg-amber-50 border-amber-200 border">
@@ -904,12 +948,17 @@ const fetchProcessedMonths = useCallback(async () => {
             <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />
             <div>
               <p className="text-sm font-medium text-red-800">
-                Attendance Deductions Applied
+                Attendance & Uniform Deductions Applied
               </p>
               <p className="text-sm text-red-700">
-                {employeesWithDeductions.length} employee(s) have attendance/uniform deductions for this month. 
+                {employeesWithDeductions.length} employee(s) have uniform and/or attendance deductions for this month. 
                 These will be automatically included in the payroll calculation.
               </p>
+              <div className="mt-2 text-xs text-red-600 space-y-1">
+                <p>• Uniform Deduction: Default MK 10,000 per employee (adjustable in employee profile)</p>
+                <p>• Absenteeism: MK 4,200 per absent day</p>
+                <p>• Late Arrival: MK 4,200 per late day</p>
+              </div>
             </div>
           </div>
         </Card>
@@ -938,7 +987,8 @@ const fetchProcessedMonths = useCallback(async () => {
               <p className="text-xs text-slate-500">Total Deductions</p>
               <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(totals.paye + totals.pension + totals.uniformDeductions)}</p>
               <p className="text-xs text-slate-500 mt-1">PAYE: {formatKwacha(totals.paye)}</p>
-              <p className="text-xs text-red-500 mt-1">Uniform: {formatKwacha(totals.uniformDeductions)}</p>
+              <p className="text-xs text-slate-500 mt-1">Pension: {formatKwacha(totals.pension)}</p>
+              <p className="text-xs text-red-500 mt-1">Uniform/Attendance: {formatKwacha(totals.uniformDeductions)}</p>
             </div>
             <div className="w-10 h-10 rounded-lg bg-red-100 text-red-600 flex items-center justify-center">
               <Calculator size={18} />
@@ -976,13 +1026,14 @@ const fetchProcessedMonths = useCallback(async () => {
           <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
             <Calculator size={16} className="text-[#D4A017]" /> Gross Pay Formula
           </h3>
-          <p className="text-sm text-slate-600">= Basic Salary + Allowances (10%) + Overtime (5%) + Bonus</p>
+          <p className="text-sm text-slate-600">= Basic Salary + Allowances (0%) + Overtime (0%) + Bonus</p>
         </Card>
         <Card className="p-5">
           <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
             <Calculator size={16} className="text-[#D4A017]" /> Net Pay Formula
           </h3>
-          <p className="text-sm text-slate-600">= Gross Pay - PAYE (30%) - Pension (5%) - Uniform/Attendance Deductions</p>
+          <p className="text-sm text-slate-600">= Gross Pay - PAYE (30%) - Pension (5%) - Uniform Deduction - Attendance Deductions</p>
+          <p className="text-xs text-slate-500 mt-2">Attendance Deductions: Absent (MK4,200/day) + Late (MK4,200/day) + Lecture + Appearance</p>
         </Card>
       </div>
 
@@ -1052,6 +1103,8 @@ const fetchProcessedMonths = useCallback(async () => {
                 const p = getDisplayPayroll(emp);
                 const deduction = getEmployeeDeduction(emp.id);
                 const hasDeduction = deduction && deduction.total_deductions > 0;
+                const hasUniform = (emp.uniform_deduction || 10000) > 0;
+                const hasAnyDeduction = hasDeduction || hasUniform;
                 const isEditable = canEditPayroll && !payrollRecords.find(r => r.employee_id === emp.id) && isCurrentMonth && !isMonthProcessed && !isApproved;
                 
                 return (
@@ -1064,7 +1117,7 @@ const fetchProcessedMonths = useCallback(async () => {
                         <div>
                           <p className="text-sm font-medium text-slate-800">{emp.full_name}</p>
                           <p className="text-xs text-slate-500">{emp.employee_number}</p>
-                          {hasDeduction && (
+                          {hasAnyDeduction && (
                             <Badge color="red" className="text-[10px] mt-0.5">Deductions</Badge>
                           )}
                           {!isEditable && payrollRecords.find(r => r.employee_id === emp.id) && (
@@ -1136,11 +1189,15 @@ const fetchProcessedMonths = useCallback(async () => {
                     <TD className="text-right font-mono font-semibold text-emerald-700 bg-emerald-50/50">
                       {formatKwacha(p.gross_pay)}
                     </TD>
-                    <TD className={`text-right font-mono font-semibold ${hasDeduction ? 'text-red-600' : 'text-slate-500'} bg-red-50/50`}>
+                    <TD className={`text-right font-mono font-semibold ${hasAnyDeduction ? 'text-red-600' : 'text-slate-500'} bg-red-50/50`}>
                       {formatKwacha(p.uniform_deduction || 0)}
-                      {hasDeduction && (
-                        <div className="text-[10px] text-red-400">
-                          {deduction?.absent_days || 0}A, {deduction?.late_days || 0}L, {deduction?.lecture_missed || 0}Lec
+                      {(hasDeduction || hasUniform) && (
+                        <div className="text-[10px] text-red-400 space-y-0.5">
+                          {hasUniform && <div>Uniform: MK{emp.uniform_deduction || 10000}</div>}
+                          {deduction?.absent_days > 0 && <div>Absent: {deduction.absent_days} × MK4,200</div>}
+                          {deduction?.late_days > 0 && <div>Late: {deduction.late_days} × MK4,200</div>}
+                          {deduction?.lecture_deduction > 0 && <div>Lecture: MK{deduction.lecture_deduction}</div>}
+                          {deduction?.appearance_deduction > 0 && <div>Appearance: MK{deduction.appearance_deduction}</div>}
                         </div>
                       )}
                     </TD>
@@ -1164,8 +1221,14 @@ const fetchProcessedMonths = useCallback(async () => {
         onItemsPerPageChange={setPayrollItemsPerPage}
       />
 
-      {/* Process Payroll Confirmation Modal */}
-      <Modal open={showConfirmModal} onClose={() => setShowConfirmModal(false)} title={`${isMonthProcessed ? 'Reprocess' : 'Process'} Payroll — ${getMonthLabel(selectedMonth)}`} size="lg">
+      {/* Process Payroll Modal - Positioned at top */}
+      <Modal 
+        open={showConfirmModal} 
+        onClose={() => setShowConfirmModal(false)} 
+        title={`${isMonthProcessed ? 'Reprocess' : 'Process'} Payroll — ${getMonthLabel(selectedMonth)}`} 
+        size="lg"
+        className="mt-4"
+      >
         <div className="space-y-4">
           <div className={`p-4 rounded-lg text-sm flex items-start gap-3 ${isMonthProcessed ? 'bg-amber-50' : 'bg-[#E8EDF5]'}`}>
             <CheckCircle2 size={18} className={`shrink-0 mt-0.5 ${isMonthProcessed ? 'text-amber-600' : 'text-[#081C3A]'}`} />
@@ -1187,24 +1250,30 @@ const fetchProcessedMonths = useCallback(async () => {
             <div className="p-4 rounded-lg bg-red-50 border border-red-200 text-sm">
               <p className="font-semibold text-red-800 flex items-center gap-2">
                 <AlertCircle size={16} />
-                Attendance/Uniform Deductions Applied
+                Uniform & Attendance Deductions Applied
               </p>
               <p className="text-red-700 mt-1">
-                {employeesWithDeductions.length} employees have attendance/uniform deductions totaling {formatKwacha(totals.uniformDeductions)}
+                {employeesWithDeductions.length} employees have uniform and/or attendance deductions totaling {formatKwacha(totals.uniformDeductions)}
               </p>
               <div className="mt-2 max-h-32 overflow-y-auto">
                 {employeesWithDeductions.slice(0, 5).map(emp => {
                   const deduction = getEmployeeDeduction(emp.id);
+                  const totalDed = (emp.uniform_deduction || 10000) + (deduction?.total_deductions || 0);
                   return (
                     <div key={emp.id} className="flex justify-between text-xs py-1 border-b border-red-100 last:border-0">
                       <span>{emp.full_name}</span>
-                      <span className="font-medium text-red-600">{formatKwacha(deduction?.total_deductions || 0)}</span>
+                      <span className="font-medium text-red-600">{formatKwacha(totalDed)}</span>
                     </div>
                   );
                 })}
                 {employeesWithDeductions.length > 5 && (
                   <p className="text-xs text-red-500 mt-1">...and {employeesWithDeductions.length - 5} more</p>
                 )}
+              </div>
+              <div className="mt-2 text-xs text-red-600 border-t border-red-200 pt-2">
+                <p>• Uniform Deduction: MK 10,000 per employee (default, adjustable)</p>
+                <p>• Absenteeism: MK 4,200 per absent day</p>
+                <p>• Late Arrival: MK 4,200 per late day</p>
               </div>
             </div>
           )}
@@ -1238,8 +1307,14 @@ const fetchProcessedMonths = useCallback(async () => {
         </div>
       </Modal>
 
-      {/* Approval Modal */}
-      <Modal open={showApprovalModal} onClose={() => { setShowApprovalModal(false); setApprovalNotes(''); }} title="Review & Approve Payroll" size="lg">
+      {/* Approval Modal - Positioned at top */}
+      <Modal 
+        open={showApprovalModal} 
+        onClose={() => { setShowApprovalModal(false); setApprovalNotes(''); }} 
+        title="Review & Approve Payroll" 
+        size="lg"
+        className="mt-4"
+      >
         <div className="space-y-4">
           <div className="p-4 rounded-lg bg-[#E8EDF5] text-sm">
             <p className="font-semibold text-slate-800">Payroll Summary</p>

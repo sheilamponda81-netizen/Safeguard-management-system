@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { cn } from '../utils/cn';
 
 // Note: All icons passed as props should come from '../utils/icons' for better tree-shaking
@@ -163,23 +163,62 @@ export function TD({ children, className = '' }: { children: React.ReactNode; cl
   return <td className={cn('px-4 py-3 text-slate-700 whitespace-nowrap', className)}>{children}</td>;
 }
 
-export function Modal({ open, onClose, title, children, size = 'md' }:
-  { open: boolean; onClose: () => void; title: string; children: React.ReactNode; size?: 'sm' | 'md' | 'lg' | 'xl' }) {
+// ===== UPDATED: Modal with top positioning =====
+export function Modal({ open, onClose, title, children, size = 'md', className = '' }:
+  { open: boolean; onClose: () => void; title: string; children: React.ReactNode; size?: 'sm' | 'md' | 'lg' | 'xl'; className?: string }) {
   if (!open) return null;
+  
   const sizes: Record<string, string> = {
     sm: 'max-w-md',
     md: 'max-w-2xl',
     lg: 'max-w-4xl',
     xl: 'max-w-6xl'
   };
+
+  // Close on Escape key
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [onClose]);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in sm:p-4 pb-safe" onClick={onClose}>
-      <div className={cn('bg-white rounded-2xl shadow-2xl w-full max-h-[90vh] overflow-hidden flex flex-col sm:rounded-lg', sizes[size])} onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between p-5 border-b border-slate-200">
+    <div 
+      className="fixed inset-0 z-50 flex items-start justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in overflow-y-auto"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div 
+        className={cn(
+          'bg-white rounded-2xl shadow-2xl w-full flex flex-col',
+          sizes[size],
+          className
+        )}
+        style={{ 
+          maxHeight: 'calc(100vh - 2rem)',
+          marginTop: '1.5rem'
+        }}
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Sticky Header */}
+        <div className="flex items-center justify-between p-5 border-b border-slate-200 sticky top-0 bg-white rounded-t-2xl z-10">
           <h2 className="text-lg font-semibold text-slate-800">{title}</h2>
-          <button onClick={onClose} className="w-8 h-8 rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-500">✕</button>
+          <button 
+            onClick={onClose} 
+            className="w-8 h-8 rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-500 transition-colors"
+            aria-label="Close modal"
+          >
+            ✕
+          </button>
         </div>
-        <div className="overflow-y-auto flex-1 p-5 max-h-[calc(90vh-120px)]">{children}</div>
+        
+        {/* Scrollable Content */}
+        <div className="overflow-y-auto flex-1 p-5" style={{ maxHeight: 'calc(100vh - 8rem)' }}>
+          {children}
+        </div>
       </div>
     </div>
   );

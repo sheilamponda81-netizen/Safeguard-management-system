@@ -6,19 +6,20 @@ import { Plus, Trash2, Edit2, Shield, CheckCircle, XCircle } from 'lucide-react'
 interface Profile {
   id: string;
   email: string;
-  role: string;
   role_level: number;
   full_name: string;
   department: string;
+  is_super_admin: boolean;
   is_active: boolean;
+  region_id: string | null;
   created_at: string;
 }
 
 const roleLevels = [
-  { level: 1, name: 'Admin', color: 'purple' },
-  { level: 2, name: 'Manager', color: 'blue' },
-  { level: 3, name: 'Supervisor', color: 'green' },
-  { level: 4, name: 'Staff', color: 'gray' }
+  { level: 1, name: 'Admin', color: 'purple', desc: 'Full system access' },
+  { level: 2, name: 'Manager', color: 'blue', desc: 'HR, Recruitment, Reports' },
+  { level: 3, name: 'Supervisor', color: 'green', desc: 'Attendance, Security' },
+  { level: 4, name: 'Staff', color: 'gray', desc: 'Basic access' }
 ];
 
 export function UserManagement() {
@@ -41,17 +42,22 @@ export function UserManagement() {
 
   const fetchUsers = async () => {
     setLoading(true);
-    const { data: profiles, error } = await supabase
-      .from('profiles')
-      .select('*')
-      .order('created_at', { ascending: false });
+    try {
+      const { data: profiles, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .order('created_at', { ascending: false });
 
-    if (error) {
-      console.error('Error fetching users:', error);
-    } else {
-      setUsers(profiles || []);
+      if (error) {
+        console.error('Error fetching users:', error);
+      } else {
+        setUsers(profiles || []);
+      }
+    } catch (err) {
+      console.error('Error:', err);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const addUser = async () => {
@@ -75,17 +81,17 @@ export function UserManagement() {
       if (authError) throw authError;
 
       if (authData.user) {
-        const roleName = roleLevels.find(r => r.level === formData.role_level)?.name || 'Staff';
         const { error: profileError } = await supabase
           .from('profiles')
           .insert({
             id: authData.user.id,
             email: formData.email,
             role_level: formData.role_level,
-            role: roleName,
             full_name: formData.full_name,
             department: formData.department,
-            is_active: true
+            is_super_admin: formData.role_level === 1,
+            is_active: true,
+            region_id: null
           });
 
         if (profileError) throw profileError;
@@ -101,10 +107,12 @@ export function UserManagement() {
   };
 
   const updateUserRole = async (userId: string, roleLevel: number) => {
-    const roleName = roleLevels.find(r => r.level === roleLevel)?.name || 'Staff';
     const { error } = await supabase
       .from('profiles')
-      .update({ role_level: roleLevel, role: roleName })
+      .update({ 
+        role_level: roleLevel,
+        is_super_admin: roleLevel === 1
+      })
       .eq('id', userId);
 
     if (error) {
@@ -115,33 +123,74 @@ export function UserManagement() {
     }
   };
 
-  const toggleUserStatus = async (user: Profile) => {
-    const { error } = await supabase
-      .from('profiles')
-      .update({ is_active: !user.is_active })
-      .eq('id', user.id);
-
-    if (error) {
-      alert('Error updating user status');
-    } else {
-      alert(`User ${user.is_active ? 'deactivated' : 'activated'} successfully`);
-      fetchUsers();
-    }
-  };
-
+  // ===== FIXED: Delete User Function =====
   const deleteUser = async (user: Profile) => {
-    if (confirm(`Are you sure you want to delete ${user.email}?`)) {
+    if (!confirm(`Are you sure you want to permanently delete ${user.email}? This action cannot be undone.`)) {
+      return;
+    }
+
+    try {
+      // Check if this is the last admin user
+      if (user.is_super_admin || user.role_level === 1) {
+        const { count, error: countError } = await supabase
+          .from('profiles')
+          .select('id', { count: 'exact', head: true })
+          .eq('is_super_admin', true);
+
+        if (countError) throw countError;
+        
+        if (count === 1) {
+          alert('Cannot delete the last admin user. Please assign another admin first.');
+          return;
+        }
+      }
+
+      // Step 1: Delete from profiles
       const { error: profileError } = await supabase
         .from('profiles')
         .delete()
         .eq('id', user.id);
 
       if (profileError) {
-        alert('Error deleting user');
-      } else {
-        alert(`User ${user.email} deleted`);
-        fetchUsers();
+        console.error('Profile deletion error:', profileError);
+        
+        // If foreign key error, try soft delete
+        if (profileError.message?.includes('foreign key')) {
+          const { error: updateError } = await supabase
+            .from('profiles')
+            .update({ 
+              is_active: false,
+              deleted_at: new Date().toISOString()
+            })
+            .eq('id', user.id);
+            
+          if (updateError) throw updateError;
+          alert(`User ${user.email} has been deactivated (soft delete)`);
+          fetchUsers();
+          return;
+        }
+        throw profileError;
       }
+
+      // Step 2: Try to delete from auth.users (may fail if no admin rights)
+      try {
+        const { error: authError } = await supabase.auth.admin.deleteUser(user.id);
+        
+        if (authError) {
+          console.warn('Auth deletion warning:', authError);
+          alert(`User ${user.email} was removed from profiles. Auth cleanup: ${authError.message}`);
+        } else {
+          alert(`User ${user.email} deleted successfully`);
+        }
+      } catch (authErr) {
+        console.warn('Auth deletion error:', authErr);
+        alert(`User ${user.email} was removed from profiles. Please manually remove from auth if needed.`);
+      }
+
+      fetchUsers();
+    } catch (error: any) {
+      console.error('Error deleting user:', error);
+      alert('Error deleting user: ' + (error.message || 'Unknown error'));
     }
   };
 
@@ -171,11 +220,7 @@ export function UserManagement() {
         {roleLevels.map(role => (
           <div key={role.level} className="p-3 rounded-lg bg-slate-50 border border-slate-200">
             <Badge color={role.color as any}>{role.name}</Badge>
-            <p className="text-xs text-slate-500 mt-2">
-              {role.level === 1 ? 'Full system access' : 
-               role.level === 2 ? 'HR, Recruitment, Reports' :
-               role.level === 3 ? 'Attendance, Security' : 'Basic access'}
-            </p>
+            <p className="text-xs text-slate-500 mt-2">{role.desc}</p>
           </div>
         ))}
       </div>
@@ -213,8 +258,8 @@ export function UserManagement() {
                       </Badge>
                     </td>
                     <td className="px-4 py-3 hidden lg:table-cell">
-                      <Badge color={user.is_active ? 'green' : 'red'}>
-                        {user.is_active ? 'Active' : 'Inactive'}
+                      <Badge color={user.is_active !== false ? 'green' : 'red'}>
+                        {user.is_active !== false ? 'Active' : 'Inactive'}
                       </Badge>
                     </td>
                     <td className="px-4 py-3 text-right">
@@ -225,13 +270,6 @@ export function UserManagement() {
                           title="Edit Role"
                         >
                           <Edit2 size={14} />
-                        </button>
-                        <button 
-                          onClick={() => toggleUserStatus(user)} 
-                          className="p-1.5 rounded-lg hover:bg-slate-100 text-blue-600"
-                          title={user.is_active ? 'Deactivate' : 'Activate'}
-                        >
-                          {user.is_active ? <XCircle size={14} /> : <CheckCircle size={14} />}
                         </button>
                         <button 
                           onClick={() => deleteUser(user)} 

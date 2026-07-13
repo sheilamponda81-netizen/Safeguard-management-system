@@ -39,6 +39,7 @@ interface Employee {
   payPoint?: string;
   contractType?: string;
   region_id?: string;
+  uniform_deduction?: number;
 }
 
 interface PayrollRecord {
@@ -63,6 +64,17 @@ interface PayslipData {
   payroll: PayrollRecord;
   month: string;
   year: string;
+}
+
+// ===== Extended Payroll Record with breakdown =====
+interface ExtendedPayrollRecord extends PayrollRecord {
+  absent_days?: number;
+  late_days?: number;
+  absent_deduction?: number;
+  late_deduction?: number;
+  lecture_deduction?: number;
+  appearance_deduction?: number;
+  uniform_amount?: number;
 }
 
 interface PayslipTemplate {
@@ -98,7 +110,8 @@ const defaultTemplate: PayslipTemplate = {
 export function PayslipsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
-  const [payrollRecords, setPayrollRecords] = useState<PayrollRecord[]>([]);
+  const [payrollRecords, setPayrollRecords] = useState<ExtendedPayrollRecord[]>([]);
+  const [employeeDeductions, setEmployeeDeductions] = useState<any[]>([]);
   const [payslips, setPayslips] = useState<PayslipData[]>([]);
   const [search, setSearch] = useState('');
   const [view, setView] = useState<PayslipData | null>(null);
@@ -167,7 +180,7 @@ export function PayslipsPage() {
         .from('profiles')
         .select('*, regions(*)')
         .eq('id', user.id)
-        .single();
+        .maybeSingle();
       setUserProfile(profile);
     }
   }, []);
@@ -177,10 +190,10 @@ export function PayslipsPage() {
     try {
       const monthYear = `${selectedYear}-${String(months.indexOf(selectedMonth) + 1).padStart(2, '0')}`;
       
-      // CRITICAL: Exclude deleted employees
+      // CRITICAL: Exclude deleted employees and include uniform_deduction
       let employeesQuery = supabase
         .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id')
+        .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id, uniform_deduction')
         .eq('status', 'Active')
         .eq('is_deleted', false);
 
@@ -201,11 +214,13 @@ export function PayslipsPage() {
         status: emp.status || 'Active',
         payPoint: emp.pay_point || 'N/A',
         contractType: emp.contract_type || 'Permanent',
-        region_id: emp.region_id
+        region_id: emp.region_id,
+        uniform_deduction: emp.uniform_deduction || 10000
       }));
 
       setEmployees(mappedEmployees);
 
+      // Fetch payroll records
       let payrollQuery = supabase
         .from('payroll')
         .select('*')
@@ -221,6 +236,15 @@ export function PayslipsPage() {
       const { data: payrollData, error: payError } = await payrollQuery;
       if (payError) throw payError;
 
+      // Fetch employee deductions for the month
+      const { data: deductionsData, error: dedError } = await supabase
+        .from('employee_deductions')
+        .select('*')
+        .eq('month', monthYear);
+
+      if (dedError) throw dedError;
+      setEmployeeDeductions(deductionsData || []);
+
       setPayrollRecords(payrollData || []);
 
       const payslipData: PayslipData[] = [];
@@ -228,7 +252,18 @@ export function PayslipsPage() {
       if (payrollData && payrollData.length > 0) {
         payrollData.forEach((payroll: any) => {
           const employee = mappedEmployees.find((e: Employee) => e.id === payroll.employee_id);
+          const deduction = deductionsData?.find((d: any) => d.employee_id === payroll.employee_id);
+          
           if (employee) {
+            // Calculate deduction breakdown
+            const absentDays = deduction?.absent_days || 0;
+            const lateDays = deduction?.late_days || 0;
+            const absentDeduction = absentDays * 4200;
+            const lateDeduction = lateDays * 4200;
+            const lectureDeduction = deduction?.lecture_deduction || 0;
+            const appearanceDeduction = deduction?.appearance_deduction || 0;
+            const uniformAmount = employee.uniform_deduction || 10000;
+            
             payslipData.push({
               employee,
               payroll: {
@@ -244,8 +279,15 @@ export function PayslipsPage() {
                 pension: payroll.pension || 0,
                 uniform_deduction: payroll.uniform_deduction || 0,
                 net_pay: payroll.net_pay,
-                processed_at: payroll.processed_at
-              },
+                processed_at: payroll.processed_at,
+                absent_days: absentDays,
+                late_days: lateDays,
+                absent_deduction: absentDeduction,
+                late_deduction: lateDeduction,
+                lecture_deduction: lectureDeduction,
+                appearance_deduction: appearanceDeduction,
+                uniform_amount: uniformAmount
+              } as ExtendedPayrollRecord,
               month: selectedMonth,
               year: selectedYear
             });
@@ -330,12 +372,22 @@ export function PayslipsPage() {
     setPayslipsPage(1);
   }, []);
 
-  // ===== GENERATE PAYSLIP HTML =====
+  // ===== GENERATE PAYSLIP HTML with detailed deductions =====
   const generatePayslipHTML = useCallback((payslip: PayslipData, customTemplate?: PayslipTemplate) => {
     const employee = payslip.employee;
-    const p = payslip.payroll;
+    const p = payslip.payroll as ExtendedPayrollRecord;
     const n = p.net_pay;
     const t = customTemplate || template;
+    
+    // Calculate deduction breakdowns
+    const uniformAmount = p.uniform_amount || employee.uniform_deduction || 10000;
+    const absentDeduction = p.absent_deduction || 0;
+    const lateDeduction = p.late_deduction || 0;
+    const lectureDeduction = p.lecture_deduction || 0;
+    const appearanceDeduction = p.appearance_deduction || 0;
+    const absentDays = p.absent_days || 0;
+    const lateDays = p.late_days || 0;
+    const totalUniformAtt = p.uniform_deduction || 0;
     
     return `<!DOCTYPE html>
       <html>
@@ -363,6 +415,7 @@ export function PayslipsPage() {
           .net-pay-section .amount { font-size: 28px; font-weight: bold; color: ${t.secondaryColor}; }
           .footer { text-align: center; font-size: 11px; color: #999; margin-top: 20px; padding-top: 15px; border-top: 1px solid #eee; }
           .deduction-item .amount { color: #dc2626; }
+          .deduction-breakdown { font-size: 11px; color: #dc2626; padding-left: 20px; }
           .company-logo { font-size: 28px; font-weight: bold; color: ${t.primaryColor}; }
           @media print { body { padding: 20px; } }
         </style>
@@ -392,17 +445,24 @@ export function PayslipsPage() {
           <div>
             <div class="section-title">Earnings</div>
             <div class="row"><span class="label">Basic Salary</span><span class="amount">${formatKwacha(p.basic_salary)}</span></div>
-            <div class="row"><span class="label">Allowances</span><span class="amount">${formatKwacha(p.allowances)}</span></div>
-            <div class="row"><span class="label">Overtime</span><span class="amount">${formatKwacha(p.overtime)}</span></div>
+            <div class="row"><span class="label">Allowances (10%)</span><span class="amount">${formatKwacha(p.allowances)}</span></div>
+            <div class="row"><span class="label">Overtime (5%)</span><span class="amount">${formatKwacha(p.overtime)}</span></div>
             <div class="row"><span class="label">Bonus</span><span class="amount">${formatKwacha(p.bonus)}</span></div>
             <div class="total-row"><span>Gross Pay</span><span class="amount">${formatKwacha(p.gross_pay)}</span></div>
           </div>
           <div>
             <div class="section-title">Deductions</div>
-            <div class="row deduction-item"><span class="label">PAYE Tax</span><span class="amount">-${formatKwacha(p.paye)}</span></div>
+            <div class="row deduction-item"><span class="label">PAYE Tax (30%)</span><span class="amount">-${formatKwacha(p.paye)}</span></div>
             <div class="row deduction-item"><span class="label">Pension (5%)</span><span class="amount">-${formatKwacha(p.pension)}</span></div>
-            <div class="row deduction-item"><span class="label">Uniform Deduction</span><span class="amount">-${formatKwacha(p.uniform_deduction)}</span></div>
-            <div class="total-row" style="border-top-color: #dc2626;"><span>Total Deductions</span><span class="amount" style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + p.uniform_deduction)}</span></div>
+            <div class="row deduction-item" style="border-bottom: none;"><span class="label">Uniform & Attendance</span><span class="amount">-${formatKwacha(totalUniformAtt)}</span></div>
+            <div class="deduction-breakdown">
+              ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
+              ${absentDays > 0 ? `<div>Absent (${absentDays} × MK4,200): -${formatKwacha(absentDeduction)}</div>` : ''}
+              ${lateDays > 0 ? `<div>Late (${lateDays} × MK4,200): -${formatKwacha(lateDeduction)}</div>` : ''}
+              ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
+              ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
+            </div>
+            <div class="total-row" style="border-top-color: #dc2626; margin-top: 4px;"><span>Total Deductions</span><span class="amount" style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + totalUniformAtt)}</span></div>
           </div>
         </div>
         <div class="net-pay-section">
@@ -423,14 +483,22 @@ export function PayslipsPage() {
   // ===== GENERATE PDF (Lazy Loaded) =====
   const generatePDF = useCallback(async (payslip: PayslipData): Promise<Blob | null> => {
     try {
-      // Lazy load PDF libraries only when needed
       const { html2canvas, jsPDF } = await loadPDFLibraries();
       
       const employee = payslip.employee;
-      const p = payslip.payroll;
+      const p = payslip.payroll as ExtendedPayrollRecord;
       const t = template;
+      
+      // Calculate deduction breakdowns
+      const uniformAmount = p.uniform_amount || employee.uniform_deduction || 10000;
+      const absentDeduction = p.absent_deduction || 0;
+      const lateDeduction = p.late_deduction || 0;
+      const lectureDeduction = p.lecture_deduction || 0;
+      const appearanceDeduction = p.appearance_deduction || 0;
+      const absentDays = p.absent_days || 0;
+      const lateDays = p.late_days || 0;
+      const totalUniformAtt = p.uniform_deduction || 0;
 
-      // Create a temporary container for the payslip
       const container = document.createElement('div');
       container.style.position = 'absolute';
       container.style.left = '-9999px';
@@ -466,17 +534,24 @@ export function PayslipsPage() {
           <div>
             <div style="font-size: 13px; font-weight: bold; color: ${t.primaryColor}; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px;">Earnings</div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Basic Salary</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.basic_salary)}</span></div>
-            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Allowances</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.allowances)}</span></div>
-            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Overtime</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.overtime)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Allowances (10%)</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.allowances)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Overtime (5%)</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.overtime)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Bonus</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.bonus)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px;"><span>Gross Pay</span><span style="color: ${t.primaryColor};">${formatKwacha(p.gross_pay)}</span></div>
           </div>
           <div>
             <div style="font-size: 13px; font-weight: bold; color: ${t.primaryColor}; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px;">Deductions</div>
-            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">PAYE Tax</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.paye)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">PAYE Tax (30%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.paye)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Pension (5%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.pension)}</span></div>
-            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Uniform Deduction</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.uniform_deduction)}</span></div>
-            <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px; border-top-color: #dc2626;"><span>Total Deductions</span><span style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + p.uniform_deduction)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5; border-bottom: none;"><span style="color: #555;">Uniform & Attendance</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(totalUniformAtt)}</span></div>
+            <div style="font-size: 11px; color: #dc2626; padding-left: 20px; padding-bottom: 6px;">
+              ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
+              ${absentDays > 0 ? `<div>Absent (${absentDays} × MK4,200): -${formatKwacha(absentDeduction)}</div>` : ''}
+              ${lateDays > 0 ? `<div>Late (${lateDays} × MK4,200): -${formatKwacha(lateDeduction)}</div>` : ''}
+              ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
+              ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
+            </div>
+            <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 4px; border-top-color: #dc2626;"><span>Total Deductions</span><span style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + totalUniformAtt)}</span></div>
           </div>
         </div>
         <div style="background: linear-gradient(135deg, ${t.primaryColor} 0%, ${t.primaryColor}cc 100%); color: white; padding: 20px 25px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-top: 20px;">
@@ -817,8 +892,9 @@ export function PayslipsPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {paginatedPayslips.map((payslip) => {
               const emp = payslip.employee;
-              const p = payslip.payroll;
+              const p = payslip.payroll as ExtendedPayrollRecord;
               const n = p.net_pay;
+              const totalDeductions = p.paye + p.pension + (p.uniform_deduction || 0);
               return (
                 <Card key={emp.id} className="p-5 hover:shadow-lg cursor-pointer transition-shadow" onClick={() => setView(payslip)}>
                   <div className="flex items-start justify-between mb-4">
@@ -834,8 +910,15 @@ export function PayslipsPage() {
                     <Badge color="green">Processed</Badge>
                   </div>
                   <div className="border-t border-slate-100 pt-4">
-                    <p className="text-xs text-slate-500 mb-1">{selectedMonth} {selectedYear} · Net Pay</p>
+                    <div className="flex justify-between text-xs text-slate-500 mb-1">
+                      <span>{selectedMonth} {selectedYear}</span>
+                      <span>Gross: {formatKwacha(p.gross_pay)}</span>
+                    </div>
                     <p className="text-2xl font-bold text-[#081C3A]">{formatKwacha(n)}</p>
+                    <div className="flex justify-between text-xs text-slate-500 mt-1">
+                      <span>Deductions: {formatKwacha(totalDeductions)}</span>
+                      <span className="text-red-500">Uniform/Att: {formatKwacha(p.uniform_deduction || 0)}</span>
+                    </div>
                     <div className="flex gap-2 mt-4">
                       <Button variant="outline" className="text-xs py-1.5 flex-1" onClick={(e) => { e.stopPropagation(); handlePrint(payslip); }}>
                         <Printer size={12} /> Print
@@ -1020,7 +1103,7 @@ interface PayslipPDFProps {
 
 function PayslipPDF({ payslip, month, year, onPrint, onDownload }: PayslipPDFProps) {
   const employee = payslip.employee;
-  const p = payslip.payroll;
+  const p = payslip.payroll as ExtendedPayrollRecord;
   const n = p.net_pay;
 
   return (
@@ -1059,8 +1142,8 @@ function PayslipPDF({ payslip, month, year, onPrint, onDownload }: PayslipPDFPro
             <div className="space-y-2 text-xs">
               {[
                 ['Basic Salary', p.basic_salary],
-                ['Allowances', p.allowances],
-                ['Overtime', p.overtime],
+                ['Allowances (10%)', p.allowances],
+                ['Overtime (5%)', p.overtime],
                 ['Bonus', p.bonus]
               ].map(([k, v]) => (
                 <div key={String(k)} className="flex justify-between">
@@ -1078,9 +1161,9 @@ function PayslipPDF({ payslip, month, year, onPrint, onDownload }: PayslipPDFPro
             <h3 className="text-xs font-bold text-[#081C3A] uppercase tracking-wider mb-3 pb-2 border-b border-slate-200">Deductions</h3>
             <div className="space-y-2 text-xs">
               {[
-                ['PAYE Tax', p.paye],
+                ['PAYE Tax (30%)', p.paye],
                 ['Pension (5%)', p.pension],
-                ['Uniform Deduction', p.uniform_deduction]
+                ['Uniform & Attendance', p.uniform_deduction]
               ].map(([k, v]) => (
                 <div key={String(k)} className="flex justify-between">
                   <span className="text-slate-600">{k}</span>
