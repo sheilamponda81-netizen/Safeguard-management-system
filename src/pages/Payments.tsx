@@ -99,7 +99,10 @@ export function PaymentsPage() {
   const fetchPaymentData = useCallback(async () => {
     setLoading(true);
     try {
-      let employeesQuery = supabase.from('employees').select('*');
+      let employeesQuery = supabase
+        .from('employees')
+        .select('*')
+        .eq('is_deleted', false); // <-- CRITICAL: Exclude deleted employees
       
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
@@ -700,6 +703,9 @@ export function PaymentsPage() {
           <div className="relative md:col-span-2">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input
+              id="searchPayments"
+              name="searchPayments"
+              type="text"
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder="Search by name, employee #..."
@@ -707,6 +713,8 @@ export function PaymentsPage() {
             />
           </div>
           <select
+            id="filterStatus"
+            name="filterStatus"
             value={filterStatus}
             onChange={e => setFilterStatus(e.target.value)}
             className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
@@ -714,6 +722,8 @@ export function PaymentsPage() {
             {statusOptions.map(s => <option key={s} value={s}>{s.toUpperCase()}</option>)}
           </select>
           <select
+            id="filterPayPoint"
+            name="filterPayPoint"
             value={filterPayPoint}
             onChange={e => setFilterPayPoint(e.target.value)}
             className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
@@ -722,6 +732,8 @@ export function PaymentsPage() {
           </select>
           {isSuperAdmin && (
             <select
+              id="filterRegion"
+              name="filterRegion"
               value={filterRegion}
               onChange={e => setFilterRegion(e.target.value)}
               className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
@@ -731,6 +743,8 @@ export function PaymentsPage() {
             </select>
           )}
           <input
+            id="filterCompany"
+            name="filterCompany"
             type="text"
             value={filterCompany}
             onChange={e => setFilterCompany(e.target.value.toUpperCase())}
@@ -738,6 +752,8 @@ export function PaymentsPage() {
             className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
           />
           <input
+            id="filterWorkstation"
+            name="filterWorkstation"
             type="text"
             value={filterWorkstation}
             onChange={e => setFilterWorkstation(e.target.value.toUpperCase())}
@@ -858,6 +874,7 @@ export function PaymentsPage() {
                       {/* Edit button - only visible for current month */}
                       {canEdit && (
                         <button
+                          type="button"
                           onClick={() => {
                             setEditingPayment(p);
                             setShowEditModal(true);
@@ -872,6 +889,7 @@ export function PaymentsPage() {
                       {/* Status change buttons - only for current month */}
                       {canEdit && p.status === 'pending' && (
                         <button
+                          type="button"
                           onClick={() => updatePaymentStatus(p.employee_id, 'processing')}
                           className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
                           title="Move to Processing"
@@ -883,6 +901,7 @@ export function PaymentsPage() {
                       {canEdit && p.status === 'processing' && (
                         <>
                           <button
+                            type="button"
                             onClick={() => updatePaymentStatus(p.employee_id, 'pending')}
                             className="w-7 h-7 rounded-lg hover:bg-yellow-100 text-yellow-600"
                             title="Move back to Pending"
@@ -890,6 +909,7 @@ export function PaymentsPage() {
                             <Undo size={14} />
                           </button>
                           <button
+                            type="button"
                             onClick={() => updatePaymentStatus(p.employee_id, 'paid')}
                             className="w-7 h-7 rounded-lg hover:bg-emerald-100 text-emerald-600"
                             title="Mark as Paid"
@@ -902,6 +922,7 @@ export function PaymentsPage() {
                       {canEdit && p.status === 'paid' && (
                         <>
                           <button
+                            type="button"
                             onClick={() => updatePaymentStatus(p.employee_id, 'processing')}
                             className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
                             title="Move back to Processing"
@@ -909,6 +930,7 @@ export function PaymentsPage() {
                             <Undo size={14} />
                           </button>
                           <button
+                            type="button"
                             onClick={() => updatePaymentStatus(p.employee_id, 'confirmed')}
                             className="w-7 h-7 rounded-lg hover:bg-green-100 text-green-600"
                             title="Confirm Receipt"
@@ -921,6 +943,7 @@ export function PaymentsPage() {
                       {canEdit && p.status === 'confirmed' && (
                         <>
                           <button
+                            type="button"
                             onClick={() => updatePaymentStatus(p.employee_id, 'paid')}
                             className="w-7 h-7 rounded-lg hover:bg-indigo-100 text-indigo-600"
                             title="Move back to Paid"
@@ -928,6 +951,7 @@ export function PaymentsPage() {
                             <Undo size={14} />
                           </button>
                           <button
+                            type="button"
                             onClick={() => updatePaymentStatus(p.employee_id, 'failed')}
                             className="w-7 h-7 rounded-lg hover:bg-red-100 text-red-600"
                             title="Mark as Failed"
@@ -940,6 +964,7 @@ export function PaymentsPage() {
                       {/* Failed status - can reset */}
                       {canEdit && p.status === 'failed' && (
                         <button
+                          type="button"
                           onClick={() => updatePaymentStatus(p.employee_id, 'pending')}
                           className="w-7 h-7 rounded-lg hover:bg-yellow-100 text-yellow-600"
                           title="Reset to Pending"
@@ -983,8 +1008,10 @@ export function PaymentsPage() {
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Employee</label>
+                  <label htmlFor="editEmployeeName" className="block text-sm font-medium text-slate-700 mb-1">Employee</label>
                   <input
+                    id="editEmployeeName"
+                    name="editEmployeeName"
                     type="text"
                     value={editingPayment.full_name}
                     disabled
@@ -992,8 +1019,10 @@ export function PaymentsPage() {
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Employee #</label>
+                  <label htmlFor="editEmployeeNumber" className="block text-sm font-medium text-slate-700 mb-1">Employee #</label>
                   <input
+                    id="editEmployeeNumber"
+                    name="editEmployeeNumber"
                     type="text"
                     value={editingPayment.employee_number}
                     disabled
@@ -1002,8 +1031,10 @@ export function PaymentsPage() {
                 </div>
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Account Number</label>
+                <label htmlFor="editAccountNumber" className="block text-sm font-medium text-slate-700 mb-1">Account Number</label>
                 <input
+                  id="editAccountNumber"
+                  name="editAccountNumber"
                   type="text"
                   value={editingPayment.account_number || ''}
                   onChange={(e) => setEditingPayment({...editingPayment, account_number: e.target.value})}
@@ -1012,8 +1043,10 @@ export function PaymentsPage() {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Transaction ID (Optional)</label>
+                <label htmlFor="editTransactionId" className="block text-sm font-medium text-slate-700 mb-1">Transaction ID (Optional)</label>
                 <input
+                  id="editTransactionId"
+                  name="editTransactionId"
                   type="text"
                   value={editingPayment.transaction_id || ''}
                   onChange={(e) => setEditingPayment({...editingPayment, transaction_id: e.target.value})}
@@ -1022,8 +1055,10 @@ export function PaymentsPage() {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Notes</label>
+                <label htmlFor="editNotes" className="block text-sm font-medium text-slate-700 mb-1">Notes</label>
                 <textarea
+                  id="editNotes"
+                  name="editNotes"
                   value={editingPayment.notes || ''}
                   onChange={(e) => setEditingPayment({...editingPayment, notes: e.target.value})}
                   placeholder="Add notes about this payment..."

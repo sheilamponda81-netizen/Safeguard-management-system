@@ -21,6 +21,7 @@ interface Employee {
   region_id?: string;
   company?: string;
   workstation?: string;
+  is_deleted?: boolean;
 }
 
 interface PayrollRecord {
@@ -75,10 +76,15 @@ export function ReportsPage() {
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
   const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
 
+  // Filter out deleted employees for all calculations
+  const activeEmployees = useMemo(() => {
+    return employees.filter(emp => !emp.is_deleted);
+  }, [employees]);
+
   // ===== COMPUTED DATA =====
   const departmentData = useMemo(() => {
     const deptMap: Record<string, { count: number; totalPayroll: number }> = {};
-    employees.forEach(emp => {
+    activeEmployees.forEach(emp => {
       const deptName = emp.department || 'Other';
       if (!deptMap[deptName]) {
         deptMap[deptName] = { count: 0, totalPayroll: 0 };
@@ -94,12 +100,12 @@ export function ReportsPage() {
       average: data.totalPayroll / data.count,
       attendance: (94 + Math.random() * 5).toFixed(1)
     }));
-  }, [employees, payrollRecords]);
+  }, [activeEmployees, payrollRecords]);
 
   const companyData = useMemo(() => {
     const companyMap: Record<string, CompanyStats> = {};
     
-    employees.forEach(emp => {
+    activeEmployees.forEach(emp => {
       const companyName = emp.company ? sanitizeInput(emp.company) : 'Unassigned';
       if (!companyMap[companyName]) {
         companyMap[companyName] = {
@@ -139,12 +145,12 @@ export function ReportsPage() {
       ...company,
       workstations: Object.values(company.workstations)
     }));
-  }, [employees, payrollRecords]);
+  }, [activeEmployees, payrollRecords]);
 
   const workstationData = useMemo(() => {
     const workstationMap: Record<string, { count: number; activeCount: number; payrollTotal: number; companies: Record<string, number> }> = {};
     
-    employees.forEach(emp => {
+    activeEmployees.forEach(emp => {
       const workstationName = emp.workstation ? sanitizeInput(emp.workstation) : 'Unassigned';
       const companyName = emp.company ? sanitizeInput(emp.company) : 'Unassigned';
       
@@ -174,7 +180,7 @@ export function ReportsPage() {
       totalPayroll: data.payrollTotal,
       companies: data.companies
     })).sort((a, b) => b.totalEmployees - a.totalEmployees);
-  }, [employees, payrollRecords]);
+  }, [activeEmployees, payrollRecords]);
 
   const payrollSummary = useMemo(() => {
     let totalGross = 0, totalNet = 0, totalPAYE = 0, totalPension = 0;
@@ -185,13 +191,13 @@ export function ReportsPage() {
       totalPension += record.pension || 0;
     });
     if (payrollRecords.length === 0) {
-      employees.forEach(emp => {
+      activeEmployees.forEach(emp => {
         totalGross += emp.basic_salary || 0;
         totalNet += emp.basic_salary || 0;
       });
     }
     return { totalGross, totalNet, totalPAYE, totalPension };
-  }, [payrollRecords, employees]);
+  }, [payrollRecords, activeEmployees]);
 
   const totalCompanies = useMemo(() => companyData.length, [companyData]);
   const totalWorkstations = useMemo(() => workstationData.length, [workstationData]);
@@ -213,7 +219,12 @@ export function ReportsPage() {
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      let employeesQuery = supabase.from('employees').select('*');
+      // CRITICAL: Exclude deleted employees
+      let employeesQuery = supabase
+        .from('employees')
+        .select('*')
+        .eq('is_deleted', false);
+      
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
       }
@@ -326,7 +337,7 @@ export function ReportsPage() {
         return {
           title: 'Employee Report',
           headers: ['Name', 'Employee ID', 'Company', 'Workstation', 'Position', 'Department', 'Status', 'Salary'],
-          rows: employees.map(emp => [
+          rows: activeEmployees.map(emp => [
             sanitizeInput(emp.full_name),
             sanitizeInput(emp.employee_number),
             sanitizeInput(emp.company || '-'),
@@ -341,7 +352,7 @@ export function ReportsPage() {
         return {
           title: 'Payroll Report',
           headers: ['Name', 'Position', 'Department', 'Gross Pay', 'PAYE', 'Pension', 'Net Pay'],
-          rows: employees.map(emp => {
+          rows: activeEmployees.map(emp => {
             const payroll = payrollRecords.find(p => p.employee_id === emp.id);
             return [
               sanitizeInput(emp.full_name),
@@ -358,7 +369,7 @@ export function ReportsPage() {
         return {
           title: 'Attendance Report',
           headers: ['Name', 'Position', 'Department', 'Attendance Rate', 'Status'],
-          rows: employees.map(emp => [
+          rows: activeEmployees.map(emp => [
             sanitizeInput(emp.full_name),
             sanitizeInput(emp.position),
             sanitizeInput(emp.department || '-'),
@@ -415,7 +426,7 @@ export function ReportsPage() {
           ])
         };
     }
-  }, [activeReport, employees, payrollRecords, applicants, companyData, workstationData, departmentData]);
+  }, [activeReport, activeEmployees, payrollRecords, applicants, companyData, workstationData, departmentData]);
 
   // ===== EXPORT REPORT =====
   const exportReport = useCallback(async () => {
@@ -431,13 +442,13 @@ export function ReportsPage() {
       csvContent += `\n\nSUMMARY\nTotal Gross Pay,${formatKwacha(payrollSummary.totalGross)}\nTotal Net Pay,${formatKwacha(payrollSummary.totalNet)}\n`;
     }
     if (activeReport === 'department') {
-      csvContent += `\n\nSUMMARY\nTotal Departments,${departmentData.length}\nTotal Employees,${employees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
+      csvContent += `\n\nSUMMARY\nTotal Departments,${departmentData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
     }
     if (activeReport === 'company') {
-      csvContent += `\n\nSUMMARY\nTotal Companies,${companyData.length}\nTotal Employees,${employees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
+      csvContent += `\n\nSUMMARY\nTotal Companies,${companyData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
     }
     if (activeReport === 'workstation') {
-      csvContent += `\n\nSUMMARY\nTotal Workstations,${workstationData.length}\nTotal Employees,${employees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
+      csvContent += `\n\nSUMMARY\nTotal Workstations,${workstationData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
     }
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -461,7 +472,7 @@ export function ReportsPage() {
     });
     
     alert(`${activeReport.toUpperCase()} Report exported!`);
-  }, [currentData, activeReport, selectedMonth, userProfile, payrollSummary, departmentData, employees, companyData, workstationData]);
+  }, [currentData, activeReport, selectedMonth, userProfile, payrollSummary, departmentData, activeEmployees, companyData, workstationData]);
 
   // ===== REPORT TABS =====
   const reportTabs = useMemo(() => [
@@ -501,16 +512,16 @@ export function ReportsPage() {
               </button>
               
               <select
-  value={selectedMonth}
-  onChange={(e) => handleMonthSelect(e.target.value)}
-  className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1 min-w-[140px] text-center cursor-pointer"
->
-  {availableMonths.map((month, index) => (
-    <option key={`${month}-${index}`} value={month}>
-      {getMonthLabel(month)} {month === systemMonth ? '●' : ''}
-    </option>
-  ))}
-</select>
+                value={selectedMonth}
+                onChange={(e) => handleMonthSelect(e.target.value)}
+                className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1 min-w-[140px] text-center cursor-pointer"
+              >
+                {availableMonths.map((month, index) => (
+                  <option key={`${month}-${index}`} value={month}>
+                    {getMonthLabel(month)} {month === systemMonth ? '●' : ''}
+                  </option>
+                ))}
+              </select>
               
               <button
                 onClick={goToNextMonth}
@@ -605,7 +616,7 @@ export function ReportsPage() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-xs text-slate-500">Total Employees</p>
-                <p className="text-2xl font-bold text-slate-800 mt-1">{employees.length}</p>
+                <p className="text-2xl font-bold text-slate-800 mt-1">{activeEmployees.length}</p>
                 <p className="text-xs text-slate-500 mt-1">Across all companies</p>
               </div>
               <div className="w-10 h-10 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center">

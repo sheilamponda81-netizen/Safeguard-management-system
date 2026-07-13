@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, Sparkles, ChevronLeft, ChevronRight } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { supabase } from '../lib/supabase';
@@ -9,6 +9,7 @@ import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
+import { debounce } from '../utils/debounce';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -69,6 +70,7 @@ export function AttendancePage() {
   const [showCopyModal, setShowCopyModal] = useState(false);
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<any>(null);
+  const [updating, setUpdating] = useState<Record<string, boolean>>({});
   
   const [deductionSettings, setDeductionSettings] = useState<DeductionSettings>({
     absentDeduction: 4200,
@@ -81,6 +83,10 @@ export function AttendancePage() {
   // ===== PAGINATION STATES =====
   const [attendancePage, setAttendancePage] = useState(1);
   const [attendanceItemsPerPage, setAttendanceItemsPerPage] = useState(20);
+
+  // ===== REFS =====
+  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string }>>(new Map());
+  const isProcessingUpdate = useRef(false);
 
   // ===== HELPER FUNCTIONS =====
   const getDatesForMonth = useCallback((monthYear: string) => {
@@ -135,8 +141,9 @@ export function AttendancePage() {
     try {
       let employeesQuery = supabase
         .from('employees')
-        .select('id, employee_number, full_name, position, department, status, region_id');
-      
+        .select('id, employee_number, full_name, position, department, status, region_id')
+        .eq('is_deleted', false);
+        
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
       }
@@ -184,7 +191,8 @@ export function AttendancePage() {
       const { data: regionEmployees } = await supabase
         .from('employees')
         .select('id')
-        .eq('region_id', userProfile.region_id);
+        .eq('region_id', userProfile.region_id)
+        .eq('is_deleted', false);
       const employeeIds = regionEmployees?.map(e => e.id) || [];
       if (employeeIds.length > 0) {
         query = query.in('employee_id', employeeIds);
@@ -252,34 +260,47 @@ export function AttendancePage() {
     }
   }, [selectedMonth]);
 
-  // ===== UPDATE ATTENDANCE =====
-  const updateAttendance = useCallback(async (employeeId: string, date: string, currentStatus: string) => {
-    const employee = employees.find(e => e.id === employeeId);
-    if (!userProfile?.is_super_admin && employee?.region_id !== userProfile?.region_id) {
-      alert('You can only edit attendance for employees in your region');
-      return;
-    }
+  // ===== PROCESS UPDATE QUEUE =====
+  const processUpdateQueue = useCallback(async () => {
+    if (isProcessingUpdate.current || updateQueue.current.size === 0) return;
     
-    if (selectedMonth !== systemMonth) {
-      alert('You can only edit attendance for the current month.');
-      return;
-    }
-    
-    const currentIndex = statusCycle.indexOf(currentStatus);
-    const nextIndex = (currentIndex + 1) % statusCycle.length;
-    const nextStatus = statusCycle[nextIndex];
+    isProcessingUpdate.current = true;
     
     try {
-      const tenantId = userProfile?.tenant_id;
+      const entries = Array.from(updateQueue.current.values());
+      updateQueue.current.clear();
       
-      const dateObj = new Date(date);
-      const currentMonthStr = selectedMonth;
-      const dateMonthStr = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
-      
-      if (dateMonthStr !== currentMonthStr) {
-        alert('You can only edit attendance for the current month.');
-        return;
+      // Group updates by employee for efficiency
+      const groupedUpdates: Record<string, any[]> = {};
+      for (const entry of entries) {
+        if (!groupedUpdates[entry.employeeId]) {
+          groupedUpdates[entry.employeeId] = [];
+        }
+        groupedUpdates[entry.employeeId].push(entry);
       }
+      
+      // Process each employee's updates
+      for (const [employeeId, updates] of Object.entries(groupedUpdates)) {
+        for (const update of updates) {
+          await processSingleUpdate(update.employeeId, update.date, update.status);
+        }
+      }
+    } catch (err) {
+      console.error('Error processing update queue:', err);
+    } finally {
+      isProcessingUpdate.current = false;
+      
+      // Process any new updates that came in while we were processing
+      if (updateQueue.current.size > 0) {
+        setTimeout(processUpdateQueue, 100);
+      }
+    }
+  }, []);
+
+  // ===== PROCESS SINGLE UPDATE =====
+  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string) => {
+    try {
+      const tenantId = userProfile?.tenant_id;
       
       const { data: existingRecord, error: checkError } = await supabase
         .from('attendance')
@@ -291,16 +312,12 @@ export function AttendancePage() {
       if (checkError) throw checkError;
       
       let result;
-      let oldStatus = currentStatus;
-      let newStatus = nextStatus;
-      
       if (existingRecord) {
         result = await supabase
           .from('attendance')
           .update({ status: nextStatus })
           .eq('id', existingRecord.id);
       } else {
-        oldStatus = '-';
         result = await supabase
           .from('attendance')
           .insert({ 
@@ -313,17 +330,61 @@ export function AttendancePage() {
       
       if (result.error) throw result.error;
       
+    } catch (err: any) {
+      console.error('Error processing update:', err);
+    }
+  }, [userProfile]);
+
+  // ===== OPTIMIZED: UPDATE ATTENDANCE WITH OPTIMISTIC UI =====
+  const updateAttendance = useCallback(async (employeeId: string, date: string, currentStatus: string) => {
+    const employee = employees.find(e => e.id === employeeId);
+    if (!userProfile?.is_super_admin && employee?.region_id !== userProfile?.region_id) {
+      showNotification('You can only edit attendance for employees in your region', 'error');
+      return;
+    }
+    
+    if (selectedMonth !== systemMonth) {
+      showNotification('Attendance can only be edited for the current month.', 'error');
+      return;
+    }
+    
+    const currentIndex = statusCycle.indexOf(currentStatus);
+    const nextIndex = (currentIndex + 1) % statusCycle.length;
+    const nextStatus = statusCycle[nextIndex];
+    
+    // ===== PERFORMANCE: Optimistic update - change UI immediately =====
+    const updateKey = `${employeeId}-${date}`;
+    if (updating[updateKey]) return; // Prevent double clicks
+    
+    setUpdating(prev => ({ ...prev, [updateKey]: true }));
+    
+    // Update local state immediately for fast UI response
+    setAttendance(prev => {
+      const existingIndex = prev.findIndex(a => a.employee_id === employeeId && a.date === date);
+      if (existingIndex >= 0) {
+        const updated = [...prev];
+        updated[existingIndex] = { ...updated[existingIndex], status: nextStatus };
+        return updated;
+      } else {
+        return [...prev, { id: '', employee_id: employeeId, date, status: nextStatus }];
+      }
+    });
+    
+    // Queue the update for background processing
+    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus });
+    
+    // Trigger queue processing
+    if (!isProcessingUpdate.current) {
+      setTimeout(processUpdateQueue, 50);
+    }
+    
+    // Log audit in background
+    try {
       await logAudit({
         action: 'UPDATE',
         entity_type: 'attendance',
-        entity_id: existingRecord?.id || employeeId,
-        old_data: { 
-          status: oldStatus,
-          employee_name: employee?.full_name || 'Unknown',
-          employee_number: employee?.employee_number || 'N/A'
-        },
         new_data: { 
-          status: newStatus, 
+          status: nextStatus, 
           employee_id: employeeId,
           employee_name: employee?.full_name || 'Unknown',
           employee_number: employee?.employee_number || 'N/A',
@@ -332,14 +393,22 @@ export function AttendancePage() {
         },
         region_id: userProfile?.region_id
       });
-      
-      await fetchData();
-      
-    } catch (err: any) {
-      console.error('Error updating attendance:', err);
-      alert('Failed to update attendance: ' + err.message);
+    } catch (err) {
+      console.error('Error logging audit:', err);
+    } finally {
+      setUpdating(prev => {
+        const newState = { ...prev };
+        delete newState[updateKey];
+        return newState;
+      });
     }
-  }, [employees, userProfile, selectedMonth, systemMonth, fetchData]);
+  }, [employees, userProfile, selectedMonth, systemMonth, updating, processUpdateQueue]);
+
+  // ===== DEBOUNCED UPDATE =====
+  const debouncedUpdate = useMemo(
+    () => debounce(updateAttendance, 150),
+    [updateAttendance]
+  );
 
   // ===== GET ATTENDANCE STATUS =====
   const getAttendanceStatus = useCallback((employeeId: string, date: string): string => {
@@ -493,7 +562,7 @@ export function AttendancePage() {
       region_id: userProfile?.region_id
     });
     
-    alert('Attendance report exported!');
+    showNotification('Attendance report exported!', 'success');
   }, [filteredEmployees, dates, selectedMonth, userProfile, getEmployeeStats, calculateEmployeeDeductions, getAttendanceStatus]);
 
   // ===== COPY FROM PREVIOUS MONTH =====
@@ -517,7 +586,8 @@ export function AttendancePage() {
       const { data: regionEmployees } = await supabase
         .from('employees')
         .select('id')
-        .eq('region_id', userProfile.region_id);
+        .eq('region_id', userProfile.region_id)
+        .eq('is_deleted', false);
       const employeeIds = regionEmployees?.map(e => e.id) || [];
       if (employeeIds.length > 0) {
         sourceQuery = sourceQuery.in('employee_id', employeeIds);
@@ -685,14 +755,14 @@ export function AttendancePage() {
         });
 
         setSavedSuccess(true);
-        alert(`Deductions saved for ${selectedEmployee.full_name}`);
+        showNotification(`Deductions saved for ${selectedEmployee.full_name}`, 'success');
         await fetchData();
         setTimeout(() => {
           setSelectedEmployee(null);
         }, 2000);
       } catch (err: any) {
         console.error('Error saving deductions:', err);
-        alert('Failed to save deductions: ' + err.message);
+        showNotification('Failed to save deductions: ' + err.message, 'error');
       } finally {
         setSaving(false);
       }
@@ -1024,6 +1094,9 @@ export function AttendancePage() {
         <div className="relative flex-1">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input 
+            id="searchAttendance"
+            name="searchAttendance"
+            type="text"
             value={search} 
             onChange={e => setSearch(sanitizeInput(e.target.value))} 
             placeholder="Search employees..." 
@@ -1077,17 +1150,23 @@ export function AttendancePage() {
                     <TD className="hidden md:table-cell text-xs">{emp.position}</TD>
                     {dates.map((date, i) => {
                       const status = getAttendanceStatus(emp.id, date);
+                      const updateKey = `${emp.id}-${date}`;
+                      const isUpdating = updating[updateKey];
                       return (
                         <td key={i} className="px-1 py-3 text-center" onClick={(e) => { 
                           e.stopPropagation(); 
-                          if (isEditable) {
-                            updateAttendance(emp.id, date, status);
-                          } else {
+                          if (isEditable && !isUpdating) {
+                            debouncedUpdate(emp.id, date, status);
+                          } else if (!isEditable) {
                             showNotification('Attendance can only be edited for the current month.', 'info');
                           }
                         }}>
-                          <div className={`w-6 h-6 mx-auto rounded text-[10px] font-semibold text-white flex items-center justify-center ${!isEditable ? 'cursor-not-allowed opacity-70' : 'cursor-pointer hover:opacity-80'} transition-opacity ${statusColors[status]}`}>
-                            {status}
+                          <div className={`w-6 h-6 mx-auto rounded text-[10px] font-semibold text-white flex items-center justify-center ${!isEditable ? 'cursor-not-allowed opacity-70' : isUpdating ? 'opacity-50' : 'cursor-pointer hover:opacity-80'} transition-opacity ${statusColors[status]}`}>
+                            {isUpdating ? (
+                              <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                            ) : (
+                              status
+                            )}
                           </div>
                         </td>
                       );

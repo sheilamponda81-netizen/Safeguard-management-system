@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, Wallet, Calculator, Check, FileText, CheckCircle2, ChevronRight, Save, TrendingUp, Users, DollarSign, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon } from 'lucide-react';
+import { Search, Wallet, Calculator, Check, FileText, CheckCircle2, ChevronRight, Save, TrendingUp, Users, DollarSign, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon, UserCheck, Clock, XCircle } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -19,6 +19,7 @@ interface Employee {
   department: string;
   basic_salary: number;
   status: string;
+  is_deleted?: boolean;
 }
 
 interface PayrollRecord {
@@ -35,6 +36,10 @@ interface PayrollRecord {
   uniform_deduction: number;
   net_pay: number;
   processed_at: string;
+  approval_status?: string;
+  approved_by?: string;
+  approved_at?: string;
+  approval_notes?: string;
 }
 
 interface EmployeeDeduction {
@@ -62,6 +67,7 @@ export function PayrollPage() {
   const [systemMonth, setSystemMonth] = useState('');
   const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [showApprovalModal, setShowApprovalModal] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [processed, setProcessed] = useState(false);
   const [editingValues, setEditingValues] = useState<Record<string, Partial<PayrollRecord>>>({});
@@ -74,6 +80,10 @@ export function PayrollPage() {
   const [canProcessPayroll, setCanProcessPayroll] = useState(false);
   const [canEditPayroll, setCanEditPayroll] = useState(false);
   const [canViewPayroll, setCanViewPayroll] = useState(false);
+  const [canApprovePayroll, setCanApprovePayroll] = useState(false);
+  const [approvalNotes, setApprovalNotes] = useState('');
+  const [approvalStatus, setApprovalStatus] = useState<'approved' | 'rejected' | null>(null);
+  const [isApproved, setIsApproved] = useState(false);
 
   // ===== PAGINATION STATES =====
   const [payrollPage, setPayrollPage] = useState(1);
@@ -83,6 +93,19 @@ export function PayrollPage() {
   const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
   const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
   const isMonthProcessed = useMemo(() => processedMonths.includes(selectedMonth), [processedMonths, selectedMonth]);
+
+  // Check if the current month's payroll is approved
+  const isMonthApproved = useMemo(() => {
+    if (payrollRecords.length === 0) return false;
+    // Check if all payroll records for this month are approved
+    return payrollRecords.every(record => record.approval_status === 'approved');
+  }, [payrollRecords]);
+
+  // Check if payroll has been processed (has records) but not yet approved
+  const isPendingApproval = useMemo(() => {
+    if (payrollRecords.length === 0) return false;
+    return !isMonthApproved && payrollRecords.some(record => record.approval_status !== 'approved');
+  }, [payrollRecords, isMonthApproved]);
 
   // ===== FILTER EMPLOYEES =====
   const filteredEmployees = useMemo(() => {
@@ -122,6 +145,8 @@ export function PayrollPage() {
       setCanProcessPayroll(isSuperAdmin || roleLevel === 1);
       setCanEditPayroll(isSuperAdmin || roleLevel <= 2);
       setCanViewPayroll(isSuperAdmin || roleLevel <= 3);
+      // Approvers: Super Admins and role level 1 (Managers)
+      setCanApprovePayroll(isSuperAdmin || roleLevel === 1);
     }
   }, []);
 
@@ -149,10 +174,13 @@ const fetchProcessedMonths = useCallback(async () => {
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
+      // CRITICAL: Only fetch active employees (not deleted)
       const { data: employeesData, error: empError } = await supabase
         .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, status')
+        .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted')
+        .eq('is_deleted', false)
         .eq('status', 'Active');
+        
       
       if (empError) throw empError;
       setEmployees(employeesData || []);
@@ -164,6 +192,14 @@ const fetchProcessedMonths = useCallback(async () => {
       
       if (payError) throw payError;
       setPayrollRecords(payrollData || []);
+      
+      // Check approval status
+      if (payrollData && payrollData.length > 0) {
+        const allApproved = payrollData.every(r => r.approval_status === 'approved');
+        setIsApproved(allApproved);
+      } else {
+        setIsApproved(false);
+      }
       
       const { data: deductionsData, error: dedError } = await supabase
         .from('employee_deductions')
@@ -220,7 +256,11 @@ const fetchProcessedMonths = useCallback(async () => {
       pension,
       uniform_deduction: uniformDeduction,
       net_pay: netPay,
-      processed_at: new Date().toISOString()
+      processed_at: new Date().toISOString(),
+      approval_status: 'pending',
+      approved_by: null,
+      approved_at: null,
+      approval_notes: null
     };
   }, [selectedMonth, getEmployeeDeduction]);
 
@@ -258,12 +298,16 @@ const fetchProcessedMonths = useCallback(async () => {
       showNotification('You do not have permission to edit payroll values', 'error');
       return;
     }
+    if (isApproved) {
+      showNotification('Cannot edit approved payroll. Please unapprove first.', 'error');
+      return;
+    }
     const safeValue = Math.max(0, Number(value) || 0);
     setEditingValues(prev => ({
       ...prev,
       [employeeId]: { ...prev[employeeId], [field]: safeValue }
     }));
-  }, [canEditPayroll]);
+  }, [canEditPayroll, isApproved]);
 
   // ===== INITIALIZATION =====
   useEffect(() => {
@@ -369,7 +413,11 @@ const fetchProcessedMonths = useCallback(async () => {
         pension: record.pension || 0,
         uniform_deduction: record.uniform_deduction || 0,
         net_pay: record.net_pay,
-        processed_at: new Date().toISOString()
+        processed_at: new Date().toISOString(),
+        approval_status: 'pending',
+        approved_by: null,
+        approved_at: null,
+        approval_notes: null
       }));
       
       const { data: inserted, error: insertError } = await supabase
@@ -397,6 +445,7 @@ const fetchProcessedMonths = useCallback(async () => {
       await fetchData();
       await fetchProcessedMonths();
       setHasData(true);
+      setIsApproved(false);
       setShowCopyModal(false);
       alert(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${inserted?.length || 0} records copied.`);
     } catch (err: any) {
@@ -406,6 +455,78 @@ const fetchProcessedMonths = useCallback(async () => {
       setProcessingStatus('');
     }
   }, [canProcessPayroll, selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
+
+  // ===== APPROVE PAYROLL =====
+  const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
+    if (!canApprovePayroll) {
+      alert('You do not have permission to approve payroll. Only managers and admins can approve.');
+      return;
+    }
+
+    if (payrollRecords.length === 0) {
+      alert('No payroll records to approve. Please process payroll first.');
+      return;
+    }
+
+    if (status === 'rejected' && !approvalNotes.trim()) {
+      alert('Please provide a reason for rejection.');
+      return;
+    }
+
+    setProcessing(true);
+    setProcessingStatus(status === 'approved' ? 'Approving payroll...' : 'Rejecting payroll...');
+
+    try {
+      const updateData = {
+        approval_status: status,
+        approved_by: userProfile?.id || null,
+        approved_at: new Date().toISOString(),
+        approval_notes: approvalNotes || null
+      };
+
+      // Update all payroll records for this month
+      const { error } = await supabase
+        .from('payroll')
+        .update(updateData)
+        .eq('month', selectedMonth);
+
+      if (error) throw error;
+
+      await logAudit({
+        action: status === 'approved' ? 'APPROVE' : 'REJECT',
+        entity_type: 'payroll',
+        new_data: {
+          month: selectedMonth,
+          status: status,
+          notes: approvalNotes,
+          recordsCount: payrollRecords.length,
+          approved_by: userProfile?.full_name || userProfile?.email
+        },
+        region_id: userProfile?.region_id
+      });
+
+      if (status === 'approved') {
+        setIsApproved(true);
+        showNotification(`✅ Payroll for ${getMonthLabel(selectedMonth)} has been approved!`, 'success');
+      } else {
+        setIsApproved(false);
+        showNotification(`❌ Payroll for ${getMonthLabel(selectedMonth)} has been rejected. Please review and reprocess.`, 'error');
+      }
+
+      setShowApprovalModal(false);
+      setApprovalNotes('');
+      setApprovalStatus(null);
+      await fetchData();
+      await fetchProcessedMonths();
+
+    } catch (err: any) {
+      console.error('Error approving payroll:', err);
+      alert('Failed to approve payroll: ' + err.message);
+    } finally {
+      setProcessing(false);
+      setProcessingStatus('');
+    }
+  }, [canApprovePayroll, payrollRecords, selectedMonth, userProfile, approvalNotes, fetchData, fetchProcessedMonths]);
 
   // ===== PROCESS PAYROLL =====
   const processPayroll = useCallback(async () => {
@@ -457,7 +578,11 @@ const fetchProcessedMonths = useCallback(async () => {
           pension: payroll.pension,
           uniform_deduction: payroll.uniform_deduction,
           net_pay: payroll.net_pay,
-          processed_at: new Date().toISOString()
+          processed_at: new Date().toISOString(),
+          approval_status: 'pending',
+          approved_by: null,
+          approved_at: null,
+          approval_notes: null
         });
       }
       
@@ -494,7 +619,8 @@ const fetchProcessedMonths = useCallback(async () => {
           totalGross: totalGross,
           totalNet: totalNet,
           totalDeductions: totalDeductions,
-          recordsSaved: insertedData?.length || 0
+          recordsSaved: insertedData?.length || 0,
+          status: 'pending_approval'
         },
         region_id: userProfile?.region_id
       });
@@ -505,10 +631,11 @@ const fetchProcessedMonths = useCallback(async () => {
       setProcessed(true);
       setShowConfirmModal(false);
       setEditingValues({});
+      setIsApproved(false);
       
       setTimeout(() => setProcessed(false), 5000);
       
-      alert(`✅ Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${insertedData?.length || 0} employees processed.`);
+      alert(`✅ Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${insertedData?.length || 0} employees processed.\n\n⚠️ The payroll is now pending approval by a manager or admin.`);
       
     } catch (err: any) {
       console.error('❌ Error processing payroll:', err);
@@ -543,7 +670,7 @@ const fetchProcessedMonths = useCallback(async () => {
     <div className="space-y-6 animate-fade-in">
       <PageHeader
         title="Payroll Management"
-        subtitle={`${getMonthLabel(selectedMonth)} Payroll Run · ${isCurrentMonth ? 'Current Month' : isFutureMonthSelected ? 'Future Month (View Only)' : 'Past Month (View Only)'}${isMonthProcessed ? ' ✅ Processed' : ''}`}
+        subtitle={`${getMonthLabel(selectedMonth)} Payroll Run · ${isCurrentMonth ? 'Current Month' : isFutureMonthSelected ? 'Future Month (View Only)' : 'Past Month (View Only)'}${isMonthProcessed ? ' ✅ Processed' : ''}${isApproved ? ' ✅ Approved' : ''}${isPendingApproval ? ' ⏳ Pending Approval' : ''}`}
         actions={
           <div className="flex gap-2 items-center">
             <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-2 py-1">
@@ -587,11 +714,40 @@ const fetchProcessedMonths = useCallback(async () => {
               </button>
             )}
 
+            {/* Approval Button - Show when payroll is processed and pending approval */}
+            {canApprovePayroll && isMonthProcessed && !isApproved && isCurrentMonth && (
+              <Button 
+                variant="secondary" 
+                onClick={() => {
+                  setApprovalStatus(null);
+                  setApprovalNotes('');
+                  setShowApprovalModal(true);
+                }}
+                disabled={processing || payrollRecords.length === 0}
+              >
+                <UserCheck size={16} className="mr-1" />
+                Review & Approve
+              </Button>
+            )}
+
+            {/* Show approval status badge */}
+            {isApproved && (
+              <Badge color="green" className="text-sm px-3 py-1">
+                <CheckCircle2 size={14} className="mr-1" /> Approved
+              </Badge>
+            )}
+
+            {isPendingApproval && !isApproved && (
+              <Badge color="yellow" className="text-sm px-3 py-1">
+                <Clock size={14} className="mr-1" /> Pending Approval
+              </Badge>
+            )}
+
             {canProcessPayroll && isCurrentMonth && (
               <Button 
                 variant={isMonthProcessed ? "outline" : "secondary"} 
                 onClick={() => setShowConfirmModal(true)}
-                disabled={processing}
+                disabled={processing || isApproved}
               >
                 {processing ? (
                   <span className="flex items-center gap-2">
@@ -625,6 +781,57 @@ const fetchProcessedMonths = useCallback(async () => {
           <div className="flex items-center gap-3">
             <div className="w-5 h-5 border-2 border-[#D4A017] border-t-transparent rounded-full animate-spin" />
             <span className="text-sm text-slate-700">{processingStatus}</span>
+          </div>
+        </Card>
+      )}
+
+      {/* Approval Status Banner */}
+      {isApproved && (
+        <Card className="p-4 bg-emerald-50 border-emerald-200 border">
+          <div className="flex items-start gap-3">
+            <CheckCircle2 size={20} className="text-emerald-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-emerald-800">✅ Payroll Approved</p>
+              <p className="text-sm text-emerald-700">
+                This payroll has been approved and is ready for payment processing.
+                {payrollRecords[0]?.approved_by && (
+                  <span className="block text-xs text-emerald-600 mt-1">
+                    Approved by: {payrollRecords[0]?.approved_by} at {payrollRecords[0]?.approved_at ? new Date(payrollRecords[0].approved_at).toLocaleString() : ''}
+                  </span>
+                )}
+                {payrollRecords[0]?.approval_notes && (
+                  <span className="block text-xs text-emerald-600 mt-1">
+                    Notes: {payrollRecords[0].approval_notes}
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {isPendingApproval && !isApproved && (
+        <Card className="p-4 bg-yellow-50 border-yellow-200 border">
+          <div className="flex items-start gap-3">
+            <Clock size={20} className="text-yellow-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-yellow-800">⏳ Pending Approval</p>
+              <p className="text-sm text-yellow-700">
+                This payroll has been processed and is waiting for manager/admin approval.
+                {canApprovePayroll && (
+                  <button 
+                    onClick={() => {
+                      setApprovalStatus(null);
+                      setApprovalNotes('');
+                      setShowApprovalModal(true);
+                    }}
+                    className="ml-2 text-[#D4A017] hover:underline font-medium"
+                  >
+                    Review & Approve Now
+                  </button>
+                )}
+              </p>
+            </div>
           </div>
         </Card>
       )}
@@ -783,6 +990,9 @@ const fetchProcessedMonths = useCallback(async () => {
         <div className="relative flex-1">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input 
+            id="searchPayroll"
+            name="searchPayroll"
+            type="text"
             value={search} 
             onChange={e => setSearch(sanitizeInput(e.target.value))} 
             placeholder="Search employees..." 
@@ -800,6 +1010,9 @@ const fetchProcessedMonths = useCallback(async () => {
         )}
         {isMonthProcessed && (
           <Badge color="green" className="text-xs">✅ Processed</Badge>
+        )}
+        {isApproved && (
+          <Badge color="green" className="text-xs">✅ Approved</Badge>
         )}
       </Card>
 
@@ -839,7 +1052,7 @@ const fetchProcessedMonths = useCallback(async () => {
                 const p = getDisplayPayroll(emp);
                 const deduction = getEmployeeDeduction(emp.id);
                 const hasDeduction = deduction && deduction.total_deductions > 0;
-                const isEditable = canEditPayroll && !payrollRecords.find(r => r.employee_id === emp.id) && isCurrentMonth && !isMonthProcessed;
+                const isEditable = canEditPayroll && !payrollRecords.find(r => r.employee_id === emp.id) && isCurrentMonth && !isMonthProcessed && !isApproved;
                 
                 return (
                   <TR key={emp.id}>
@@ -857,6 +1070,9 @@ const fetchProcessedMonths = useCallback(async () => {
                           {!isEditable && payrollRecords.find(r => r.employee_id === emp.id) && (
                             <Badge color="gray" className="text-[10px] mt-0.5">Processed</Badge>
                           )}
+                          {isApproved && (
+                            <Badge color="green" className="text-[10px] mt-0.5">✅ Approved</Badge>
+                          )}
                         </div>
                       </div>
                     </TD>
@@ -864,6 +1080,8 @@ const fetchProcessedMonths = useCallback(async () => {
                     <TD className="text-right">
                       {isEditable ? (
                         <input 
+                          id={`basic-${emp.id}`}
+                          name={`basic-${emp.id}`}
                           type="number" 
                           value={p.basic_salary} 
                           onChange={e => updateField(emp.id, 'basic_salary', Number(e.target.value))} 
@@ -876,6 +1094,8 @@ const fetchProcessedMonths = useCallback(async () => {
                     <TD className="text-right">
                       {isEditable ? (
                         <input 
+                          id={`allowances-${emp.id}`}
+                          name={`allowances-${emp.id}`}
                           type="number" 
                           value={p.allowances} 
                           onChange={e => updateField(emp.id, 'allowances', Number(e.target.value))} 
@@ -888,6 +1108,8 @@ const fetchProcessedMonths = useCallback(async () => {
                     <TD className="text-right">
                       {isEditable ? (
                         <input 
+                          id={`overtime-${emp.id}`}
+                          name={`overtime-${emp.id}`}
                           type="number" 
                           value={p.overtime} 
                           onChange={e => updateField(emp.id, 'overtime', Number(e.target.value))} 
@@ -900,6 +1122,8 @@ const fetchProcessedMonths = useCallback(async () => {
                     <TD className="text-right">
                       {isEditable ? (
                         <input 
+                          id={`bonus-${emp.id}`}
+                          name={`bonus-${emp.id}`}
                           type="number" 
                           value={p.bonus} 
                           onChange={e => updateField(emp.id, 'bonus', Number(e.target.value))} 
@@ -940,6 +1164,7 @@ const fetchProcessedMonths = useCallback(async () => {
         onItemsPerPageChange={setPayrollItemsPerPage}
       />
 
+      {/* Process Payroll Confirmation Modal */}
       <Modal open={showConfirmModal} onClose={() => setShowConfirmModal(false)} title={`${isMonthProcessed ? 'Reprocess' : 'Process'} Payroll — ${getMonthLabel(selectedMonth)}`} size="lg">
         <div className="space-y-4">
           <div className={`p-4 rounded-lg text-sm flex items-start gap-3 ${isMonthProcessed ? 'bg-amber-50' : 'bg-[#E8EDF5]'}`}>
@@ -950,6 +1175,11 @@ const fetchProcessedMonths = useCallback(async () => {
                 ? ` You are about to reprocess payroll for ${getMonthLabel(selectedMonth)}. This will overwrite all existing payroll data for this month.`
                 : ` You are about to process payroll for ${employees.length} employees for the period ${getMonthLabel(selectedMonth)}.`
               }
+              {!isMonthProcessed && (
+                <p className="mt-2 text-sm text-amber-600">
+                  ⚠️ After processing, the payroll will be pending approval by a manager or admin.
+                </p>
+              )}
             </div>
           </div>
           
@@ -1008,6 +1238,103 @@ const fetchProcessedMonths = useCallback(async () => {
         </div>
       </Modal>
 
+      {/* Approval Modal */}
+      <Modal open={showApprovalModal} onClose={() => { setShowApprovalModal(false); setApprovalNotes(''); }} title="Review & Approve Payroll" size="lg">
+        <div className="space-y-4">
+          <div className="p-4 rounded-lg bg-[#E8EDF5] text-sm">
+            <p className="font-semibold text-slate-800">Payroll Summary</p>
+            <div className="grid grid-cols-2 gap-2 mt-2">
+              <div>
+                <p className="text-xs text-slate-500">Month</p>
+                <p className="font-medium">{getMonthLabel(selectedMonth)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Employees</p>
+                <p className="font-medium">{payrollRecords.length}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Total Gross Pay</p>
+                <p className="font-medium text-emerald-700">{formatKwacha(totals.gross)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Total Net Pay</p>
+                <p className="font-medium text-[#081C3A]">{formatKwacha(totals.net)}</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="max-h-60 overflow-y-auto border border-slate-200 rounded-lg">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50">
+                <tr>
+                  <th className="px-3 py-2 text-left text-xs font-medium text-slate-500">Employee</th>
+                  <th className="px-3 py-2 text-right text-xs font-medium text-slate-500">Gross Pay</th>
+                  <th className="px-3 py-2 text-right text-xs font-medium text-slate-500">Deductions</th>
+                  <th className="px-3 py-2 text-right text-xs font-medium text-slate-500">Net Pay</th>
+                </tr>
+              </thead>
+              <tbody>
+                {payrollRecords.slice(0, 10).map(record => {
+                  const emp = employees.find(e => e.id === record.employee_id);
+                  return (
+                    <tr key={record.id} className="border-t border-slate-100">
+                      <td className="px-3 py-2 text-xs">{emp?.full_name || 'Unknown'}</td>
+                      <td className="px-3 py-2 text-right text-xs">{formatKwacha(record.gross_pay)}</td>
+                      <td className="px-3 py-2 text-right text-xs text-red-600">
+                        {formatKwacha(record.paye + record.pension + record.uniform_deduction)}
+                      </td>
+                      <td className="px-3 py-2 text-right text-xs font-semibold">{formatKwacha(record.net_pay)}</td>
+                    </tr>
+                  );
+                })}
+                {payrollRecords.length > 10 && (
+                  <tr className="border-t border-slate-100">
+                    <td colSpan={4} className="px-3 py-2 text-center text-xs text-slate-500">
+                      ... and {payrollRecords.length - 10} more employees
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div>
+            <label htmlFor="approvalNotes" className="block text-sm font-medium text-slate-700 mb-1">
+              Approval Notes (Required for rejection)
+            </label>
+            <textarea
+              id="approvalNotes"
+              name="approvalNotes"
+              value={approvalNotes}
+              onChange={(e) => setApprovalNotes(e.target.value)}
+              placeholder="Add any notes about this approval..."
+              rows={3}
+              className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-4 border-t border-slate-100">
+            <Button variant="outline" onClick={() => { setShowApprovalModal(false); setApprovalNotes(''); }}>
+              Cancel
+            </Button>
+            <Button 
+              variant="danger" 
+              onClick={() => approvePayroll('rejected')} 
+              disabled={processing}
+            >
+              <XCircle size={14} className="mr-1" /> Reject
+            </Button>
+            <Button 
+              variant="secondary" 
+              onClick={() => approvePayroll('approved')} 
+              disabled={processing}
+            >
+              <CheckCircle2 size={14} className="mr-1" /> Approve Payroll
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
       {processed && (
         <div className="fixed bottom-4 right-4 z-50 p-4 rounded-xl bg-emerald-600 text-white shadow-2xl animate-fade-in max-w-sm">
           <div className="flex items-start gap-3">
@@ -1018,6 +1345,7 @@ const fetchProcessedMonths = useCallback(async () => {
               {totals.uniformDeductions > 0 && (
                 <p className="text-sm opacity-80 mt-1">Including {formatKwacha(totals.uniformDeductions)} in deductions</p>
               )}
+              <p className="text-sm opacity-80 mt-1">⏳ Pending approval by manager/admin</p>
             </div>
             <button onClick={() => setProcessed(false)} className="ml-4 text-white/80 hover:text-white">✕</button>
           </div>

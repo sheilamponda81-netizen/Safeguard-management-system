@@ -3,7 +3,7 @@ import {
   Search, Shield, MapPin, Download, Edit2, Trash2, UserPlus, X, 
   ChevronLeft, ChevronRight, Calendar, Lock, AlertCircle, RefreshCw,
   Eye, CheckCircle, XCircle, Clock, User, Briefcase, Building2,
-  Shirt, Footprints, HardHat, ClipboardList, Filter, ChevronDown
+  Shirt, Footprints, HardHat, ClipboardList, Filter, ChevronDown, Save
 } from '../utils/icons';
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Input } from '../components/ui';
 import { supabase } from '../lib/supabase';
@@ -61,7 +61,6 @@ export function SecurityPage() {
   const [filterShift, setFilterShift] = useState('all');
   const [filterStatus, setFilterStatus] = useState('all');
   const [filterUniform, setFilterUniform] = useState('all');
-  const [initialFetchDone, setInitialFetchDone] = useState(false);
 
   // ===== PAGINATION =====
   const [currentPage, setCurrentPage] = useState(1);
@@ -69,14 +68,9 @@ export function SecurityPage() {
 
   // ===== REFS =====
   const isMounted = useRef(true);
-  const fetchInProgress = useRef(false);
+  const initialFetchDone = useRef(false);
 
   // ===== SITES, SHIFTS, SUPERVISORS =====
-  const sitesList = [
-    'Reserve Bank of Malawi', 'Illovo Sugar HQ', 'NBS Bank Towers', 'Standard Bank Plaza',
-    'Old Mutual Centre', 'Mzuzu Coffee Estates', 'Castel Brewery', 'Sunbird Capital Hotel'
-  ];
-  
   const shiftsList = ['Morning (06-14)', 'Afternoon (14-22)', 'Night (22-06)', '24hr Rotation'];
   const supervisorsList = ['William Banda', 'Agnes Phiri', 'John Mwanza', 'Felix Soko'];
   
@@ -165,12 +159,8 @@ export function SecurityPage() {
 
   // ===== FETCH SECURITY DATA =====
   const fetchSecurityData = useCallback(async () => {
-    if (fetchInProgress.current) {
-      console.log('Fetch already in progress, skipping...');
-      return;
-    }
+    if (!isMounted.current) return;
     
-    fetchInProgress.current = true;
     setLoading(true);
     setFetchError(null);
     
@@ -183,18 +173,23 @@ export function SecurityPage() {
         } else {
           setFetchError('Unable to load user profile');
           setLoading(false);
-          fetchInProgress.current = false;
           return;
         }
       }
       
       console.log('Fetching security data for region:', profile?.region_id);
       
+      // Build the query - exclude deleted employees
       let query = supabase
         .from('employees')
         .select('*')
-        .or('position.ilike.%guard%,position.ilike.%security%,position.ilike.%officer%,position.ilike.%patrol%,position.ilike.%supervisor%');
+        .eq('is_deleted', false);
       
+      // Filter by security-related positions
+      const positionFilter = 'position.ilike.%guard%,position.ilike.%security%,position.ilike.%officer%,position.ilike.%patrol%,position.ilike.%supervisor%';
+      query = query.or(positionFilter);
+      
+      // Region filter for non-super admins
       if (!profile?.is_super_admin && profile?.region_id) {
         query = query.eq('region_id', profile.region_id);
       }
@@ -206,7 +201,6 @@ export function SecurityPage() {
         setFetchError('Database error: ' + error.message);
         setSecurityData([]);
         setLoading(false);
-        fetchInProgress.current = false;
         return;
       }
       
@@ -215,8 +209,6 @@ export function SecurityPage() {
       if (!data || data.length === 0) {
         setSecurityData([]);
         setLoading(false);
-        fetchInProgress.current = false;
-        setInitialFetchDone(true);
         return;
       }
       
@@ -245,7 +237,6 @@ export function SecurityPage() {
       
       if (isMounted.current) {
         setSecurityData(enhancedData);
-        setInitialFetchDone(true);
       }
     } catch (err: any) {
       console.error('Error in fetchSecurityData:', err);
@@ -257,27 +248,31 @@ export function SecurityPage() {
       if (isMounted.current) {
         setLoading(false);
       }
-      fetchInProgress.current = false;
     }
   }, [userProfile, fetchUserProfile, shiftsList, supervisorsList]);
 
   // ===== INITIALIZATION - Run once on mount =====
   useEffect(() => {
-    if (!initialFetchDone && !fetchInProgress.current) {
-      fetchSecurityData();
-    }
+    isMounted.current = true;
+    
+    const init = async () => {
+      if (!initialFetchDone.current) {
+        await fetchSecurityData();
+        initialFetchDone.current = true;
+      }
+    };
+    
+    init();
     
     return () => {
       isMounted.current = false;
     };
-  }, []);
+  }, [fetchSecurityData]);
 
   // ===== REFRESH - Manual refresh function =====
   const refreshData = useCallback(() => {
-    if (!fetchInProgress.current) {
-      setInitialFetchDone(false);
-      fetchSecurityData();
-    }
+    initialFetchDone.current = false;
+    fetchSecurityData();
   }, [fetchSecurityData]);
 
   // ===== ADD GUARD =====
@@ -363,7 +358,8 @@ export function SecurityPage() {
             next_of_kin_phone: newGuard.emergency_phone || '',
             guardId: newGuard.guardId || `G-${Math.floor(Math.random() * 1000)}`,
             hire_date: new Date().toISOString().split('T')[0],
-            department: 'Operations'
+            department: 'Operations',
+            is_deleted: false
           }])
           .select();
 
@@ -497,7 +493,12 @@ export function SecurityPage() {
         
         const { error } = await supabase
           .from('employees')
-          .delete()
+          .update({
+            is_deleted: true,
+            status: 'Deleted',
+            deleted_at: new Date().toISOString(),
+            deleted_reason: 'Removed from security personnel'
+          })
           .eq('id', item.id);
           
         if (error) throw error;
@@ -578,7 +579,7 @@ export function SecurityPage() {
   }, []);
 
   // ===== RENDER =====
-  if (loading && !initialFetchDone) {
+  if (loading) {
     return (
       <div className="flex flex-col items-center justify-center py-12">
         <div className="w-12 h-12 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin mb-4" />
@@ -678,6 +679,9 @@ export function SecurityPage() {
           <div className="relative">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input 
+              id="searchSecurity"
+              name="searchSecurity"
+              type="text"
               value={search} 
               onChange={e => setSearch(e.target.value)} 
               placeholder="Search guards..." 
@@ -685,6 +689,8 @@ export function SecurityPage() {
             />
           </div>
           <select
+            id="filterShift"
+            name="filterShift"
             value={filterShift}
             onChange={e => setFilterShift(e.target.value)}
             className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
@@ -693,6 +699,8 @@ export function SecurityPage() {
             {shiftsList.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
           <select
+            id="filterStatus"
+            name="filterStatus"
             value={filterStatus}
             onChange={e => setFilterStatus(e.target.value)}
             className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
@@ -701,6 +709,8 @@ export function SecurityPage() {
             {guardStatusList.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
           <select
+            id="filterUniform"
+            name="filterUniform"
             value={filterUniform}
             onChange={e => setFilterUniform(e.target.value)}
             className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
@@ -790,6 +800,7 @@ export function SecurityPage() {
                       <td className="px-4 py-3 text-right">
                         <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
                           <button 
+                            type="button"
                             onClick={() => handleView(emp)} 
                             className="w-7 h-7 rounded-lg hover:bg-slate-100 text-blue-600 flex items-center justify-center"
                             title="View Details"
@@ -797,6 +808,7 @@ export function SecurityPage() {
                             <Eye size={14} />
                           </button>
                           <button 
+                            type="button"
                             onClick={() => handleEdit(emp)} 
                             className="w-7 h-7 rounded-lg hover:bg-slate-100 text-amber-600 flex items-center justify-center"
                             title="Edit"
@@ -804,6 +816,7 @@ export function SecurityPage() {
                             <Edit2 size={14} />
                           </button>
                           <button 
+                            type="button"
                             onClick={() => handleDelete(emp)} 
                             className="w-7 h-7 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"
                             title="Delete"
@@ -835,7 +848,6 @@ export function SecurityPage() {
         <AddGuardForm 
           onAdd={handleAddGuard} 
           onCancel={() => setShowAddModal(false)}
-          sitesList={sitesList}
           shiftsList={shiftsList}
           supervisorsList={supervisorsList}
           uniformStatusList={uniformStatusList}
@@ -855,7 +867,6 @@ export function SecurityPage() {
             guard={editingItem}
             onSave={saveEdit} 
             onCancel={() => { setShowEditModal(false); setEditingItem(null); }}
-            sitesList={sitesList}
             shiftsList={shiftsList}
             supervisorsList={supervisorsList}
             uniformStatusList={uniformStatusList}
@@ -875,8 +886,8 @@ export function SecurityPage() {
   );
 }
 
-// ===== IMPROVED ADD GUARD FORM WITH SEARCHABLE EMPLOYEE SELECTOR =====
-function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList, userRegion, isSuperAdmin }: any) {
+// ===== ADD GUARD FORM =====
+function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList, userRegion, isSuperAdmin }: any) {
   const [formData, setFormData] = useState({
     employee_id: '',
     full_name: '',
@@ -908,7 +919,7 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
   const inputRef = useRef<HTMLInputElement>(null);
   const [selectedEmployee, setSelectedEmployee] = useState<any>(null);
 
-  // Fetch all employees for search
+  // Fetch all employees for search (excluding deleted)
   useEffect(() => {
     const fetchEmployees = async () => {
       setLoadingEmployees(true);
@@ -916,6 +927,7 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
         const { data, error } = await supabase
           .from('employees')
           .select('id, full_name, employee_number, position, phone, company, workstation, status, region_id')
+          .eq('is_deleted', false)
           .order('full_name');
         
         if (error) throw error;
@@ -1015,13 +1027,15 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
       
       {/* Searchable Employee Selector */}
       <div>
-        <label className="block text-sm font-medium text-slate-700 mb-1.5">
+        <label htmlFor="employeeSearch" className="block text-sm font-medium text-slate-700 mb-1.5">
           Search Employee <span className="text-xs text-slate-400">(Type to search existing employees)</span>
         </label>
         <div className="relative" ref={dropdownRef}>
           <div className="relative">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input
+              id="employeeSearch"
+              name="employeeSearch"
               ref={inputRef}
               type="text"
               value={employeeSearch}
@@ -1042,16 +1056,13 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
             />
             {selectedEmployee && (
               <button
+                type="button"
                 onClick={clearSelectedEmployee}
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
               >
                 <X size={16} />
               </button>
             )}
-            <ChevronDown 
-              size={16} 
-              className={`absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 transition-transform ${showEmployeeDropdown ? 'rotate-180' : ''}`}
-            />
           </div>
           
           {/* Dropdown results */}
@@ -1066,6 +1077,7 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
                 <div className="px-4 py-3 text-sm text-slate-500 text-center">
                   No employees found matching "{employeeSearch}"
                   <button
+                    type="button"
                     onClick={() => {
                       setShowEmployeeDropdown(false);
                       setFormData({
@@ -1083,6 +1095,7 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
                 filteredEmployees.map((emp: any) => (
                   <button
                     key={emp.id}
+                    type="button"
                     onClick={() => selectEmployee(emp)}
                     className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors flex items-center gap-3"
                   >
@@ -1132,85 +1145,116 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
       </div>
 
       <div className="grid grid-cols-2 gap-4">
-        <Input 
-          label="Full Name *" 
-          value={formData.full_name} 
-          onChange={(e: any) => updateForm('full_name', e.target.value)} 
-          required 
-          disabled={!!selectedEmployee}
-          className={selectedEmployee ? 'bg-slate-50' : ''}
-        />
-        <Input 
-          label="Employee Number" 
-          value={formData.employee_number} 
-          onChange={(e: any) => updateForm('employee_number', e.target.value)} 
-          disabled={!!selectedEmployee}
-          className={selectedEmployee ? 'bg-slate-50' : ''}
-        />
-        <Input 
-          label="Guard ID" 
-          value={formData.guardId} 
-          onChange={(e: any) => updateForm('guardId', e.target.value)} 
-        />
-        <Input 
-          label="Phone" 
-          value={formData.phone} 
-          onChange={(e: any) => updateForm('phone', e.target.value)} 
-          disabled={!!selectedEmployee}
-          className={selectedEmployee ? 'bg-slate-50' : ''}
-        />
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Full Name *</label>
+          <input 
+            type="text"
+            value={formData.full_name} 
+            onChange={(e: any) => updateForm('full_name', e.target.value)} 
+            required 
+            disabled={!!selectedEmployee}
+            className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Employee Number</label>
+          <input 
+            type="text"
+            value={formData.employee_number} 
+            onChange={(e: any) => updateForm('employee_number', e.target.value)} 
+            disabled={!!selectedEmployee}
+            className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Guard ID</label>
+          <input 
+            type="text"
+            value={formData.guardId} 
+            onChange={(e: any) => updateForm('guardId', e.target.value)} 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone</label>
+          <input 
+            type="text"
+            value={formData.phone} 
+            onChange={(e: any) => updateForm('phone', e.target.value)} 
+            disabled={!!selectedEmployee}
+            className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
+          />
+        </div>
         
-        <select 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          value={formData.position} 
-          onChange={(e: any) => updateForm('position', e.target.value)}
-          disabled={!!selectedEmployee}
-        >
-          <option>Security Guard</option>
-          <option>Senior Security Officer</option>
-          <option>Patrol Officer</option>
-          <option>Supervisor</option>
-          <option>K9 Handler</option>
-        </select>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Position</label>
+          <select 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+            value={formData.position} 
+            onChange={(e: any) => updateForm('position', e.target.value)}
+            disabled={!!selectedEmployee}
+          >
+            <option>Security Guard</option>
+            <option>Senior Security Officer</option>
+            <option>Patrol Officer</option>
+            <option>Supervisor</option>
+            <option>K9 Handler</option>
+          </select>
+        </div>
         
-        <select 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          value={formData.status} 
-          onChange={(e: any) => updateForm('status', e.target.value)}
-        >
-          {guardStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Status</label>
+          <select 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+            value={formData.status} 
+            onChange={(e: any) => updateForm('status', e.target.value)}
+          >
+            {guardStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-4">
-        <Input 
-          label="Company" 
-          value={formData.company} 
-          onChange={(e: any) => updateForm('company', e.target.value)} 
-          disabled={!!selectedEmployee}
-          className={selectedEmployee ? 'bg-slate-50' : ''}
-        />
-        <Input 
-          label="Workstation / Site" 
-          value={formData.workstation} 
-          onChange={(e: any) => updateForm('workstation', e.target.value)} 
-          disabled={!!selectedEmployee}
-          className={selectedEmployee ? 'bg-slate-50' : ''}
-        />
-        <select 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          value={formData.shift} 
-          onChange={(e: any) => updateForm('shift', e.target.value)}
-        >
-          {shiftsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-        </select>
-        <select 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          value={formData.supervisor} 
-          onChange={(e: any) => updateForm('supervisor', e.target.value)}
-        >
-          {supervisorsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Company</label>
+          <input 
+            type="text"
+            value={formData.company} 
+            onChange={(e: any) => updateForm('company', e.target.value)} 
+            disabled={!!selectedEmployee}
+            className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Workstation / Site</label>
+          <input 
+            type="text"
+            value={formData.workstation} 
+            onChange={(e: any) => updateForm('workstation', e.target.value)} 
+            disabled={!!selectedEmployee}
+            className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Shift</label>
+          <select 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+            value={formData.shift} 
+            onChange={(e: any) => updateForm('shift', e.target.value)}
+          >
+            {shiftsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Supervisor</label>
+          <select 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+            value={formData.supervisor} 
+            onChange={(e: any) => updateForm('supervisor', e.target.value)}
+          >
+            {supervisorsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
       </div>
 
       {/* Uniform & Equipment Section */}
@@ -1219,41 +1263,54 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
           <Shirt size={16} className="text-[#D4A017]" /> Uniform & Equipment
         </h4>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.uniform_status} 
-            onChange={(e: any) => updateForm('uniform_status', e.target.value)}
-          >
-            {uniformStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.uniform_condition} 
-            onChange={(e: any) => updateForm('uniform_condition', e.target.value)}
-          >
-            {uniformConditionList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.shoes_status} 
-            onChange={(e: any) => updateForm('shoes_status', e.target.value)}
-          >
-            {shoesStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.licenseStatus} 
-            onChange={(e: any) => updateForm('licenseStatus', e.target.value)}
-          >
-            {licenseStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Uniform Status</label>
+            <select 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              value={formData.uniform_status} 
+              onChange={(e: any) => updateForm('uniform_status', e.target.value)}
+            >
+              {uniformStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Uniform Condition</label>
+            <select 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              value={formData.uniform_condition} 
+              onChange={(e: any) => updateForm('uniform_condition', e.target.value)}
+            >
+              {uniformConditionList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Shoes Status</label>
+            <select 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              value={formData.shoes_status} 
+              onChange={(e: any) => updateForm('shoes_status', e.target.value)}
+            >
+              {shoesStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">License Status</label>
+            <select 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              value={formData.licenseStatus} 
+              onChange={(e: any) => updateForm('licenseStatus', e.target.value)}
+            >
+              {licenseStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
         </div>
         <div className="mt-4">
-          <Input 
-            label="License Expiry Date" 
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">License Expiry Date</label>
+          <input 
             type="date"
             value={formData.license_expiry} 
             onChange={(e: any) => updateForm('license_expiry', e.target.value)} 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
         </div>
       </div>
@@ -1264,16 +1321,24 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
           <User size={16} className="text-[#D4A017]" /> Emergency Contact
         </h4>
         <div className="grid grid-cols-2 gap-4">
-          <Input 
-            label="Contact Name" 
-            value={formData.emergency_contact} 
-            onChange={(e: any) => updateForm('emergency_contact', e.target.value)} 
-          />
-          <Input 
-            label="Contact Phone" 
-            value={formData.emergency_phone} 
-            onChange={(e: any) => updateForm('emergency_phone', e.target.value)} 
-          />
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Contact Name</label>
+            <input 
+              type="text"
+              value={formData.emergency_contact} 
+              onChange={(e: any) => updateForm('emergency_contact', e.target.value)} 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Contact Phone</label>
+            <input 
+              type="text"
+              value={formData.emergency_phone} 
+              onChange={(e: any) => updateForm('emergency_phone', e.target.value)} 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
         </div>
       </div>
 
@@ -1288,80 +1353,116 @@ function AddGuardForm({ onAdd, onCancel, sitesList, shiftsList, supervisorsList,
 }
 
 // ===== EDIT GUARD FORM =====
-function EditGuardForm({ guard, onSave, onCancel, sitesList, shiftsList, supervisorsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList }: any) {
+function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList }: any) {
   const [formData, setFormData] = useState(guard);
 
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-4">
-        <Input 
-          label="Full Name *" 
-          value={formData.full_name} 
-          onChange={(e: any) => setFormData({...formData, full_name: e.target.value})} 
-          required 
-        />
-        <Input 
-          label="Employee Number" 
-          value={formData.employee_number} 
-          onChange={(e: any) => setFormData({...formData, employee_number: e.target.value})} 
-        />
-        <Input 
-          label="Guard ID" 
-          value={formData.guardId} 
-          onChange={(e: any) => setFormData({...formData, guardId: e.target.value})} 
-        />
-        <Input 
-          label="Phone" 
-          value={formData.phone} 
-          onChange={(e: any) => setFormData({...formData, phone: e.target.value})} 
-        />
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Full Name *</label>
+          <input 
+            type="text"
+            value={formData.full_name} 
+            onChange={(e: any) => setFormData({...formData, full_name: e.target.value})} 
+            required 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Employee Number</label>
+          <input 
+            type="text"
+            value={formData.employee_number} 
+            onChange={(e: any) => setFormData({...formData, employee_number: e.target.value})} 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Guard ID</label>
+          <input 
+            type="text"
+            value={formData.guardId} 
+            onChange={(e: any) => setFormData({...formData, guardId: e.target.value})} 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone</label>
+          <input 
+            type="text"
+            value={formData.phone} 
+            onChange={(e: any) => setFormData({...formData, phone: e.target.value})} 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
         
-        <select 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          value={formData.position} 
-          onChange={(e: any) => setFormData({...formData, position: e.target.value})}
-        >
-          <option>Security Guard</option>
-          <option>Senior Security Officer</option>
-          <option>Patrol Officer</option>
-          <option>Supervisor</option>
-          <option>K9 Handler</option>
-        </select>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Position</label>
+          <select 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+            value={formData.position} 
+            onChange={(e: any) => setFormData({...formData, position: e.target.value})}
+          >
+            <option>Security Guard</option>
+            <option>Senior Security Officer</option>
+            <option>Patrol Officer</option>
+            <option>Supervisor</option>
+            <option>K9 Handler</option>
+          </select>
+        </div>
         
-        <select 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          value={formData.status} 
-          onChange={(e: any) => setFormData({...formData, status: e.target.value})}
-        >
-          {guardStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Status</label>
+          <select 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+            value={formData.status} 
+            onChange={(e: any) => setFormData({...formData, status: e.target.value})}
+          >
+            {guardStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-4">
-        <Input 
-          label="Company" 
-          value={formData.company} 
-          onChange={(e: any) => setFormData({...formData, company: e.target.value})} 
-        />
-        <Input 
-          label="Workstation / Site" 
-          value={formData.workstation} 
-          onChange={(e: any) => setFormData({...formData, workstation: e.target.value})} 
-        />
-        <select 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          value={formData.shift} 
-          onChange={(e: any) => setFormData({...formData, shift: e.target.value})}
-        >
-          {shiftsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-        </select>
-        <select 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          value={formData.supervisor} 
-          onChange={(e: any) => setFormData({...formData, supervisor: e.target.value})}
-        >
-          {supervisorsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Company</label>
+          <input 
+            type="text"
+            value={formData.company} 
+            onChange={(e: any) => setFormData({...formData, company: e.target.value})} 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Workstation / Site</label>
+          <input 
+            type="text"
+            value={formData.workstation} 
+            onChange={(e: any) => setFormData({...formData, workstation: e.target.value})} 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Shift</label>
+          <select 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+            value={formData.shift} 
+            onChange={(e: any) => setFormData({...formData, shift: e.target.value})}
+          >
+            {shiftsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Supervisor</label>
+          <select 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+            value={formData.supervisor} 
+            onChange={(e: any) => setFormData({...formData, supervisor: e.target.value})}
+          >
+            {supervisorsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
       </div>
 
       <div className="border-t pt-4">
@@ -1369,41 +1470,54 @@ function EditGuardForm({ guard, onSave, onCancel, sitesList, shiftsList, supervi
           <Shirt size={16} className="text-[#D4A017]" /> Uniform & Equipment
         </h4>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.uniform_status} 
-            onChange={(e: any) => setFormData({...formData, uniform_status: e.target.value})}
-          >
-            {uniformStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.uniform_condition} 
-            onChange={(e: any) => setFormData({...formData, uniform_condition: e.target.value})}
-          >
-            {uniformConditionList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.shoes_status} 
-            onChange={(e: any) => setFormData({...formData, shoes_status: e.target.value})}
-          >
-            {shoesStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.licenseStatus} 
-            onChange={(e: any) => setFormData({...formData, licenseStatus: e.target.value})}
-          >
-            {licenseStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Uniform Status</label>
+            <select 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              value={formData.uniform_status} 
+              onChange={(e: any) => setFormData({...formData, uniform_status: e.target.value})}
+            >
+              {uniformStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Uniform Condition</label>
+            <select 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              value={formData.uniform_condition} 
+              onChange={(e: any) => setFormData({...formData, uniform_condition: e.target.value})}
+            >
+              {uniformConditionList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Shoes Status</label>
+            <select 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              value={formData.shoes_status} 
+              onChange={(e: any) => setFormData({...formData, shoes_status: e.target.value})}
+            >
+              {shoesStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">License Status</label>
+            <select 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              value={formData.licenseStatus} 
+              onChange={(e: any) => setFormData({...formData, licenseStatus: e.target.value})}
+            >
+              {licenseStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
         </div>
         <div className="mt-4">
-          <Input 
-            label="License Expiry Date" 
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">License Expiry Date</label>
+          <input 
             type="date"
             value={formData.license_expiry} 
             onChange={(e: any) => setFormData({...formData, license_expiry: e.target.value})} 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
         </div>
       </div>
@@ -1413,16 +1527,24 @@ function EditGuardForm({ guard, onSave, onCancel, sitesList, shiftsList, supervi
           <User size={16} className="text-[#D4A017]" /> Emergency Contact
         </h4>
         <div className="grid grid-cols-2 gap-4">
-          <Input 
-            label="Contact Name" 
-            value={formData.emergency_contact} 
-            onChange={(e: any) => setFormData({...formData, emergency_contact: e.target.value})} 
-          />
-          <Input 
-            label="Contact Phone" 
-            value={formData.emergency_phone} 
-            onChange={(e: any) => setFormData({...formData, emergency_phone: e.target.value})} 
-          />
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Contact Name</label>
+            <input 
+              type="text"
+              value={formData.emergency_contact} 
+              onChange={(e: any) => setFormData({...formData, emergency_contact: e.target.value})} 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Contact Phone</label>
+            <input 
+              type="text"
+              value={formData.emergency_phone} 
+              onChange={(e: any) => setFormData({...formData, emergency_phone: e.target.value})} 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            />
+          </div>
         </div>
       </div>
 

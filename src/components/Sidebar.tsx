@@ -8,9 +8,8 @@ import {
 } from '../utils/icons';
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { ChevronRight } from 'lucide-react';
-
 
 export type NavKey =
   | "dashboard"
@@ -39,7 +38,6 @@ export const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "payments", label: "Payments", icon: DollarSign },
   { id: "reports", label: "Reports", icon: BarChart3 },
   { id: "settings", label: "Settings", icon: Settings },
-  // ===== ADD auditlogs HERE (ONLY ONCE) =====
   { id: "auditlogs", label: "Audit Logs", icon: History },
 ];
 
@@ -58,7 +56,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "settings",
     "security",
     "features",
-    "auditlogs", // ← Super Admin can see auditlogs
+    "auditlogs",
   ],
   2: [
     "dashboard",
@@ -79,29 +77,44 @@ export function Sidebar({
   onNavigate,
   open,
   onClose,
+  onPreload,
 }: {
   active: NavKey;
   onNavigate: (k: NavKey) => void;
   open: boolean;
   onClose: () => void;
+  onPreload?: (key: NavKey) => void;
 }) {
   const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
   const [loading, setLoading] = useState(true);
   const [userName, setUserName] = useState<string>("User");
   const [userEmail, setUserEmail] = useState<string>("");
   const [isMobile, setIsMobile] = useState(false);
-
-  // Check if mobile
+  
+  // ===== PERFORMANCE: Use matchMedia instead of window.innerWidth =====
   useEffect(() => {
-    const checkMobile = () => {
-      setIsMobile(window.innerWidth < 1024);
+    if (typeof window === 'undefined') return;
+    
+    const mql = window.matchMedia('(max-width: 1024px)');
+    
+    const handleChange = (e: MediaQueryListEvent) => {
+      setIsMobile(e.matches);
+      // Close sidebar when transitioning to mobile
+      if (e.matches && open) {
+        onClose();
+      }
     };
     
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
+    // Set initial value
+    setIsMobile(mql.matches);
     
-    return () => window.removeEventListener('resize', checkMobile);
-  }, []);
+    // Add listener
+    mql.addEventListener('change', handleChange);
+    
+    return () => {
+      mql.removeEventListener('change', handleChange);
+    };
+  }, [open, onClose]);
 
   // Prevent body scroll when sidebar is open on mobile
   useEffect(() => {
@@ -150,7 +163,6 @@ export function Sidebar({
             );
             setUserRoleLevel(profile?.role_level || 4);
           }
-          console.log("User role level in sidebar:", userRoleLevel);
         }
       } catch (err) {
         console.error("Failed to get user info:", err);
@@ -178,7 +190,8 @@ export function Sidebar({
     return "Staff";
   };
 
-  const NavLink = ({ item }: { item: (typeof allNavItems)[number] }) => {
+  // ===== PERFORMANCE: Memoize NavLink component =====
+  const NavLink = useCallback(({ item }: { item: (typeof allNavItems)[number] }) => {
     const Icon = item.icon;
     const isActive = active === item.id;
     return (
@@ -189,6 +202,18 @@ export function Sidebar({
             onClose();
           }
         }}
+        onMouseEnter={() => {
+          // ===== PERFORMANCE: Preload page on hover =====
+          if (onPreload) {
+            onPreload(item.id);
+          }
+        }}
+        onTouchStart={() => {
+          // ===== PERFORMANCE: Preload on touch for mobile =====
+          if (onPreload) {
+            onPreload(item.id);
+          }
+        }}
         className={cn(
           "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all group",
           isActive
@@ -196,12 +221,14 @@ export function Sidebar({
             : "text-slate-600 hover:bg-slate-100 hover:text-slate-900",
         )}
       >
-        <Icon size={18} className={isActive ? "text-[#D4A017]" : ""} />
+        <span className="icon-container" data-icon="true">
+          <Icon size={18} className={isActive ? "text-[#D4A017]" : ""} />
+        </span>
         <span className="flex-1 text-left">{item.label}</span>
         {isActive && <ChevronRight size={14} />}
       </button>
     );
-  };
+  }, [active, onNavigate, isMobile, onClose, onPreload]);
 
   // Sidebar content
   const content = (
@@ -253,6 +280,16 @@ export function Sidebar({
                   onClose();
                 }
               }}
+              onMouseEnter={() => {
+                if (onPreload) {
+                  onPreload("security");
+                }
+              }}
+              onTouchStart={() => {
+                if (onPreload) {
+                  onPreload("security");
+                }
+              }}
               className={cn(
                 "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
                 active === "security"
@@ -271,6 +308,16 @@ export function Sidebar({
                 onNavigate("features");
                 if (isMobile) {
                   onClose();
+                }
+              }}
+              onMouseEnter={() => {
+                if (onPreload) {
+                  onPreload("features");
+                }
+              }}
+              onTouchStart={() => {
+                if (onPreload) {
+                  onPreload("features");
                 }
               }}
               className={cn(

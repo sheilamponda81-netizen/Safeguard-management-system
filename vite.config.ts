@@ -19,14 +19,14 @@ export default defineConfig({
       ext: '.br',
       threshold: 10240,
     }),
-    visualizer({
+    process.env.ANALYZE === 'true' && visualizer({
       filename: 'dist/stats.html',
       open: true,
       gzipSize: true,
       brotliSize: true,
       template: 'treemap',
     }),
-  ],
+  ].filter(Boolean),
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -50,24 +50,45 @@ export default defineConfig({
     sourcemap: false,
     minify: 'esbuild',
     target: 'es2020',
-    chunkSizeWarningLimit: 500,
+    chunkSizeWarningLimit: 1000,
     rollupOptions: {
       output: {
         manualChunks: {
+          // React core
           'vendor-react': ['react', 'react-dom', 'react-router-dom', 'react-is'],
-          'vendor-supabase-core': ['@supabase/supabase-js'],
-          'vendor-supabase-auth': ['@supabase/auth-js'],
-          'vendor-supabase-storage': ['@supabase/storage-js'],
-          'vendor-supabase-functions': ['@supabase/functions-js'],
-          'vendor-charts-core': ['recharts', 'use-sync-external-store'],
-          'vendor-ui-core': ['lucide-react', 'sonner'],
-          'vendor-ui-utils': ['class-variance-authority', 'clsx', 'tailwind-merge'],
+          
+          // Supabase split into smaller chunks
+          'vendor-supabase': ['@supabase/supabase-js'],
+          'vendor-auth': ['@supabase/auth-js'],
+          'vendor-storage': ['@supabase/storage-js'],
+          'vendor-functions': ['@supabase/functions-js'],
+          
+          // ===== PERFORMANCE: Split charts into smaller chunks =====
+          'vendor-charts-core': ['recharts'],
+          'vendor-charts-utils': ['use-sync-external-store'],
+          
+          // ===== PERFORMANCE: Split PDF into smaller chunks =====
+          'vendor-pdf-core': ['jspdf'],
+          'vendor-pdf-utils': ['jspdf-autotable', 'html2canvas'],
+          
+          // ===== PERFORMANCE: Split icons =====
+          'vendor-icons': ['lucide-react'],
+          
+          // UI libraries
+          'vendor-ui': ['sonner', 'class-variance-authority', 'clsx', 'tailwind-merge'],
+          
+          // Utilities
           'vendor-utils': ['lodash-es', 'es-toolkit'],
-          'vendor-pdf': ['jspdf', 'jspdf-autotable', 'html2canvas'],
         },
         chunkFileNames: 'assets/[name]-[hash].js',
         entryFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash][extname]',
       },
+    },
+    cssCodeSplit: true,
+    treeshake: {
+      moduleSideEffects: false,
+      propertyReadSideEffects: false,
     },
   },
   optimizeDeps: {
@@ -82,15 +103,25 @@ export default defineConfig({
       'lodash-es',
       'es-toolkit',
       'react-is',
-      // ===== FIX: Add these for recharts =====
       'recharts',
       'use-sync-external-store',
       'use-sync-external-store/shim/with-selector',
     ],
-    exclude: ['jspdf', 'html2canvas'],
+    exclude: ['jspdf', 'html2canvas', 'jspdf-autotable'],
+    esbuildOptions: {
+      target: 'es2020',
+      treeShaking: true,
+    },
   },
   esbuild: {
     drop: process.env.NODE_ENV === 'production' ? ['console', 'debugger'] : [],
     target: 'es2020',
+    treeShaking: true,
+  },
+  css: {
+    devSourcemap: false,
+    modules: {
+      localsConvention: 'camelCase',
+    },
   },
 });

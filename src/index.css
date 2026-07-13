@@ -13,13 +13,196 @@ body {
   margin: 0;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   background-color: #F8FAFC;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Custom Safeguard Security Styles */
+/* ===== PERFORMANCE: Optimized rendering ===== */
+
+/* Prevent layout shifts during loading */
+* {
+  box-sizing: border-box;
+}
+
+/* Optimize image and SVG rendering */
+img, svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+/* ===== PERFORMANCE: Layout containment ===== */
+
+/* Chart containers - isolate layout calculations */
+.chart-container {
+  contain: layout paint style;
+  content-visibility: auto;
+  contain-intrinsic-size: 300px 250px;
+}
+
+/* Icon containers - prevent layout shifts */
+.icon-container {
+  contain: layout style;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 1.5em;
+  height: 1.5em;
+}
+
+/* SVG icons with explicit sizing */
+.icon-container svg {
+  width: 100%;
+  height: 100%;
+  max-width: 24px;
+  max-height: 24px;
+  display: block;
+}
+
+/* Card with charts - isolate from page layout */
+.card-chart {
+  contain: layout style;
+  content-visibility: auto;
+  contain-intrinsic-size: 400px 300px;
+}
+
+/* Sidebar navigation - isolate layout */
+.nav-container {
+  contain: layout style;
+}
+
+/* ===== PERFORMANCE: Reduce paint costs ===== */
+
+/* Use will-change sparingly for animations */
+.animate-fade-in {
+  will-change: opacity, transform;
+}
+
+/* Prevent layout shifts for loading states */
+.loading-placeholder {
+  contain: strict;
+  content-visibility: auto;
+  contain-intrinsic-size: 100px 100px;
+}
+
+/* Optimize recharts containers */
+.recharts-wrapper {
+  contain: layout paint;
+}
+
+.recharts-surface {
+  shape-rendering: crispEdges;
+}
+
+/* ===== PERFORMANCE: Optimize scrolling ===== */
+.overflow-auto {
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
+}
+
+/* ===== PERFORMANCE: Optimize transitions ===== */
+.transition-all {
+  will-change: transform, opacity, background-color;
+}
+
+.transition-colors {
+  will-change: background-color, color, border-color;
+}
+
+/* ===== PERFORMANCE: Content visibility for off-screen ===== */
+.content-visibility-auto {
+  content-visibility: auto;
+  contain-intrinsic-size: 200px;
+}
+
+/* ===== PERFORMANCE: Icon optimization ===== */
+
+/* Ensure all icons have fixed dimensions */
+[data-icon] {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5em;
+  height: 1.5em;
+}
+
+[data-icon] svg {
+  width: 100%;
+  height: 100%;
+  max-width: 24px;
+  max-height: 24px;
+  display: block;
+}
+
+/* ===== Custom Safeguard Security Styles ===== */
 .gold-gradient {
   background: linear-gradient(135deg, #D4A017 0%, #B8860B 100%);
 }
 
 .navy-gradient {
   background: linear-gradient(135deg, #081C3A 0%, #0A2540 100%);
+}
+
+/* ===== SCROLLBAR STYLING ===== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* ===== ANIMATIONS ===== */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.25s ease-out forwards;
+}
+
+/* ===== TABLET/MOBILE OPTIMIZATIONS ===== */
+@media (max-width: 768px) {
+  .chart-container {
+    contain-intrinsic-size: 200px 180px;
+  }
+  
+  .card-chart {
+    contain-intrinsic-size: 300px 250px;
+  }
+  
+  /* Reduce paint costs on mobile */
+  .animate-fade-in {
+    will-change: opacity;
+  }
+}
+
+/* ===== PRINT STYLES ===== */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  
+  .print-break {
+    page-break-after: always;
+  }
 }

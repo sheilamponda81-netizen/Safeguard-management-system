@@ -26,6 +26,7 @@ interface Employee {
   phone: string;
   email: string;
   status: string;
+  is_deleted?: boolean;
 }
 
 interface TerminalDue {
@@ -163,10 +164,12 @@ export function TerminalDuesPage() {
 
   const fetchEmployees = useCallback(async () => {
     try {
+      // CRITICAL: Exclude deleted employees
       let query = supabase
         .from('employees')
         .select('*')
-        .eq('status', 'Active');
+        .eq('status', 'Active')
+        .eq('is_deleted', false);
 
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         query = query.eq('region_id', userProfile.region_id);
@@ -186,7 +189,8 @@ export function TerminalDuesPage() {
         region_id: emp.region_id || '',
         phone: emp.phone || '',
         email: emp.email || '',
-        status: emp.status || 'Active'
+        status: emp.status || 'Active',
+        is_deleted: emp.is_deleted || false
       }));
       
       setEmployees(mappedEmployees);
@@ -208,7 +212,8 @@ export function TerminalDuesPage() {
         const { data: regionEmployees } = await supabase
           .from('employees')
           .select('id')
-          .eq('region_id', userProfile.region_id);
+          .eq('region_id', userProfile.region_id)
+          .eq('is_deleted', false);
         const employeeIds = regionEmployees?.map(e => e.id) || [];
         if (employeeIds.length > 0) {
           query = query.in('employee_id', employeeIds);
@@ -596,16 +601,21 @@ export function TerminalDuesPage() {
           <div className="relative">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input
+              id="searchDues"
+              name="searchDues"
+              type="text"
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder="Search by name or employee #..."
-              className="w-full pl-10 pr-3 py-2 text-sm border border-slate-200 rounded-lg"
+              className="w-full pl-10 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
           </div>
           <select
+            id="filterStatus"
+            name="filterStatus"
             value={filterStatus}
             onChange={e => setFilterStatus(e.target.value)}
-            className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
+            className="px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           >
             <option value="all">All Status</option>
             <option value="pending">Pending</option>
@@ -672,12 +682,14 @@ export function TerminalDuesPage() {
                     <TD className="text-right">
                       <div className="flex items-center justify-end gap-1">
                         <button
+                          type="button"
                           onClick={() => handleViewDetail(calc)}
                           className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
                         >
                           <Eye size={14} />
                         </button>
                         <button
+                          type="button"
                           onClick={() => {
                             setEditingCalculation(calc);
                             setShowEditModal(true);
@@ -689,12 +701,14 @@ export function TerminalDuesPage() {
                         {calc.status === 'pending' && (
                           <>
                             <button
+                              type="button"
                               onClick={() => updateStatus(calc.id, 'approved')}
                               className="w-7 h-7 rounded-lg hover:bg-emerald-100 text-emerald-600"
                             >
                               <CheckCircle size={14} />
                             </button>
                             <button
+                              type="button"
                               onClick={() => updateStatus(calc.id, 'paid')}
                               className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
                             >
@@ -704,6 +718,7 @@ export function TerminalDuesPage() {
                         )}
                         {calc.status === 'approved' && (
                           <button
+                            type="button"
                             onClick={() => updateStatus(calc.id, 'paid')}
                             className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
                           >
@@ -740,13 +755,15 @@ export function TerminalDuesPage() {
         <div className="space-y-4">
           {/* Searchable Employee Selector */}
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">
+            <label htmlFor="employeeSearch" className="block text-sm font-medium text-slate-700 mb-1">
               Search Employee <span className="text-red-500">*</span>
             </label>
             <div className="relative" ref={dropdownRef}>
               <div className="relative">
                 <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                 <input
+                  id="employeeSearch"
+                  name="employeeSearch"
                   ref={inputRef}
                   type="text"
                   value={employeeSearch}
@@ -777,12 +794,13 @@ export function TerminalDuesPage() {
                 <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg max-h-60 overflow-y-auto">
                   {filteredEmployees.length === 0 ? (
                     <div className="px-4 py-3 text-sm text-slate-500 text-center">
-                      No employees found matching "{employeeSearch}"
+                      No active employees found matching "{employeeSearch}"
                     </div>
                   ) : (
                     filteredEmployees.map((emp) => (
                       <button
                         key={emp.id}
+                        type="button"
                         onClick={() => selectEmployee(emp)}
                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors flex items-center gap-3"
                       >
@@ -828,24 +846,28 @@ export function TerminalDuesPage() {
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Date Left</label>
               <input
+                id="dateLeft"
+                name="dateLeft"
                 type="date"
                 value={formData.date_left}
                 onChange={(e) => {
                   setFormData({ ...formData, date_left: e.target.value });
                   setPreviewCalculation(null);
                 }}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
               />
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Termination Type</label>
               <select
+                id="terminationType"
+                name="terminationType"
                 value={formData.termination_type}
                 onChange={(e) => {
                   setFormData({ ...formData, termination_type: e.target.value });
                   setPreviewCalculation(null);
                 }}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
               >
                 {terminationTypes.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
               </select>
@@ -853,12 +875,14 @@ export function TerminalDuesPage() {
             <div className="col-span-2">
               <label className="block text-sm font-medium text-slate-700 mb-1">Reason for Termination</label>
               <select
+                id="terminationReason"
+                name="terminationReason"
                 value={formData.reason}
                 onChange={(e) => {
                   setFormData({ ...formData, reason: e.target.value });
                   setPreviewCalculation(null);
                 }}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
               >
                 <option value="">-- Select Reason --</option>
                 {terminationReasons.map(r => <option key={r} value={r}>{r}</option>)}
@@ -867,25 +891,29 @@ export function TerminalDuesPage() {
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Deductions (MK)</label>
               <input
+                id="deductions"
+                name="deductions"
                 type="number"
                 value={formData.deductions}
                 onChange={(e) => {
                   setFormData({ ...formData, deductions: parseFloat(e.target.value) || 0 });
                   setPreviewCalculation(null);
                 }}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
               />
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Uniform Refund (MK)</label>
               <input
+                id="uniformRefund"
+                name="uniformRefund"
                 type="number"
                 value={formData.uniform_refund}
                 onChange={(e) => {
                   setFormData({ ...formData, uniform_refund: parseFloat(e.target.value) || 0 });
                   setPreviewCalculation(null);
                 }}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
               />
             </div>
           </div>
@@ -1048,9 +1076,11 @@ export function TerminalDuesPage() {
               <div><p className="text-slate-500">Position</p><p className="font-semibold">{editingCalculation.position}</p></div>
               <div><p className="text-slate-500">Status</p>
                 <select
+                  id="editStatus"
+                  name="editStatus"
                   value={editingCalculation.status}
                   onChange={(e) => setEditingCalculation({ ...editingCalculation, status: e.target.value as any })}
-                  className="w-full px-2 py-1 text-sm border border-slate-200 rounded-lg"
+                  className="w-full px-2 py-1 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
                 >
                   <option value="pending">Pending</option>
                   <option value="approved">Approved</option>
@@ -1065,36 +1095,44 @@ export function TerminalDuesPage() {
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Deductions (MK)</label>
                   <input
+                    id="editDeductions"
+                    name="editDeductions"
                     type="number"
                     value={editingCalculation.deductions}
                     onChange={(e) => setEditingCalculation({ ...editingCalculation, deductions: parseFloat(e.target.value) || 0 })}
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
                   />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Uniform Refund (MK)</label>
                   <input
+                    id="editUniformRefund"
+                    name="editUniformRefund"
                     type="number"
                     value={editingCalculation.uniform_refund}
                     onChange={(e) => setEditingCalculation({ ...editingCalculation, uniform_refund: parseFloat(e.target.value) || 0 })}
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
                   />
                 </div>
                 <div className="col-span-2">
                   <label className="block text-sm font-medium text-slate-700 mb-1">Other Benefits (MK)</label>
                   <input
+                    id="editOtherBenefits"
+                    name="editOtherBenefits"
                     type="number"
                     value={editingCalculation.other_benefits}
                     onChange={(e) => setEditingCalculation({ ...editingCalculation, other_benefits: parseFloat(e.target.value) || 0 })}
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
                   />
                 </div>
                 <div className="col-span-2">
                   <label className="block text-sm font-medium text-slate-700 mb-1">Reason for Termination</label>
                   <select
+                    id="editReason"
+                    name="editReason"
                     value={editingCalculation.reason_for_termination}
                     onChange={(e) => setEditingCalculation({ ...editingCalculation, reason_for_termination: e.target.value })}
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
                   >
                     {terminationReasons.map(r => <option key={r} value={r}>{r}</option>)}
                   </select>
@@ -1102,9 +1140,11 @@ export function TerminalDuesPage() {
                 <div className="col-span-2">
                   <label className="block text-sm font-medium text-slate-700 mb-1">Termination Type</label>
                   <select
+                    id="editTerminationType"
+                    name="editTerminationType"
                     value={editingCalculation.termination_type}
                     onChange={(e) => setEditingCalculation({ ...editingCalculation, termination_type: e.target.value })}
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
                   >
                     {terminationTypes.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
                   </select>

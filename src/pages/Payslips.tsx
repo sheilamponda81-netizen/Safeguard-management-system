@@ -1,6 +1,6 @@
-﻿import { useState, useMemo, useEffect, useCallback } from 'react';
-import { Search, FileText, Download, Printer, Eye, Shield, FileDown, User, Building2, Calendar, Clock, CheckCircle, XCircle, AlertCircle, ChevronLeft, ChevronRight } from '../utils/icons';
-
+﻿import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import { Search, FileText, Download, Printer, Eye, Shield, FileDown, User, Building2, Calendar, Clock, CheckCircle, XCircle, AlertCircle, ChevronLeft, ChevronRight, Settings, Upload, Save, RefreshCw, Archive, FileArchive } from '../utils/icons';
+import { Archive as ArchiveIcon, FileArchive as FileArchiveIcon } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -14,6 +14,19 @@ import {
   getAvailableMonthsFromSystem
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
+import JSZip from 'jszip';
+
+// ===== PERFORMANCE: Lazy load PDF libraries only when needed =====
+const loadPDFLibraries = async () => {
+  const [html2canvasModule, jsPDFModule] = await Promise.all([
+    import('html2canvas'),
+    import('jspdf')
+  ]);
+  return { 
+    html2canvas: html2canvasModule.default, 
+    jsPDF: jsPDFModule.default 
+  };
+};
 
 interface Employee {
   id: string;
@@ -52,6 +65,36 @@ interface PayslipData {
   year: string;
 }
 
+interface PayslipTemplate {
+  companyName: string;
+  companyAddress: string;
+  companyPhone: string;
+  showLogo: boolean;
+  showPayPoint: boolean;
+  showContractType: boolean;
+  showAuthorizedBy: boolean;
+  authorizedName: string;
+  authorizedTitle: string;
+  footerText: string;
+  primaryColor: string;
+  secondaryColor: string;
+}
+
+const defaultTemplate: PayslipTemplate = {
+  companyName: 'SAFEGUARD SECURITY SERVICES',
+  companyAddress: 'Lilongwe, Malawi · (+265) 1 234 567',
+  companyPhone: '(+265) 1 234 567',
+  showLogo: true,
+  showPayPoint: true,
+  showContractType: true,
+  showAuthorizedBy: true,
+  authorizedName: 'William Banda',
+  authorizedTitle: 'Admin',
+  footerText: 'This is a system-generated payslip. No signature required.',
+  primaryColor: '#081C3A',
+  secondaryColor: '#D4A017'
+};
+
 export function PayslipsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -65,6 +108,9 @@ export function PayslipsPage() {
   const [systemMonth, setSystemMonth] = useState('');
   const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const [showTemplateModal, setShowTemplateModal] = useState(false);
+  const [template, setTemplate] = useState<PayslipTemplate>(defaultTemplate);
+  const [downloading, setDownloading] = useState(false);
 
   // ===== PAGINATION STATES =====
   const [payslipsPage, setPayslipsPage] = useState(1);
@@ -100,6 +146,19 @@ export function PayslipsPage() {
     setPayslipsPage(1);
   }, [search]);
 
+  // ===== LOAD TEMPLATE FROM LOCAL STORAGE =====
+  useEffect(() => {
+    const savedTemplate = localStorage.getItem('payslipTemplate');
+    if (savedTemplate) {
+      try {
+        const parsed = JSON.parse(savedTemplate);
+        setTemplate({ ...defaultTemplate, ...parsed });
+      } catch (e) {
+        console.error('Error loading template:', e);
+      }
+    }
+  }, []);
+
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
     const { data: { user } } = await supabase.auth.getUser();
@@ -118,10 +177,12 @@ export function PayslipsPage() {
     try {
       const monthYear = `${selectedYear}-${String(months.indexOf(selectedMonth) + 1).padStart(2, '0')}`;
       
+      // CRITICAL: Exclude deleted employees
       let employeesQuery = supabase
         .from('employees')
         .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id')
-        .eq('status', 'Active');
+        .eq('status', 'Active')
+        .eq('is_deleted', false);
 
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
@@ -269,131 +330,303 @@ export function PayslipsPage() {
     setPayslipsPage(1);
   }, []);
 
-  // ===== PDF DOWNLOAD =====
+  // ===== GENERATE PAYSLIP HTML =====
+  const generatePayslipHTML = useCallback((payslip: PayslipData, customTemplate?: PayslipTemplate) => {
+    const employee = payslip.employee;
+    const p = payslip.payroll;
+    const n = p.net_pay;
+    const t = customTemplate || template;
+    
+    return `<!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>Payslip - ${employee.fullName}</title>
+        <style>
+          body { font-family: Arial, sans-serif; padding: 40px; max-width: 800px; margin: 0 auto; color: #1a1a2e; }
+          .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid ${t.primaryColor}; padding-bottom: 20px; margin-bottom: 20px; }
+          .company-name { font-size: 24px; font-weight: bold; color: ${t.primaryColor}; }
+          .company-sub { font-size: 12px; color: #666; }
+          .payslip-title { font-size: 20px; font-weight: bold; color: ${t.primaryColor}; text-align: right; }
+          .employee-info { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; padding: 15px 0; border-bottom: 1px solid #ddd; margin-bottom: 20px; font-size: 13px; }
+          .employee-info .label { color: #666; font-size: 11px; }
+          .employee-info .value { font-weight: 600; color: #1a1a2e; }
+          .earnings-deductions { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 20px; }
+          .section-title { font-size: 13px; font-weight: bold; color: ${t.primaryColor}; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px; }
+          .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5; }
+          .row .label { color: #555; }
+          .row .amount { font-weight: 500; font-family: monospace; }
+          .total-row { display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px; }
+          .total-row .amount { color: ${t.primaryColor}; }
+          .net-pay-section { background: linear-gradient(135deg, ${t.primaryColor} 0%, ${t.primaryColor}cc 100%); color: white; padding: 20px 25px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }
+          .net-pay-section .label { font-size: 12px; opacity: 0.8; text-transform: uppercase; letter-spacing: 0.5px; }
+          .net-pay-section .amount { font-size: 28px; font-weight: bold; color: ${t.secondaryColor}; }
+          .footer { text-align: center; font-size: 11px; color: #999; margin-top: 20px; padding-top: 15px; border-top: 1px solid #eee; }
+          .deduction-item .amount { color: #dc2626; }
+          .company-logo { font-size: 28px; font-weight: bold; color: ${t.primaryColor}; }
+          @media print { body { padding: 20px; } }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <div>
+            <div class="company-name">${t.companyName}</div>
+            <div class="company-sub">${t.companyAddress}</div>
+          </div>
+          <div>
+            <div class="payslip-title">PAYSLIP</div>
+            <div style="text-align: right; font-size: 12px; color: #666;">${selectedMonth} ${selectedYear}</div>
+          </div>
+        </div>
+        <div class="employee-info">
+          <div><div class="label">Employee</div><div class="value">${employee.fullName}</div></div>
+          <div><div class="label">Employee No.</div><div class="value">${employee.employeeNumber}</div></div>
+          <div><div class="label">Position</div><div class="value">${employee.position}</div></div>
+          <div><div class="label">Department</div><div class="value">${employee.department}</div></div>
+          <div><div class="label">Pay Period</div><div class="value">${selectedMonth} 01 - ${selectedMonth} 30, ${selectedYear}</div></div>
+          ${t.showPayPoint ? `<div><div class="label">Pay Point</div><div class="value">${employee.payPoint || 'N/A'}</div></div>` : ''}
+          ${t.showContractType ? `<div><div class="label">Contract</div><div class="value">${employee.contractType || 'Permanent'}</div></div>` : ''}
+          <div><div class="label">Date Paid</div><div class="value">${selectedMonth} 30, ${selectedYear}</div></div>
+        </div>
+        <div class="earnings-deductions">
+          <div>
+            <div class="section-title">Earnings</div>
+            <div class="row"><span class="label">Basic Salary</span><span class="amount">${formatKwacha(p.basic_salary)}</span></div>
+            <div class="row"><span class="label">Allowances</span><span class="amount">${formatKwacha(p.allowances)}</span></div>
+            <div class="row"><span class="label">Overtime</span><span class="amount">${formatKwacha(p.overtime)}</span></div>
+            <div class="row"><span class="label">Bonus</span><span class="amount">${formatKwacha(p.bonus)}</span></div>
+            <div class="total-row"><span>Gross Pay</span><span class="amount">${formatKwacha(p.gross_pay)}</span></div>
+          </div>
+          <div>
+            <div class="section-title">Deductions</div>
+            <div class="row deduction-item"><span class="label">PAYE Tax</span><span class="amount">-${formatKwacha(p.paye)}</span></div>
+            <div class="row deduction-item"><span class="label">Pension (5%)</span><span class="amount">-${formatKwacha(p.pension)}</span></div>
+            <div class="row deduction-item"><span class="label">Uniform Deduction</span><span class="amount">-${formatKwacha(p.uniform_deduction)}</span></div>
+            <div class="total-row" style="border-top-color: #dc2626;"><span>Total Deductions</span><span class="amount" style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + p.uniform_deduction)}</span></div>
+          </div>
+        </div>
+        <div class="net-pay-section">
+          <div>
+            <div class="label">Total Net Pay</div>
+            <div class="amount">${formatKwacha(n)}</div>
+          </div>
+          ${t.showAuthorizedBy ? `<div style="text-align: right; font-size: 12px;">
+            <div style="opacity: 0.8;">Authorized: ${t.authorizedName}</div>
+            <div style="opacity: 0.8;">${t.authorizedTitle}</div>
+          </div>` : ''}
+        </div>
+        <div class="footer">${t.footerText}</div>
+      </body>
+      </html>`;
+  }, [selectedMonth, selectedYear, template]);
+
+  // ===== GENERATE PDF (Lazy Loaded) =====
+  const generatePDF = useCallback(async (payslip: PayslipData): Promise<Blob | null> => {
+    try {
+      // Lazy load PDF libraries only when needed
+      const { html2canvas, jsPDF } = await loadPDFLibraries();
+      
+      const employee = payslip.employee;
+      const p = payslip.payroll;
+      const t = template;
+
+      // Create a temporary container for the payslip
+      const container = document.createElement('div');
+      container.style.position = 'absolute';
+      container.style.left = '-9999px';
+      container.style.top = '-9999px';
+      container.style.width = '800px';
+      container.style.padding = '40px';
+      container.style.backgroundColor = '#ffffff';
+      container.style.fontFamily = 'Arial, sans-serif';
+      container.style.color = '#1a1a2e';
+      
+      container.innerHTML = `
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid ${t.primaryColor}; padding-bottom: 20px; margin-bottom: 20px;">
+          <div>
+            <div style="font-size: 24px; font-weight: bold; color: ${t.primaryColor};">${t.companyName}</div>
+            <div style="font-size: 12px; color: #666;">${t.companyAddress}</div>
+          </div>
+          <div>
+            <div style="font-size: 20px; font-weight: bold; color: ${t.primaryColor}; text-align: right;">PAYSLIP</div>
+            <div style="text-align: right; font-size: 12px; color: #666;">${selectedMonth} ${selectedYear}</div>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; padding: 15px 0; border-bottom: 1px solid #ddd; margin-bottom: 20px; font-size: 13px;">
+          <div><div style="color: #666; font-size: 11px;">Employee</div><div style="font-weight: 600;">${employee.fullName}</div></div>
+          <div><div style="color: #666; font-size: 11px;">Employee No.</div><div style="font-weight: 600;">${employee.employeeNumber}</div></div>
+          <div><div style="color: #666; font-size: 11px;">Position</div><div style="font-weight: 600;">${employee.position}</div></div>
+          <div><div style="color: #666; font-size: 11px;">Department</div><div style="font-weight: 600;">${employee.department}</div></div>
+          <div><div style="color: #666; font-size: 11px;">Pay Period</div><div style="font-weight: 600;">${selectedMonth} 01 - ${selectedMonth} 30, ${selectedYear}</div></div>
+          ${t.showPayPoint ? `<div><div style="color: #666; font-size: 11px;">Pay Point</div><div style="font-weight: 600;">${employee.payPoint || 'N/A'}</div></div>` : ''}
+          ${t.showContractType ? `<div><div style="color: #666; font-size: 11px;">Contract</div><div style="font-weight: 600;">${employee.contractType || 'Permanent'}</div></div>` : ''}
+          <div><div style="color: #666; font-size: 11px;">Date Paid</div><div style="font-weight: 600;">${selectedMonth} 30, ${selectedYear}</div></div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 20px;">
+          <div>
+            <div style="font-size: 13px; font-weight: bold; color: ${t.primaryColor}; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px;">Earnings</div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Basic Salary</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.basic_salary)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Allowances</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.allowances)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Overtime</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.overtime)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Bonus</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.bonus)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px;"><span>Gross Pay</span><span style="color: ${t.primaryColor};">${formatKwacha(p.gross_pay)}</span></div>
+          </div>
+          <div>
+            <div style="font-size: 13px; font-weight: bold; color: ${t.primaryColor}; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px;">Deductions</div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">PAYE Tax</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.paye)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Pension (5%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.pension)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Uniform Deduction</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.uniform_deduction)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px; border-top-color: #dc2626;"><span>Total Deductions</span><span style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + p.uniform_deduction)}</span></div>
+          </div>
+        </div>
+        <div style="background: linear-gradient(135deg, ${t.primaryColor} 0%, ${t.primaryColor}cc 100%); color: white; padding: 20px 25px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-top: 20px;">
+          <div>
+            <div style="font-size: 12px; opacity: 0.8; text-transform: uppercase; letter-spacing: 0.5px;">Total Net Pay</div>
+            <div style="font-size: 28px; font-weight: bold; color: ${t.secondaryColor};">${formatKwacha(n)}</div>
+          </div>
+          ${t.showAuthorizedBy ? `<div style="text-align: right; font-size: 12px;">
+            <div style="opacity: 0.8;">Authorized: ${t.authorizedName}</div>
+            <div style="opacity: 0.8;">${t.authorizedTitle}</div>
+          </div>` : ''}
+        </div>
+        <div style="text-align: center; font-size: 11px; color: #999; margin-top: 20px; padding-top: 15px; border-top: 1px solid #eee;">${t.footerText}</div>
+      `;
+
+      document.body.appendChild(container);
+
+      const canvas = await html2canvas(container, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        logging: false,
+      });
+
+      document.body.removeChild(container);
+
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
+      
+      pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
+      
+      return pdf.output('blob');
+    } catch (error: any) {
+      console.error('PDF Generation Error:', error);
+      showNotification('Failed to generate PDF: ' + error.message, 'error');
+      return null;
+    }
+  }, [selectedMonth, selectedYear, template]);
+
+  // ===== DOWNLOAD SINGLE PAYSLIP =====
   const handlePDFDownload = useCallback(async (payslip: PayslipData) => {
     try {
       const employee = payslip.employee;
-      const p = payslip.payroll;
-      const n = p.net_pay;
+      const pdfBlob = await generatePDF(payslip);
       
-      const payslipHTML = `<!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="UTF-8">
-          <title>Payslip - ${employee.fullName}</title>
-          <style>
-            body { font-family: Arial, sans-serif; padding: 40px; max-width: 800px; margin: 0 auto; color: #1a1a2e; }
-            .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid #081C3A; padding-bottom: 20px; margin-bottom: 20px; }
-            .company-name { font-size: 24px; font-weight: bold; color: #081C3A; }
-            .company-sub { font-size: 12px; color: #666; }
-            .payslip-title { font-size: 20px; font-weight: bold; color: #081C3A; text-align: right; }
-            .employee-info { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; padding: 15px 0; border-bottom: 1px solid #ddd; margin-bottom: 20px; font-size: 13px; }
-            .employee-info .label { color: #666; font-size: 11px; }
-            .employee-info .value { font-weight: 600; color: #1a1a2e; }
-            .earnings-deductions { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 20px; }
-            .section-title { font-size: 13px; font-weight: bold; color: #081C3A; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px; }
-            .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5; }
-            .row .label { color: #555; }
-            .row .amount { font-weight: 500; font-family: monospace; }
-            .total-row { display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px; }
-            .total-row .amount { color: #081C3A; }
-            .net-pay-section { background: linear-gradient(135deg, #081C3A 0%, #1a2f5c 100%); color: white; padding: 20px 25px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }
-            .net-pay-section .label { font-size: 12px; opacity: 0.8; text-transform: uppercase; letter-spacing: 0.5px; }
-            .net-pay-section .amount { font-size: 28px; font-weight: bold; color: #D4A017; }
-            .footer { text-align: center; font-size: 11px; color: #999; margin-top: 20px; padding-top: 15px; border-top: 1px solid #eee; }
-            .deduction-item .amount { color: #dc2626; }
-            @media print { body { padding: 20px; } }
-          </style>
-        </head>
-        <body>
-          <div class="header">
-            <div>
-              <div class="company-name">SAFEGUARD SECURITY SERVICES</div>
-              <div class="company-sub">Lilongwe, Malawi · (+265) 1 234 567</div>
-            </div>
-            <div>
-              <div class="payslip-title">PAYSLIP</div>
-              <div style="text-align: right; font-size: 12px; color: #666;">${selectedMonth} ${selectedYear}</div>
-            </div>
-          </div>
-          <div class="employee-info">
-            <div><div class="label">Employee</div><div class="value">${employee.fullName}</div></div>
-            <div><div class="label">Employee No.</div><div class="value">${employee.employeeNumber}</div></div>
-            <div><div class="label">Position</div><div class="value">${employee.position}</div></div>
-            <div><div class="label">Department</div><div class="value">${employee.department}</div></div>
-            <div><div class="label">Pay Period</div><div class="value">${selectedMonth} 01 - ${selectedMonth} 30, ${selectedYear}</div></div>
-            <div><div class="label">Pay Point</div><div class="value">${employee.payPoint || 'N/A'}</div></div>
-            <div><div class="label">Contract</div><div class="value">${employee.contractType || 'Permanent'}</div></div>
-            <div><div class="label">Date Paid</div><div class="value">${selectedMonth} 30, ${selectedYear}</div></div>
-          </div>
-          <div class="earnings-deductions">
-            <div>
-              <div class="section-title">Earnings</div>
-              <div class="row"><span class="label">Basic Salary</span><span class="amount">${formatKwacha(p.basic_salary)}</span></div>
-              <div class="row"><span class="label">Allowances</span><span class="amount">${formatKwacha(p.allowances)}</span></div>
-              <div class="row"><span class="label">Overtime</span><span class="amount">${formatKwacha(p.overtime)}</span></div>
-              <div class="row"><span class="label">Bonus</span><span class="amount">${formatKwacha(p.bonus)}</span></div>
-              <div class="total-row"><span>Gross Pay</span><span class="amount">${formatKwacha(p.gross_pay)}</span></div>
-            </div>
-            <div>
-              <div class="section-title">Deductions</div>
-              <div class="row deduction-item"><span class="label">PAYE Tax</span><span class="amount">-${formatKwacha(p.paye)}</span></div>
-              <div class="row deduction-item"><span class="label">Pension (5%)</span><span class="amount">-${formatKwacha(p.pension)}</span></div>
-              <div class="row deduction-item"><span class="label">Uniform Deduction</span><span class="amount">-${formatKwacha(p.uniform_deduction)}</span></div>
-              <div class="total-row" style="border-top-color: #dc2626;"><span>Total Deductions</span><span class="amount" style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + p.uniform_deduction)}</span></div>
-            </div>
-          </div>
-          <div class="net-pay-section">
-            <div>
-              <div class="label">Total Net Pay</div>
-              <div class="amount">${formatKwacha(n)}</div>
-            </div>
-            <div style="text-align: right; font-size: 12px;">
-              <div style="opacity: 0.8;">Payment Method: Bank Transfer</div>
-              <div style="opacity: 0.8;">Authorized: William Banda (Admin)</div>
-            </div>
-          </div>
-          <div class="footer">This is a system-generated payslip. No signature required.</div>
-        </body>
-        </html>`;
+      if (pdfBlob) {
+        const url = URL.createObjectURL(pdfBlob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `Payslip_${employee.fullName.replace(/\s/g, '_')}_${selectedMonth}_${selectedYear}.pdf`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(url), 100);
 
-      const blob = new Blob([payslipHTML], { type: 'text/html' });
-      const url = URL.createObjectURL(blob);
+        await logAudit({
+          action: 'EXPORT',
+          entity_type: 'payslip',
+          new_data: { 
+            employee_name: employee.fullName, 
+            employee_number: employee.employeeNumber, 
+            month: selectedMonth, 
+            year: selectedYear, 
+            net_pay: payslip.payroll.net_pay,
+            format: 'PDF'
+          },
+          region_id: userProfile?.region_id
+        });
+
+        showNotification(`Payslip for ${employee.fullName} downloaded successfully`, 'success');
+      }
+    } catch (error: any) {
+      console.error('PDF Download Error:', error);
+      showNotification(`Failed to generate payslip: ${error.message || 'Unknown error'}`, 'error');
+    }
+  }, [selectedMonth, selectedYear, userProfile, generatePDF]);
+
+  // ===== BULK DOWNLOAD ALL PAYSLIPS AS ZIP =====
+  const handleBulkDownload = useCallback(async () => {
+    if (payslips.length === 0) {
+      showNotification('No payslips to download.', 'error');
+      return;
+    }
+
+    setDownloading(true);
+    try {
+      const zip = new JSZip();
+      const folder = zip.folder(`Payslips_${selectedMonth}_${selectedYear}`);
+      
+      let successCount = 0;
+      
+      for (const payslip of payslips) {
+        const pdfBlob = await generatePDF(payslip);
+        if (pdfBlob) {
+          const fileName = `Payslip_${payslip.employee.fullName.replace(/\s/g, '_')}_${selectedMonth}_${selectedYear}.pdf`;
+          folder?.file(fileName, pdfBlob);
+          successCount++;
+        }
+      }
+
+      if (successCount === 0) {
+        showNotification('Failed to generate any payslips.', 'error');
+        setDownloading(false);
+        return;
+      }
+
+      const zipBlob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(zipBlob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `Payslip_${employee.fullName.replace(/\s/g, '_')}_${selectedMonth}_${selectedYear}.html`;
-      
+      link.download = `Payslips_${selectedMonth}_${selectedYear}.zip`;
       document.body.appendChild(link);
       link.click();
-      if (link.parentNode) link.parentNode.removeChild(link);
+      document.body.removeChild(link);
       setTimeout(() => URL.revokeObjectURL(url), 100);
 
       await logAudit({
         action: 'EXPORT',
         entity_type: 'payslip',
         new_data: { 
-          employee_name: employee.fullName, 
-          employee_number: employee.employeeNumber, 
           month: selectedMonth, 
-          year: selectedYear, 
-          net_pay: n 
+          year: selectedYear,
+          count: successCount,
+          format: 'ZIP'
         },
         region_id: userProfile?.region_id
       });
 
-      showNotification(`Payslip for ${employee.fullName} downloaded successfully`, 'success');
+      showNotification(`Downloaded ${successCount} payslips as ZIP`, 'success');
     } catch (error: any) {
-      console.error('PDF Download Error:', error);
-      showNotification(`Failed to generate payslip: ${error.message || 'Unknown error'}`, 'error');
+      console.error('Bulk Download Error:', error);
+      showNotification('Failed to download payslips: ' + error.message, 'error');
+    } finally {
+      setDownloading(false);
     }
-  }, [selectedMonth, selectedYear, userProfile]);
+  }, [payslips, selectedMonth, selectedYear, userProfile, generatePDF]);
+
+  // ===== SAVE TEMPLATE =====
+  const saveTemplate = useCallback(() => {
+    localStorage.setItem('payslipTemplate', JSON.stringify(template));
+    showNotification('Payslip template saved successfully!', 'success');
+    setShowTemplateModal(false);
+  }, [template]);
 
   // ===== PRINT FUNCTION =====
   const handlePrint = useCallback((payslip: PayslipData) => {
     try {
       const employee = payslip.employee;
-      const p = payslip.payroll;
-      const n = p.net_pay;
       
       logAudit({
         action: 'VIEW',
@@ -414,86 +647,7 @@ export function PayslipsPage() {
         return;
       }
 
-      const payslipHTML = `<!DOCTYPE html>
-        <html>
-        <head>
-          <title>Payslip - ${employee.fullName}</title>
-          <style>
-            body { font-family: Arial, sans-serif; padding: 40px; max-width: 800px; margin: 0 auto; color: #1a1a2e; }
-            .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid #081C3A; padding-bottom: 20px; margin-bottom: 20px; }
-            .company-name { font-size: 24px; font-weight: bold; color: #081C3A; }
-            .company-sub { font-size: 12px; color: #666; }
-            .payslip-title { font-size: 20px; font-weight: bold; color: #081C3A; text-align: right; }
-            .employee-info { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; padding: 15px 0; border-bottom: 1px solid #ddd; margin-bottom: 20px; font-size: 13px; }
-            .employee-info .label { color: #666; font-size: 11px; }
-            .employee-info .value { font-weight: 600; color: #1a1a2e; }
-            .earnings-deductions { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 20px; }
-            .section-title { font-size: 13px; font-weight: bold; color: #081C3A; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px; }
-            .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5; }
-            .row .label { color: #555; }
-            .row .amount { font-weight: 500; font-family: monospace; }
-            .total-row { display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px; }
-            .total-row .amount { color: #081C3A; }
-            .net-pay-section { background: linear-gradient(135deg, #081C3A 0%, #1a2f5c 100%); color: white; padding: 20px 25px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }
-            .net-pay-section .label { font-size: 12px; opacity: 0.8; text-transform: uppercase; letter-spacing: 0.5px; }
-            .net-pay-section .amount { font-size: 28px; font-weight: bold; color: #D4A017; }
-            .footer { text-align: center; font-size: 11px; color: #999; margin-top: 20px; padding-top: 15px; border-top: 1px solid #eee; }
-            .deduction-item .amount { color: #dc2626; }
-            @media print { body { padding: 20px; } }
-          </style>
-        </head>
-        <body>
-          <div class="header">
-            <div>
-              <div class="company-name">SAFEGUARD SECURITY SERVICES</div>
-              <div class="company-sub">Lilongwe, Malawi · (+265) 1 234 567</div>
-            </div>
-            <div>
-              <div class="payslip-title">PAYSLIP</div>
-              <div style="text-align: right; font-size: 12px; color: #666;">${selectedMonth} ${selectedYear}</div>
-            </div>
-          </div>
-          <div class="employee-info">
-            <div><div class="label">Employee</div><div class="value">${employee.fullName}</div></div>
-            <div><div class="label">Employee No.</div><div class="value">${employee.employeeNumber}</div></div>
-            <div><div class="label">Position</div><div class="value">${employee.position}</div></div>
-            <div><div class="label">Department</div><div class="value">${employee.department}</div></div>
-            <div><div class="label">Pay Period</div><div class="value">${selectedMonth} 01 - ${selectedMonth} 30, ${selectedYear}</div></div>
-            <div><div class="label">Pay Point</div><div class="value">${employee.payPoint || 'N/A'}</div></div>
-            <div><div class="label">Contract</div><div class="value">${employee.contractType || 'Permanent'}</div></div>
-            <div><div class="label">Date Paid</div><div class="value">${selectedMonth} 30, ${selectedYear}</div></div>
-          </div>
-          <div class="earnings-deductions">
-            <div>
-              <div class="section-title">Earnings</div>
-              <div class="row"><span class="label">Basic Salary</span><span class="amount">${formatKwacha(p.basic_salary)}</span></div>
-              <div class="row"><span class="label">Allowances</span><span class="amount">${formatKwacha(p.allowances)}</span></div>
-              <div class="row"><span class="label">Overtime</span><span class="amount">${formatKwacha(p.overtime)}</span></div>
-              <div class="row"><span class="label">Bonus</span><span class="amount">${formatKwacha(p.bonus)}</span></div>
-              <div class="total-row"><span>Gross Pay</span><span class="amount">${formatKwacha(p.gross_pay)}</span></div>
-            </div>
-            <div>
-              <div class="section-title">Deductions</div>
-              <div class="row deduction-item"><span class="label">PAYE Tax</span><span class="amount">-${formatKwacha(p.paye)}</span></div>
-              <div class="row deduction-item"><span class="label">Pension (5%)</span><span class="amount">-${formatKwacha(p.pension)}</span></div>
-              <div class="row deduction-item"><span class="label">Uniform Deduction</span><span class="amount">-${formatKwacha(p.uniform_deduction)}</span></div>
-              <div class="total-row" style="border-top-color: #dc2626;"><span>Total Deductions</span><span class="amount" style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + p.uniform_deduction)}</span></div>
-            </div>
-          </div>
-          <div class="net-pay-section">
-            <div>
-              <div class="label">Total Net Pay</div>
-              <div class="amount">${formatKwacha(n)}</div>
-            </div>
-            <div style="text-align: right; font-size: 12px;">
-              <div style="opacity: 0.8;">Payment Method: Bank Transfer</div>
-              <div style="opacity: 0.8;">Authorized: William Banda (Admin)</div>
-            </div>
-          </div>
-          <div class="footer">This is a system-generated payslip. No signature required.</div>
-        </body>
-        </html>`;
-
+      const payslipHTML = generatePayslipHTML(payslip);
       printWindow.document.write(payslipHTML);
       printWindow.document.close();
       printWindow.focus();
@@ -502,7 +656,7 @@ export function PayslipsPage() {
       console.error('Print error:', error);
       showNotification('Failed to print payslip', 'error');
     }
-  }, [selectedMonth, selectedYear, userProfile]);
+  }, [selectedMonth, selectedYear, userProfile, generatePayslipHTML]);
 
   // ===== RENDER =====
   if (loading) {
@@ -530,6 +684,8 @@ export function PayslipsPage() {
               
               <div className="flex items-center gap-1">
                 <select 
+                  id="monthSelect"
+                  name="monthSelect"
                   value={selectedMonth} 
                   onChange={(e) => handleMonthSelect(e.target.value)}
                   className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1 min-w-[100px] text-center cursor-pointer"
@@ -539,6 +695,8 @@ export function PayslipsPage() {
                   ))}
                 </select>
                 <select 
+                  id="yearSelect"
+                  name="yearSelect"
                   value={selectedYear} 
                   onChange={(e) => handleYearSelect(e.target.value)}
                   className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1 w-[80px] text-center cursor-pointer"
@@ -566,6 +724,26 @@ export function PayslipsPage() {
               >
                 Jump to Current
               </button>
+            )}
+
+            {payslips.length > 0 && (
+              <>
+                <Button variant="outline" onClick={() => setShowTemplateModal(true)}>
+                  <Settings size={16} className="mr-1" /> Template
+                </Button>
+                <Button variant="secondary" onClick={handleBulkDownload} disabled={downloading}>
+                  {downloading ? (
+                    <span className="flex items-center gap-2">
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      Downloading...
+                    </span>
+                  ) : (
+                    <>
+                      <FileArchiveIcon size={16} className="mr-1" /> Bulk Download
+                    </>
+                  )}
+                </Button>
+              </>
             )}
           </>
         } 
@@ -614,6 +792,9 @@ export function PayslipsPage() {
             <div className="relative flex-1">
               <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
               <input 
+                id="searchPayslips"
+                name="searchPayslips"
+                type="text"
                 value={search} 
                 onChange={e => setSearch(e.target.value)} 
                 placeholder="Search employees..." 
@@ -621,6 +802,16 @@ export function PayslipsPage() {
               />
             </div>
             <div className="text-sm text-slate-500">{filtered.length} payslips found</div>
+            <Button variant="outline" onClick={handleBulkDownload} disabled={downloading || payslips.length === 0} className="text-xs">
+              {downloading ? (
+                <span className="flex items-center gap-2">
+                  <div className="w-3 h-3 border-2 border-[#081C3A] border-t-transparent rounded-full animate-spin" />
+                  Downloading...
+                </span>
+              ) : (
+                <><ArchiveIcon size={14} className="mr-1" /> Download All ({payslips.length})</>
+              )}
+            </Button>
           </Card>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -672,6 +863,148 @@ export function PayslipsPage() {
 
       <Modal open={!!view} onClose={() => setView(null)} title={`Payslip Preview - ${selectedMonth} ${selectedYear}`} size="lg">
         {view && <PayslipPDF payslip={view} month={selectedMonth} year={selectedYear} onPrint={handlePrint} onDownload={handlePDFDownload} />}
+      </Modal>
+
+      {/* Template Customization Modal */}
+      <Modal open={showTemplateModal} onClose={() => setShowTemplateModal(false)} title="Payslip Template Customization" size="lg">
+        <div className="space-y-4">
+          <div className="p-3 bg-[#E8EDF5] rounded-lg text-sm">
+            <p className="text-slate-700">Customize the payslip layout and appearance. Changes will be saved locally.</p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="companyName" className="block text-sm font-medium text-slate-700 mb-1">Company Name</label>
+              <input
+                id="companyName"
+                name="companyName"
+                type="text"
+                value={template.companyName}
+                onChange={(e) => setTemplate({...template, companyName: e.target.value})}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+            <div>
+              <label htmlFor="companyAddress" className="block text-sm font-medium text-slate-700 mb-1">Company Address</label>
+              <input
+                id="companyAddress"
+                name="companyAddress"
+                type="text"
+                value={template.companyAddress}
+                onChange={(e) => setTemplate({...template, companyAddress: e.target.value})}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="primaryColor" className="block text-sm font-medium text-slate-700 mb-1">Primary Color</label>
+              <input
+                id="primaryColor"
+                name="primaryColor"
+                type="color"
+                value={template.primaryColor}
+                onChange={(e) => setTemplate({...template, primaryColor: e.target.value})}
+                className="w-full h-10 px-2 py-1 border border-slate-200 rounded-lg cursor-pointer"
+              />
+            </div>
+            <div>
+              <label htmlFor="secondaryColor" className="block text-sm font-medium text-slate-700 mb-1">Secondary Color</label>
+              <input
+                id="secondaryColor"
+                name="secondaryColor"
+                type="color"
+                value={template.secondaryColor}
+                onChange={(e) => setTemplate({...template, secondaryColor: e.target.value})}
+                className="w-full h-10 px-2 py-1 border border-slate-200 rounded-lg cursor-pointer"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="authorizedName" className="block text-sm font-medium text-slate-700 mb-1">Authorized Name</label>
+              <input
+                id="authorizedName"
+                name="authorizedName"
+                type="text"
+                value={template.authorizedName}
+                onChange={(e) => setTemplate({...template, authorizedName: e.target.value})}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+            <div>
+              <label htmlFor="authorizedTitle" className="block text-sm font-medium text-slate-700 mb-1">Authorized Title</label>
+              <input
+                id="authorizedTitle"
+                name="authorizedTitle"
+                type="text"
+                value={template.authorizedTitle}
+                onChange={(e) => setTemplate({...template, authorizedTitle: e.target.value})}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="footerText" className="block text-sm font-medium text-slate-700 mb-1">Footer Text</label>
+            <input
+              id="footerText"
+              name="footerText"
+              type="text"
+              value={template.footerText}
+              onChange={(e) => setTemplate({...template, footerText: e.target.value})}
+              className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={template.showLogo}
+                onChange={(e) => setTemplate({...template, showLogo: e.target.checked})}
+                className="w-4 h-4 rounded border-slate-300"
+              />
+              Show Logo
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={template.showPayPoint}
+                onChange={(e) => setTemplate({...template, showPayPoint: e.target.checked})}
+                className="w-4 h-4 rounded border-slate-300"
+              />
+              Show Pay Point
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={template.showContractType}
+                onChange={(e) => setTemplate({...template, showContractType: e.target.checked})}
+                className="w-4 h-4 rounded border-slate-300"
+              />
+              Show Contract Type
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={template.showAuthorizedBy}
+                onChange={(e) => setTemplate({...template, showAuthorizedBy: e.target.checked})}
+                className="w-4 h-4 rounded border-slate-300"
+              />
+              Show Authorized By
+            </label>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-4 border-t border-slate-100">
+            <Button variant="outline" onClick={() => setShowTemplateModal(false)}>Cancel</Button>
+            <Button variant="secondary" onClick={saveTemplate}>
+              <Save size={14} className="mr-1" /> Save Template
+            </Button>
+          </div>
+        </div>
       </Modal>
     </div>
   );

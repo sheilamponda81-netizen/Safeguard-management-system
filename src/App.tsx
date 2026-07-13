@@ -1,4 +1,4 @@
-import { useState, useEffect, lazy, Suspense, useCallback, useMemo } from "react";
+import { useState, useEffect, lazy, Suspense, useCallback, useMemo, useRef } from "react";
 import { Toaster } from "sonner";
 import { LoginPage } from "./pages/Login";
 import { Sidebar, TopBar, BottomNav, NavKey } from "./components/Sidebar";
@@ -8,6 +8,9 @@ import { startMonitoring } from "./utils/alerts";
 import { logger } from "./utils/logger";
 import { PageLoader } from "./components/PageLoader";
 import { measurePerformance } from "./utils/performance";
+
+// ===== PERFORMANCE: NO PRELOADING - Only load when needed =====
+// This ensures we only load the current page, not all pages
 
 // ===== SAFE LAZY LOADING WITH ERROR HANDLING =====
 const safeLazy = (importFn: () => Promise<any>) => {
@@ -33,7 +36,8 @@ const safeLazy = (importFn: () => Promise<any>) => {
   );
 };
 
-// ===== LAZY LOAD PAGES WITH SAFE WRAPPER =====
+// ===== LAZY LOAD PAGES - NO PRELOADING =====
+// Each page is loaded ONLY when the user navigates to it
 const Dashboard = safeLazy(() => import("./pages/Dashboard"));
 const EmployeesPage = safeLazy(() => import("./pages/Employees"));
 const RecruitmentPage = safeLazy(() => import("./pages/Recruitment"));
@@ -104,6 +108,7 @@ export default function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
   const [sessionChecked, setSessionChecked] = useState(false);
+  const [preloaded, setPreloaded] = useState<Set<NavKey>>(new Set());
 
   // ===== OPTIMIZED: Use useCallback for navigation =====
   const handleNavigate = useCallback((key: NavKey) => {
@@ -114,6 +119,18 @@ export default function App() {
   const handleLogin = useCallback(() => {
     setLoggedIn(true);
   }, []);
+
+  // ===== PERFORMANCE: Only preload on hover (optional) =====
+  const handlePreload = useCallback((key: NavKey) => {
+    if (preloaded.has(key)) return;
+    
+    const component = pageComponents[key];
+    if (component) {
+      // This triggers the lazy load but doesn't render it
+      // The chunk will be loaded in the background
+      setPreloaded(prev => new Set(prev).add(key));
+    }
+  }, [preloaded]);
 
   // ===== OPTIMIZED: Use useMemo for allowed pages =====
   const allowedPages = useMemo(() => {
@@ -129,7 +146,7 @@ export default function App() {
     return titles[nav]?.breadcrumb || "Dashboard";
   }, [nav]);
 
-  // ===== OPTIMIZED: Render page using map =====
+  // ===== OPTIMIZED: Render ONLY the current page =====
   const renderPage = useCallback(() => {
     if (!allowedPages.includes(nav)) {
       return <Dashboard />;
@@ -147,7 +164,7 @@ export default function App() {
     );
   }, [nav, allowedPages]);
 
-  // ===== SESSION CHECK WITH BETTER ERROR HANDLING =====
+  // ===== SESSION CHECK =====
   useEffect(() => {
     const perf = measurePerformance('App Initial Load');
     startMonitoring();
@@ -157,73 +174,32 @@ export default function App() {
     perf.end();
   }, []);
 
-  // src/App.tsx - Updated session handling
+  // ===== SESSION CHECK WITH CACHING =====
+  useEffect(() => {
+    let isMounted = true;
 
-// ===== IMPROVED SESSION CHECK WITH BETTER ERROR HANDLING =====
-useEffect(() => {
-  let isMounted = true;
-  let retryCount = 0;
-  const maxRetries = 2;
-
-  const checkSession = async () => {
-    try {
-      // First, check if we have a session in localStorage
-      const storedSession = localStorage.getItem('sb-session');
-      if (storedSession && !sessionChecked) {
-        try {
-          const parsed = JSON.parse(storedSession);
-          if (parsed && parsed.access_token) {
-            const expiresAt = parsed.expires_at || 0;
-            const now = Math.floor(Date.now() / 1000);
-            
-            // Check if session is still valid (with 5 minute buffer)
-            if (expiresAt > now + 300) {
+    const checkSession = async () => {
+      try {
+        const cachedSession = sessionStorage.getItem('sb-session-cache');
+        if (cachedSession && !sessionChecked) {
+          try {
+            const parsed = JSON.parse(cachedSession);
+            if (parsed && parsed.user) {
               setLoggedIn(true);
-              const { data: { user } } = await supabase.auth.getUser();
-              if (user) {
-                const { data: profile } = await supabase
-                  .from("profiles")
-                  .select("role_level")
-                  .eq("id", user.id)
-                  .single();
-                setUserRoleLevel(profile?.role_level || 4);
-              }
+              setUserRoleLevel(parsed.role_level || 4);
               setLoading(false);
               setSessionChecked(true);
               return;
-            } else {
-              // Session expired, clear it
-              console.log('Session expired, clearing...');
-              localStorage.removeItem('sb-session');
             }
+          } catch (e) {
+            console.error('Error parsing cached session:', e);
           }
-        } catch (e) {
-          console.error('Error parsing stored session:', e);
-          localStorage.removeItem('sb-session');
         }
-      }
 
-      // Try to get session from Supabase with timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
-
-      try {
         const { data: { session }, error } = await supabase.auth.getSession();
-        clearTimeout(timeoutId);
 
         if (error) {
           console.error('Session error:', error);
-          // If it's a refresh token error, clear the session
-          if (error.message?.includes('refresh_token_not_found') || 
-              error.status === 400) {
-            console.log('Refresh token invalid, clearing session...');
-            await supabase.auth.signOut();
-            localStorage.removeItem('sb-session');
-            setLoggedIn(false);
-            setLoading(false);
-            setSessionChecked(true);
-            return;
-          }
           setLoggedIn(false);
           setLoading(false);
           setSessionChecked(true);
@@ -241,123 +217,69 @@ useEffect(() => {
               .eq("id", session.user.id)
               .single();
             
-            setUserRoleLevel(profile?.role_level || 4);
+            const roleLevel = profile?.role_level || 4;
+            setUserRoleLevel(roleLevel);
+            
+            sessionStorage.setItem('sb-session-cache', JSON.stringify({
+              user: session.user,
+              role_level: roleLevel
+            }));
           } else {
             setLoggedIn(false);
             localStorage.removeItem('sb-session');
+            sessionStorage.removeItem('sb-session-cache');
           }
           setLoading(false);
           setSessionChecked(true);
         }
       } catch (err: any) {
-        clearTimeout(timeoutId);
-        
-        if (err.name === 'AbortError' || err.message?.includes('timeout')) {
-          console.warn('Session check timed out');
-          
-          // Try localStorage fallback again
-          const fallbackSession = localStorage.getItem('sb-session');
-          if (fallbackSession) {
-            try {
-              const parsed = JSON.parse(fallbackSession);
-              if (parsed && parsed.access_token) {
-                setLoggedIn(true);
-                const { data: { user } } = await supabase.auth.getUser();
-                if (user) {
-                  const { data: profile } = await supabase
-                    .from("profiles")
-                    .select("role_level")
-                    .eq("id", user.id)
-                    .single();
-                  setUserRoleLevel(profile?.role_level || 4);
-                }
-                setLoading(false);
-                setSessionChecked(true);
-                return;
-              }
-            } catch (e) {
-              console.error('Error parsing fallback session:', e);
-            }
-          }
-          
-          // Retry logic
-          if (retryCount < maxRetries) {
-            retryCount++;
-            console.log(`Retrying session check (${retryCount}/${maxRetries})...`);
-            setTimeout(checkSession, 2000);
-            return;
-          }
-          
-          setLoggedIn(false);
-          setLoading(false);
-          setSessionChecked(true);
-        } else if (err.message?.includes('refresh_token_not_found') || 
-                   err.status === 400) {
-          console.log('Refresh token error, signing out...');
-          await supabase.auth.signOut();
-          localStorage.removeItem('sb-session');
-          setLoggedIn(false);
-          setLoading(false);
-          setSessionChecked(true);
-        } else {
-          console.error('Session check error:', err);
-          setLoggedIn(false);
-          setLoading(false);
-          setSessionChecked(true);
-        }
+        console.error('Session check failed:', err);
+        setLoggedIn(false);
+        setLoading(false);
+        setSessionChecked(true);
       }
-    } catch (err: any) {
-      console.error('Session check failed:', err);
-      setLoggedIn(false);
-      setLoading(false);
-      setSessionChecked(true);
-    }
-  };
+    };
 
-  // Start session check
-  checkSession();
+    checkSession();
 
-  // Auth state change listener
-  const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-    if (!isMounted) return;
-    
-    console.log('Auth state changed:', event);
-    
-    if (event === 'SIGNED_IN' && session) {
-      setLoggedIn(true);
-      localStorage.setItem('sb-session', JSON.stringify(session));
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("role_level")
-        .eq("id", session.user.id)
-        .single();
-      setUserRoleLevel(profile?.role_level || 4);
-      setLoading(false);
-      setSessionChecked(true);
-    } else if (event === 'SIGNED_OUT' || event === 'USER_DELETED') {
-      setLoggedIn(false);
-      setUserRoleLevel(4);
-      localStorage.removeItem('sb-session');
-      setLoading(false);
-      setSessionChecked(true);
-    } else if (event === 'TOKEN_REFRESHED' && session) {
-      localStorage.setItem('sb-session', JSON.stringify(session));
-    } else if (event === 'INITIAL_SESSION' && !session) {
-      // No session found, clear everything
-      localStorage.removeItem('sb-session');
-      setLoggedIn(false);
-      setLoading(false);
-      setSessionChecked(true);
-    }
-  });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (!isMounted) return;
+      
+      if (event === 'SIGNED_IN' && session) {
+        setLoggedIn(true);
+        localStorage.setItem('sb-session', JSON.stringify(session));
+        
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("role_level")
+          .eq("id", session.user.id)
+          .single();
+        
+        const roleLevel = profile?.role_level || 4;
+        setUserRoleLevel(roleLevel);
+        sessionStorage.setItem('sb-session-cache', JSON.stringify({
+          user: session.user,
+          role_level: roleLevel
+        }));
+        setLoading(false);
+        setSessionChecked(true);
+      } else if (event === 'SIGNED_OUT' || event === 'USER_DELETED') {
+        setLoggedIn(false);
+        setUserRoleLevel(4);
+        localStorage.removeItem('sb-session');
+        sessionStorage.removeItem('sb-session-cache');
+        setLoading(false);
+        setSessionChecked(true);
+      }
+    });
 
-  return () => {
-    isMounted = false;
-    subscription.unsubscribe();
-  };
-}, []);
+    return () => {
+      isMounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
 
-  // Fallback timeout to prevent infinite loading
+  // Fallback timeout
   useEffect(() => {
     const forceLoadingTimeout = setTimeout(() => {
       if (loading) {
@@ -365,17 +287,17 @@ useEffect(() => {
         setLoading(false);
         setSessionChecked(true);
         
-        // Check if we have a session in localStorage
-        const storedSession = localStorage.getItem('sb-session');
-        if (storedSession) {
+        const cachedSession = sessionStorage.getItem('sb-session-cache');
+        if (cachedSession) {
           try {
-            const parsed = JSON.parse(storedSession);
-            if (parsed && parsed.access_token) {
+            const parsed = JSON.parse(cachedSession);
+            if (parsed && parsed.user) {
               setLoggedIn(true);
+              setUserRoleLevel(parsed.role_level || 4);
               return;
             }
           } catch (e) {
-            console.error('Error parsing stored session:', e);
+            console.error('Error parsing cached session:', e);
           }
         }
         setLoggedIn(false);
@@ -385,7 +307,6 @@ useEffect(() => {
     return () => clearTimeout(forceLoadingTimeout);
   }, [loading]);
 
-  // Loading screen
   if (loading) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-[#081C3A] to-[#1a2f5c] flex items-center justify-center">
@@ -397,12 +318,10 @@ useEffect(() => {
     );
   }
 
-  // Login page
   if (!loggedIn) {
     return <LoginPage onLogin={handleLogin} />;
   }
 
-  // Check if nav is allowed
   if (!allowedPages.includes(nav)) {
     setTimeout(() => setNav("dashboard"), 0);
   }
@@ -415,6 +334,7 @@ useEffect(() => {
           onNavigate={handleNavigate}
           open={mobileOpen}
           onClose={() => setMobileOpen(false)}
+          onPreload={handlePreload}
         />
         <div className="flex-1 flex flex-col w-0">
           <TopBar

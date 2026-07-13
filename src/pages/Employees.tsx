@@ -1,6 +1,5 @@
 ﻿import { useState, useMemo, useEffect, useCallback } from 'react';
-import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, User, Phone, MapPin, Heart, ChevronLeft, ChevronRight } from '../utils/icons';
-
+import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, User, Phone, MapPin, Heart, ChevronLeft, ChevronRight, Archive, RotateCcw, Calendar, Clock, AlertCircle } from 'lucide-react';
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -8,6 +7,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { getEmployeeAuditData, getChanges } from '../utils/auditHelpers';
+import { Pagination } from '../components/Pagination';
 
 interface Employee {
   id: string;
@@ -41,6 +41,8 @@ interface Employee {
   is_deleted?: boolean;
   deleted_at?: string;
   deleted_reason?: string;
+  deleted_by?: string;
+  deleted_by_name?: string;
   created_at?: string;
 }
 
@@ -101,6 +103,8 @@ export function EmployeesPage() {
   const [filterPayPoint, setFilterPayPoint] = useState<string>('');
   const [userProfile, setUserProfile] = useState<any>(null);
   const [userLoading, setUserLoading] = useState(true);
+  const [showDeletedModal, setShowDeletedModal] = useState(false);
+  const [selectedDeletedEmployee, setSelectedDeletedEmployee] = useState<Employee | null>(null);
   
   // ===== PAGINATION =====
   const [currentPage, setCurrentPage] = useState(1);
@@ -110,25 +114,37 @@ export function EmployeesPage() {
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
   const userRegion = useMemo(() => regions.find(r => r.id === userProfile?.region_id), [regions, userProfile]);
 
+  // Separate active and deleted employees - ONLY ACTIVE EMPLOYEES (is_deleted = false or null)
+  const activeEmployees = useMemo(() => employees.filter(e => !e.is_deleted), [employees]);
+  const deletedEmployees = useMemo(() => employees.filter(e => e.is_deleted === true), [employees]);
+
   const filtered = useMemo(() => {
-    return employees.filter(e => {
+    // When statusFilter is 'deleted', show ONLY deleted employees
+    if (statusFilter === 'deleted') {
+      return deletedEmployees.filter(e => {
+        const matchesSearch = e.fullName.toLowerCase().includes(search.toLowerCase()) || 
+                             e.employeeNumber.toLowerCase().includes(search.toLowerCase()) || 
+                             e.position.toLowerCase().includes(search.toLowerCase());
+        return matchesSearch;
+      });
+    }
+    
+    // Otherwise show ONLY active employees with optional status filter
+    let data = activeEmployees;
+    
+    return data.filter(e => {
       const matchesSearch = e.fullName.toLowerCase().includes(search.toLowerCase()) || 
                            e.employeeNumber.toLowerCase().includes(search.toLowerCase()) || 
                            e.position.toLowerCase().includes(search.toLowerCase());
       
       let matchesFilter = true;
-      
-      if (statusFilter === 'all') {
-        matchesFilter = true;
-      } else if (statusFilter === 'deleted') {
-        matchesFilter = e.is_deleted === true;
-      } else {
-        matchesFilter = e.status === statusFilter && e.is_deleted !== true;
+      if (statusFilter !== 'all') {
+        matchesFilter = e.status === statusFilter;
       }
       
       return matchesSearch && matchesFilter;
     });
-  }, [employees, search, statusFilter]);
+  }, [activeEmployees, deletedEmployees, search, statusFilter]);
 
   const totalPages = useMemo(() => Math.ceil(filtered.length / itemsPerPage), [filtered, itemsPerPage]);
   
@@ -137,9 +153,6 @@ export function EmployeesPage() {
     const endIndex = Math.min(startIndex + itemsPerPage, filtered.length);
     return filtered.slice(startIndex, endIndex);
   }, [filtered, currentPage, itemsPerPage]);
-
-  const activeEmployees = useMemo(() => employees.filter(e => !e.is_deleted), [employees]);
-  const deletedEmployees = useMemo(() => employees.filter(e => e.is_deleted === true), [employees]);
 
   // ===== CALLBACKS =====
   const fetchRegions = useCallback(async () => {
@@ -211,6 +224,7 @@ export function EmployeesPage() {
         is_deleted: emp.is_deleted || false,
         deleted_at: emp.deleted_at || null,
         deleted_reason: emp.deleted_reason || null,
+        deleted_by: emp.deleted_by || null,
         created_at: emp.created_at || null,
       }));
       setEmployees(mappedEmployees);
@@ -350,6 +364,7 @@ export function EmployeesPage() {
         is_deleted: false,
         deleted_at: null,
         deleted_reason: null,
+        deleted_by: null,
       }])
       .select();
     
@@ -387,6 +402,7 @@ export function EmployeesPage() {
         is_deleted: data[0].is_deleted || false,
         deleted_at: data[0].deleted_at || null,
         deleted_reason: data[0].deleted_reason || null,
+        deleted_by: data[0].deleted_by || null,
         created_at: data[0].created_at || null,
       };
       setEmployees([newEmployee, ...employees]);
@@ -559,6 +575,7 @@ export function EmployeesPage() {
     }
     
     const employeeData = { ...employee };
+    const deletedBy = userProfile?.full_name || userProfile?.email || 'Unknown';
     
     const { error } = await supabase
       .from('employees')
@@ -567,6 +584,7 @@ export function EmployeesPage() {
         is_deleted: true,
         deleted_at: new Date().toISOString(),
         deleted_reason: reason.trim(),
+        deleted_by: userProfile?.id || null,
       })
       .eq('id', employee.id);
       
@@ -581,6 +599,7 @@ export function EmployeesPage() {
             is_deleted: true,
             deleted_at: new Date().toISOString(),
             deleted_reason: reason.trim(),
+            deleted_by: userProfile?.id || null,
           };
         }
         return e;
@@ -592,7 +611,11 @@ export function EmployeesPage() {
         entity_type: 'employee',
         entity_id: employee.id,
         old_data: getEmployeeAuditData(employeeData),
-        new_data: { deleted_reason: reason.trim(), deleted_at: new Date().toISOString() },
+        new_data: { 
+          deleted_reason: reason.trim(), 
+          deleted_at: new Date().toISOString(),
+          deleted_by: deletedBy
+        },
         region_id: employee.region_id
       });
       
@@ -615,6 +638,7 @@ export function EmployeesPage() {
           is_deleted: false,
           deleted_at: null,
           deleted_reason: null,
+          deleted_by: null,
         })
         .eq('id', employee.id);
         
@@ -629,6 +653,7 @@ export function EmployeesPage() {
               is_deleted: false,
               deleted_at: null,
               deleted_reason: null,
+              deleted_by: null,
             };
           }
           return e;
@@ -639,7 +664,7 @@ export function EmployeesPage() {
           action: 'UPDATE',
           entity_type: 'employee',
           entity_id: employee.id,
-          old_data: { is_deleted: true, status: 'Deleted' },
+          old_data: { is_deleted: true, status: 'Deleted', deleted_reason: employee.deleted_reason },
           new_data: { is_deleted: false, status: 'Active' },
           region_id: employee.region_id
         });
@@ -653,7 +678,7 @@ export function EmployeesPage() {
   // ===== EXPORT EMPLOYEES =====
   const handleExport = useCallback(() => {
     const csv = [
-      ['Employee ID', 'Full Name', 'Company', 'Workstation', 'Account Number', 'Gender', 'Age', 'Phone', 'Position', 'Department', 'Basic Salary', 'Status', 'Pay Point', 'Uniform Deduction', 'Next of Kin', 'Relationship', 'NOK Phone', 'Deleted'],
+      ['Employee ID', 'Full Name', 'Company', 'Workstation', 'Account Number', 'Gender', 'Age', 'Phone', 'Position', 'Department', 'Basic Salary', 'Status', 'Pay Point', 'Uniform Deduction', 'Next of Kin', 'Relationship', 'NOK Phone', 'Deleted', 'Deleted Reason', 'Deleted Date'],
       ...filtered.map(e => [
         e.employeeNumber, e.fullName, e.company || '', e.workstation || '',
         e.account_number || '', e.gender, e.age, e.phone, e.position, e.department, e.basicSalary, e.status, e.pay_point || '',
@@ -661,7 +686,9 @@ export function EmployeesPage() {
         e.next_of_kin_name || '',
         e.next_of_kin_relationship || '',
         e.next_of_kin_phone || '',
-        e.is_deleted ? 'Yes' : 'No'
+        e.is_deleted ? 'Yes' : 'No',
+        e.is_deleted ? (e.deleted_reason || '') : '',
+        e.is_deleted ? (e.deleted_at ? new Date(e.deleted_at).toLocaleDateString() : '') : ''
       ])
     ].map(row => row.join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -693,6 +720,12 @@ export function EmployeesPage() {
     setEditingEmployee(employee);
     setShowEdit(true);
   }, [userProfile]);
+
+  // ===== VIEW DELETED EMPLOYEE DETAILS =====
+  const handleViewDeleted = useCallback((employee: Employee) => {
+    setSelectedDeletedEmployee(employee);
+    setShowDeletedModal(true);
+  }, []);
 
   // ===== PAGINATION =====
   const goToPage = useCallback((page: number) => {
@@ -814,7 +847,7 @@ export function EmployeesPage() {
           { label: 'Total Active', n: activeEmployees.length },
           { label: 'Active', n: activeEmployees.filter(e => e.status === 'Active').length },
           { label: 'On Leave', n: activeEmployees.filter(e => e.status === 'On Leave').length },
-          { label: '🗑️ Deleted', n: deletedEmployees.length }
+          { label: <span className="flex items-center gap-1"><Archive size={14} /> Deleted</span>, n: deletedEmployees.length }
         ].map((s, i) => (
           <Card key={i} className="p-4">
             <p className="text-xs text-slate-500">{s.label}</p>
@@ -835,18 +868,23 @@ export function EmployeesPage() {
         </div>
         <div className="flex gap-2 flex-wrap">
           {[
-            { v: 'all', l: 'All' },
+            { v: 'all', l: 'All Active' },
             { v: 'Active', l: 'Active' },
             { v: 'On Leave', l: 'On Leave' },
             { v: 'Suspended', l: 'Suspended' },
-            { v: 'deleted', l: '🗑️ Deleted' }
+            { v: 'deleted', l: <span className="flex items-center gap-1"><Archive size={12} /> Deleted</span> }
           ].map(f => (
             <button
               key={f.v}
-              onClick={() => setStatusFilter(f.v)}
+              onClick={() => {
+                setStatusFilter(f.v);
+                setCurrentPage(1);
+              }}
               className={`px-3 py-2 text-xs font-medium rounded-lg transition-colors ${
                 statusFilter === f.v 
-                  ? 'bg-[#081C3A] text-white' 
+                  ? f.v === 'deleted'
+                    ? 'bg-red-600 text-white'
+                    : 'bg-[#081C3A] text-white'
                   : f.v === 'deleted' 
                     ? 'bg-red-50 text-red-600 hover:bg-red-100' 
                     : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -875,7 +913,7 @@ export function EmployeesPage() {
             </THead>
             <TBody>
               {currentItems.map(emp => (
-                <TR key={emp.id} onClick={() => setSelected(emp)}>
+                <TR key={emp.id} onClick={() => !emp.is_deleted && setSelected(emp)}>
                   <TD>
                     <div className="flex items-center gap-3">
                       <div className="w-8 h-8 rounded-full bg-[#081C3A] flex items-center justify-center text-white text-xs font-bold shrink-0">
@@ -903,17 +941,29 @@ export function EmployeesPage() {
                   </TD>
                   <td className="px-4 py-3 text-right">
                     <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
-                      <button onClick={() => setSelected(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Eye size={14} /></button>
-                      {!emp.is_deleted && (
+                      {emp.is_deleted ? (
                         <>
-                          <button onClick={() => handleEdit(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Edit2 size={14} /></button>
+                          <button 
+                            onClick={() => handleViewDeleted(emp)} 
+                            className="w-8 h-8 rounded-lg hover:bg-slate-100 text-blue-600 flex items-center justify-center"
+                            title="View Deleted Details"
+                          >
+                            <Eye size={14} />
+                          </button>
+                          <button 
+                            onClick={() => restoreEmployee(emp)} 
+                            className="w-8 h-8 rounded-lg hover:bg-emerald-50 text-emerald-600 flex items-center justify-center"
+                            title="Restore Employee"
+                          >
+                            <RotateCcw size={14} />
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button onClick={() => setSelected(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Eye size={14} /></button>
+                          <button onClick={() => handleEdit(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-amber-600 flex items-center justify-center"><Edit2 size={14} /></button>
                           <button onClick={() => handleDelete(emp)} className="w-8 h-8 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"><Trash2 size={14} /></button>
                         </>
-                      )}
-                      {emp.is_deleted && (
-                        <button onClick={() => restoreEmployee(emp)} className="w-8 h-8 rounded-lg hover:bg-emerald-50 text-emerald-600 flex items-center justify-center" title="Restore Employee">
-                          <UserPlus size={14} />
-                        </button>
                       )}
                     </div>
                   </td>
@@ -923,70 +973,93 @@ export function EmployeesPage() {
           </table>
         </div>
         
-        {/* Pagination */}
-        <div className="px-4 py-3 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500">
-          <span>
-            Showing {filtered.length === 0 ? 0 : (currentPage - 1) * itemsPerPage + 1} to {Math.min(currentPage * itemsPerPage, filtered.length)} of {filtered.length} employees
-          </span>
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => goToPage(currentPage - 1)}
-              disabled={currentPage === 1 || filtered.length === 0}
-              className="px-3 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-            >
-              <ChevronLeft size={14} /> Previous
-            </button>
-            
-            <div className="flex items-center gap-1">
-              {Array.from({ length: Math.min(totalPages, 5) }, (_, i) => {
-                let pageNum: number;
-                if (totalPages <= 5) {
-                  pageNum = i + 1;
-                } else if (currentPage <= 3) {
-                  pageNum = i + 1;
-                } else if (currentPage >= totalPages - 2) {
-                  pageNum = totalPages - 4 + i;
-                } else {
-                  pageNum = currentPage - 2 + i;
-                }
-                
-                return (
-                  <button
-                    key={pageNum}
-                    onClick={() => goToPage(pageNum)}
-                    className={`px-3 py-1.5 rounded-md transition-colors ${
-                      currentPage === pageNum
-                        ? 'bg-[#081C3A] text-white'
-                        : 'border border-slate-200 hover:bg-slate-50'
-                    }`}
-                  >
-                    {pageNum}
-                  </button>
-                );
-              })}
-              {totalPages > 5 && currentPage < totalPages - 2 && (
-                <>
-                  <span className="px-1">...</span>
-                  <button
-                    onClick={() => goToPage(totalPages)}
-                    className="px-3 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50"
-                  >
-                    {totalPages}
-                  </button>
-                </>
-              )}
-            </div>
-            
-            <button
-              onClick={() => goToPage(currentPage + 1)}
-              disabled={currentPage === totalPages || filtered.length === 0}
-              className="px-3 py-1.5 rounded-md border border-slate-200 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-            >
-              Next <ChevronRight size={14} />
-            </button>
-          </div>
-        </div>
+        <Pagination
+          currentPage={currentPage}
+          totalPages={totalPages}
+          totalItems={filtered.length}
+          itemsPerPage={itemsPerPage}
+          onPageChange={goToPage}
+          onItemsPerPageChange={(items) => {
+            setItemsPerPage(items);
+            setCurrentPage(1);
+          }}
+        />
       </div>
+
+      {/* Deleted Employee Details Modal */}
+      <Modal
+        open={showDeletedModal}
+        onClose={() => { setShowDeletedModal(false); setSelectedDeletedEmployee(null); }}
+        title="Deleted Employee Details"
+        size="lg"
+      >
+        {selectedDeletedEmployee && (
+          <div className="space-y-4">
+            <div className="flex items-center gap-4">
+              <div className="w-16 h-16 rounded-2xl bg-red-100 flex items-center justify-center text-red-600 text-xl font-bold">
+                {selectedDeletedEmployee.fullName?.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
+              </div>
+              <div>
+                <h3 className="text-xl font-bold text-slate-800">{selectedDeletedEmployee.fullName}</h3>
+                <p className="text-sm text-slate-500">{selectedDeletedEmployee.position} · {selectedDeletedEmployee.employeeNumber}</p>
+                <Badge color="red">🗑️ Deleted</Badge>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div className="p-3 bg-red-50 rounded-lg border border-red-200">
+                <p className="text-xs text-red-600 font-semibold flex items-center gap-1">
+                  <AlertCircle size={14} /> Deletion Reason
+                </p>
+                <p className="font-medium text-slate-800 mt-1">{selectedDeletedEmployee.deleted_reason || 'No reason provided'}</p>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
+                <p className="text-xs text-slate-500 font-semibold flex items-center gap-1">
+                  <Calendar size={14} /> Deleted On
+                </p>
+                <p className="font-medium text-slate-800 mt-1">
+                  {selectedDeletedEmployee.deleted_at ? new Date(selectedDeletedEmployee.deleted_at).toLocaleString() : 'Unknown'}
+                </p>
+              </div>
+            </div>
+
+            <div className="border-t pt-4">
+              <h4 className="font-semibold text-slate-800 mb-3 text-sm">Employee Information</h4>
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div><p className="text-slate-500 text-xs">Phone</p><p className="font-medium">{selectedDeletedEmployee.phone || 'N/A'}</p></div>
+                <div><p className="text-slate-500 text-xs">Email</p><p className="font-medium">{selectedDeletedEmployee.email || 'N/A'}</p></div>
+                <div><p className="text-slate-500 text-xs">Department</p><p className="font-medium">{selectedDeletedEmployee.department || 'N/A'}</p></div>
+                <div><p className="text-slate-500 text-xs">Basic Salary</p><p className="font-medium">{formatKwacha(selectedDeletedEmployee.basicSalary)}</p></div>
+                <div><p className="text-slate-500 text-xs">Date Hired</p><p className="font-medium">{selectedDeletedEmployee.dateHired ? new Date(selectedDeletedEmployee.dateHired).toLocaleDateString() : 'N/A'}</p></div>
+                <div><p className="text-slate-500 text-xs">Company</p><p className="font-medium">{selectedDeletedEmployee.company || 'N/A'}</p></div>
+              </div>
+            </div>
+
+            {selectedDeletedEmployee.deleted_by && (
+              <div className="border-t pt-4">
+                <h4 className="font-semibold text-slate-800 mb-3 text-sm">Deletion Record</h4>
+                <div className="p-3 bg-slate-50 rounded-lg text-sm">
+                  <p><span className="text-slate-500">Deleted by:</span> <span className="font-medium">{selectedDeletedEmployee.deleted_by}</span></p>
+                  <p className="mt-1"><span className="text-slate-500">Employee ID:</span> <span className="font-medium">{selectedDeletedEmployee.employeeNumber}</span></p>
+                </div>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-4 border-t">
+              <Button variant="outline" onClick={() => { setShowDeletedModal(false); setSelectedDeletedEmployee(null); }}>
+                Close
+              </Button>
+              <Button variant="secondary" onClick={() => {
+                restoreEmployee(selectedDeletedEmployee);
+                setShowDeletedModal(false);
+                setSelectedDeletedEmployee(null);
+              }}>
+                <RotateCcw size={14} className="mr-1" /> Restore Employee
+              </Button>
+            </div>
+          </div>
+        )}
+      </Modal>
 
       <Modal open={showAdd} onClose={() => setShowAdd(false)} title="Add New Employee" size="xl">
         <AddEmployeeForm 

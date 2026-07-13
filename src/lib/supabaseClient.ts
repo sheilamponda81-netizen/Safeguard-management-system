@@ -1,51 +1,57 @@
 // src/lib/supabaseClient.ts
 
 import { createClient } from '@supabase/supabase-js';
+import { requestDeduplicator } from '../utils/requestDeduplicator';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
+// Create the supabase client with optimized settings
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: {
     persistSession: true,
     autoRefreshToken: true,
+    detectSessionInUrl: true,
+  },
+  global: {
+    headers: {
+      'X-Client-Info': 'safeguard-hr',
+    },
   },
   db: {
     schema: 'public',
   },
 });
 
-// Helper to ensure tenant isolation in queries
-export const withTenantFilter = <T>(query: any): any => {
-  // This is a helper function - the real enforcement is at the database level via RLS
-  return query;
-};
+/**
+ * Optimized query execution with deduplication
+ */
+export async function executeQuery<T>(
+  table: string,
+  queryFn: () => Promise<{ data: T | null; error: any }>,
+  cacheKey?: string,
+  useCache: boolean = true
+): Promise<T> {
+  const key = cacheKey || `${table}:${JSON.stringify(queryFn)}`;
+  
+  return requestDeduplicator.execute(
+    key,
+    async () => {
+      const { data, error } = await queryFn();
+      if (error) throw error;
+      return data as T;
+    },
+    useCache
+  );
+}
 
-// Get current user's tenant ID
-export const getCurrentTenantId = async (): Promise<string | null> => {
-  try {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return null;
-
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('tenant_id')
-      .eq('id', user.id)
-      .single();
-
-    if (error) throw error;
-    return data?.tenant_id || null;
-  } catch (error) {
-    console.error('Error fetching tenant ID:', error);
-    return null;
-  }
-};
-
-// Set tenant context for the session
-export const setTenantContext = async (tenantId: string): Promise<void> => {
-  try {
-    await supabase.rpc('set_tenant_context', { tenant_id: tenantId });
-  } catch (error) {
-    console.error('Error setting tenant context:', error);
-  }
-};
+/**
+ * Invalidate cache for a table
+ */
+export function invalidateTableCache(table: string): void {
+  requestDeduplicator.invalidatePattern(new RegExp(`^${table}:`));
+  // Also invalidate in the data cache
+  import('./dataCache').then(({ dataCache }) => {
+    dataCache.invalidatePattern(new RegExp(`^${table}`));
+  });
+}
