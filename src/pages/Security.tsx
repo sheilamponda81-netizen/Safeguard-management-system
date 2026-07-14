@@ -146,7 +146,7 @@ export function SecurityPage() {
           .from('profiles')
           .select('*, regions(*)')
           .eq('id', user.id)
-          .single();
+          .maybeSingle();
         if (error) throw error;
         return profile;
       }
@@ -303,7 +303,7 @@ export function SecurityPage() {
           .from('employees')
           .select('*')
           .eq('id', newGuard.employee_id)
-          .single();
+          .maybeSingle();
 
         if (fetchError) throw fetchError;
 
@@ -434,17 +434,19 @@ export function SecurityPage() {
     setShowEditModal(true);
   }, []);
 
-  // ===== SAVE EDIT =====
+  // ===== SAVE EDIT - UPDATED to sync with employees table =====
   const saveEdit = useCallback(async () => {
     if (!editingItem) return;
     
     try {
       const oldData = securityData.find(item => item.id === editingItem.id);
       
+      // Update all fields in the employees table - this will sync everywhere
       const { error } = await supabase
         .from('employees')
         .update({
           full_name: editingItem.full_name,
+          employee_number: editingItem.employee_number,
           position: editingItem.position,
           phone: editingItem.phone,
           status: editingItem.status,
@@ -456,15 +458,20 @@ export function SecurityPage() {
           uniform_condition: editingItem.uniform_condition,
           shoes_status: editingItem.shoes_status,
           license_status: editingItem.licenseStatus,
-          license_expiry: editingItem.license_expiry,
+          license_expiry: editingItem.license_expiry || null,
           next_of_kin_name: editingItem.emergency_contact,
           next_of_kin_phone: editingItem.emergency_phone,
           guardId: editingItem.guardId
         })
         .eq('id', editingItem.id);
 
-      if (error) throw error;
+      if (error) {
+        console.error('Supabase update error:', error);
+        showNotification('Failed to update guard: ' + error.message, 'error');
+        return;
+      }
       
+      // Update local state
       setSecurityData(prev => prev.map(item => item.id === editingItem.id ? editingItem : item));
       showNotification(`${editingItem.full_name} updated successfully`, 'success');
       setShowEditModal(false);
@@ -906,7 +913,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
     license_expiry: '',
     emergency_contact: '',
     emergency_phone: '',
-    guardId: `G-${Math.floor(Math.random() * 1000)}`,
+    guardId: '',
     is_existing_employee: false
   });
 
@@ -918,6 +925,11 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
   const dropdownRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [selectedEmployee, setSelectedEmployee] = useState<any>(null);
+  const [supervisorSearch, setSupervisorSearch] = useState('');
+  const [filteredSupervisors, setFilteredSupervisors] = useState<any[]>([]);
+  const [showSupervisorDropdown, setShowSupervisorDropdown] = useState(false);
+  const supervisorDropdownRef = useRef<HTMLDivElement>(null);
+  const [allSupervisors, setAllSupervisors] = useState<any[]>([]);
 
   // Fetch all employees for search (excluding deleted)
   useEffect(() => {
@@ -941,6 +953,47 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
     fetchEmployees();
   }, []);
 
+  // ===== FETCH SUPERVISORS (only employees with supervisor positions) =====
+  useEffect(() => {
+    const fetchSupervisors = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('employees')
+          .select('id, full_name, employee_number, position')
+          .eq('is_deleted', false)
+          .or('position.ilike.%supervisor%,position.ilike.%manager%,position.ilike.%lead%')
+          .order('full_name');
+        
+        if (error) throw error;
+        setAllSupervisors(data || []);
+      } catch (err) {
+        console.error('Error fetching supervisors:', err);
+      }
+    };
+    fetchSupervisors();
+  }, []);
+
+  // Filter supervisors based on search
+  useEffect(() => {
+    if (supervisorSearch.trim() === '') {
+      setFilteredSupervisors(allSupervisors);
+      return;
+    }
+    
+    const searchLower = supervisorSearch.toLowerCase().trim();
+    const filtered = allSupervisors.filter((sup: any) => {
+      const fullName = (sup.full_name || '').toLowerCase();
+      const employeeNumber = (sup.employee_number || '').toLowerCase();
+      const position = (sup.position || '').toLowerCase();
+      
+      return fullName.includes(searchLower) ||
+             employeeNumber.includes(searchLower) ||
+             position.includes(searchLower);
+    });
+    
+    setFilteredSupervisors(filtered.slice(0, 15));
+  }, [supervisorSearch, allSupervisors]);
+
   // Filter employees based on search
   useEffect(() => {
     if (employeeSearch.trim() === '') {
@@ -962,15 +1015,26 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
     setFilteredEmployees(filtered.slice(0, 15));
   }, [employeeSearch, allEmployees]);
 
-  // Close dropdown when clicking outside
+  // Close dropdowns when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
         setShowEmployeeDropdown(false);
       }
+      if (supervisorDropdownRef.current && !supervisorDropdownRef.current.contains(event.target as Node)) {
+        setShowSupervisorDropdown(false);
+      }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // ===== GENERATE GUARD ID =====
+  useEffect(() => {
+    if (!formData.guardId) {
+      const randomNum = Math.floor(1000 + Math.random() * 9000);
+      setFormData(prev => ({ ...prev, guardId: `G-${randomNum}` }));
+    }
   }, []);
 
   // Select employee from dropdown - auto-fill form
@@ -1011,6 +1075,20 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
     if (inputRef.current) {
       inputRef.current.focus();
     }
+  };
+
+  // Select supervisor from dropdown
+  const selectSupervisor = (supervisor: any) => {
+    setFormData(prev => ({ ...prev, supervisor: supervisor.full_name }));
+    setSupervisorSearch(supervisor.full_name);
+    setShowSupervisorDropdown(false);
+  };
+
+  // Clear selected supervisor
+  const clearSupervisor = () => {
+    setSupervisorSearch('');
+    setFormData(prev => ({ ...prev, supervisor: supervisorsList[0] }));
+    setShowSupervisorDropdown(false);
   };
 
   const updateForm = (field: string, value: any) => {
@@ -1173,7 +1251,9 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             value={formData.guardId} 
             onChange={(e: any) => updateForm('guardId', e.target.value)} 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            placeholder="Auto-generated"
           />
+          <p className="text-xs text-slate-400 mt-1">Auto-generated if left empty</p>
         </div>
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone</label>
@@ -1247,13 +1327,86 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
         </div>
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">Supervisor</label>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.supervisor} 
-            onChange={(e: any) => updateForm('supervisor', e.target.value)}
-          >
-            {supervisorsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
+          <div className="relative" ref={supervisorDropdownRef}>
+            <div className="relative">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                value={supervisorSearch}
+                onChange={(e) => {
+                  setSupervisorSearch(e.target.value);
+                  setShowSupervisorDropdown(true);
+                  if (e.target.value === '') {
+                    setFormData(prev => ({ ...prev, supervisor: '' }));
+                  }
+                }}
+                onFocus={() => {
+                  if (supervisorSearch.trim() !== '' || allSupervisors.length > 0) {
+                    setShowSupervisorDropdown(true);
+                  }
+                }}
+                placeholder="Search supervisors..."
+                className="w-full pl-10 pr-10 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent"
+              />
+              {supervisorSearch && (
+                <button
+                  type="button"
+                  onClick={clearSupervisor}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                >
+                  <X size={16} />
+                </button>
+              )}
+            </div>
+            
+            {/* Supervisor dropdown results */}
+            {showSupervisorDropdown && (
+              <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg max-h-60 overflow-y-auto">
+                {filteredSupervisors.length === 0 ? (
+                  <div className="px-4 py-3 text-sm text-slate-500 text-center">
+                    No supervisors found matching "{supervisorSearch}"
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowSupervisorDropdown(false);
+                        setFormData(prev => ({ ...prev, supervisor: supervisorSearch }));
+                      }}
+                      className="block mt-2 text-[#D4A017] hover:underline text-xs"
+                    >
+                      Add "{supervisorSearch}" as supervisor
+                    </button>
+                  </div>
+                ) : (
+                  filteredSupervisors.map((sup: any) => (
+                    <button
+                      key={sup.id}
+                      type="button"
+                      onClick={() => selectSupervisor(sup)}
+                      className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors flex items-center gap-3"
+                    >
+                      <div className="w-8 h-8 rounded-full bg-[#D4A017] text-white text-xs font-bold flex items-center justify-center flex-shrink-0">
+                        {((sup.full_name || 'S').split(' ').map((n: string) => n[0]).join('').slice(0, 2)).toUpperCase()}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-slate-800 truncate">{sup.full_name || 'Unknown'}</p>
+                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                          <span>{sup.employee_number || 'N/A'}</span>
+                          <span className="w-1 h-1 rounded-full bg-slate-300" />
+                          <span>{sup.position || 'N/A'}</span>
+                        </div>
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+          {formData.supervisor && !supervisorSearch && (
+            <div className="mt-1 p-1.5 bg-emerald-50 border border-emerald-200 rounded-lg text-xs flex items-center gap-2">
+              <CheckCircle size={14} className="text-emerald-600" />
+              <span className="text-emerald-700">Selected: <strong>{formData.supervisor}</strong></span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1304,15 +1457,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             </select>
           </div>
         </div>
-        <div className="mt-4">
-          <label className="block text-sm font-medium text-slate-700 mb-1.5">License Expiry Date</label>
-          <input 
-            type="date"
-            value={formData.license_expiry} 
-            onChange={(e: any) => updateForm('license_expiry', e.target.value)} 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
-          />
-        </div>
+        {/* ===== REMOVED: License Expiry Date field ===== */}
       </div>
 
       {/* Emergency Contact */}
@@ -1355,6 +1500,70 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
 // ===== EDIT GUARD FORM =====
 function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList }: any) {
   const [formData, setFormData] = useState(guard);
+  const [supervisorSearch, setSupervisorSearch] = useState(guard.supervisor || '');
+  const [filteredSupervisors, setFilteredSupervisors] = useState<any[]>([]);
+  const [allSupervisors, setAllSupervisors] = useState<any[]>([]);
+  const [showSupervisorDropdown, setShowSupervisorDropdown] = useState(false);
+  const supervisorDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Fetch supervisors
+  useEffect(() => {
+    const fetchSupervisors = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('employees')
+          .select('id, full_name, employee_number, position')
+          .eq('is_deleted', false)
+          .or('position.ilike.%supervisor%,position.ilike.%manager%,position.ilike.%lead%')
+          .order('full_name');
+        
+        if (error) throw error;
+        setAllSupervisors(data || []);
+      } catch (err) {
+        console.error('Error fetching supervisors:', err);
+      }
+    };
+    fetchSupervisors();
+  }, []);
+
+  // Filter supervisors based on search
+  useEffect(() => {
+    if (supervisorSearch.trim() === '') {
+      setFilteredSupervisors(allSupervisors);
+      return;
+    }
+    
+    const searchLower = supervisorSearch.toLowerCase().trim();
+    const filtered = allSupervisors.filter((sup: any) => {
+      const fullName = (sup.full_name || '').toLowerCase();
+      const employeeNumber = (sup.employee_number || '').toLowerCase();
+      const position = (sup.position || '').toLowerCase();
+      
+      return fullName.includes(searchLower) ||
+             employeeNumber.includes(searchLower) ||
+             position.includes(searchLower);
+    });
+    
+    setFilteredSupervisors(filtered.slice(0, 15));
+  }, [supervisorSearch, allSupervisors]);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (supervisorDropdownRef.current && !supervisorDropdownRef.current.contains(event.target as Node)) {
+        setShowSupervisorDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Select supervisor from dropdown
+  const selectSupervisor = (supervisor: any) => {
+    setFormData({ ...formData, supervisor: supervisor.full_name });
+    setSupervisorSearch(supervisor.full_name);
+    setShowSupervisorDropdown(false);
+  };
 
   return (
     <div className="space-y-4">
@@ -1455,13 +1664,77 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, u
         </div>
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">Supervisor</label>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.supervisor} 
-            onChange={(e: any) => setFormData({...formData, supervisor: e.target.value})}
-          >
-            {supervisorsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
-          </select>
+          <div className="relative" ref={supervisorDropdownRef}>
+            <div className="relative">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                value={supervisorSearch}
+                onChange={(e) => {
+                  setSupervisorSearch(e.target.value);
+                  setShowSupervisorDropdown(true);
+                  if (e.target.value === '') {
+                    setFormData({ ...formData, supervisor: '' });
+                  }
+                }}
+                onFocus={() => {
+                  if (supervisorSearch.trim() !== '' || allSupervisors.length > 0) {
+                    setShowSupervisorDropdown(true);
+                  }
+                }}
+                placeholder="Search supervisors..."
+                className="w-full pl-10 pr-10 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent"
+              />
+            </div>
+            
+            {/* Supervisor dropdown results */}
+            {showSupervisorDropdown && (
+              <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg max-h-60 overflow-y-auto">
+                {filteredSupervisors.length === 0 ? (
+                  <div className="px-4 py-3 text-sm text-slate-500 text-center">
+                    No supervisors found matching "{supervisorSearch}"
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowSupervisorDropdown(false);
+                        setFormData({ ...formData, supervisor: supervisorSearch });
+                      }}
+                      className="block mt-2 text-[#D4A017] hover:underline text-xs"
+                    >
+                      Add "{supervisorSearch}" as supervisor
+                    </button>
+                  </div>
+                ) : (
+                  filteredSupervisors.map((sup: any) => (
+                    <button
+                      key={sup.id}
+                      type="button"
+                      onClick={() => selectSupervisor(sup)}
+                      className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors flex items-center gap-3"
+                    >
+                      <div className="w-8 h-8 rounded-full bg-[#D4A017] text-white text-xs font-bold flex items-center justify-center flex-shrink-0">
+                        {((sup.full_name || 'S').split(' ').map((n: string) => n[0]).join('').slice(0, 2)).toUpperCase()}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-slate-800 truncate">{sup.full_name || 'Unknown'}</p>
+                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                          <span>{sup.employee_number || 'N/A'}</span>
+                          <span className="w-1 h-1 rounded-full bg-slate-300" />
+                          <span>{sup.position || 'N/A'}</span>
+                        </div>
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+          {formData.supervisor && !supervisorSearch && (
+            <div className="mt-1 p-1.5 bg-emerald-50 border border-emerald-200 rounded-lg text-xs flex items-center gap-2">
+              <CheckCircle size={14} className="text-emerald-600" />
+              <span className="text-emerald-700">Selected: <strong>{formData.supervisor}</strong></span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1511,15 +1784,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, u
             </select>
           </div>
         </div>
-        <div className="mt-4">
-          <label className="block text-sm font-medium text-slate-700 mb-1.5">License Expiry Date</label>
-          <input 
-            type="date"
-            value={formData.license_expiry} 
-            onChange={(e: any) => setFormData({...formData, license_expiry: e.target.value})} 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
-          />
-        </div>
+        {/* ===== REMOVED: License Expiry Date field ===== */}
       </div>
 
       <div className="border-t pt-4">
@@ -1614,9 +1879,6 @@ function ViewGuard({ guard, onClose }: { guard: SecurityPersonnel; onClose: () =
             </p>
           </div>
         </div>
-        {guard.license_expiry && (
-          <p className="text-xs text-slate-500 mt-2">License Expiry: {new Date(guard.license_expiry).toLocaleDateString()}</p>
-        )}
       </div>
 
       <div className="border-t pt-4">
