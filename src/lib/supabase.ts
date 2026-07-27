@@ -1,7 +1,14 @@
 ﻿import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = 'https://jaqpnslmzgmybrjspece.supabase.co';
-const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImphcXBuc2xtemdteWJyanNwZWNlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA2NDY4MzQsImV4cCI6MjA5NjIyMjgzNH0.Kfr_i53upL1mA12hq4s9fh2i4YSa3-biVrxxlQk3jC0';
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error(
+    'Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. Set them in a local .env file ' +
+    '(see .env.example) or in your Vercel project\'s Environment Variables.'
+  );
+}
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
