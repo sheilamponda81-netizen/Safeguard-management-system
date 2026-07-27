@@ -4,8 +4,8 @@ import {
   Shield, Sparkles, History, LogOut, Menu, X, ChevronDown, 
   Building2, MapPin, User, Briefcase, Wallet, Clock, 
   CheckCircle, AlertCircle, Calculator, ClipboardList, 
-  CalendarCheck, BarChart3
-} from '../utils/icons';
+  CalendarCheck, BarChart3, BookOpen
+} from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
@@ -24,9 +24,10 @@ export type NavKey =
   | "settings"
   | "security"
   | "features"
-  | "auditlogs";
+  | "auditlogs"
+  | "user-manual";
 
-// ===== ALL NAV ITEMS - NO DUPLICATES =====
+// ===== ALL NAV ITEMS =====
 export const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "employees", label: "Employees", icon: Users },
@@ -37,6 +38,7 @@ export const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "payslips", label: "Payslips", icon: FileText },
   { id: "payments", label: "Payments", icon: DollarSign },
   { id: "reports", label: "Reports", icon: BarChart3 },
+  { id: "user-manual", label: "User Manual", icon: BookOpen },
   { id: "settings", label: "Settings", icon: Settings },
   { id: "auditlogs", label: "Audit Logs", icon: History },
 ];
@@ -57,6 +59,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "security",
     "features",
     "auditlogs",
+    "user-manual",
   ],
   2: [
     "dashboard",
@@ -67,9 +70,10 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "terminal-dues",
     "reports",
     "security",
+    "user-manual",
   ],
-  3: ["dashboard", "attendance", "security"],
-  4: ["dashboard", "payslips"],
+  3: ["dashboard", "attendance", "security", "user-manual"],
+  4: ["dashboard", "payslips", "user-manual"],
 };
 
 export function Sidebar({
@@ -99,16 +103,12 @@ export function Sidebar({
     
     const handleChange = (e: MediaQueryListEvent) => {
       setIsMobile(e.matches);
-      // Close sidebar when transitioning to mobile
       if (e.matches && open) {
         onClose();
       }
     };
     
-    // Set initial value
     setIsMobile(mql.matches);
-    
-    // Add listener
     mql.addEventListener('change', handleChange);
     
     return () => {
@@ -151,7 +151,7 @@ export function Sidebar({
             .from("profiles")
             .select("full_name, role_level")
             .eq("id", user.id)
-            .single();
+            .maybeSingle();
 
           if (error) {
             console.error("Error fetching profile:", error);
@@ -203,13 +203,11 @@ export function Sidebar({
           }
         }}
         onMouseEnter={() => {
-          // ===== PERFORMANCE: Preload page on hover =====
           if (onPreload) {
             onPreload(item.id);
           }
         }}
         onTouchStart={() => {
-          // ===== PERFORMANCE: Preload on touch for mobile =====
           if (onPreload) {
             onPreload(item.id);
           }
@@ -245,7 +243,6 @@ export function Sidebar({
             <p className="text-xs text-slate-500">HR & Payroll</p>
           </div>
         </div>
-        {/* Close button for mobile */}
         {isMobile && (
           <button
             onClick={onClose}
@@ -267,7 +264,6 @@ export function Sidebar({
           <div className="px-3 py-2 text-sm text-slate-500">Loading...</div>
         )}
 
-        {/* Security and Features - only show for Admin (level 1) */}
         {!loading && userRoleLevel === 1 && (
           <>
             <p className="px-3 py-2 mt-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -363,23 +359,19 @@ export function Sidebar({
 
   return (
     <>
-      {/* Desktop Sidebar */}
       <aside className="hidden lg:flex flex-col w-64 bg-white border-r border-slate-200 h-screen sticky top-0">
         {content}
       </aside>
 
-      {/* Mobile Sidebar (Overlay + Slide) */}
       <div
         className={`lg:hidden fixed inset-0 z-50 transition-opacity duration-300 ${
           open ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
         }`}
       >
-        {/* Overlay */}
         <div
           className="absolute inset-0 bg-slate-900/50 backdrop-blur-sm"
           onClick={onClose}
         />
-        {/* Sidebar */}
         <aside
           className={`absolute left-0 top-0 bottom-0 w-72 bg-white flex flex-col shadow-2xl transition-transform duration-300 ease-in-out ${
             open ? 'translate-x-0' : '-translate-x-full'
@@ -414,7 +406,7 @@ export function BottomNav({
             .from("profiles")
             .select("role_level")
             .eq("id", user.id)
-            .single();
+            .maybeSingle();
           setUserRoleLevel(data?.role_level || 4);
         }
       } catch (err) {
@@ -427,10 +419,10 @@ export function BottomNav({
   }, []);
 
   const roleBottomItems: Record<number, NavKey[]> = {
-    1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings", "auditlogs"],
-    2: ["dashboard", "employees", "terminal-dues", "attendance", "reports"],
-    3: ["dashboard", "employees", "attendance","terminal-dues", "reports"],
-    4: ["dashboard", "employees", "payments", "payslips", "reports"],
+    1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings", "auditlogs", "user-manual"],
+    2: ["dashboard", "employees", "terminal-dues", "attendance", "reports", "user-manual"],
+    3: ["dashboard", "employees", "attendance","terminal-dues", "reports", "user-manual"],
+    4: ["dashboard", "employees", "payments", "payslips", "reports", "user-manual"],
   };
 
   const allowedBottomMenus =
@@ -448,6 +440,7 @@ export function BottomNav({
     { id: "security", label: "Security", icon: Shield },
     { id: "payslips", label: "Payslips", icon: FileText },
     { id: "auditlogs", label: "Audit Logs", icon: History },
+    { id: "user-manual", label: "User Manual", icon: BookOpen },
   ];
 
   const items = allItems.filter((item) =>
@@ -493,7 +486,6 @@ export function TopBar({
     <div className="sticky top-0 z-30 bg-white/80 backdrop-blur border-b border-slate-200">
       <div className="flex items-center justify-between px-4 md:px-6 py-3">
         <div className="flex items-center gap-3">
-          {/* Hamburger Menu Button - Mobile Only */}
           <button
             className="lg:hidden w-10 h-10 rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-600 transition-colors"
             onClick={onMenuClick}

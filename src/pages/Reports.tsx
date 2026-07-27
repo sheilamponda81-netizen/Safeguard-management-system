@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { FileDown, FileSpreadsheet, FileText, TrendingUp, Users, DollarSign, Calendar, UserCheck, Building2, Briefcase, MapPin, PieChart, ChevronLeft, ChevronRight } from '../utils/icons';
+import { FileDown, FileSpreadsheet, FileText, TrendingUp, Users, DollarSign, Calendar, UserCheck, Building2, Briefcase, MapPin, PieChart, ChevronLeft, ChevronRight, Home, Building } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -22,6 +22,10 @@ interface Employee {
   company?: string;
   workstation?: string;
   is_deleted?: boolean;
+  assignment_type?: string;
+  resident_name?: string;
+  resident_contact?: string;
+  company_id?: string;
 }
 
 interface PayrollRecord {
@@ -44,7 +48,10 @@ interface Applicant {
 }
 
 interface CompanyStats {
+  id: string;
   name: string;
+  normalized_name: string;
+  type: string;
   totalEmployees: number;
   activeEmployees: number;
   totalPayroll: number;
@@ -65,6 +72,7 @@ export function ReportsPage() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [payrollRecords, setPayrollRecords] = useState<PayrollRecord[]>([]);
   const [applicants, setApplicants] = useState<Applicant[]>([]);
+  const [companies, setCompanies] = useState<any[]>([]);
   const [selectedMonth, setSelectedMonth] = useState('');
   const [systemMonth, setSystemMonth] = useState('');
   const [availableMonths, setAvailableMonths] = useState<string[]>([]);
@@ -102,14 +110,35 @@ export function ReportsPage() {
     }));
   }, [activeEmployees, payrollRecords]);
 
+  // ===== COMPANY DATA - Using companies table and assignment_type =====
   const companyData = useMemo(() => {
     const companyMap: Record<string, CompanyStats> = {};
     
     activeEmployees.forEach(emp => {
-      const companyName = emp.company ? sanitizeInput(emp.company) : 'Unassigned';
-      if (!companyMap[companyName]) {
-        companyMap[companyName] = {
-          name: companyName,
+      // Determine the entity name based on assignment type
+      let entityName: string;
+      let entityType: string;
+      let entityId: string;
+      
+      if (emp.assignment_type === 'resident' && emp.resident_name) {
+        entityName = sanitizeInput(emp.resident_name);
+        entityType = 'resident';
+        entityId = `resident-${emp.resident_name}`;
+      } else if (emp.company) {
+        entityName = sanitizeInput(emp.company);
+        entityType = 'company';
+        entityId = emp.company_id || `company-${emp.company}`;
+      } else {
+        // Skip employees with no company or resident assignment
+        return;
+      }
+      
+      if (!companyMap[entityId]) {
+        companyMap[entityId] = {
+          id: entityId,
+          name: entityName,
+          normalized_name: entityName.toUpperCase(),
+          type: entityType,
           totalEmployees: 0,
           activeEmployees: 0,
           totalPayroll: 0,
@@ -117,28 +146,28 @@ export function ReportsPage() {
         };
       }
       
-      companyMap[companyName].totalEmployees++;
+      companyMap[entityId].totalEmployees++;
       if (emp.status === 'Active') {
-        companyMap[companyName].activeEmployees++;
+        companyMap[entityId].activeEmployees++;
       }
       
       const payroll = payrollRecords.find(p => p.employee_id === emp.id);
-      companyMap[companyName].totalPayroll += payroll?.net_pay || emp.basic_salary || 0;
+      companyMap[entityId].totalPayroll += payroll?.net_pay || emp.basic_salary || 0;
       
-      const workstationName = emp.workstation ? sanitizeInput(emp.workstation) : 'Unassigned';
-      if (!companyMap[companyName].workstations[workstationName]) {
-        companyMap[companyName].workstations[workstationName] = {
+      const workstationName = emp.workstation ? sanitizeInput(emp.workstation) : 'No Site';
+      if (!companyMap[entityId].workstations[workstationName]) {
+        companyMap[entityId].workstations[workstationName] = {
           name: workstationName,
           employeeCount: 0,
           activeCount: 0,
           payrollTotal: 0
         };
       }
-      companyMap[companyName].workstations[workstationName].employeeCount++;
+      companyMap[entityId].workstations[workstationName].employeeCount++;
       if (emp.status === 'Active') {
-        companyMap[companyName].workstations[workstationName].activeCount++;
+        companyMap[entityId].workstations[workstationName].activeCount++;
       }
-      companyMap[companyName].workstations[workstationName].payrollTotal += payroll?.net_pay || emp.basic_salary || 0;
+      companyMap[entityId].workstations[workstationName].payrollTotal += payroll?.net_pay || emp.basic_salary || 0;
     });
     
     return Object.values(companyMap).map(company => ({
@@ -147,19 +176,36 @@ export function ReportsPage() {
     }));
   }, [activeEmployees, payrollRecords]);
 
+  // ===== WORKSTATION DATA =====
   const workstationData = useMemo(() => {
-    const workstationMap: Record<string, { count: number; activeCount: number; payrollTotal: number; companies: Record<string, number> }> = {};
+    const workstationMap: Record<string, { count: number; activeCount: number; payrollTotal: number; entities: Record<string, { name: string; type: string; count: number }> }> = {};
     
     activeEmployees.forEach(emp => {
-      const workstationName = emp.workstation ? sanitizeInput(emp.workstation) : 'Unassigned';
-      const companyName = emp.company ? sanitizeInput(emp.company) : 'Unassigned';
+      const workstationName = emp.workstation ? sanitizeInput(emp.workstation) : 'No Site';
+      
+      // Determine the entity name based on assignment type
+      let entityName: string;
+      let entityType: string;
+      let entityKey: string;
+      
+      if (emp.assignment_type === 'resident' && emp.resident_name) {
+        entityName = sanitizeInput(emp.resident_name);
+        entityType = 'resident';
+        entityKey = `resident-${entityName}`;
+      } else if (emp.company) {
+        entityName = sanitizeInput(emp.company);
+        entityType = 'company';
+        entityKey = `company-${entityName}`;
+      } else {
+        return;
+      }
       
       if (!workstationMap[workstationName]) {
         workstationMap[workstationName] = {
           count: 0,
           activeCount: 0,
           payrollTotal: 0,
-          companies: {}
+          entities: {}
         };
       }
       
@@ -170,7 +216,15 @@ export function ReportsPage() {
       
       const payroll = payrollRecords.find(p => p.employee_id === emp.id);
       workstationMap[workstationName].payrollTotal += payroll?.net_pay || emp.basic_salary || 0;
-      workstationMap[workstationName].companies[companyName] = (workstationMap[workstationName].companies[companyName] || 0) + 1;
+      
+      if (!workstationMap[workstationName].entities[entityKey]) {
+        workstationMap[workstationName].entities[entityKey] = {
+          name: entityName,
+          type: entityType,
+          count: 0
+        };
+      }
+      workstationMap[workstationName].entities[entityKey].count++;
     });
     
     return Object.entries(workstationMap).map(([name, data]) => ({
@@ -178,7 +232,7 @@ export function ReportsPage() {
       totalEmployees: data.count,
       activeEmployees: data.activeCount,
       totalPayroll: data.payrollTotal,
-      companies: data.companies
+      entities: data.entities
     })).sort((a, b) => b.totalEmployees - a.totalEmployees);
   }, [activeEmployees, payrollRecords]);
 
@@ -211,8 +265,21 @@ export function ReportsPage() {
         .from('profiles')
         .select('*, regions(*)')
         .eq('id', user.id)
-        .single();
+        .maybeSingle();
       setUserProfile(profile);
+    }
+  }, []);
+
+  const fetchCompanies = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from('companies')
+        .select('*')
+        .order('name');
+      if (error) throw error;
+      setCompanies(data || []);
+    } catch (err) {
+      console.error('Error fetching companies:', err);
     }
   }, []);
 
@@ -252,6 +319,9 @@ export function ReportsPage() {
       if (appError) throw appError;
       setApplicants(applicantsData || []);
       
+      // Fetch companies for reference
+      await fetchCompanies();
+      
       // Check data exists for payroll
       if (activeReport === 'payroll') {
         setHasData((payrollData?.length || 0) > 0);
@@ -267,7 +337,7 @@ export function ReportsPage() {
     } finally {
       setLoading(false);
     }
-  }, [userProfile, selectedMonth, activeReport]);
+  }, [userProfile, selectedMonth, activeReport, fetchCompanies]);
 
   // ===== INITIALIZATION =====
   useEffect(() => {
@@ -336,28 +406,47 @@ export function ReportsPage() {
       case 'employee':
         return {
           title: 'Employee Report',
-          headers: ['Name', 'Employee ID', 'Company', 'Workstation', 'Position', 'Department', 'Status', 'Salary'],
-          rows: activeEmployees.map(emp => [
-            sanitizeInput(emp.full_name),
-            sanitizeInput(emp.employee_number),
-            sanitizeInput(emp.company || '-'),
-            sanitizeInput(emp.workstation || '-'),
-            sanitizeInput(emp.position),
-            sanitizeInput(emp.department || '-'),
-            sanitizeInput(emp.status),
-            formatKwacha(emp.basic_salary || 0)
-          ])
+          headers: ['Name', 'Employee ID', 'Company/Resident', 'Type', 'Workstation', 'Position', 'Department', 'Status', 'Salary'],
+          rows: activeEmployees.map(emp => {
+            let entityName = '-';
+            let entityType = '-';
+            if (emp.assignment_type === 'resident' && emp.resident_name) {
+              entityName = sanitizeInput(emp.resident_name);
+              entityType = 'Resident';
+            } else if (emp.company) {
+              entityName = sanitizeInput(emp.company);
+              entityType = 'Company';
+            }
+            return [
+              sanitizeInput(emp.full_name),
+              sanitizeInput(emp.employee_number),
+              entityName,
+              entityType,
+              sanitizeInput(emp.workstation || '-'),
+              sanitizeInput(emp.position),
+              sanitizeInput(emp.department || '-'),
+              sanitizeInput(emp.status),
+              formatKwacha(emp.basic_salary || 0)
+            ];
+          })
         };
       case 'payroll':
         return {
           title: 'Payroll Report',
-          headers: ['Name', 'Position', 'Department', 'Gross Pay', 'PAYE', 'Pension', 'Net Pay'],
+          headers: ['Name', 'Position', 'Department', 'Company/Resident', 'Gross Pay', 'PAYE', 'Pension', 'Net Pay'],
           rows: activeEmployees.map(emp => {
             const payroll = payrollRecords.find(p => p.employee_id === emp.id);
+            let entityName = '-';
+            if (emp.assignment_type === 'resident' && emp.resident_name) {
+              entityName = sanitizeInput(emp.resident_name);
+            } else if (emp.company) {
+              entityName = sanitizeInput(emp.company);
+            }
             return [
               sanitizeInput(emp.full_name),
               sanitizeInput(emp.position),
               sanitizeInput(emp.department || '-'),
+              entityName,
               formatKwacha(payroll?.gross_pay || emp.basic_salary || 0),
               formatKwacha(payroll?.paye || 0),
               formatKwacha(payroll?.pension || 0),
@@ -368,14 +457,23 @@ export function ReportsPage() {
       case 'attendance':
         return {
           title: 'Attendance Report',
-          headers: ['Name', 'Position', 'Department', 'Attendance Rate', 'Status'],
-          rows: activeEmployees.map(emp => [
-            sanitizeInput(emp.full_name),
-            sanitizeInput(emp.position),
-            sanitizeInput(emp.department || '-'),
-            `${(85 + Math.random() * 10).toFixed(1)}%`,
-            sanitizeInput(emp.status)
-          ])
+          headers: ['Name', 'Position', 'Department', 'Company/Resident', 'Attendance Rate', 'Status'],
+          rows: activeEmployees.map(emp => {
+            let entityName = '-';
+            if (emp.assignment_type === 'resident' && emp.resident_name) {
+              entityName = sanitizeInput(emp.resident_name);
+            } else if (emp.company) {
+              entityName = sanitizeInput(emp.company);
+            }
+            return [
+              sanitizeInput(emp.full_name),
+              sanitizeInput(emp.position),
+              sanitizeInput(emp.department || '-'),
+              entityName,
+              `${(85 + Math.random() * 10).toFixed(1)}%`,
+              sanitizeInput(emp.status)
+            ];
+          })
         };
       case 'recruitment':
         return {
@@ -391,10 +489,11 @@ export function ReportsPage() {
         };
       case 'company':
         return {
-          title: 'Company & Workstation Report',
-          headers: ['Company', 'Total Employees', 'Active', 'Total Payroll', 'Workstations Breakdown'],
+          title: 'Company & Resident Report',
+          headers: ['Name', 'Type', 'Total Employees', 'Active', 'Total Payroll', 'Workstations/Sites'],
           rows: companyData.map(company => [
             sanitizeInput(company.name),
+            company.type === 'resident' ? '🏠 Resident' : '🏢 Company',
             company.totalEmployees,
             company.activeEmployees,
             formatKwacha(company.totalPayroll),
@@ -404,13 +503,15 @@ export function ReportsPage() {
       case 'workstation':
         return {
           title: 'Workstation Analysis Report',
-          headers: ['Workstation', 'Total Employees', 'Active', 'Total Payroll', 'Companies'],
+          headers: ['Workstation/Site', 'Total Employees', 'Active', 'Total Payroll', 'Companies/Residents'],
           rows: workstationData.map(ws => [
             sanitizeInput(ws.name),
             ws.totalEmployees,
             ws.activeEmployees,
             formatKwacha(ws.totalPayroll),
-            Object.entries(ws.companies).map(([company, count]) => `${sanitizeInput(company)}: ${count}`).join(' | ')
+            Object.entries(ws.entities).map(([key, entity]) => 
+              `${entity.type === 'resident' ? '🏠' : '🏢'} ${sanitizeInput(entity.name)}: ${entity.count}`
+            ).join(' | ')
           ])
         };
       default:
@@ -445,10 +546,10 @@ export function ReportsPage() {
       csvContent += `\n\nSUMMARY\nTotal Departments,${departmentData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
     }
     if (activeReport === 'company') {
-      csvContent += `\n\nSUMMARY\nTotal Companies,${companyData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
+      csvContent += `\n\nSUMMARY\nTotal Companies/Residents,${companyData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
     }
     if (activeReport === 'workstation') {
-      csvContent += `\n\nSUMMARY\nTotal Workstations,${workstationData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
+      csvContent += `\n\nSUMMARY\nTotal Workstations/Sites,${workstationData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
     }
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -477,7 +578,7 @@ export function ReportsPage() {
   // ===== REPORT TABS =====
   const reportTabs = useMemo(() => [
     { id: 'employee', label: 'Employees', icon: Users },
-    { id: 'company', label: 'Companies', icon: Building2 },
+    { id: 'company', label: 'Companies & Residents', icon: Building2 },
     { id: 'workstation', label: 'Workstations', icon: MapPin },
     { id: 'payroll', label: 'Payroll', icon: DollarSign },
     { id: 'attendance', label: 'Attendance', icon: Calendar },
@@ -591,9 +692,9 @@ export function ReportsPage() {
           <Card className="p-4">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-xs text-slate-500">Total Companies</p>
+                <p className="text-xs text-slate-500">Total Companies/Residents</p>
                 <p className="text-2xl font-bold text-slate-800 mt-1">{totalCompanies}</p>
-                <p className="text-xs text-slate-500 mt-1">Active clients</p>
+                <p className="text-xs text-slate-500 mt-1">Active entities</p>
               </div>
               <div className="w-10 h-10 rounded-lg bg-[#E8EDF5] text-[#081C3A] flex items-center justify-center">
                 <Building2 size={18} />
@@ -617,7 +718,7 @@ export function ReportsPage() {
               <div>
                 <p className="text-xs text-slate-500">Total Employees</p>
                 <p className="text-2xl font-bold text-slate-800 mt-1">{activeEmployees.length}</p>
-                <p className="text-xs text-slate-500 mt-1">Across all companies</p>
+                <p className="text-xs text-slate-500 mt-1">Across all entities</p>
               </div>
               <div className="w-10 h-10 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center">
                 <Users size={18} />
@@ -643,16 +744,16 @@ export function ReportsPage() {
       {activeReport === 'company' && companyData.length > 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {companyData.slice(0, 6).map(company => (
-            <Card key={company.name} className="p-4 hover:shadow-md transition-shadow">
+            <Card key={company.id} className="p-4 hover:shadow-md transition-shadow">
               <div className="flex items-start justify-between mb-3">
                 <div className="flex items-center gap-2">
                   <div className="w-8 h-8 rounded-lg bg-[#081C3A] text-white flex items-center justify-center">
-                    <Building2 size={14} />
+                    {company.type === 'resident' ? <Home size={14} /> : <Building2 size={14} />}
                   </div>
                   <h4 className="font-bold text-slate-800">{company.name}</h4>
                 </div>
-                <Badge color={company.activeEmployees === company.totalEmployees ? 'green' : 'gold'}>
-                  {company.activeEmployees}/{company.totalEmployees} Active
+                <Badge color={company.type === 'resident' ? 'green' : 'blue'}>
+                  {company.type === 'resident' ? 'Resident' : 'Company'}
                 </Badge>
               </div>
               <div className="space-y-2 text-sm">
@@ -661,11 +762,15 @@ export function ReportsPage() {
                   <span className="font-semibold">{company.totalEmployees}</span>
                 </div>
                 <div className="flex justify-between">
+                  <span className="text-slate-500">Active:</span>
+                  <span className="font-semibold">{company.activeEmployees}/{company.totalEmployees}</span>
+                </div>
+                <div className="flex justify-between">
                   <span className="text-slate-500">Monthly Payroll:</span>
                   <span className="font-semibold text-[#D4A017]">{formatKwacha(company.totalPayroll)}</span>
                 </div>
                 <div className="border-t pt-2 mt-2">
-                  <p className="text-xs text-slate-500 mb-2">Workstations:</p>
+                  <p className="text-xs text-slate-500 mb-2">Workstations/Sites:</p>
                   <div className="space-y-1">
                     {company.workstations.slice(0, 3).map(ws => (
                       <div key={ws.name} className="flex justify-between text-xs">
@@ -708,11 +813,11 @@ export function ReportsPage() {
                   <span className="font-semibold text-[#D4A017]">{formatKwacha(ws.totalPayroll)}</span>
                 </div>
                 <div className="border-t pt-2 mt-2">
-                  <p className="text-xs text-slate-500 mb-2">Companies at this site:</p>
+                  <p className="text-xs text-slate-500 mb-2">Companies/Residents at this site:</p>
                   <div className="flex flex-wrap gap-1">
-                    {Object.entries(ws.companies).map(([company, count]) => (
-                      <Badge key={company} color="gray" className="text-xs">
-                        {company}: {count}
+                    {Object.entries(ws.entities).map(([key, entity]) => (
+                      <Badge key={key} color={entity.type === 'resident' ? 'green' : 'gray'} className="text-xs">
+                        {entity.type === 'resident' ? '🏠' : '🏢'} {entity.name}: {entity.count}
                       </Badge>
                     ))}
                   </div>

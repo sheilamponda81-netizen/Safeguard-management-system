@@ -2,7 +2,7 @@
 import { 
   Users, Wallet, UserMinus, ClipboardList, CheckCircle2, TrendingUp, 
   ArrowRight, Bell, ShieldCheck, Calendar, Shield, MapPin, 
-  ChevronLeft, ChevronRight, RefreshCw, AlertCircle
+  ChevronLeft, ChevronRight, RefreshCw, AlertCircle, Building2, Home
 } from '../utils/icons';
 import { Card, StatCard, Button, Badge, Table, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
@@ -69,6 +69,8 @@ export function Dashboard() {
     activeGuards: 0,
     supervisorsOnDuty: 0,
     sitesCount: 0,
+    companiesCount: 0,
+    residentsCount: 0,
     expiringLicenses: 0,
     totalPayroll: 0,
     onLeave: 0,
@@ -277,6 +279,18 @@ export function Dashboard() {
       
       const uniqueSites = [...new Set(employeesData.map((e: any) => e.workstation).filter(Boolean))];
       
+      // ===== COUNT COMPANIES AND RESIDENTS =====
+      const companies = new Set<string>();
+      const residents = new Set<string>();
+      
+      employeesData.forEach((e: any) => {
+        if (e.assignment_type === 'resident' && e.resident_name) {
+          residents.add(e.resident_name);
+        } else if (e.company) {
+          companies.add(e.company);
+        }
+      });
+      
       const expiringLicenses = employeesData.filter((e: any) => 
         e.license_status === 'Expiring' || e.license_status === 'Expired'
       ).length;
@@ -323,6 +337,8 @@ export function Dashboard() {
         activeGuards,
         supervisorsOnDuty,
         sitesCount: uniqueSites.length,
+        companiesCount: companies.size,
+        residentsCount: residents.size,
         expiringLicenses,
         totalPayroll,
         onLeave,
@@ -659,6 +675,12 @@ export function Dashboard() {
         <StatCard title="Attendance Rate" value={`${stats.attendanceRate}%`} icon={CheckCircle2} accent="gold" sub={`${monthLabel}`} />
       </div>
 
+      {/* Company & Resident Stats */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <StatCard title="Companies" value={String(stats.companiesCount)} icon={Building2} accent="blue" sub="Active clients" />
+        <StatCard title="Residents" value={String(stats.residentsCount)} icon={Home} accent="green" sub="Residential clients" />
+      </div>
+
       {/* Quick status */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <Card className="p-4 flex items-center gap-3">
@@ -740,28 +762,47 @@ export function Dashboard() {
             <Button variant="outline" className="text-xs py-1.5">View all <ArrowRight size={14} /></Button>
           </div>
           <Table className="border-0 rounded-none">
-            <THead><TR hover={false}><TH>Name</TH><TH>Position</TH><TH>Department</TH><TH>Status</TH></TR></THead>
+            <THead><TR hover={false}><TH>Name</TH><TH>Position</TH><TH>Department</TH><TH>Company/Resident</TH><TH>Status</TH></TR></THead>
             <TBody>
-              {recent.map((emp: any) => (
-                <TR key={emp.id}>
-                  <TD>
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-full bg-[#081C3A] flex items-center justify-center text-white text-xs font-bold">
-                        {emp.full_name?.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
+              {recent.map((emp: any) => {
+                let entityName = '-';
+                let entityIcon = null;
+                if (emp.assignment_type === 'resident' && emp.resident_name) {
+                  entityName = emp.resident_name;
+                  entityIcon = '🏠';
+                } else if (emp.company) {
+                  entityName = emp.company;
+                  entityIcon = '🏢';
+                }
+                return (
+                  <TR key={emp.id}>
+                    <TD>
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-full bg-[#081C3A] flex items-center justify-center text-white text-xs font-bold">
+                          {emp.full_name?.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
+                        </div>
+                        <div>
+                          <p className="text-sm font-medium text-slate-800">{emp.full_name}</p>
+                          <p className="text-xs text-slate-500">{emp.employee_number}</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="text-sm font-medium text-slate-800">{emp.full_name}</p>
-                        <p className="text-xs text-slate-500">{emp.employee_number}</p>
-                      </div>
-                    </div>
-                  </TD>
-                  <TD>{emp.position}</TD>
-                  <TD>{emp.department}</TD>
-                  <TD><Badge color={emp.status === 'Active' ? 'green' : emp.status === 'On Leave' ? 'yellow' : 'red'}>{emp.status}</Badge></TD>
-                </TR>
-              ))}
+                    </TD>
+                    <TD>{emp.position}</TD>
+                    <TD>{emp.department}</TD>
+                    <TD>
+                      {entityIcon && (
+                        <span className="flex items-center gap-1 text-xs">
+                          <span>{entityIcon}</span>
+                          <span className="truncate max-w-[80px]">{entityName}</span>
+                        </span>
+                      )}
+                    </TD>
+                    <TD><Badge color={emp.status === 'Active' ? 'green' : emp.status === 'On Leave' ? 'yellow' : 'red'}>{emp.status}</Badge></TD>
+                  </TR>
+                );
+              })}
               {recent.length === 0 && (
-                <TR><TD colSpan={4} className="text-center py-4 text-slate-500">No active employees found</TD></TR>
+                <TR><TD colSpan={5} className="text-center py-4 text-slate-500">No active employees found</TD></TR>
               )}
             </TBody>
           </Table>

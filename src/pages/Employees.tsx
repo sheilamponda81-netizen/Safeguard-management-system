@@ -1,5 +1,5 @@
 ﻿import { useState, useMemo, useEffect, useCallback } from 'react';
-import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, User, Phone, MapPin, Heart, ChevronLeft, ChevronRight, Archive, RotateCcw, Calendar, Clock, AlertCircle } from 'lucide-react';
+import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, User, Phone, MapPin, Heart, ChevronLeft, ChevronRight, Archive, RotateCcw, Calendar, Clock, AlertCircle, Building2, Home, Loader2 } from 'lucide-react';
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -44,6 +44,10 @@ interface Employee {
   deleted_by?: string;
   deleted_by_name?: string;
   created_at?: string;
+  assignment_type?: string;
+  resident_name?: string;
+  resident_contact?: string;
+  company_id?: string;
 }
 
 const departmentOptions = [
@@ -65,6 +69,25 @@ const relationshipOptions = [
   'Friend',
   'Other'
 ];
+
+// ===== IMPROVED: Smart Text Normalization =====
+const normalizeText = (value: string): string => {
+  if (!value) return '';
+  
+  // Step 1: Remove multiple spaces and trim
+  let normalized = value.trim().replace(/\s+/g, ' ');
+  
+  // Step 2: Convert to uppercase
+  normalized = normalized.toUpperCase();
+  
+  // Step 3: Remove special characters (keep letters, numbers, spaces, and hyphens)
+  normalized = normalized.replace(/[^A-Z0-9\s-]/g, '');
+  
+  // Step 4: Remove extra spaces again
+  normalized = normalized.replace(/\s+/g, ' ');
+  
+  return normalized;
+};
 
 const formatText = (value: string) => {
   return value
@@ -167,7 +190,7 @@ export function EmployeesPage() {
         .from('profiles')
         .select('*, regions(*)')
         .eq('id', user.id)
-        .single();
+        .maybeSingle();
       setUserProfile(profile);
     }
     setUserLoading(false);
@@ -226,6 +249,10 @@ export function EmployeesPage() {
         deleted_reason: emp.deleted_reason || null,
         deleted_by: emp.deleted_by || null,
         created_at: emp.created_at || null,
+        assignment_type: emp.assignment_type || 'company',
+        resident_name: emp.resident_name || '',
+        resident_contact: emp.resident_contact || '',
+        company_id: emp.company_id || null,
       }));
       setEmployees(mappedEmployees);
     } catch (err: any) {
@@ -287,6 +314,8 @@ export function EmployeesPage() {
       workstation: sanitizeInput(emp.workstation),
       nationalId: sanitizeInput(emp.nationalId),
       phone: sanitizeInput(emp.phone),
+      resident_name: sanitizeInput(emp.resident_name || ''),
+      resident_contact: sanitizeInput(emp.resident_contact || ''),
       next_of_kin_name: sanitizeInput(emp.next_of_kin_name),
       next_of_kin_relationship: sanitizeInput(emp.next_of_kin_relationship),
       next_of_kin_phone: sanitizeInput(emp.next_of_kin_phone),
@@ -326,8 +355,11 @@ export function EmployeesPage() {
       return;
     }
     
-    const formattedCompany = safeEmp.company ? formatText(safeEmp.company) : null;
+    // Format company and workstation based on assignment type
+    const formattedCompany = safeEmp.assignment_type === 'company' && safeEmp.company ? formatText(safeEmp.company) : null;
     const formattedWorkstation = safeEmp.workstation ? formatText(safeEmp.workstation) : null;
+    const formattedResidentName = safeEmp.assignment_type === 'resident' ? formatText(safeEmp.resident_name) : null;
+    const formattedResidentContact = safeEmp.assignment_type === 'resident' ? sanitizeInput(safeEmp.resident_contact) : null;
     
     const uniformDeduction = parseInt(safeEmp.uniform_deduction) || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
@@ -365,6 +397,10 @@ export function EmployeesPage() {
         deleted_at: null,
         deleted_reason: null,
         deleted_by: null,
+        assignment_type: safeEmp.assignment_type || 'company',
+        resident_name: formattedResidentName,
+        resident_contact: formattedResidentContact,
+        // company_id will be set by the trigger
       }])
       .select();
     
@@ -404,6 +440,10 @@ export function EmployeesPage() {
         deleted_reason: data[0].deleted_reason || null,
         deleted_by: data[0].deleted_by || null,
         created_at: data[0].created_at || null,
+        assignment_type: data[0].assignment_type || 'company',
+        resident_name: data[0].resident_name || '',
+        resident_contact: data[0].resident_contact || '',
+        company_id: data[0].company_id || null,
       };
       setEmployees([newEmployee, ...employees]);
       
@@ -437,6 +477,8 @@ export function EmployeesPage() {
       workstation: sanitizeInput(emp.workstation),
       nationalId: sanitizeInput(emp.nationalId),
       phone: sanitizeInput(emp.phone),
+      resident_name: sanitizeInput(emp.resident_name || ''),
+      resident_contact: sanitizeInput(emp.resident_contact || ''),
       next_of_kin_name: sanitizeInput(emp.next_of_kin_name),
       next_of_kin_relationship: sanitizeInput(emp.next_of_kin_relationship),
       next_of_kin_phone: sanitizeInput(emp.next_of_kin_phone),
@@ -455,8 +497,10 @@ export function EmployeesPage() {
       return;
     }
     
-    const formattedCompany = safeEmp.company ? formatText(safeEmp.company) : null;
+    const formattedCompany = safeEmp.assignment_type === 'company' && safeEmp.company ? formatText(safeEmp.company) : null;
     const formattedWorkstation = safeEmp.workstation ? formatText(safeEmp.workstation) : null;
+    const formattedResidentName = safeEmp.assignment_type === 'resident' ? formatText(safeEmp.resident_name) : null;
+    const formattedResidentContact = safeEmp.assignment_type === 'resident' ? sanitizeInput(safeEmp.resident_contact) : null;
     
     const uniformDeduction = parseInt(safeEmp.uniform_deduction) || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
@@ -489,6 +533,10 @@ export function EmployeesPage() {
         next_of_kin_relationship: safeEmp.next_of_kin_relationship,
         next_of_kin_phone: safeEmp.next_of_kin_phone,
         next_of_kin_address: safeEmp.next_of_kin_address,
+        assignment_type: safeEmp.assignment_type || 'company',
+        resident_name: formattedResidentName,
+        resident_contact: formattedResidentContact,
+        // company_id will be updated by trigger
       })
       .eq('id', editingEmployee.id)
       .select();
@@ -523,6 +571,10 @@ export function EmployeesPage() {
         next_of_kin_relationship: data[0].next_of_kin_relationship || '',
         next_of_kin_phone: data[0].next_of_kin_phone || '',
         next_of_kin_address: data[0].next_of_kin_address || '',
+        assignment_type: data[0].assignment_type || 'company',
+        resident_name: data[0].resident_name || '',
+        resident_contact: data[0].resident_contact || '',
+        company_id: data[0].company_id || null,
       };
       setEmployees(employees.map(e => e.id === updatedEmployee.id ? updatedEmployee : e));
       
@@ -678,7 +730,7 @@ export function EmployeesPage() {
   // ===== EXPORT EMPLOYEES =====
   const handleExport = useCallback(() => {
     const csv = [
-      ['Employee ID', 'Full Name', 'Company', 'Workstation', 'Account Number', 'Gender', 'Age', 'Phone', 'Position', 'Department', 'Basic Salary', 'Status', 'Pay Point', 'Uniform Deduction', 'Next of Kin', 'Relationship', 'NOK Phone', 'Deleted', 'Deleted Reason', 'Deleted Date'],
+      ['Employee ID', 'Full Name', 'Company', 'Workstation', 'Account Number', 'Gender', 'Age', 'Phone', 'Position', 'Department', 'Basic Salary', 'Status', 'Pay Point', 'Uniform Deduction', 'Next of Kin', 'Relationship', 'NOK Phone', 'Deleted', 'Deleted Reason', 'Deleted Date', 'Assignment Type', 'Resident Name', 'Resident Contact'],
       ...filtered.map(e => [
         e.employeeNumber, e.fullName, e.company || '', e.workstation || '',
         e.account_number || '', e.gender, e.age, e.phone, e.position, e.department, e.basicSalary, e.status, e.pay_point || '',
@@ -688,7 +740,10 @@ export function EmployeesPage() {
         e.next_of_kin_phone || '',
         e.is_deleted ? 'Yes' : 'No',
         e.is_deleted ? (e.deleted_reason || '') : '',
-        e.is_deleted ? (e.deleted_at ? new Date(e.deleted_at).toLocaleDateString() : '') : ''
+        e.is_deleted ? (e.deleted_at ? new Date(e.deleted_at).toLocaleDateString() : '') : '',
+        e.assignment_type || 'company',
+        e.resident_name || '',
+        e.resident_contact || ''
       ])
     ].map(row => row.join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -902,7 +957,7 @@ export function EmployeesPage() {
             <THead>
               <TR hover={false}>
                 <TH>Employee</TH>
-                <TH className="hidden lg:table-cell">Company</TH>
+                <TH className="hidden lg:table-cell">Company/Resident</TH>
                 <TH className="hidden xl:table-cell">Workstation</TH>
                 <TH className="hidden md:table-cell">Phone</TH>
                 <TH>Position</TH>
@@ -925,7 +980,28 @@ export function EmployeesPage() {
                       </div>
                     </div>
                   </TD>
-                  <TD className="hidden lg:table-cell">{emp.company || '-'}</TD>
+                  <TD className="hidden lg:table-cell">
+                    {emp.assignment_type === 'resident' ? (
+                      <div className="flex flex-col">
+                        <span className="flex items-center gap-1 text-xs">
+                          <Home size={12} className="text-emerald-600" />
+                          <span className="font-medium">{emp.resident_name || '-'}</span>
+                        </span>
+                        {emp.resident_contact && (
+                          <span className="text-[10px] text-slate-400">Contact: {emp.resident_contact}</span>
+                        )}
+                        <Badge color="green" className="text-[8px]">Resident</Badge>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col">
+                        <span className="flex items-center gap-1 text-xs">
+                          <Building2 size={12} className="text-blue-600" />
+                          <span className="font-medium">{emp.company || '-'}</span>
+                        </span>
+                        <Badge color="blue" className="text-[8px]">Company</Badge>
+                      </div>
+                    )}
+                  </TD>
                   <TD className="hidden xl:table-cell">{emp.workstation || '-'}</TD>
                   <TD className="hidden md:table-cell">{emp.phone || '-'}</TD>
                   <TD>{emp.position}</TD>
@@ -1031,7 +1107,13 @@ export function EmployeesPage() {
                 <div><p className="text-slate-500 text-xs">Department</p><p className="font-medium">{selectedDeletedEmployee.department || 'N/A'}</p></div>
                 <div><p className="text-slate-500 text-xs">Basic Salary</p><p className="font-medium">{formatKwacha(selectedDeletedEmployee.basicSalary)}</p></div>
                 <div><p className="text-slate-500 text-xs">Date Hired</p><p className="font-medium">{selectedDeletedEmployee.dateHired ? new Date(selectedDeletedEmployee.dateHired).toLocaleDateString() : 'N/A'}</p></div>
-                <div><p className="text-slate-500 text-xs">Company</p><p className="font-medium">{selectedDeletedEmployee.company || 'N/A'}</p></div>
+                <div><p className="text-slate-500 text-xs">Company/Resident</p><p className="font-medium">
+                  {selectedDeletedEmployee.assignment_type === 'resident' ? (
+                    <span>{selectedDeletedEmployee.resident_name || 'N/A'} (Resident)</span>
+                  ) : (
+                    <span>{selectedDeletedEmployee.company || 'N/A'} (Company)</span>
+                  )}
+                </p></div>
               </div>
             </div>
 
@@ -1128,8 +1210,11 @@ function AddEmployeeForm({
     status: "Active",
     email: "",
     region_id: userRegionId || "",
+    assignment_type: "company",
     company: "",
     workstation: "",
+    resident_name: "",
+    resident_contact: "",
     pay_point: "",
     account_number: "",
     uniform_deduction: 10000,
@@ -1141,6 +1226,15 @@ function AddEmployeeForm({
 
   const [positions, setPositions] = useState<any[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [showResidentFields, setShowResidentFields] = useState(false);
+  const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
+  const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
+  const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
+  const [showResidentSuggestions, setShowResidentSuggestions] = useState(false);
+  const [suggestionLoading, setSuggestionLoading] = useState(false);
+  
+  // ===== NEW: Loading state for submit button =====
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const update = (k: string, v: any) => {
     setForm((prev: any) => ({ ...prev, [k]: v }));
@@ -1160,6 +1254,73 @@ function AddEmployeeForm({
     const rawValue = e.target.value.replace(/[^\d]/g, "");
     const numericValue = parseInt(rawValue) || 0;
     update("uniform_deduction", numericValue);
+  };
+
+  // ===== FETCH COMPANY SUGGESTIONS =====
+  const fetchCompanySuggestions = useCallback(async (input: string) => {
+    if (!input || input.length < 2) {
+      setCompanySuggestions([]);
+      return;
+    }
+    
+    setSuggestionLoading(true);
+    try {
+      const normalized = normalizeText(input);
+      const { data } = await supabase
+        .from('companies')
+        .select('name, normalized_name')
+        .ilike('normalized_name', `%${normalized}%`)
+        .eq('type', 'company')
+        .limit(5);
+      
+      setCompanySuggestions(data?.map(c => c.name) || []);
+      setShowCompanySuggestions(true);
+    } catch (err) {
+      console.error('Error fetching company suggestions:', err);
+    } finally {
+      setSuggestionLoading(false);
+    }
+  }, []);
+
+  // ===== FETCH RESIDENT SUGGESTIONS =====
+  const fetchResidentSuggestions = useCallback(async (input: string) => {
+    if (!input || input.length < 2) {
+      setResidentSuggestions([]);
+      return;
+    }
+    
+    setSuggestionLoading(true);
+    try {
+      const normalized = normalizeText(input);
+      const { data } = await supabase
+        .from('employees')
+        .select('resident_name')
+        .eq('assignment_type', 'resident')
+        .ilike('resident_name', `%${normalized}%`)
+        .limit(5);
+      
+      const uniqueNames = [...new Set(data?.map(e => e.resident_name).filter(Boolean) || [])];
+      setResidentSuggestions(uniqueNames);
+      setShowResidentSuggestions(true);
+    } catch (err) {
+      console.error('Error fetching resident suggestions:', err);
+    } finally {
+      setSuggestionLoading(false);
+    }
+  }, []);
+
+  // Handle assignment type change
+  const handleAssignmentTypeChange = (type: string) => {
+    update("assignment_type", type);
+    setShowResidentFields(type === 'resident');
+    if (type === 'company') {
+      update("resident_name", "");
+      update("resident_contact", "");
+      setShowResidentSuggestions(false);
+    } else {
+      update("company", "");
+      setShowCompanySuggestions(false);
+    }
   };
 
   const generateEmployeeNumber = async (regionId: string) => {
@@ -1250,67 +1411,104 @@ function AddEmployeeForm({
     fetchPositions();
   }, []);
 
-  const submit = (e: React.FormEvent) => {
+  // ===== UPDATED SUBMIT FUNCTION =====
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    
+    // Prevent multiple submissions
+    if (isSubmitting) return;
+    
+    // Validation
     if (!form.employeeNumber || !form.fullName) {
-      alert("Please fill in Employee Number and Full Name");
+      showNotification("Please fill in Employee Number and Full Name", "error");
       return;
     }
     if (!form.phone) {
-      alert("Please enter phone number");
+      showNotification("Please enter phone number", "error");
       return;
     }
     if (isSuperAdmin && !form.region_id) {
-      alert("Please select a region");
+      showNotification("Please select a region", "error");
       return;
     }
-    onSubmit(form);
+    if (form.assignment_type === 'company' && !form.company) {
+      showNotification("Please enter the company name", "error");
+      return;
+    }
+    if (form.assignment_type === 'resident' && !form.resident_name) {
+      showNotification("Please enter the resident name", "error");
+      return;
+    }
+    
+    // Set submitting state
+    setIsSubmitting(true);
+    
+    try {
+      // Call the parent onSubmit
+      await onSubmit(form);
+    } catch (error) {
+      console.error('Error submitting form:', error);
+      showNotification("An error occurred while adding the employee", "error");
+    } finally {
+      // Reset submitting state after a delay to prevent rapid clicks
+      setTimeout(() => {
+        setIsSubmitting(false);
+      }, 2000);
+    }
   };
 
+  // ===== FIELD HELPER =====
   const field = (
     k: string,
     label: string,
     type = "text",
     required = false,
     options?: { label: string; value: string }[],
-  ) => (
-    <div>
-      <label className="block text-sm font-medium text-slate-700 mb-1.5">
-        {label}
-        {required && <span className="text-red-500 ml-1">*</span>}
-      </label>
-      {options ? (
-        <select
-          value={form[k] || ""}
-          onChange={(e) => update(k, e.target.value)}
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
-        >
-          <option value="">Select {label}</option>
-          {options.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
-      ) : type === "salary" ? (
-        <input
-          type="text"
-          value={formatNumberWithCommas(form[k] || 0)}
-          onChange={handleSalaryChange}
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right"
-          required={required}
-        />
-      ) : (
-        <input
-          type={type}
-          value={form[k] || ""}
-          onChange={(e) => update(k, e.target.value)}
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
-          required={required}
-        />
-      )}
-    </div>
-  );
+  ) => {
+    const fieldKey = `field-${k}`;
+    
+    return (
+      <div key={fieldKey}>
+        <label className="block text-sm font-medium text-slate-700 mb-1.5">
+          {label}
+          {required && <span className="text-red-500 ml-1">*</span>}
+        </label>
+        {options ? (
+          <select
+            value={form[k] || ""}
+            onChange={(e) => update(k, e.target.value)}
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
+            disabled={isSubmitting}
+          >
+            <option value="">Select {label}</option>
+            {options.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        ) : type === "salary" ? (
+          <input
+            type="text"
+            value={formatNumberWithCommas(form[k] || 0)}
+            onChange={handleSalaryChange}
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right"
+            required={required}
+            disabled={isSubmitting}
+          />
+        ) : (
+          <input
+            type={type}
+            value={form[k] || ""}
+            onChange={(e) => update(k, e.target.value)}
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            required={required}
+            disabled={isSubmitting}
+          />
+        )}
+      </div>
+    );
+  };
 
   return (
     <form onSubmit={submit} className="space-y-6">
@@ -1385,42 +1583,208 @@ function AddEmployeeForm({
         </div>
       </div>
 
+      {/* ===== COMPANY & LOCATION ===== */}
       <div>
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Company & Location</h4>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Company</label>
-            <input
-              type="text"
-              value={form.company || ""}
-              onChange={(e) => {
-                let val = e.target.value.toUpperCase().trim();
-                val = val.replace(/[^A-Z0-9\s]/g, "");
-                val = val.replace(/\s+/g, " ");
-                update("company", val);
-              }}
-              placeholder="e.g., MASM, AHL, TCC"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] uppercase"
-            />
-            <p className="text-xs text-slate-400 mt-1">Auto-formatted to UPPERCASE</p>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Workstation / Site</label>
-            <input
-              type="text"
-              value={form.workstation || ""}
-              onChange={(e) => {
-                let val = e.target.value.toUpperCase().trim();
-                val = val.replace(/[^A-Z0-9\s]/g, "");
-                val = val.replace(/\s+/g, " ");
-                update("workstation", val);
-              }}
-              placeholder="e.g., CLINIC, MAIN OFFICE, GATE 1"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] uppercase"
-            />
-            <p className="text-xs text-slate-400 mt-1">Auto-formatted to UPPERCASE</p>
-          </div>
+        <p className="text-xs text-slate-500 mb-3">Select the type of assignment and provide the details</p>
+        
+        {/* Assignment Type Toggle */}
+        <div className="flex gap-3 mb-4">
+          <button
+            type="button"
+            onClick={() => handleAssignmentTypeChange('company')}
+            disabled={isSubmitting}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+              form.assignment_type === 'company'
+                ? 'bg-[#081C3A] text-white shadow-md'
+                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+            } ${isSubmitting ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            <Building2 size={16} />
+            Company
+          </button>
+          <button
+            type="button"
+            onClick={() => handleAssignmentTypeChange('resident')}
+            disabled={isSubmitting}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+              form.assignment_type === 'resident'
+                ? 'bg-[#081C3A] text-white shadow-md'
+                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+            } ${isSubmitting ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            <Home size={16} />
+            Resident
+          </button>
         </div>
+
+        {/* Company Fields with Autocomplete */}
+        {form.assignment_type === 'company' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Company Name <span className="text-red-500">*</span>
+              </label>
+              <div className="relative">
+                <input
+                  type="text"
+                  value={form.company || ""}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    update("company", val);
+                    fetchCompanySuggestions(val);
+                    setShowCompanySuggestions(true);
+                  }}
+                  onFocus={() => {
+                    if (form.company && form.company.length >= 2) {
+                      setShowCompanySuggestions(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    setTimeout(() => setShowCompanySuggestions(false), 200);
+                  }}
+                  disabled={isSubmitting}
+                  placeholder="Type company name... (e.g., MASM, AHL)"
+                  className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+                />
+                {showCompanySuggestions && companySuggestions.length > 0 && (
+                  <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg max-h-40 overflow-y-auto">
+                    {companySuggestions.map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        onClick={() => {
+                          update("company", suggestion);
+                          setShowCompanySuggestions(false);
+                        }}
+                        disabled={isSubmitting}
+                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors text-sm flex items-center gap-2"
+                      >
+                        <Building2 size={14} className="text-slate-400" />
+                        <span>{suggestion}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-slate-400 mt-1">
+                <span className="text-emerald-600">✓</span> Auto-suggestions from existing companies
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Workstation / Site
+              </label>
+              <input
+                type="text"
+                value={form.workstation || ""}
+                onChange={(e) => {
+                  let val = e.target.value.toUpperCase().trim();
+                  val = val.replace(/[^A-Z0-9\s]/g, "");
+                  val = val.replace(/\s+/g, " ");
+                  update("workstation", val);
+                }}
+                disabled={isSubmitting}
+                placeholder="e.g., CLINIC, MAIN OFFICE, GATE 1"
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] uppercase"
+              />
+              <p className="text-xs text-slate-400 mt-1">Auto-formatted to UPPERCASE. No symbols allowed.</p>
+            </div>
+          </div>
+        )}
+
+        {/* Resident Fields with Autocomplete */}
+        {form.assignment_type === 'resident' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Resident Name <span className="text-red-500">*</span>
+              </label>
+              <div className="relative">
+                <input
+                  type="text"
+                  value={form.resident_name || ""}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    update("resident_name", val);
+                    fetchResidentSuggestions(val);
+                    setShowResidentSuggestions(true);
+                  }}
+                  onFocus={() => {
+                    if (form.resident_name && form.resident_name.length >= 2) {
+                      setShowResidentSuggestions(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    setTimeout(() => setShowResidentSuggestions(false), 200);
+                  }}
+                  disabled={isSubmitting}
+                  placeholder="e.g., MR PHIRI, MRS KAMANGA"
+                  className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+                />
+                {showResidentSuggestions && residentSuggestions.length > 0 && (
+                  <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg max-h-40 overflow-y-auto">
+                    {residentSuggestions.map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        onClick={() => {
+                          update("resident_name", suggestion);
+                          setShowResidentSuggestions(false);
+                        }}
+                        disabled={isSubmitting}
+                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors text-sm flex items-center gap-2"
+                      >
+                        <Home size={14} className="text-slate-400" />
+                        <span>{suggestion}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-slate-400 mt-1">
+                <span className="text-emerald-600">✓</span> Auto-suggestions from existing residents
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Resident Contact
+              </label>
+              <input
+                type="text"
+                value={form.resident_contact || ""}
+                onChange={(e) => {
+                  let val = e.target.value.trim();
+                  val = val.replace(/[^0-9+\s]/g, "");
+                  update("resident_contact", val);
+                }}
+                disabled={isSubmitting}
+                placeholder="e.g., 0888123456"
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              />
+              <p className="text-xs text-slate-400 mt-1">Phone number for the resident (numbers only)</p>
+            </div>
+            <div className="col-span-2">
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Workstation / Site
+              </label>
+              <input
+                type="text"
+                value={form.workstation || ""}
+                onChange={(e) => {
+                  let val = e.target.value.toUpperCase().trim();
+                  val = val.replace(/[^A-Z0-9\s]/g, "");
+                  val = val.replace(/\s+/g, " ");
+                  update("workstation", val);
+                }}
+                disabled={isSubmitting}
+                placeholder="e.g., HOUSE NUMBER, AREA, LOCATION"
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] uppercase"
+              />
+              <p className="text-xs text-slate-400 mt-1">Auto-formatted to UPPERCASE. No symbols allowed.</p>
+            </div>
+          </div>
+        )}
       </div>
 
       <div>
@@ -1432,6 +1796,7 @@ function AddEmployeeForm({
               type="text"
               value={formatNumberWithCommas(form.basicSalary || 0)}
               onChange={handleSalaryChange}
+              disabled={isSubmitting}
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right"
             />
           </div>
@@ -1440,6 +1805,7 @@ function AddEmployeeForm({
             <select
               value={form.pay_point || ""}
               onChange={(e) => update("pay_point", e.target.value)}
+              disabled={isSubmitting}
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
             >
               <option value="">Select Pay Point</option>
@@ -1468,6 +1834,7 @@ function AddEmployeeForm({
               type="text"
               value={formatNumberWithCommas(form.uniform_deduction || 0)}
               onChange={handleUniformDeductionChange}
+              disabled={isSubmitting}
               placeholder="10,000"
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right"
             />
@@ -1493,6 +1860,7 @@ function AddEmployeeForm({
               type="text"
               value={form.next_of_kin_name || ""}
               onChange={(e) => update("next_of_kin_name", e.target.value)}
+              disabled={isSubmitting}
               placeholder="Enter next of kin full name"
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
@@ -1502,6 +1870,7 @@ function AddEmployeeForm({
             <select
               value={form.next_of_kin_relationship || ""}
               onChange={(e) => update("next_of_kin_relationship", e.target.value)}
+              disabled={isSubmitting}
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
             >
               <option value="">Select Relationship</option>
@@ -1518,6 +1887,7 @@ function AddEmployeeForm({
               type="tel"
               value={form.next_of_kin_phone || ""}
               onChange={(e) => update("next_of_kin_phone", e.target.value)}
+              disabled={isSubmitting}
               placeholder="Enter next of kin phone number"
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
@@ -1528,6 +1898,7 @@ function AddEmployeeForm({
               type="text"
               value={form.next_of_kin_address || ""}
               onChange={(e) => update("next_of_kin_address", e.target.value)}
+              disabled={isSubmitting}
               placeholder="Enter next of kin address"
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
@@ -1548,6 +1919,7 @@ function AddEmployeeForm({
               type="text"
               value={form.account_number || ""}
               onChange={(e) => update("account_number", e.target.value)}
+              disabled={isSubmitting}
               placeholder="e.g., 5063532125021 or 0888123456"
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
@@ -1575,6 +1947,7 @@ function AddEmployeeForm({
                     setForm((prev: any) => ({ ...prev, employeeNumber: "" }));
                   }
                 }}
+                disabled={isSubmitting}
                 className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
               >
                 <option value="">-- Please select a region --</option>
@@ -1597,8 +1970,33 @@ function AddEmployeeForm({
       </div>
 
       <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-100">
-        <button type="button" onClick={onCancel} className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium hover:bg-slate-50">Cancel</button>
-        <button type="submit" className="px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e]">✓ Hire Employee</button>
+        <button 
+          type="button" 
+          onClick={onCancel} 
+          disabled={isSubmitting}
+          className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium hover:bg-slate-50 disabled:opacity-50"
+        >
+          Cancel
+        </button>
+        <button 
+          type="submit" 
+          disabled={isSubmitting}
+          className={`px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] transition-all flex items-center gap-2 ${
+            isSubmitting ? 'opacity-70 cursor-not-allowed' : ''
+          }`}
+        >
+          {isSubmitting ? (
+            <>
+              <Loader2 size={16} className="animate-spin" />
+              Adding Employee...
+            </>
+          ) : (
+            <>
+              <UserPlus size={16} />
+              Hire Employee
+            </>
+          )}
+        </button>
       </div>
     </form>
   );
@@ -1631,8 +2029,11 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
     status: employee.status,
     email: employee.email || '',
     region_id: employee.region_id || '',
+    assignment_type: employee.assignment_type || 'company',
     company: employee.company || '',
     workstation: employee.workstation || '',
+    resident_name: employee.resident_name || '',
+    resident_contact: employee.resident_contact || '',
     pay_point: employee.pay_point || '',
     account_number: employee.account_number || '',
     uniform_deduction: employee.uniform_deduction || 0,
@@ -1643,6 +2044,14 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
   });
   
   const [positions, setPositions] = useState<any[]>([]);
+  const [showResidentFields, setShowResidentFields] = useState(form.assignment_type === 'resident');
+  const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
+  const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
+  const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
+  const [showResidentSuggestions, setShowResidentSuggestions] = useState(false);
+  
+  // ===== NEW: Loading state for edit submit button =====
+  const [isSubmitting, setIsSubmitting] = useState(false);
   
   const update = (k: string, v: any) => {
     setForm({ ...form, [k]: v });
@@ -1666,6 +2075,66 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
     update('uniform_deduction', numericValue);
   };
 
+  const handleAssignmentTypeChange = (type: string) => {
+    update("assignment_type", type);
+    setShowResidentFields(type === 'resident');
+    if (type === 'company') {
+      update("resident_name", "");
+      update("resident_contact", "");
+      setShowResidentSuggestions(false);
+    } else {
+      update("company", "");
+      setShowCompanySuggestions(false);
+    }
+  };
+
+  // ===== FETCH COMPANY SUGGESTIONS =====
+  const fetchCompanySuggestionsEdit = useCallback(async (input: string) => {
+    if (!input || input.length < 2) {
+      setCompanySuggestions([]);
+      return;
+    }
+    
+    try {
+      const normalized = normalizeText(input);
+      const { data } = await supabase
+        .from('companies')
+        .select('name, normalized_name')
+        .ilike('normalized_name', `%${normalized}%`)
+        .eq('type', 'company')
+        .limit(5);
+      
+      setCompanySuggestions(data?.map(c => c.name) || []);
+      setShowCompanySuggestions(true);
+    } catch (err) {
+      console.error('Error fetching company suggestions:', err);
+    }
+  }, []);
+
+  // ===== FETCH RESIDENT SUGGESTIONS =====
+  const fetchResidentSuggestionsEdit = useCallback(async (input: string) => {
+    if (!input || input.length < 2) {
+      setResidentSuggestions([]);
+      return;
+    }
+    
+    try {
+      const normalized = normalizeText(input);
+      const { data } = await supabase
+        .from('employees')
+        .select('resident_name')
+        .eq('assignment_type', 'resident')
+        .ilike('resident_name', `%${normalized}%`)
+        .limit(5);
+      
+      const uniqueNames = [...new Set(data?.map(e => e.resident_name).filter(Boolean) || [])];
+      setResidentSuggestions(uniqueNames);
+      setShowResidentSuggestions(true);
+    } catch (err) {
+      console.error('Error fetching resident suggestions:', err);
+    }
+  }, []);
+
   useEffect(() => {
     const fetchPositions = async () => {
       const { data } = await supabase
@@ -1678,42 +2147,78 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
     fetchPositions();
   }, []);
 
-  const submit = (e: React.FormEvent) => {
+  // ===== UPDATED SUBMIT FUNCTION =====
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    
+    // Prevent multiple submissions
+    if (isSubmitting) return;
+    
+    // Validation
     if (!form.employeeNumber || !form.fullName) {
-      alert('Please fill in Employee Number and Full Name');
+      showNotification('Please fill in Employee Number and Full Name', 'error');
       return;
     }
     if (!form.phone) {
-      alert('Please enter phone number');
+      showNotification('Please enter phone number', 'error');
       return;
     }
-    onSubmit(form);
+    if (form.assignment_type === 'company' && !form.company) {
+      showNotification("Please enter the company name", 'error');
+      return;
+    }
+    if (form.assignment_type === 'resident' && !form.resident_name) {
+      showNotification("Please enter the resident name", 'error');
+      return;
+    }
+    
+    // Set submitting state
+    setIsSubmitting(true);
+    
+    try {
+      // Call the parent onSubmit
+      await onSubmit(form);
+    } catch (error) {
+      console.error('Error submitting form:', error);
+      showNotification('An error occurred while updating the employee', 'error');
+    } finally {
+      // Reset submitting state after a delay
+      setTimeout(() => {
+        setIsSubmitting(false);
+      }, 2000);
+    }
   };
 
-  const field = (k: string, label: string, type = 'text', required = false, options?: { label: string; value: string }[]) => (
-    <div>
-      <label className="block text-sm font-medium text-slate-700 mb-1.5">{label}{required && <span className="text-red-500 ml-1">*</span>}</label>
-      {options ? (
-        <select 
-          value={form[k] || ''} 
-          onChange={e => update(k, e.target.value)} 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
-        >
-          <option value="">Select {label}</option>
-          {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </select>
-      ) : (
-        <input 
-          type={type} 
-          value={form[k] || ''} 
-          onChange={e => update(k, e.target.value)} 
-          className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-          required={required}
-        />
-      )}
-    </div>
-  );
+  // ===== FIELD HELPER =====
+  const field = (k: string, label: string, type = 'text', required = false, options?: { label: string; value: string }[]) => {
+    const fieldId = `edit-field-${k}`;
+    
+    return (
+      <div key={fieldId}>
+        <label className="block text-sm font-medium text-slate-700 mb-1.5">{label}{required && <span className="text-red-500 ml-1">*</span>}</label>
+        {options ? (
+          <select 
+            value={form[k] || ''} 
+            onChange={e => update(k, e.target.value)} 
+            disabled={isSubmitting}
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white disabled:opacity-50"
+          >
+            <option value="">Select {label}</option>
+            {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        ) : (
+          <input 
+            type={type} 
+            value={form[k] || ''} 
+            onChange={e => update(k, e.target.value)} 
+            disabled={isSubmitting}
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50" 
+            required={required}
+          />
+        )}
+      </div>
+    );
+  };
 
   return (
     <form onSubmit={submit} className="space-y-6">
@@ -1768,42 +2273,208 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
         </div>
       </div>
 
+      {/* ===== COMPANY & LOCATION ===== */}
       <div>
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Company & Location</h4>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Company</label>
-            <input 
-              type="text" 
-              value={form.company || ''} 
-              onChange={e => {
-                let val = e.target.value.toUpperCase().trim();
-                val = val.replace(/[^A-Z0-9\s]/g, '');
-                val = val.replace(/\s+/g, ' ');
-                update('company', val);
-              }}
-              placeholder="e.g., MASM, AHL, TCC"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] uppercase"
-            />
-            <p className="text-xs text-slate-400 mt-1">Auto-formatted to UPPERCASE</p>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Workstation / Site</label>
-            <input 
-              type="text" 
-              value={form.workstation || ''} 
-              onChange={e => {
-                let val = e.target.value.toUpperCase().trim();
-                val = val.replace(/[^A-Z0-9\s]/g, '');
-                val = val.replace(/\s+/g, ' ');
-                update('workstation', val);
-              }}
-              placeholder="e.g., CLINIC, MAIN OFFICE, GATE 1"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] uppercase"
-            />
-            <p className="text-xs text-slate-400 mt-1">Auto-formatted to UPPERCASE</p>
-          </div>
+        <p className="text-xs text-slate-500 mb-3">Select the type of assignment and provide the details</p>
+        
+        {/* Assignment Type Toggle */}
+        <div className="flex gap-3 mb-4">
+          <button
+            type="button"
+            onClick={() => handleAssignmentTypeChange('company')}
+            disabled={isSubmitting}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+              form.assignment_type === 'company'
+                ? 'bg-[#081C3A] text-white shadow-md'
+                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+            } ${isSubmitting ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            <Building2 size={16} />
+            Company
+          </button>
+          <button
+            type="button"
+            onClick={() => handleAssignmentTypeChange('resident')}
+            disabled={isSubmitting}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+              form.assignment_type === 'resident'
+                ? 'bg-[#081C3A] text-white shadow-md'
+                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+            } ${isSubmitting ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            <Home size={16} />
+            Resident
+          </button>
         </div>
+
+        {/* Company Fields with Autocomplete */}
+        {form.assignment_type === 'company' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Company Name <span className="text-red-500">*</span>
+              </label>
+              <div className="relative">
+                <input
+                  type="text"
+                  value={form.company || ""}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    update("company", val);
+                    fetchCompanySuggestionsEdit(val);
+                    setShowCompanySuggestions(true);
+                  }}
+                  onFocus={() => {
+                    if (form.company && form.company.length >= 2) {
+                      setShowCompanySuggestions(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    setTimeout(() => setShowCompanySuggestions(false), 200);
+                  }}
+                  disabled={isSubmitting}
+                  placeholder="Type company name... (e.g., MASM, AHL)"
+                  className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50"
+                />
+                {showCompanySuggestions && companySuggestions.length > 0 && (
+                  <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg max-h-40 overflow-y-auto">
+                    {companySuggestions.map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        onClick={() => {
+                          update("company", suggestion);
+                          setShowCompanySuggestions(false);
+                        }}
+                        disabled={isSubmitting}
+                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors text-sm flex items-center gap-2"
+                      >
+                        <Building2 size={14} className="text-slate-400" />
+                        <span>{suggestion}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-slate-400 mt-1">
+                <span className="text-emerald-600">✓</span> Auto-suggestions from existing companies
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Workstation / Site
+              </label>
+              <input
+                type="text"
+                value={form.workstation || ""}
+                onChange={(e) => {
+                  let val = e.target.value.toUpperCase().trim();
+                  val = val.replace(/[^A-Z0-9\s]/g, "");
+                  val = val.replace(/\s+/g, " ");
+                  update("workstation", val);
+                }}
+                disabled={isSubmitting}
+                placeholder="e.g., CLINIC, MAIN OFFICE, GATE 1"
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] uppercase disabled:opacity-50"
+              />
+              <p className="text-xs text-slate-400 mt-1">Auto-formatted to UPPERCASE. No symbols allowed.</p>
+            </div>
+          </div>
+        )}
+
+        {/* Resident Fields with Autocomplete */}
+        {form.assignment_type === 'resident' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Resident Name <span className="text-red-500">*</span>
+              </label>
+              <div className="relative">
+                <input
+                  type="text"
+                  value={form.resident_name || ""}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    update("resident_name", val);
+                    fetchResidentSuggestionsEdit(val);
+                    setShowResidentSuggestions(true);
+                  }}
+                  onFocus={() => {
+                    if (form.resident_name && form.resident_name.length >= 2) {
+                      setShowResidentSuggestions(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    setTimeout(() => setShowResidentSuggestions(false), 200);
+                  }}
+                  disabled={isSubmitting}
+                  placeholder="e.g., MR PHIRI, MRS KAMANGA"
+                  className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50"
+                />
+                {showResidentSuggestions && residentSuggestions.length > 0 && (
+                  <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg max-h-40 overflow-y-auto">
+                    {residentSuggestions.map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        onClick={() => {
+                          update("resident_name", suggestion);
+                          setShowResidentSuggestions(false);
+                        }}
+                        disabled={isSubmitting}
+                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors text-sm flex items-center gap-2"
+                      >
+                        <Home size={14} className="text-slate-400" />
+                        <span>{suggestion}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-slate-400 mt-1">
+                <span className="text-emerald-600">✓</span> Auto-suggestions from existing residents
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Resident Contact
+              </label>
+              <input
+                type="text"
+                value={form.resident_contact || ""}
+                onChange={(e) => {
+                  let val = e.target.value.trim();
+                  val = val.replace(/[^0-9+\s]/g, "");
+                  update("resident_contact", val);
+                }}
+                disabled={isSubmitting}
+                placeholder="e.g., 0888123456"
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50"
+              />
+              <p className="text-xs text-slate-400 mt-1">Phone number for the resident (numbers only)</p>
+            </div>
+            <div className="col-span-2">
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Workstation / Site
+              </label>
+              <input
+                type="text"
+                value={form.workstation || ""}
+                onChange={(e) => {
+                  let val = e.target.value.toUpperCase().trim();
+                  val = val.replace(/[^A-Z0-9\s]/g, "");
+                  val = val.replace(/\s+/g, " ");
+                  update("workstation", val);
+                }}
+                disabled={isSubmitting}
+                placeholder="e.g., HOUSE NUMBER, AREA, LOCATION"
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] uppercase disabled:opacity-50"
+              />
+              <p className="text-xs text-slate-400 mt-1">Auto-formatted to UPPERCASE. No symbols allowed.</p>
+            </div>
+          </div>
+        )}
       </div>
 
       <div>
@@ -1815,7 +2486,8 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
               type="text" 
               value={formatNumberWithCommas(String(form.basicSalary || '0'))} 
               onChange={handleSalaryChange}
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right" 
+              disabled={isSubmitting}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right disabled:opacity-50" 
             />
           </div>
           <div>
@@ -1823,7 +2495,8 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
             <select 
               value={form.pay_point || ''} 
               onChange={e => update('pay_point', e.target.value)} 
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
+              disabled={isSubmitting}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white disabled:opacity-50"
             >
               <option value="">Select Pay Point</option>
               <option value="national_bank">National Bank of Malawi</option>
@@ -1851,8 +2524,9 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
               type="text"
               value={formatNumberWithCommas(String(form.uniform_deduction || '0'))}
               onChange={handleUniformDeductionChange}
+              disabled={isSubmitting}
               placeholder="10,000"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right disabled:opacity-50"
             />
             <p className="text-xs text-slate-400 mt-1">This amount will be deducted from monthly income and refunded in terminal dues</p>
           </div>
@@ -1876,8 +2550,9 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
               type="text"
               value={form.next_of_kin_name || ""}
               onChange={(e) => update("next_of_kin_name", e.target.value)}
+              disabled={isSubmitting}
               placeholder="Enter next of kin full name"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50"
             />
           </div>
           <div>
@@ -1885,7 +2560,8 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
             <select
               value={form.next_of_kin_relationship || ""}
               onChange={(e) => update("next_of_kin_relationship", e.target.value)}
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
+              disabled={isSubmitting}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white disabled:opacity-50"
             >
               <option value="">Select Relationship</option>
               {relationshipOptions.map((rel) => (
@@ -1901,8 +2577,9 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
               type="tel"
               value={form.next_of_kin_phone || ""}
               onChange={(e) => update("next_of_kin_phone", e.target.value)}
+              disabled={isSubmitting}
               placeholder="Enter next of kin phone number"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50"
             />
           </div>
           <div>
@@ -1911,8 +2588,9 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
               type="text"
               value={form.next_of_kin_address || ""}
               onChange={(e) => update("next_of_kin_address", e.target.value)}
+              disabled={isSubmitting}
               placeholder="Enter next of kin address"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50"
             />
           </div>
         </div>
@@ -1931,8 +2609,9 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
               type="text" 
               value={form.account_number || ''} 
               onChange={e => update('account_number', e.target.value)}
+              disabled={isSubmitting}
               placeholder="e.g., 5063532125021 or 0888123456"
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50" 
             />
             <p className="text-xs text-slate-400 mt-1">Bank account number for salary payments</p>
           </div>
@@ -1940,8 +2619,33 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
       </div>
 
       <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-100">
-        <button type="button" onClick={onCancel} className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium hover:bg-slate-50">Cancel</button>
-        <button type="submit" className="px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e]">✓ Update Employee</button>
+        <button 
+          type="button" 
+          onClick={onCancel} 
+          disabled={isSubmitting}
+          className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium hover:bg-slate-50 disabled:opacity-50"
+        >
+          Cancel
+        </button>
+        <button 
+          type="submit" 
+          disabled={isSubmitting}
+          className={`px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] transition-all flex items-center gap-2 ${
+            isSubmitting ? 'opacity-70 cursor-not-allowed' : ''
+          }`}
+        >
+          {isSubmitting ? (
+            <>
+              <Loader2 size={16} className="animate-spin" />
+              Updating...
+            </>
+          ) : (
+            <>
+              <UserPlus size={16} />
+              Update Employee
+            </>
+          )}
+        </button>
       </div>
     </form>
   );
@@ -2011,7 +2715,10 @@ function EmployeeProfile({ employee, onBack }: { employee: Employee; onBack: () 
               {[
                 ['Position', employee.position], ['Department', employee.department], ['Qualification', employee.qualification || '-'],
                 ['Date Hired', employee.dateHired], ['Contract Type', employee.contractType || 'Permanent'],
-                ['Company', employee.company || '-'], ['Workstation', employee.workstation || '-'],
+                ['Assignment Type', employee.assignment_type === 'resident' ? 'Resident' : 'Company'],
+                ['Company/Resident', employee.assignment_type === 'resident' ? employee.resident_name || '-' : employee.company || '-'],
+                ['Resident Contact', employee.resident_contact || '-'],
+                ['Workstation', employee.workstation || '-'],
                 ['Pay Point', employee.pay_point || '-'], ['Bank Account', employee.account_number || '-'],
                 ['Uniform Deduction', formatKwacha(employee.uniform_deduction || 0)],
                 ['Next of Kin', employee.next_of_kin_name || 'Not provided'],

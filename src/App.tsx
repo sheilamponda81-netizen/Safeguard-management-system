@@ -10,9 +10,6 @@ import { PageLoader } from "./components/PageLoader";
 import { measurePerformance } from "./utils/performance";
 
 // ===== PERFORMANCE: NO PRELOADING - Only load when needed =====
-// This ensures we only load the current page, not all pages
-
-// ===== SAFE LAZY LOADING WITH ERROR HANDLING =====
 const safeLazy = (importFn: () => Promise<any>) => {
   return lazy(() =>
     importFn().catch((error) => {
@@ -36,8 +33,7 @@ const safeLazy = (importFn: () => Promise<any>) => {
   );
 };
 
-// ===== LAZY LOAD PAGES - NO PRELOADING =====
-// Each page is loaded ONLY when the user navigates to it
+// ===== LAZY LOAD PAGES =====
 const Dashboard = safeLazy(() => import("./pages/Dashboard"));
 const EmployeesPage = safeLazy(() => import("./pages/Employees"));
 const RecruitmentPage = safeLazy(() => import("./pages/Recruitment"));
@@ -51,6 +47,7 @@ const SettingsPage = safeLazy(() => import("./pages/Misc"));
 const AuditLogsPage = safeLazy(() => import("./pages/AuditLogs"));
 const TerminalDuesPage = safeLazy(() => import("./pages/TerminalDues"));
 const FeaturesPage = safeLazy(() => import("./pages/Features"));
+const UserManualPage = safeLazy(() => import("./pages/UserManual"));
 
 // ===== PAGE COMPONENTS MAP =====
 const pageComponents: Record<NavKey, React.LazyExoticComponent<() => JSX.Element>> = {
@@ -67,6 +64,7 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<() => JSX.Element
   security: SecurityPage,
   features: FeaturesPage,
   auditlogs: AuditLogsPage,
+  "user-manual": UserManualPage,
 };
 
 // ===== ROLE CONFIGURATION =====
@@ -75,13 +73,15 @@ const rolePages: Record<number, NavKey[]> = {
     "dashboard", "employees", "recruitment", "attendance",
     "payroll", "payslips", "payments", "terminal-dues",
     "reports", "settings", "security", "features", "auditlogs",
+    "user-manual",
   ],
   2: [
     "dashboard", "employees", "recruitment", "attendance",
     "payments", "terminal-dues", "reports", "security",
+    "user-manual",
   ],
-  3: ["dashboard", "attendance", "security"],
-  4: ["dashboard", "payslips"],
+  3: ["dashboard", "attendance", "security", "user-manual"],
+  4: ["dashboard", "payslips", "user-manual"],
 };
 
 // ===== TITLES CONFIGURATION =====
@@ -99,6 +99,7 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   security: { title: "Security Personnel", breadcrumb: "Security" },
   features: { title: "Future Features", breadcrumb: "Roadmap" },
   auditlogs: { title: "Audit Logs", breadcrumb: "Audit Logs" },
+  "user-manual": { title: "User Manual", breadcrumb: "User Manual" },
 };
 
 export default function App() {
@@ -120,14 +121,12 @@ export default function App() {
     setLoggedIn(true);
   }, []);
 
-  // ===== PERFORMANCE: Only preload on hover (optional) =====
+  // ===== PERFORMANCE: Only preload on hover =====
   const handlePreload = useCallback((key: NavKey) => {
     if (preloaded.has(key)) return;
     
     const component = pageComponents[key];
     if (component) {
-      // This triggers the lazy load but doesn't render it
-      // The chunk will be loaded in the background
       setPreloaded(prev => new Set(prev).add(key));
     }
   }, [preloaded]);
@@ -215,7 +214,7 @@ export default function App() {
               .from("profiles")
               .select("role_level")
               .eq("id", session.user.id)
-              .single();
+              .maybeSingle();
             
             const roleLevel = profile?.role_level || 4;
             setUserRoleLevel(roleLevel);
@@ -253,7 +252,7 @@ export default function App() {
           .from("profiles")
           .select("role_level")
           .eq("id", session.user.id)
-          .single();
+          .maybeSingle();
         
         const roleLevel = profile?.role_level || 4;
         setUserRoleLevel(roleLevel);

@@ -808,189 +808,200 @@ export function PaymentsPage() {
         </Card>
       )}
 
-      {/* Payments Table */}
-      <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <THead>
-              <TR hover={false}>
-                <TH className="w-8">
-                  <input
-                    type="checkbox"
-                    checked={selectedEmployees.length === payments.length && payments.length > 0 && canEdit}
-                    onChange={toggleSelectAll}
-                    disabled={!canEdit}
-                    className="w-4 h-4 rounded border-slate-300 disabled:opacity-50"
-                  />
-                </TH>
-                <TH>Employee</TH>
-                <TH className="hidden lg:table-cell">Company</TH>
-                <TH className="hidden xl:table-cell">Workstation</TH>
-                <TH>Pay Point</TH>
-                <TH className="text-right">Net Pay</TH>
-                <TH>Status</TH>
-                <TH className="text-right">Actions</TH>
-              </TR>
-            </THead>
-            <TBody>
-              {paginatedPayments.map((p) => (
-                <TR key={p.employee_id} className="hover:bg-slate-50">
-                  <TD className="w-8">
-                    <input
-                      type="checkbox"
-                      checked={selectedEmployees.includes(p.employee_id)}
-                      onChange={() => toggleSelectEmployee(p.employee_id)}
-                      disabled={!canEdit}
-                      className="w-4 h-4 rounded border-slate-300 disabled:opacity-50"
-                    />
-                  </TD>
-                  <TD>
-                    <div>
-                      <p className="font-medium text-slate-800">{p.full_name}</p>
-                      <p className="text-xs text-slate-500">{p.employee_number}</p>
-                      <p className="text-xs text-slate-400">{p.phone}</p>
-                    </div>
-                  </TD>
-                  <TD className="hidden lg:table-cell">
-                    <span className="text-xs">{p.company || '-'}</span>
-                  </TD>
-                  <TD className="hidden xl:table-cell">
-                    <span className="text-xs">{p.workstation || '-'}</span>
-                  </TD>
-                  <TD>
-                    <div className="flex items-center gap-1">
-                      {getPaymentMethodIcon(p.pay_point)}
-                      <span className="text-xs capitalize">
-                        {p.pay_point?.replace('_', ' ') || '-'}
-                      </span>
-                    </div>
-                  </TD>
-                  <TD className="text-right font-semibold text-[#D4A017]">
-                    {formatKwacha(p.net_pay)}
-                  </TD>
-                  <TD>{getStatusBadge(p.status)}</TD>
-                  <TD className="text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      {/* Edit button - only visible for current month */}
-                      {canEdit && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setEditingPayment(p);
-                            setShowEditModal(true);
-                          }}
-                          className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
-                          title="Edit Details"
-                        >
-                          <Edit2 size={14} />
-                        </button>
-                      )}
-                      
-                      {/* Status change buttons - only for current month */}
-                      {canEdit && p.status === 'pending' && (
-                        <button
-                          type="button"
-                          onClick={() => updatePaymentStatus(p.employee_id, 'processing')}
-                          className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
-                          title="Move to Processing"
-                        >
-                          <Clock size={14} />
-                        </button>
-                      )}
-                      
-                      {canEdit && p.status === 'processing' && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => updatePaymentStatus(p.employee_id, 'pending')}
-                            className="w-7 h-7 rounded-lg hover:bg-yellow-100 text-yellow-600"
-                            title="Move back to Pending"
-                          >
-                            <Undo size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => updatePaymentStatus(p.employee_id, 'paid')}
-                            className="w-7 h-7 rounded-lg hover:bg-emerald-100 text-emerald-600"
-                            title="Mark as Paid"
-                          >
-                            <DollarSign size={14} />
-                          </button>
-                        </>
-                      )}
-                      
-                      {canEdit && p.status === 'paid' && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => updatePaymentStatus(p.employee_id, 'processing')}
-                            className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
-                            title="Move back to Processing"
-                          >
-                            <Undo size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => updatePaymentStatus(p.employee_id, 'confirmed')}
-                            className="w-7 h-7 rounded-lg hover:bg-green-100 text-green-600"
-                            title="Confirm Receipt"
-                          >
-                            <CheckCircle size={14} />
-                          </button>
-                        </>
-                      )}
-                      
-                      {canEdit && p.status === 'confirmed' && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => updatePaymentStatus(p.employee_id, 'paid')}
-                            className="w-7 h-7 rounded-lg hover:bg-indigo-100 text-indigo-600"
-                            title="Move back to Paid"
-                          >
-                            <Undo size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => updatePaymentStatus(p.employee_id, 'failed')}
-                            className="w-7 h-7 rounded-lg hover:bg-red-100 text-red-600"
-                            title="Mark as Failed"
-                          >
-                            <XCircle size={14} />
-                          </button>
-                        </>
-                      )}
-                      
-                      {/* Failed status - can reset */}
-                      {canEdit && p.status === 'failed' && (
-                        <button
-                          type="button"
-                          onClick={() => updatePaymentStatus(p.employee_id, 'pending')}
-                          className="w-7 h-7 rounded-lg hover:bg-yellow-100 text-yellow-600"
-                          title="Reset to Pending"
-                        >
-                          <Repeat size={14} />
-                        </button>
-                      )}
+  
+<div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+  <div className="overflow-x-auto">
+    <table className="w-full text-sm">
+      <THead>
+        <TR hover={false}>
+          <TH className="w-8">
+            <input
+              type="checkbox"
+              checked={selectedEmployees.length === payments.length && payments.length > 0 && canEdit}
+              onChange={toggleSelectAll}
+              disabled={!canEdit}
+              className="w-4 h-4 rounded border-slate-300 disabled:opacity-50"
+            />
+          </TH>
+          <TH>Employee</TH>
+          <TH className="hidden lg:table-cell">Company</TH>
+          <TH className="hidden xl:table-cell">Workstation</TH>
+          <TH>Pay Point</TH>
+          <TH className="hidden md:table-cell">Account Number</TH> {/* NEW COLUMN */}
+          <TH className="text-right">Net Pay</TH>
+          <TH>Status</TH>
+          <TH className="text-right">Actions</TH>
+        </TR>
+      </THead>
+      <TBody>
+        {paginatedPayments.map((p) => (
+          <TR key={p.employee_id} className="hover:bg-slate-50">
+            <TD className="w-8">
+              <input
+                type="checkbox"
+                checked={selectedEmployees.includes(p.employee_id)}
+                onChange={() => toggleSelectEmployee(p.employee_id)}
+                disabled={!canEdit}
+                className="w-4 h-4 rounded border-slate-300 disabled:opacity-50"
+              />
+            </TD>
+            <TD>
+              <div>
+                <p className="font-medium text-slate-800">{p.full_name}</p>
+                <p className="text-xs text-slate-500">{p.employee_number}</p>
+                <p className="text-xs text-slate-400">{p.phone}</p>
+              </div>
+            </TD>
+            <TD className="hidden lg:table-cell">
+              <span className="text-xs">{p.company || '-'}</span>
+            </TD>
+            <TD className="hidden xl:table-cell">
+              <span className="text-xs">{p.workstation || '-'}</span>
+            </TD>
+            <TD>
+              <div className="flex items-center gap-1">
+                {getPaymentMethodIcon(p.pay_point)}
+                <span className="text-xs capitalize">
+                  {p.pay_point?.replace('_', ' ') || '-'}
+                </span>
+              </div>
+            </TD>
+            <TD className="hidden md:table-cell"> {/* NEW COLUMN DATA */}
+              <div className="flex flex-col">
+                <span className="text-xs font-mono text-slate-700">
+                  {p.account_number || '-'}
+                </span>
+                {!p.account_number && (
+                  <span className="text-[10px] text-amber-500">No account set</span>
+                )}
+              </div>
+            </TD>
+            <TD className="text-right font-semibold text-[#D4A017]">
+              {formatKwacha(p.net_pay)}
+            </TD>
+            <TD>{getStatusBadge(p.status)}</TD>
+            <TD className="text-right">
+              <div className="flex items-center justify-end gap-1">
+                {/* Edit button - only visible for current month */}
+                {canEdit && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingPayment(p);
+                      setShowEditModal(true);
+                    }}
+                    className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
+                    title="Edit Details"
+                  >
+                    <Edit2 size={14} />
+                  </button>
+                )}
+                
+                {/* Status change buttons - only for current month */}
+                {canEdit && p.status === 'pending' && (
+                  <button
+                    type="button"
+                    onClick={() => updatePaymentStatus(p.employee_id, 'processing')}
+                    className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
+                    title="Move to Processing"
+                  >
+                    <Clock size={14} />
+                  </button>
+                )}
+                
+                {canEdit && p.status === 'processing' && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => updatePaymentStatus(p.employee_id, 'pending')}
+                      className="w-7 h-7 rounded-lg hover:bg-yellow-100 text-yellow-600"
+                      title="Move back to Pending"
+                    >
+                      <Undo size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updatePaymentStatus(p.employee_id, 'paid')}
+                      className="w-7 h-7 rounded-lg hover:bg-emerald-100 text-emerald-600"
+                      title="Mark as Paid"
+                    >
+                      <DollarSign size={14} />
+                    </button>
+                  </>
+                )}
+                
+                {canEdit && p.status === 'paid' && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => updatePaymentStatus(p.employee_id, 'processing')}
+                      className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
+                      title="Move back to Processing"
+                    >
+                      <Undo size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updatePaymentStatus(p.employee_id, 'confirmed')}
+                      className="w-7 h-7 rounded-lg hover:bg-green-100 text-green-600"
+                      title="Confirm Receipt"
+                    >
+                      <CheckCircle size={14} />
+                    </button>
+                  </>
+                )}
+                
+                {canEdit && p.status === 'confirmed' && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => updatePaymentStatus(p.employee_id, 'paid')}
+                      className="w-7 h-7 rounded-lg hover:bg-indigo-100 text-indigo-600"
+                      title="Move back to Paid"
+                    >
+                      <Undo size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updatePaymentStatus(p.employee_id, 'failed')}
+                      className="w-7 h-7 rounded-lg hover:bg-red-100 text-red-600"
+                      title="Mark as Failed"
+                    >
+                      <XCircle size={14} />
+                    </button>
+                  </>
+                )}
+                
+                {/* Failed status - can reset */}
+                {canEdit && p.status === 'failed' && (
+                  <button
+                    type="button"
+                    onClick={() => updatePaymentStatus(p.employee_id, 'pending')}
+                    className="w-7 h-7 rounded-lg hover:bg-yellow-100 text-yellow-600"
+                    title="Reset to Pending"
+                  >
+                    <Repeat size={14} />
+                  </button>
+                )}
 
-                      {/* View Only indicator */}
-                      {!canEdit && (
-                        <span className="text-xs text-slate-400">🔒</span>
-                      )}
-                    </div>
-                  </TD>
-                </TR>
-              ))}
-            </TBody>
-          </table>
-        </div>
-        {payments.length === 0 && (
-          <div className="text-center py-8 text-slate-500">
-            <Wallet size={32} className="mx-auto mb-2 text-slate-300" />
-            No payment records found for {getMonthLabel(selectedMonth)}
-          </div>
-        )}
-      </div>
+                {/* View Only indicator */}
+                {!canEdit && (
+                  <span className="text-xs text-slate-400">🔒</span>
+                )}
+              </div>
+            </TD>
+          </TR>
+        ))}
+      </TBody>
+    </table>
+  </div>
+  {payments.length === 0 && (
+    <div className="text-center py-8 text-slate-500">
+      <Wallet size={32} className="mx-auto mb-2 text-slate-300" />
+      No payment records found for {getMonthLabel(selectedMonth)}
+    </div>
+  )}
+</div>
 
       <Pagination
         currentPage={paymentsPage}
