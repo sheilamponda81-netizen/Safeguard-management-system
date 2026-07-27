@@ -55,7 +55,7 @@ export default defineConfig({
       output: {
         manualChunks: {
           // React core
-          'vendor-react': ['react', 'react-dom', 'react-router-dom', 'react-is'],
+          'vendor-react': ['react', 'react-dom', 'react-is'],
           
           // Supabase split into smaller chunks
           'vendor-supabase': ['@supabase/supabase-js'],
@@ -95,7 +95,6 @@ export default defineConfig({
     include: [
       'react',
       'react-dom',
-      'react-router-dom',
       '@supabase/supabase-js',
       '@supabase/auth-js',
       'lucide-react',

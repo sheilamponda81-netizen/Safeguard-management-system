@@ -9,6 +9,7 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs,
 import { generateEmployees, formatKwacha, computePayroll, netPay, grossPay, Employee } from '../data';
 import { UserManagement } from '../components/UserManagement';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 // ===== Import audit logger =====
 import { logAudit } from '../utils/auditLogger';
 // ===== IMPORT MonthSettings =====
@@ -1010,15 +1011,8 @@ export function SecurityPage() {
 
   useEffect(() => {
     const fetchUserProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .single();
-        setUserProfile(profile);
-      }
+      const profile = await getCurrentProfile();
+      setUserProfile(profile);
     };
     fetchUserProfile();
   }, []);

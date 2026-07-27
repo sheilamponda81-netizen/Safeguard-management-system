@@ -3,9 +3,10 @@ import { Calculator, Users, Search, Download, Printer, FileText, Calendar, Clock
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
-import { 
+import {
   getSystemCurrentMonth, 
   getMonthLabel, 
   getNextMonth, 
@@ -151,15 +152,8 @@ export function TerminalDuesPage() {
 
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('*, regions(*)')
-        .eq('id', user.id)
-        .single();
-      setUserProfile(profile);
-    }
+    const profile = await getCurrentProfile();
+    setUserProfile(profile);
   }, []);
 
   const fetchEmployees = useCallback(async () => {

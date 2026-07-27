@@ -3,6 +3,7 @@ import { Toaster } from "sonner";
 import { LoginPage } from "./pages/Login";
 import { Sidebar, TopBar, BottomNav, NavKey } from "./components/Sidebar";
 import { supabase } from "./lib/supabase";
+import { getCurrentProfile } from "./utils/currentProfile";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { startMonitoring } from "./utils/alerts";
 import { logger } from "./utils/logger";
@@ -210,12 +211,8 @@ export default function App() {
             setLoggedIn(true);
             localStorage.setItem('sb-session', JSON.stringify(session));
             
-            const { data: profile } = await supabase
-              .from("profiles")
-              .select("role_level")
-              .eq("id", session.user.id)
-              .maybeSingle();
-            
+            const profile = await getCurrentProfile();
+
             const roleLevel = profile?.role_level || 4;
             setUserRoleLevel(roleLevel);
             
@@ -248,12 +245,8 @@ export default function App() {
         setLoggedIn(true);
         localStorage.setItem('sb-session', JSON.stringify(session));
         
-        const { data: profile } = await supabase
-          .from("profiles")
-          .select("role_level")
-          .eq("id", session.user.id)
-          .maybeSingle();
-        
+        const profile = await getCurrentProfile();
+
         const roleLevel = profile?.role_level || 4;
         setUserRoleLevel(roleLevel);
         sessionStorage.setItem('sb-session-cache', JSON.stringify({

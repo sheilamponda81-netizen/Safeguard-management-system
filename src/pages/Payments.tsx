@@ -3,6 +3,7 @@ import { Search, Download, DollarSign, CheckCircle, XCircle, Clock, Banknote, Sm
 
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input } from '../components/ui';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 import { formatKwacha } from '../data';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
@@ -14,6 +15,7 @@ import {
   getAvailableMonthsFromSystem
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 
 export function PaymentsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
@@ -37,6 +39,12 @@ export function PaymentsPage() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [selectedEmployees, setSelectedEmployees] = useState<string[]>([]);
   const [processingBulk, setProcessingBulk] = useState(false);
+
+  // Debounced so typing in these fields doesn't refetch the whole employees
+  // table on every keystroke -- only once input settles for 300ms.
+  const debouncedSearch = useDebouncedValue(search, 300);
+  const debouncedFilterCompany = useDebouncedValue(filterCompany, 300);
+  const debouncedFilterWorkstation = useDebouncedValue(filterWorkstation, 300);
 
   // ===== PAGINATION STATES =====
   const [paymentsPage, setPaymentsPage] = useState(1);
@@ -79,15 +87,8 @@ export function PaymentsPage() {
 
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('*, regions(*)')
-        .eq('id', user.id)
-        .single();
-      setUserProfile(profile);
-    }
+    const profile = await getCurrentProfile();
+    setUserProfile(profile);
   }, []);
 
   const fetchRegions = useCallback(async () => {
@@ -110,11 +111,11 @@ export function PaymentsPage() {
       if (filterRegion !== 'all' && userProfile?.is_super_admin) {
         employeesQuery = employeesQuery.eq('region_id', filterRegion);
       }
-      if (filterCompany) {
-        employeesQuery = employeesQuery.ilike('company', `%${filterCompany}%`);
+      if (debouncedFilterCompany) {
+        employeesQuery = employeesQuery.ilike('company', `%${debouncedFilterCompany}%`);
       }
-      if (filterWorkstation) {
-        employeesQuery = employeesQuery.ilike('workstation', `%${filterWorkstation}%`);
+      if (debouncedFilterWorkstation) {
+        employeesQuery = employeesQuery.ilike('workstation', `%${debouncedFilterWorkstation}%`);
       }
       if (filterPayPoint !== 'all') {
         employeesQuery = employeesQuery.eq('pay_point', filterPayPoint);
@@ -192,11 +193,11 @@ export function PaymentsPage() {
       if (filterStatus !== 'all') {
         filtered = merged.filter(p => p.status === filterStatus);
       }
-      if (search) {
-        filtered = filtered.filter(p => 
-          p.full_name?.toLowerCase().includes(search.toLowerCase()) ||
-          p.employee_number?.toLowerCase().includes(search.toLowerCase()) ||
-          p.company?.toLowerCase().includes(search.toLowerCase())
+      if (debouncedSearch) {
+        filtered = filtered.filter(p =>
+          p.full_name?.toLowerCase().includes(debouncedSearch.toLowerCase()) ||
+          p.employee_number?.toLowerCase().includes(debouncedSearch.toLowerCase()) ||
+          p.company?.toLowerCase().includes(debouncedSearch.toLowerCase())
         );
       }
 
@@ -206,7 +207,7 @@ export function PaymentsPage() {
     } finally {
       setLoading(false);
     }
-  }, [userProfile, selectedMonth, filterStatus, filterRegion, filterCompany, filterWorkstation, filterPayPoint, search]);
+  }, [userProfile, selectedMonth, filterStatus, filterRegion, debouncedFilterCompany, debouncedFilterWorkstation, filterPayPoint, debouncedSearch]);
 
   // ===== INITIALIZATION =====
   useEffect(() => {
@@ -228,7 +229,7 @@ export function PaymentsPage() {
     if (userProfile && selectedMonth) {
       fetchPaymentData();
     }
-  }, [userProfile, selectedMonth, filterStatus, filterRegion, filterCompany, filterWorkstation, filterPayPoint, fetchPaymentData]);
+  }, [userProfile, selectedMonth, filterStatus, filterRegion, debouncedFilterCompany, debouncedFilterWorkstation, filterPayPoint, fetchPaymentData]);
 
   // ===== MONTH NAVIGATION =====
   const goToPreviousMonth = useCallback(() => {

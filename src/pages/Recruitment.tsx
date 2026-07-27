@@ -5,9 +5,10 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input
 import { formatKwacha } from '../data';
 import { showNotification } from '../utils/clickHandlers';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 import { logAudit } from '../utils/auditLogger';
-import { 
-  getSystemCurrentMonth, 
+import {
+  getSystemCurrentMonth,
   getMonthLabel, 
   getNextMonth, 
   getPreviousMonth,
@@ -78,15 +79,8 @@ export function RecruitmentPage() {
 
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('*, regions(*)')
-        .eq('id', user.id)
-        .single();
-      setUserProfile(profile);
-    }
+    const profile = await getCurrentProfile();
+    setUserProfile(profile);
   }, []);
 
   const fetchApplicants = useCallback(async () => {

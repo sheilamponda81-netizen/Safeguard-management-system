@@ -7,7 +7,8 @@ import {
 import { Card, StatCard, Button, Badge, Table, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
-import { 
+import { getCurrentProfile } from '../utils/currentProfile';
+import {
   getSystemCurrentMonth, 
   getMonthLabel, 
   getNextMonth, 
@@ -157,11 +158,7 @@ export function Dashboard() {
     const getUserInfo = async () => {
       const { data: { user } } = await supabase.auth.getUser();
       if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('full_name, is_super_admin, region_id, regions(*)')
-          .eq('id', user.id)
-          .maybeSingle();
+        const profile = await getCurrentProfile();
         setUserProfile(profile);
         const name = profile?.full_name || user.email?.split('@')[0] || 'User';
         setUserName(name);
@@ -389,40 +386,43 @@ export function Dashboard() {
       setPayrollHistory(historyData);
       
       // ===== ATTENDANCE DATA - Starting from July 2026 =====
-      const attendanceDataTemp = [];
-      for (const month of chartMonths) {
+      // Single query spanning the whole 6-month window, grouped by month
+      // client-side, instead of one sequential await per month.
+      const monthRanges = chartMonths.map(month => {
         const [year, monthNum] = month.split('-').map(Number);
         const monthName = monthNames[monthNum - 1];
-        const label = `${monthName} ${year}`;
-        
-        const startDate = `${year}-${String(monthNum).padStart(2, '0')}-01`;
         const lastDay = new Date(year, monthNum, 0).getDate();
-        const endDate = `${year}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
-        
-        let recordsQuery = supabase
+        return {
+          label: `${monthName} ${year}`,
+          startDate: `${year}-${String(monthNum).padStart(2, '0')}-01`,
+          endDate: `${year}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`,
+        };
+      });
+
+      const employeeIds = employeesData.map(e => e.id);
+      let allAttendanceRecords: { date: string; status: string }[] = [];
+      if (monthRanges.length > 0 && employeeIds.length > 0) {
+        const { data: records } = await supabase
           .from('attendance')
-          .select('status')
-          .gte('date', startDate)
-          .lte('date', endDate);
-        
-        const employeeIds = employeesData.map(e => e.id);
-        if (employeeIds.length > 0) {
-          recordsQuery = recordsQuery.in('employee_id', employeeIds);
-        }
-        
-        const { data: records } = await recordsQuery;
-        
+          .select('date, status')
+          .gte('date', monthRanges[0].startDate)
+          .lte('date', monthRanges[monthRanges.length - 1].endDate)
+          .in('employee_id', employeeIds);
+        allAttendanceRecords = records || [];
+      }
+
+      const attendanceDataTemp = monthRanges.map(({ label, startDate, endDate }) => {
         let present = 0;
         let total = 0;
-        records?.forEach(r => {
-          if (r.status !== '-') {
+        allAttendanceRecords.forEach(r => {
+          if (r.date >= startDate && r.date <= endDate && r.status !== '-') {
             total++;
             if (r.status === 'P') present++;
           }
         });
         const rate = total > 0 ? Math.round((present / total) * 100) : 85 + Math.round(Math.random() * 10);
-        attendanceDataTemp.push({ month: label, rate });
-      }
+        return { month: label, rate };
+      });
       setAttendanceData(attendanceDataTemp);
       
       setDataReady(true);

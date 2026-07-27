@@ -43,4 +43,4 @@ export const reactIsPatch = (): void => {
   // Patch already applied, nothing to do
 };
 
-export default reactIs;
+export default (window as any).reactIs as ReactIsPatch;
