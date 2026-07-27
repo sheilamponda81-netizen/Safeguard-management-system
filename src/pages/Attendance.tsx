@@ -307,7 +307,7 @@ export function AttendancePage() {
         .select('id')
         .eq('employee_id', employeeId)
         .eq('date', date)
-        .Single();
+        .maybeSingle();
       
       if (checkError) throw checkError;
       
