@@ -7,6 +7,7 @@ import {
 } from '../utils/icons';
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Input } from '../components/ui';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
@@ -140,17 +141,7 @@ export function SecurityPage() {
   // ===== FETCH USER PROFILE =====
   const fetchUserProfile = useCallback(async () => {
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile, error } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .maybeSingle();
-        if (error) throw error;
-        return profile;
-      }
-      return null;
+      return await getCurrentProfile();
     } catch (err) {
       console.error('Error fetching user profile:', err);
       return null;

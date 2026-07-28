@@ -3,11 +3,13 @@ import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, User, Pho
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { getEmployeeAuditData, getChanges } from '../utils/auditHelpers';
 import { Pagination } from '../components/Pagination';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 
 interface Employee {
   id: string;
@@ -124,6 +126,9 @@ export function EmployeesPage() {
   const [filterCompany, setFilterCompany] = useState<string>('');
   const [filterWorkstation, setFilterWorkstation] = useState<string>('');
   const [filterPayPoint, setFilterPayPoint] = useState<string>('');
+  // Debounced so typing doesn't refetch the whole employees table per keystroke.
+  const debouncedFilterCompany = useDebouncedValue(filterCompany, 300);
+  const debouncedFilterWorkstation = useDebouncedValue(filterWorkstation, 300);
   const [userProfile, setUserProfile] = useState<any>(null);
   const [userLoading, setUserLoading] = useState(true);
   const [showDeletedModal, setShowDeletedModal] = useState(false);
@@ -184,15 +189,8 @@ export function EmployeesPage() {
   }, []);
 
   const fetchUserProfile = useCallback(async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('*, regions(*)')
-        .eq('id', user.id)
-        .maybeSingle();
-      setUserProfile(profile);
-    }
+    const profile = await getCurrentProfile();
+    setUserProfile(profile);
     setUserLoading(false);
   }, []);
 
@@ -208,8 +206,8 @@ export function EmployeesPage() {
       if (filterRegionId && userProfile?.is_super_admin) {
         query = query.eq('region_id', filterRegionId);
       }
-      if (filterCompany) query = query.ilike('company', `%${filterCompany}%`);
-      if (filterWorkstation) query = query.ilike('workstation', `%${filterWorkstation}%`);
+      if (debouncedFilterCompany) query = query.ilike('company', `%${debouncedFilterCompany}%`);
+      if (debouncedFilterWorkstation) query = query.ilike('workstation', `%${debouncedFilterWorkstation}%`);
       if (filterPayPoint) query = query.eq('pay_point', filterPayPoint);
       
       const { data, error } = await query.order('full_name');
@@ -261,7 +259,7 @@ export function EmployeesPage() {
     } finally {
       setLoading(false);
     }
-  }, [userProfile, filterRegionId, filterCompany, filterWorkstation, filterPayPoint]);
+  }, [userProfile, filterRegionId, debouncedFilterCompany, debouncedFilterWorkstation, filterPayPoint]);
 
   // ===== CHECK DUPLICATES =====
   const checkDuplicates = useCallback(async (phone: string, accountNumber: string, employeeId?: string) => {

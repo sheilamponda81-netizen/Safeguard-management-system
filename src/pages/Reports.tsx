@@ -3,6 +3,7 @@ import { FileDown, FileSpreadsheet, FileText, TrendingUp, Users, DollarSign, Cal
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
 import { sanitizeInput } from '../utils/securityHeaders';
@@ -259,15 +260,8 @@ export function ReportsPage() {
 
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('*, regions(*)')
-        .eq('id', user.id)
-        .maybeSingle();
-      setUserProfile(profile);
-    }
+    const profile = await getCurrentProfile();
+    setUserProfile(profile);
   }, []);
 
   const fetchCompanies = useCallback(async () => {

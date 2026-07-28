@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
+import { getCurrentProfile } from "../utils/currentProfile";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { ChevronRight } from 'lucide-react';
 
@@ -147,11 +148,13 @@ export function Sidebar({
         } = await supabase.auth.getUser();
         if (user) {
           setUserEmail(user.email || "");
-          const { data: profile, error } = await supabase
-            .from("profiles")
-            .select("full_name, role_level")
-            .eq("id", user.id)
-            .maybeSingle();
+          let profile: any = null;
+          let error: any = null;
+          try {
+            profile = await getCurrentProfile();
+          } catch (e) {
+            error = e;
+          }
 
           if (error) {
             console.error("Error fetching profile:", error);
@@ -402,12 +405,8 @@ export function BottomNav({
           data: { user },
         } = await supabase.auth.getUser();
         if (user) {
-          const { data } = await supabase
-            .from("profiles")
-            .select("role_level")
-            .eq("id", user.id)
-            .maybeSingle();
-          setUserRoleLevel(data?.role_level || 4);
+          const profile = await getCurrentProfile();
+          setUserRoleLevel(profile?.role_level || 4);
         }
       } catch (err) {
         console.error("Failed to get role:", err);

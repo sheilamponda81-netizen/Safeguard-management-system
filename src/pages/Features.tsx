@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Map, Building2, ClipboardList, Car, Bot, Camera, Sparkles, Smartphone } from 'lucide-react';
 import { Card, Button, Badge, PageHeader } from '../components/ui';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 // ===== Import audit logger =====
 import { logAudit } from '../utils/auditLogger';
 
@@ -11,15 +12,8 @@ export function FeaturesPage() {
   // Fetch user profile for audit logging
   useEffect(() => {
     const fetchUserProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*, regions(*)')
-          .eq('id', user.id)
-          .single();
-        setUserProfile(profile);
-      }
+      const profile = await getCurrentProfile();
+      setUserProfile(profile);
     };
     fetchUserProfile();
   }, []);

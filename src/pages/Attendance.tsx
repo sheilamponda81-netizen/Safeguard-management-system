@@ -2,6 +2,7 @@
 import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, Sparkles, ChevronLeft, ChevronRight } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
 import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
@@ -123,15 +124,8 @@ export function AttendancePage() {
 
   // ===== FETCH USER PROFILE =====
   const fetchUserProfile = useCallback(async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('*, regions(*)')
-        .eq('id', user.id)
-        .single();
-      setUserProfile(profile);
-    }
+    const profile = await getCurrentProfile();
+    setUserProfile(profile);
   }, []);
 
   // ===== FETCH DATA =====

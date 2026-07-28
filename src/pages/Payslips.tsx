@@ -4,12 +4,13 @@ import { Archive as ArchiveIcon, FileArchive as FileArchiveIcon } from 'lucide-r
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
+import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
-import { 
-  getSystemCurrentMonth, 
-  getMonthLabel, 
-  getNextMonth, 
+import {
+  getSystemCurrentMonth,
+  getMonthLabel,
+  getNextMonth,
   getPreviousMonth,
   getAvailableMonthsFromSystem
 } from '../utils/currentMonth';
@@ -174,15 +175,8 @@ export function PayslipsPage() {
 
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('*, regions(*)')
-        .eq('id', user.id)
-        .maybeSingle();
-      setUserProfile(profile);
-    }
+    const profile = await getCurrentProfile();
+    setUserProfile(profile);
   }, []);
 
   const fetchPayslipData = useCallback(async () => {
