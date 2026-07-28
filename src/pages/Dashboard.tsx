@@ -9,15 +9,13 @@ import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import {
-  getSystemCurrentMonth, 
-  getMonthLabel, 
-  getNextMonth, 
+  getSystemCurrentMonth,
+  getMonthLabel,
+  getNextMonth,
   getPreviousMonth,
   getAvailableMonthsFromSystem,
   getChartMonths,
-  getShortMonthLabel,
-  getSystemStartDate,
-  isBeforeSystemStart
+  normalizeMonthKey
 } from '../utils/currentMonth';
 import { showNotification } from '../utils/clickHandlers';
 
@@ -76,6 +74,8 @@ export function Dashboard() {
     totalPayroll: 0,
     onLeave: 0,
     pendingRecruitment: 0,
+    shortlistedRecruitment: 0,
+    interviewedRecruitment: 0,
     attendanceRate: 0,
     notifications: 0
   });
@@ -84,6 +84,7 @@ export function Dashboard() {
   const [pieData, setPieData] = useState<any[]>([]);
   const [recent, setRecent] = useState<any[]>([]);
   const [growthData, setGrowthData] = useState<any[]>([]);
+  const [payrollStatusLabel, setPayrollStatusLabel] = useState('Not Processed');
   const [dataReady, setDataReady] = useState(false);
   const [initialLoad, setInitialLoad] = useState(true);
 
@@ -250,14 +251,17 @@ export function Dashboard() {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
       }
       
-      const [employeesRes, applicantsRes] = await Promise.all([
+      const [employeesRes, applicantsRes, shortlistedRes, interviewedRes] = await Promise.all([
         employeesQuery,
-        supabase.from('applicants').select('id', { count: 'exact', head: false }).eq('interview_status', 'Pending')
+        supabase.from('applicants').select('id', { count: 'exact', head: false }).eq('interview_status', 'Pending'),
+        supabase.from('applicants').select('id', { count: 'exact', head: false }).eq('interview_status', 'Shortlisted'),
+        supabase.from('applicants').select('id', { count: 'exact', head: false }).eq('interview_status', 'Interviewed')
       ]);
-      
+
       const employeesData = employeesRes.data || [];
       setEmployees(employeesData);
-      
+      const employeeIds = employeesData.map((e: any) => e.id);
+
       // ===== ACCURATE STATS CALCULATIONS =====
       const activeGuards = employeesData.filter((e: any) => 
         (e.position?.toLowerCase().includes('guard') || 
@@ -299,7 +303,6 @@ export function Dashboard() {
       // ===== ACCURATE ATTENDANCE RATE =====
       let attendanceRate = 0;
       if (employeesData.length > 0) {
-        const employeeIds = employeesData.map(e => e.id);
         const monthStart = `${selectedMonth}-01`;
         const lastDay = new Date(parseInt(selectedMonth.split('-')[0]), parseInt(selectedMonth.split('-')[1]), 0).getDate();
         const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
@@ -340,6 +343,8 @@ export function Dashboard() {
         totalPayroll,
         onLeave,
         pendingRecruitment: applicantsRes.count || 0,
+        shortlistedRecruitment: shortlistedRes.count || 0,
+        interviewedRecruitment: interviewedRes.count || 0,
         attendanceRate,
         notifications: 0
       });
@@ -356,36 +361,62 @@ export function Dashboard() {
       // ===== RECENT HIRES (non-deleted, active employees) =====
       setRecent(employeesData.slice(0, 6));
       
-      // ===== GROWTH DATA (from 2022 to current) =====
-      const growth: { year: string; employees: number }[] = [];
-      const years = ['2022', '2023', '2024', '2025', '2026'];
-      let cumulative = 0;
-      for (const year of years) {
-        const count = employeesData.filter((e: any) => e.hire_date?.startsWith(year)).length;
-        cumulative += count;
-        growth.push({ year, employees: cumulative || (year === '2022' ? 0 : growth[growth.length-1]?.employees || 0) });
-      }
-      setGrowthData(growth);
-      
-      // ===== PAYROLL HISTORY - Starting from July 2026 =====
+      // ===== GROWTH DATA — real cumulative headcount per month, starting from
+      // the system's actual start month (June 2026), not a fabricated
+      // multi-year history the system never existed for. =====
       const chartMonths = getChartMonths(selectedMonth);
       const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-      
-      // Generate payroll history using the chart months
-      const historyData = chartMonths.map((month, index) => {
+
+      const growth = chartMonths.map(month => {
         const [year, monthNum] = month.split('-').map(Number);
         const monthName = monthNames[monthNum - 1];
-        // Create a realistic payroll amount (varies slightly per month)
-        const baseAmount = totalPayroll > 0 ? totalPayroll : 500000;
-        const variation = 0.8 + (index * 0.04); // Gradual increase
+        const lastDay = new Date(year, monthNum, 0).getDate();
+        const monthEnd = `${year}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+        const count = employeesData.filter((e: any) => e.hire_date && e.hire_date <= monthEnd).length;
+        return { month: `${monthName} ${year}`, employees: count };
+      });
+      setGrowthData(growth);
+
+      // ===== PAYROLL HISTORY — real net pay totals per month from the
+      // `payroll` table. A month with no processed payroll run shows 0,
+      // never a fabricated estimate. =====
+      let payrollQuery = supabase.from('payroll').select('month, net_pay, employee_id, approval_status');
+      if (employeeIds.length > 0) {
+        payrollQuery = payrollQuery.in('employee_id', employeeIds);
+      }
+      const { data: allPayrollRecords } = await payrollQuery;
+
+      const payrollTotalsByMonthKey = new Map<string, number>();
+      (allPayrollRecords || []).forEach((r: any) => {
+        const key = normalizeMonthKey(r.month);
+        if (!key) return;
+        payrollTotalsByMonthKey.set(key, (payrollTotalsByMonthKey.get(key) || 0) + (r.net_pay || 0));
+      });
+
+      // Real payroll status for the selected month, not a hardcoded "Ready".
+      const selectedMonthKey = normalizeMonthKey(selectedMonth);
+      const selectedMonthPayrollRecords = (allPayrollRecords || []).filter(
+        (r: any) => normalizeMonthKey(r.month) === selectedMonthKey
+      );
+      setPayrollStatusLabel(
+        selectedMonthPayrollRecords.length === 0
+          ? 'Not Processed'
+          : selectedMonthPayrollRecords.every((r: any) => r.approval_status === 'approved')
+            ? 'Approved'
+            : 'Pending Approval'
+      );
+
+      const historyData = chartMonths.map(month => {
+        const [year, monthNum] = month.split('-').map(Number);
+        const monthName = monthNames[monthNum - 1];
         return {
           month: `${monthName} ${year}`,
-          amount: Math.round(baseAmount * variation)
+          amount: payrollTotalsByMonthKey.get(month) || 0
         };
       });
       setPayrollHistory(historyData);
-      
-      // ===== ATTENDANCE DATA - Starting from July 2026 =====
+
+      // ===== ATTENDANCE DATA - Starting from June 2026 =====
       // Single query spanning the whole 6-month window, grouped by month
       // client-side, instead of one sequential await per month.
       const monthRanges = chartMonths.map(month => {
@@ -399,7 +430,6 @@ export function Dashboard() {
         };
       });
 
-      const employeeIds = employeesData.map(e => e.id);
       let allAttendanceRecords: { date: string; status: string }[] = [];
       if (monthRanges.length > 0 && employeeIds.length > 0) {
         const { data: records } = await supabase
@@ -420,7 +450,7 @@ export function Dashboard() {
             if (r.status === 'P') present++;
           }
         });
-        const rate = total > 0 ? Math.round((present / total) * 100) : 85 + Math.round(Math.random() * 10);
+        const rate = total > 0 ? Math.round((present / total) * 100) : 0;
         return { month: label, rate };
       });
       setAttendanceData(attendanceDataTemp);
@@ -545,7 +575,7 @@ export function Dashboard() {
       children: (
         <>
           <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-          <XAxis dataKey="year" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
+          <XAxis dataKey="month" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
           <YAxis tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} />
           <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`${v} employees`, 'Workforce']} />
           <Line type="monotone" dataKey="employees" stroke="#D4A017" strokeWidth={3} dot={{ fill: '#081C3A', strokeWidth: 2, r: 4, stroke: '#fff' }} />
@@ -661,10 +691,10 @@ export function Dashboard() {
 
       {/* Stats Cards - Load immediately, no chart dependencies */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard title="Total Employees" value={String(stats.total)} icon={Users} accent="navy" change="↑ from last month" sub={`${stats.activeGuards} Active Guards`} />
-        <StatCard title="Monthly Payroll" value={stats.totalPayroll > 0 ? formatKwacha(stats.totalPayroll) : 'MK 0'} icon={Wallet} accent="gold" change="↑ from last month" sub={`Period: ${monthLabel}`} />
-        <StatCard title="Absent Employees" value={String(stats.onLeave)} icon={UserMinus} accent="red" change="↓ from yesterday" sub="On leave today" />
-        <StatCard title="Pending Recruitment" value={String(stats.pendingRecruitment)} icon={ClipboardList} accent="blue" change="3 shortlisted today" sub="5 Interviews Scheduled" />
+        <StatCard title="Total Employees" value={String(stats.total)} icon={Users} accent="navy" sub={`${stats.activeGuards} Active Guards`} />
+        <StatCard title="Monthly Payroll" value={stats.totalPayroll > 0 ? formatKwacha(stats.totalPayroll) : 'MK 0'} icon={Wallet} accent="gold" sub={`Period: ${monthLabel}`} />
+        <StatCard title="On Leave" value={String(stats.onLeave)} icon={UserMinus} accent="red" sub="Currently on leave" />
+        <StatCard title="Pending Recruitment" value={String(stats.pendingRecruitment)} icon={ClipboardList} accent="blue" sub={`${stats.shortlistedRecruitment} shortlisted, ${stats.interviewedRecruitment} interviewed`} />
       </div>
 
       {/* Security Personnel Dashboard */}
@@ -684,8 +714,8 @@ export function Dashboard() {
       {/* Quick status */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <Card className="p-4 flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-emerald-100 flex items-center justify-center text-emerald-600"><CheckCircle2 size={20} /></div>
-          <div><p className="text-xs text-slate-500">Payroll Status</p><p className="font-semibold text-slate-800 text-sm">Ready</p></div>
+          <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${payrollStatusLabel === 'Approved' ? 'bg-emerald-100 text-emerald-600' : payrollStatusLabel === 'Pending Approval' ? 'bg-[#FFF1CC] text-[#D4A017]' : 'bg-slate-100 text-slate-500'}`}><CheckCircle2 size={20} /></div>
+          <div><p className="text-xs text-slate-500">Payroll Status</p><p className="font-semibold text-slate-800 text-sm">{payrollStatusLabel}</p></div>
         </Card>
         <Card className="p-4 flex items-center gap-3">
           <div className="w-10 h-10 rounded-lg bg-blue-100 flex items-center justify-center text-blue-600"><TrendingUp size={20} /></div>
@@ -736,7 +766,7 @@ export function Dashboard() {
         <Card className="p-5">
           <div className="flex items-center justify-between mb-4">
             <div><h3 className="font-semibold text-slate-800">Attendance Trend</h3><p className="text-xs text-slate-500">Workforce attendance percentage</p></div>
-            <Badge color="green">+2.0%</Badge>
+            <Badge color="green">{stats.attendanceRate}% ({monthLabel})</Badge>
           </div>
           <div className="h-56">
             {renderAttendanceChart}
@@ -745,8 +775,8 @@ export function Dashboard() {
 
         <Card className="p-5">
           <div className="flex items-center justify-between mb-4">
-            <div><h3 className="font-semibold text-slate-800">Employee Growth</h3><p className="text-xs text-slate-500">Year-on-year workforce expansion</p></div>
-            <Badge color="navy">Scaling to 1000+</Badge>
+            <div><h3 className="font-semibold text-slate-800">Employee Growth</h3><p className="text-xs text-slate-500">Workforce headcount since the system started (June 2026)</p></div>
+            <Badge color="navy">{stats.total} Total</Badge>
           </div>
           <div className="h-56">
             {renderGrowthChart}
