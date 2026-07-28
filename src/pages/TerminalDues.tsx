@@ -28,6 +28,7 @@ interface Employee {
   email: string;
   status: string;
   is_deleted?: boolean;
+  uniform_deduction?: number;
 }
 
 interface TerminalDue {
@@ -184,7 +185,8 @@ export function TerminalDuesPage() {
         phone: emp.phone || '',
         email: emp.email || '',
         status: emp.status || 'Active',
-        is_deleted: emp.is_deleted || false
+        is_deleted: emp.is_deleted || false,
+        uniform_deduction: emp.uniform_deduction
       }));
       
       setEmployees(mappedEmployees);
@@ -283,11 +285,15 @@ export function TerminalDuesPage() {
   // ===== SELECT EMPLOYEE =====
   const selectEmployee = useCallback((employee: Employee) => {
     setSelectedEmployee(employee);
-    setFormData({ ...formData, employee_id: employee.id });
+    setFormData(prev => ({
+      ...prev,
+      employee_id: employee.id,
+      uniform_refund: employee.uniform_deduction ?? 0
+    }));
     setEmployeeSearch(employee.fullName || '');
     setShowEmployeeDropdown(false);
     setPreviewCalculation(null);
-  }, [formData]);
+  }, []);
 
   // ===== CALCULATE TERMINAL DUES =====
   const calculateTerminalDues = useCallback(() => {
@@ -298,16 +304,22 @@ export function TerminalDuesPage() {
 
     const dateJoined = new Date(selectedEmployee.hire_date);
     const dateLeft = new Date(formData.date_left);
-    
-    let monthsDiff = (dateLeft.getFullYear() - dateJoined.getFullYear()) * 12 + 
+
+    let monthsDiff = (dateLeft.getFullYear() - dateJoined.getFullYear()) * 12 +
                      (dateLeft.getMonth() - dateJoined.getMonth());
-    
-    const periodMonths = Math.max(1, monthsDiff);
-    
-    const basicSalary = selectedEmployee.basicSalary || 150000;
-    
+
+    if (monthsDiff <= 0) {
+      showNotification('Date Left must be after the employee\'s Date Joined', 'error');
+      return null;
+    }
+
+    const periodMonths = monthsDiff;
+
+    const basicSalary = selectedEmployee.basicSalary ?? 150000;
+
     const gratuity = Math.round((periodMonths * basicSalary * 10) / 100);
-    const annualLeave = Math.round((26 * basicSalary * 1) / 26);
+    // Annual leave payout is a flat one month's basic salary.
+    const annualLeave = basicSalary;
     const uniformRefund = Number(formData.uniform_refund) || 0;
     const otherBenefits = Number(formData.other_benefits) || 0;
     const subtotal = gratuity + annualLeave + uniformRefund + otherBenefits;
@@ -837,7 +849,7 @@ export function TerminalDuesPage() {
               <div><strong>Employee:</strong> {selectedEmployee.fullName || 'Unknown'}</div>
               <div><strong>Employee #:</strong> {selectedEmployee.employeeNumber || 'N/A'}</div>
               <div><strong>Position:</strong> {selectedEmployee.position || 'N/A'}</div>
-              <div><strong>Basic Salary:</strong> {formatKwacha(selectedEmployee.basicSalary || 150000)}</div>
+              <div><strong>Basic Salary:</strong> {formatKwacha(selectedEmployee.basicSalary ?? 150000)}</div>
               <div className="col-span-2"><strong>Date Joined:</strong> {new Date(selectedEmployee.hire_date).toLocaleDateString()}</div>
             </div>
           )}

@@ -875,14 +875,18 @@ export function AttendancePage() {
             
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="p-4 bg-slate-50 rounded-lg">
+                <p className="text-xs text-slate-400 mb-2">
+                  Counted automatically from this month's attendance record -- Payroll
+                  uses these live, so they're no longer editable here.
+                </p>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <label className="text-sm text-slate-700">Absent Days</label>
                     <input
                       type="number"
                       value={editableDeductions.absentDays}
-                      onChange={(e) => handleDeductionChange('absentDays', parseInt(e.target.value) || 0)}
-                      className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                      disabled
+                      className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
                       min="0"
                     />
                   </div>
@@ -891,8 +895,8 @@ export function AttendancePage() {
                     <input
                       type="number"
                       value={editableDeductions.absentDeduction}
-                      onChange={(e) => handleDeductionChange('absentDeduction', parseInt(e.target.value) || 0)}
-                      className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                      disabled
+                      className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
                       min="0"
                     />
                   </div>
@@ -901,8 +905,8 @@ export function AttendancePage() {
                     <input
                       type="number"
                       value={editableDeductions.lateDays}
-                      onChange={(e) => handleDeductionChange('lateDays', parseInt(e.target.value) || 0)}
-                      className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                      disabled
+                      className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
                       min="0"
                     />
                   </div>
@@ -911,8 +915,8 @@ export function AttendancePage() {
                     <input
                       type="number"
                       value={editableDeductions.lateDeduction}
-                      onChange={(e) => handleDeductionChange('lateDeduction', parseInt(e.target.value) || 0)}
-                      className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                      disabled
+                      className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
                       min="0"
                     />
                   </div>
