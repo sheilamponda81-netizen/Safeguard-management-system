@@ -1192,9 +1192,19 @@ const handleDeletePosition = async (position: any) => {
         </Card>
       )}
       
-      <RoleModal />
-      <PositionModal />
-      <RegionModal />
+      {/* Rendered via direct call, not <RoleModal /> etc. -- these are defined
+          as closures inside this component (not hoisted to module scope) so
+          they can capture all the enclosing form state directly. Invoking
+          them as JSX elements (<RoleModal />) would make React treat the
+          function's fresh identity on every render as a brand-new component
+          type and remount the whole modal (including the <input>s) on every
+          keystroke, losing focus after each character. Calling them as plain
+          functions inlines their returned JSX directly into this tree, so
+          reconciliation is based on the stable Modal/input types inside them
+          instead. */}
+      {RoleModal()}
+      {PositionModal()}
+      {RegionModal()}
     </div>
   );
 }
