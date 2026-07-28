@@ -294,17 +294,15 @@ export function AttendancePage() {
   // ===== PROCESS SINGLE UPDATE =====
   const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string) => {
     try {
-      const tenantId = userProfile?.tenant_id;
-      
       const { data: existingRecord, error: checkError } = await supabase
         .from('attendance')
         .select('id')
         .eq('employee_id', employeeId)
         .eq('date', date)
         .maybeSingle();
-      
+
       if (checkError) throw checkError;
-      
+
       let result;
       if (existingRecord) {
         result = await supabase
@@ -312,22 +310,28 @@ export function AttendancePage() {
           .update({ status: nextStatus })
           .eq('id', existingRecord.id);
       } else {
+        // tenant_id is omitted -- it defaults to the current user's own
+        // tenant via the DB column default, same convention used by
+        // positions/regions inserts elsewhere in the app. Explicitly
+        // passing `tenant_id: null` here previously (when userProfile
+        // hadn't finished loading yet) would override that default and
+        // violate the NOT NULL constraint, silently failing every insert.
         result = await supabase
           .from('attendance')
-          .insert({ 
-            employee_id: employeeId, 
-            date: date, 
+          .insert({
+            employee_id: employeeId,
+            date: date,
             status: nextStatus,
-            tenant_id: tenantId || null
           });
       }
-      
+
       if (result.error) throw result.error;
-      
+
     } catch (err: any) {
       console.error('Error processing update:', err);
+      showNotification(`Failed to save attendance: ${err.message || 'Unknown error'}`, 'error');
     }
-  }, [userProfile]);
+  }, []);
 
   // ===== OPTIMIZED: UPDATE ATTENDANCE WITH OPTIMISTIC UI =====
   const updateAttendance = useCallback(async (employeeId: string, date: string, currentStatus: string) => {
