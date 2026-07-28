@@ -10,6 +10,7 @@ import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
+import { getPayrollRates, PayrollRates } from '../utils/payrollSettings';
 
 interface Employee {
   id: string;
@@ -21,6 +22,11 @@ interface Employee {
   status: string;
   is_deleted?: boolean;
   uniform_deduction?: number;
+}
+
+interface AttendanceCount {
+  absentDays: number;
+  lateDays: number;
 }
 
 interface PayrollRecord {
@@ -86,6 +92,18 @@ export function PayrollPage() {
   const [approvalStatus, setApprovalStatus] = useState<'approved' | 'rejected' | null>(null);
   const [isApproved, setIsApproved] = useState(false);
   const [approverName, setApproverName] = useState('');
+  // Live attendance-derived absent/late counts for the selected month, keyed by
+  // employee_id -- payroll deductions now always reflect real attendance directly,
+  // with no separate manual "save deductions" step required.
+  const [attendanceCounts, setAttendanceCounts] = useState<Map<string, AttendanceCount>>(new Map());
+  // Position name -> whether that position's employees should get the uniform
+  // deduction at all (Settings -> Positions -> "Requires Uniform").
+  const [positionsRequiringUniform, setPositionsRequiringUniform] = useState<Map<string, boolean>>(new Map());
+  const [payrollRates, setPayrollRatesState] = useState<PayrollRates>({
+    payeRate: 0.30,
+    payeThreshold: 50000,
+    pensionEmployeeRate: 0.05,
+  });
 
   // ===== PAGINATION STATES =====
   const [payrollPage, setPayrollPage] = useState(1);
@@ -200,35 +218,73 @@ export function PayrollPage() {
         .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction')
         .eq('is_deleted', false)
         .eq('status', 'Active');
-        
+
       if (empError) throw empError;
       setEmployees(employeesData || []);
-      
+
       const { data: payrollData, error: payError } = await supabase
         .from('payroll')
         .select('*')
         .eq('month', selectedMonth);
-      
+
       if (payError) throw payError;
       setPayrollRecords(payrollData || []);
-      
+
       if (payrollData && payrollData.length > 0) {
         const allApproved = payrollData.every(r => r.approval_status === 'approved');
         setIsApproved(allApproved);
       } else {
         setIsApproved(false);
       }
-      
+
       const { data: deductionsData, error: dedError } = await supabase
         .from('employee_deductions')
         .select('*')
         .eq('month', selectedMonth);
-      
+
       if (dedError) throw dedError;
       setEmployeeDeductions(deductionsData || []);
-      
+
+      // ===== Live attendance-derived absent/late counts for this month =====
+      const [yearStr, monthStr] = selectedMonth.split('-');
+      const year = parseInt(yearStr, 10);
+      const monthNum = parseInt(monthStr, 10);
+      const monthStart = `${selectedMonth}-01`;
+      const lastDay = new Date(year, monthNum, 0).getDate();
+      const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
+      const employeeIds = (employeesData || []).map(e => e.id);
+
+      const counts = new Map<string, AttendanceCount>();
+      if (employeeIds.length > 0) {
+        const { data: attendanceData, error: attendanceError } = await supabase
+          .from('attendance')
+          .select('employee_id, status')
+          .gte('date', monthStart)
+          .lte('date', monthEnd)
+          .in('employee_id', employeeIds);
+
+        if (attendanceError) throw attendanceError;
+
+        (attendanceData || []).forEach(record => {
+          const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
+          if (record.status === 'A') existing.absentDays += 1;
+          if (record.status === 'L') existing.lateDays += 1;
+          counts.set(record.employee_id, existing);
+        });
+      }
+      setAttendanceCounts(counts);
+
+      // ===== Positions (for the "Requires Uniform" gate) =====
+      const { data: positionsData, error: positionsError } = await supabase
+        .from('positions')
+        .select('name, requires_uniform');
+      if (positionsError) throw positionsError;
+      setPositionsRequiringUniform(
+        new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
+      );
+
       setHasData((payrollData?.length || 0) > 0);
-      
+
     } catch (err: any) {
       console.error('Error fetching data:', err);
       showNotification('Failed to load payroll data: ' + err.message, 'error');
@@ -236,6 +292,11 @@ export function PayrollPage() {
       setLoading(false);
     }
   }, [selectedMonth]);
+
+  // ===== Shared payroll rates (PAYE rate/threshold, pension rate) from Settings =====
+  useEffect(() => {
+    getPayrollRates().then(setPayrollRatesState);
+  }, []);
 
   // ===== GET EMPLOYEE DATA =====
   const getPayrollForEmployee = useCallback((employeeId: string): PayrollRecord | null => {
@@ -255,24 +316,37 @@ export function PayrollPage() {
     const overtime = customValues?.overtime ?? 0;
     const bonus = customValues?.bonus ?? 0;
     const grossPay = basicSalary + allowances + overtime + bonus;
-    
-    const paye = customValues?.paye ?? Math.round(grossPay * 0.30);
-    const pension = customValues?.pension ?? Math.round(grossPay * 0.05);
-    
-    const uniformDeductionValue = employee.uniform_deduction || 10000;
-    
+
+    // PAYE/pension rates come from Settings (system_settings via getPayrollRates),
+    // not hardcoded -- and PAYE applies only to gross pay above the threshold,
+    // matching the policy Settings itself states.
+    const paye = customValues?.paye ?? Math.round(Math.max(0, grossPay - payrollRates.payeThreshold) * payrollRates.payeRate);
+    const pension = customValues?.pension ?? Math.round(grossPay * payrollRates.pensionEmployeeRate);
+
+    // Uniform deduction only applies to positions marked "Requires Uniform" in
+    // Settings -> Positions (defaults to true for positions with no explicit
+    // setting yet). `?? 10000`, not `|| 10000`, so an employee whose deduction
+    // was intentionally set to 0 isn't silently overridden back to 10000.
+    const positionRequiresUniform = positionsRequiringUniform.get(employee.position) ?? true;
+    const uniformDeductionValue = positionRequiresUniform ? (employee.uniform_deduction ?? 10000) : 0;
+
+    // Absent/late deductions are now always derived live from the actual
+    // attendance table for this month -- no separate "save deductions" step
+    // is required for them to count. lecture/appearance deductions have no
+    // attendance-grid equivalent and still come from employee_deductions.
     const deduction = getEmployeeDeduction(employee.id);
-    const absentDays = deduction?.absent_days || 0;
-    const lateDays = deduction?.late_days || 0;
+    const attendance = attendanceCounts.get(employee.id);
+    const absentDays = attendance?.absentDays || 0;
+    const lateDays = attendance?.lateDays || 0;
     const absentDeduction = absentDays * 4200;
     const lateDeduction = lateDays * 4200;
     const lectureDeduction = deduction?.lecture_deduction || 0;
     const appearanceDeduction = deduction?.appearance_deduction || 0;
     const totalAttendanceDeductions = absentDeduction + lateDeduction + lectureDeduction + appearanceDeduction;
     const totalUniformDeduction = uniformDeductionValue + totalAttendanceDeductions;
-    
+
     const netPay = grossPay - paye - pension - totalUniformDeduction;
-    
+
     return {
       id: '',
       employee_id: employee.id,
@@ -292,7 +366,7 @@ export function PayrollPage() {
       approved_at: null,
       approval_notes: null
     };
-  }, [selectedMonth, getEmployeeDeduction]);
+  }, [selectedMonth, getEmployeeDeduction, attendanceCounts, positionsRequiringUniform, payrollRates]);
 
   const getDisplayPayroll = useCallback((employee: Employee): PayrollRecord => {
     const existing = getPayrollForEmployee(employee.id);
@@ -316,13 +390,11 @@ export function PayrollPage() {
   }, [employees, getDisplayPayroll]);
 
   const employeesWithDeductions = useMemo(() => {
-    return employees.filter(emp => {
-      const deduction = getEmployeeDeduction(emp.id);
-      const hasDeduction = deduction && deduction.total_deductions > 0;
-      const hasUniform = (emp.uniform_deduction || 0) > 0;
-      return hasDeduction || hasUniform;
-    });
-  }, [employees, getEmployeeDeduction]);
+    // Uses the same uniform_deduction total calculatePayroll actually produces
+    // (position eligibility + live attendance + lecture/appearance), rather than
+    // re-deriving it separately here and risking the two disagreeing.
+    return employees.filter(emp => getDisplayPayroll(emp).uniform_deduction > 0);
+  }, [employees, getDisplayPayroll]);
 
   // ===== UPDATE FIELD =====
   const updateField = useCallback((employeeId: string, field: keyof PayrollRecord, value: number) => {
@@ -590,24 +662,13 @@ export function PayrollPage() {
       
       for (const employee of employees) {
         const edited = editingValues[employee.id];
-        const deduction = getEmployeeDeduction(employee.id);
-        
-        const uniformDeductionValue = employee.uniform_deduction || 10000;
-        
-        const absentDays = deduction?.absent_days || 0;
-        const lateDays = deduction?.late_days || 0;
-        const absentDeduction = absentDays * 4200;
-        const lateDeduction = lateDays * 4200;
-        const lectureDeduction = deduction?.lecture_deduction || 0;
-        const appearanceDeduction = deduction?.appearance_deduction || 0;
-        const totalAttendanceDeductions = absentDeduction + lateDeduction + lectureDeduction + appearanceDeduction;
-        const totalUniformDeduction = uniformDeductionValue + totalAttendanceDeductions;
-        
-        const payroll = calculatePayroll(employee, { 
-          ...edited, 
-          uniform_deduction: totalUniformDeduction 
-        });
-        
+
+        // calculatePayroll computes uniform/attendance deductions itself (rates,
+        // per-position uniform eligibility, and live attendance counts) -- it
+        // never reads a uniform_deduction override from customValues, so there's
+        // no need to (and no correct way to) pre-compute it here.
+        const payroll = calculatePayroll(employee, edited);
+
         totalGross += payroll.gross_pay;
         totalNet += payroll.net_pay;
         totalDeductions += (payroll.paye + payroll.pension + payroll.uniform_deduction);
@@ -690,7 +751,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, editingValues, getEmployeeDeduction, calculatePayroll, selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, editingValues, calculatePayroll, selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -1102,9 +1163,11 @@ export function PayrollPage() {
               {paginatedEmployees.map(emp => {
                 const p = getDisplayPayroll(emp);
                 const deduction = getEmployeeDeduction(emp.id);
-                const hasDeduction = deduction && deduction.total_deductions > 0;
-                const hasUniform = (emp.uniform_deduction || 10000) > 0;
-                const hasAnyDeduction = hasDeduction || hasUniform;
+                const attendance = attendanceCounts.get(emp.id);
+                const positionRequiresUniform = positionsRequiringUniform.get(emp.position) ?? true;
+                const uniformAmount = positionRequiresUniform ? (emp.uniform_deduction ?? 10000) : 0;
+                const hasUniform = uniformAmount > 0;
+                const hasAnyDeduction = p.uniform_deduction > 0;
                 const isEditable = canEditPayroll && !payrollRecords.find(r => r.employee_id === emp.id) && isCurrentMonth && !isMonthProcessed && !isApproved;
                 
                 return (
@@ -1191,13 +1254,13 @@ export function PayrollPage() {
                     </TD>
                     <TD className={`text-right font-mono font-semibold ${hasAnyDeduction ? 'text-red-600' : 'text-slate-500'} bg-red-50/50`}>
                       {formatKwacha(p.uniform_deduction || 0)}
-                      {(hasDeduction || hasUniform) && (
+                      {hasAnyDeduction && (
                         <div className="text-[10px] text-red-400 space-y-0.5">
-                          {hasUniform && <div>Uniform: MK{emp.uniform_deduction || 10000}</div>}
-                          {deduction?.absent_days > 0 && <div>Absent: {deduction.absent_days} × MK4,200</div>}
-                          {deduction?.late_days > 0 && <div>Late: {deduction.late_days} × MK4,200</div>}
-                          {deduction?.lecture_deduction > 0 && <div>Lecture: MK{deduction.lecture_deduction}</div>}
-                          {deduction?.appearance_deduction > 0 && <div>Appearance: MK{deduction.appearance_deduction}</div>}
+                          {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
+                          {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × MK4,200</div>}
+                          {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × MK4,200</div>}
+                          {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
+                          {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
                         </div>
                       )}
                     </TD>
@@ -1257,8 +1320,7 @@ export function PayrollPage() {
               </p>
               <div className="mt-2 max-h-32 overflow-y-auto">
                 {employeesWithDeductions.slice(0, 5).map(emp => {
-                  const deduction = getEmployeeDeduction(emp.id);
-                  const totalDed = (emp.uniform_deduction || 10000) + (deduction?.total_deductions || 0);
+                  const totalDed = getDisplayPayroll(emp).uniform_deduction;
                   return (
                     <div key={emp.id} className="flex justify-between text-xs py-1 border-b border-red-100 last:border-0">
                       <span>{emp.full_name}</span>

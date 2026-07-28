@@ -15,6 +15,7 @@ import { logAudit } from '../utils/auditLogger';
 // ===== IMPORT MonthSettings =====
 import { MonthSettings } from '../components/MonthSettings';
 import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
+import { getPayrollRates, setPayrollRates } from '../utils/payrollSettings';
 
 /* ----------------- PAYSLIPS PAGE ----------------- */
 export function PayslipsPage() {
@@ -105,7 +106,8 @@ export function SettingsPage() {
     name: '',
     category: 'security',
     default_salary: 150000,
-    is_active: true
+    is_active: true,
+    requires_uniform: true
   });
 
   // Regions state
@@ -231,12 +233,13 @@ const handleSavePosition = async () => {
           category: positionForm.category,
           default_salary: positionForm.default_salary,
           is_active: positionForm.is_active,
+          requires_uniform: positionForm.requires_uniform,
           updated_at: new Date().toISOString()
           // Remove tenant_id from update
         })
         .eq('id', editingPosition.id);
       if (error) throw error;
-      
+
       // Audit log for update
       await logAudit({
         action: 'UPDATE',
@@ -246,11 +249,12 @@ const handleSavePosition = async () => {
           name: editingPosition.name,
           category: editingPosition.category,
           default_salary: editingPosition.default_salary,
-          is_active: editingPosition.is_active
+          is_active: editingPosition.is_active,
+          requires_uniform: editingPosition.requires_uniform
         },
         new_data: positionForm
       });
-      
+
       alert('Position updated successfully');
     } else {
       // ===== FIX: Don't include tenant_id in insert =====
@@ -260,12 +264,13 @@ const handleSavePosition = async () => {
           name: positionForm.name,
           category: positionForm.category,
           default_salary: positionForm.default_salary,
-          is_active: positionForm.is_active
+          is_active: positionForm.is_active,
+          requires_uniform: positionForm.requires_uniform
           // tenant_id is omitted - let it default to NULL
         }])
         .select();
       if (error) throw error;
-      
+
       // Audit log for create
       await logAudit({
         action: 'CREATE',
@@ -273,14 +278,14 @@ const handleSavePosition = async () => {
         entity_id: data?.[0]?.id || 'new',
         new_data: positionForm
       });
-      
+
       alert('Position added successfully');
     }
-    
+
     await loadPositions();
     setShowPositionModal(false);
     setEditingPosition(null);
-    setPositionForm({ name: '', category: 'security', default_salary: 150000, is_active: true });
+    setPositionForm({ name: '', category: 'security', default_salary: 150000, is_active: true, requires_uniform: true });
   } catch (error: any) {
     console.error('Error saving position:', error);
     alert(`Failed to save position: ${error.message || 'Unknown error'}`);
@@ -326,7 +331,8 @@ const handleDeletePosition = async (position: any) => {
       name: position.name,
       category: position.category,
       default_salary: position.default_salary,
-      is_active: position.is_active
+      is_active: position.is_active,
+      requires_uniform: position.requires_uniform !== false
     });
     setShowPositionModal(true);
   };
@@ -484,7 +490,23 @@ const handleDeletePosition = async (position: any) => {
     try {
       const oldData = JSON.parse(localStorage.getItem('taxSettings') || '{}');
       localStorage.setItem('taxSettings', JSON.stringify(taxForm));
-      
+
+      // Persist the rate Payroll.tsx actually uses, shared across every admin's
+      // browser via system_settings (localStorage above is per-browser only and
+      // was previously the only place this was saved -- Payroll never read it).
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        const currentRates = await getPayrollRates();
+        await setPayrollRates(
+          {
+            ...currentRates,
+            payeRate: (parseFloat(taxForm.taxRate) || 0) / 100,
+            payeThreshold: parseFloat(taxForm.taxFreeThreshold) || 0,
+          },
+          user.id
+        );
+      }
+
       // Audit log
       await logAudit({
         action: 'UPDATE',
@@ -492,7 +514,7 @@ const handleDeletePosition = async (position: any) => {
         old_data: Object.keys(oldData).length > 0 ? oldData : null,
         new_data: taxForm
       });
-      
+
       setTimeout(() => {
         setSaving(false);
         setShowSuccess(true);
@@ -510,7 +532,22 @@ const handleDeletePosition = async (position: any) => {
     try {
       const oldData = JSON.parse(localStorage.getItem('pensionSettings') || '{}');
       localStorage.setItem('pensionSettings', JSON.stringify(pensionForm));
-      
+
+      // Only the employee contribution % is ever deducted from an employee's own
+      // pay (see Payroll.tsx) -- employerContribution is the company's own
+      // bookkeeping figure and isn't subtracted from anyone's net pay.
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        const currentRates = await getPayrollRates();
+        await setPayrollRates(
+          {
+            ...currentRates,
+            pensionEmployeeRate: (parseFloat(pensionForm.employeeContribution) || 0) / 100,
+          },
+          user.id
+        );
+      }
+
       // Audit log
       await logAudit({
         action: 'UPDATE',
@@ -699,7 +736,15 @@ const handleDeletePosition = async (position: any) => {
     if (savedPension) setPensionForm(JSON.parse(savedPension));
     const savedPayroll = localStorage.getItem('payrollSettings');
     if (savedPayroll) setPayrollForm(JSON.parse(savedPayroll));
-    
+
+    // system_settings is the shared source of truth Payroll.tsx actually reads
+    // (localStorage above is only a per-browser cache) -- load it last so it
+    // wins over any stale/different localStorage value from this browser.
+    getPayrollRates().then(rates => {
+      setTaxForm(prev => ({ ...prev, taxRate: String(rates.payeRate * 100), taxFreeThreshold: String(rates.payeThreshold) }));
+      setPensionForm(prev => ({ ...prev, employeeContribution: String(rates.pensionEmployeeRate * 100) }));
+    });
+
     loadRoles();
     loadPositions();
     loadRegions();
@@ -809,6 +854,16 @@ const handleDeletePosition = async (position: any) => {
             className="w-4 h-4 rounded border-slate-300"
           />
           <label className="text-sm text-slate-700">Active (visible in employee form)</label>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={positionForm.requires_uniform}
+            onChange={(e) => setPositionForm({...positionForm, requires_uniform: e.target.checked})}
+            className="w-4 h-4 rounded border-slate-300"
+          />
+          <label className="text-sm text-slate-700">Requires Uniform (uniform deduction applies to this position)</label>
         </div>
       </div>
       <div className="flex justify-end gap-2 mt-6">
@@ -997,7 +1052,7 @@ const handleDeletePosition = async (position: any) => {
             </div>
             <Button variant="secondary" onClick={() => {
               setEditingPosition(null);
-              setPositionForm({ name: '', category: 'security', default_salary: 150000, is_active: true });
+              setPositionForm({ name: '', category: 'security', default_salary: 150000, is_active: true, requires_uniform: true });
               setShowPositionModal(true);
             }}>
               <Plus size={14} className="mr-1" /> New Position
@@ -1011,6 +1066,7 @@ const handleDeletePosition = async (position: any) => {
                   <th className="px-4 py-2 text-left">Position Name</th>
                   <th className="px-4 py-2 text-left">Category</th>
                   <th className="px-4 py-2 text-right">Default Salary</th>
+                  <th className="px-4 py-2 text-center">Uniform</th>
                   <th className="px-4 py-2 text-center">Status</th>
                   <th className="px-4 py-2 text-right">Actions</th>
                 </tr>
@@ -1018,7 +1074,7 @@ const handleDeletePosition = async (position: any) => {
               <tbody>
                 {positions.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="text-center py-8 text-slate-500">
+                    <td colSpan={6} className="text-center py-8 text-slate-500">
                       No positions found. Click "New Position" to add one.
                     </td>
                   </tr>
@@ -1037,6 +1093,11 @@ const handleDeletePosition = async (position: any) => {
                       </td>
                       <td className="px-4 py-2 text-right font-mono">
                         {formatKwacha(pos.default_salary)}
+                      </td>
+                      <td className="px-4 py-2 text-center">
+                        <Badge color={pos.requires_uniform !== false ? 'blue' : 'gray'}>
+                          {pos.requires_uniform !== false ? 'Yes' : 'No'}
+                        </Badge>
                       </td>
                       <td className="px-4 py-2 text-center">
                         <Badge color={pos.is_active ? 'green' : 'gray'}>
