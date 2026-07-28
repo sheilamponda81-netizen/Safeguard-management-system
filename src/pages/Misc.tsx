@@ -845,7 +845,7 @@ const handleDeletePosition = async (position: any) => {
             placeholder="e.g., N"
           />
           <p className="text-xs text-slate-400 mt-1">
-            The first letter is used as this region's prefix in auto-generated employee numbers (e.g. "N" for Northern gives SF-N-001). Leave blank to use the first letter of the region name instead.
+            The first letter is used as this region's prefix in auto-generated employee numbers (e.g. "N" for Northern gives SFG-N-001). Leave blank to use the first letter of the region name instead.
           </p>
         </div>
       </div>

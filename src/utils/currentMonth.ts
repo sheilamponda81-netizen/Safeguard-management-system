@@ -344,3 +344,21 @@ export const getShortMonthLabel = (month: string): string => {
   const date = new Date(parseInt(year), parseInt(monthNum) - 1, 1);
   return date.toLocaleString('default', { month: 'short', year: '2-digit' });
 };
+
+// ===== Normalize a month value to "YYYY-MM", tolerating both the "YYYY-MM"
+// format (used consistently by this file) and a "Month YYYY" free-text
+// format (e.g. "June 2026") that other parts of the app have historically
+// written to the `payroll.month` column. Returns null if it can't be parsed,
+// so callers can treat that as "no match" rather than a false positive. =====
+export const normalizeMonthKey = (value: string | null | undefined): string | null => {
+  if (!value) return null;
+  const isoMatch = value.match(/^(\d{4})-(\d{1,2})$/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}`;
+  }
+  const parsed = new Date(`1 ${value}`);
+  if (!isNaN(parsed.getTime())) {
+    return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}`;
+  }
+  return null;
+};

@@ -1334,7 +1334,7 @@ function AddEmployeeForm({
       // of the region's name -- so "Northern Region" still gets "N" even if
       // nobody has set an explicit one-letter code yet.
       const regionLetter = (region.code?.trim() || region.name?.trim() || "X").charAt(0).toUpperCase();
-      const prefix = `SF-${regionLetter}-`;
+      const prefix = `SFG-${regionLetter}-`;
 
       const { data } = await supabase
         .from("employees")
