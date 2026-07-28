@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, Sparkles, ChevronLeft, ChevronRight } from '../utils/icons';
+import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, ChevronLeft, ChevronRight } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
@@ -57,6 +57,18 @@ interface DeductionSettings {
   appearanceDeduction: number;
 }
 
+// These rates have no Settings UI to configure them (nothing in the app ever
+// wrote to the old `attendanceDeductionSettings` localStorage key they used
+// to be read from), so they're a fixed constant rather than state that can
+// never actually change.
+const DEDUCTION_SETTINGS: DeductionSettings = {
+  absentDeduction: 4200,
+  lateDeduction: 4200,
+  lectureDeduction: 3000,
+  lectureFullMonthDeduction: 15000,
+  appearanceDeduction: 2000,
+};
+
 export function AttendancePage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -72,14 +84,6 @@ export function AttendancePage() {
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<any>(null);
   const [updating, setUpdating] = useState<Record<string, boolean>>({});
-  
-  const [deductionSettings, setDeductionSettings] = useState<DeductionSettings>({
-    absentDeduction: 4200,
-    lateDeduction: 4200,
-    lectureDeduction: 3000,
-    lectureFullMonthDeduction: 15000,
-    appearanceDeduction: 2000
-  });
 
   // ===== PAGINATION STATES =====
   const [attendancePage, setAttendancePage] = useState(1);
@@ -100,18 +104,6 @@ export function AttendancePage() {
       datesArr.push(dateStr);
     }
     return datesArr;
-  }, []);
-
-  const loadDeductionSettings = useCallback(async () => {
-    try {
-      const saved = localStorage.getItem('attendanceDeductionSettings');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        setDeductionSettings(parsed);
-      }
-    } catch (err) {
-      console.error('Error loading deduction settings:', err);
-    }
   }, []);
 
   // ===== MEMOIZED VALUES =====
@@ -150,17 +142,21 @@ export function AttendancePage() {
       const datesArr = getDatesForMonth(selectedMonth);
       if (datesArr.length > 0 && employeesData && employeesData.length > 0) {
         const employeeIds = employeesData.map(e => e.id);
-        
+
         let attendanceQuery = supabase
           .from('attendance')
           .select('*')
           .gte('date', datesArr[0])
           .lte('date', datesArr[datesArr.length - 1])
           .in('employee_id', employeeIds);
-        
+
         const { data: attendanceData, error: attError } = await attendanceQuery;
         if (attError) throw attError;
         setAttendance(attendanceData || []);
+        setHasData((attendanceData || []).length > 0);
+      } else {
+        setAttendance([]);
+        setHasData(false);
       }
     } catch (err: any) {
       console.error('Error fetching data:', err);
@@ -169,37 +165,6 @@ export function AttendancePage() {
       setLoading(false);
     }
   }, [selectedMonth, userProfile, getDatesForMonth]);
-
-  // ===== CHECK DATA EXISTS =====
-  const checkDataExists = useCallback(async (month: string) => {
-    const datesArr = getDatesForMonth(month);
-    if (datesArr.length === 0) return false;
-    
-    let query = supabase
-      .from('attendance')
-      .select('id', { count: 'exact', head: true })
-      .gte('date', datesArr[0])
-      .lte('date', datesArr[datesArr.length - 1]);
-    
-    if (!userProfile?.is_super_admin && userProfile?.region_id) {
-      const { data: regionEmployees } = await supabase
-        .from('employees')
-        .select('id')
-        .eq('region_id', userProfile.region_id)
-        .eq('is_deleted', false);
-      const employeeIds = regionEmployees?.map(e => e.id) || [];
-      if (employeeIds.length > 0) {
-        query = query.in('employee_id', employeeIds);
-      }
-    }
-    
-    const { count, error } = await query;
-    if (error) {
-      console.error('Error checking data:', error);
-      return false;
-    }
-    return (count || 0) > 0;
-  }, [userProfile, getDatesForMonth]);
 
   // ===== INITIALIZATION =====
   useEffect(() => {
@@ -214,8 +179,7 @@ export function AttendancePage() {
       await fetchUserProfile();
     };
     init();
-    loadDeductionSettings();
-  }, [fetchUserProfile, loadDeductionSettings]);
+  }, [fetchUserProfile]);
 
   useEffect(() => {
     if (userProfile && selectedMonth) {
@@ -274,7 +238,7 @@ export function AttendancePage() {
       }
       
       // Process each employee's updates
-      for (const [employeeId, updates] of Object.entries(groupedUpdates)) {
+      for (const updates of Object.values(groupedUpdates)) {
         for (const update of updates) {
           await processSingleUpdate(update.employeeId, update.date, update.status);
         }
@@ -408,15 +372,40 @@ export function AttendancePage() {
     [updateAttendance]
   );
 
+  // ===== ATTENDANCE LOOKUP INDEXES =====
+  // With the employee base heading toward ~2000 records, a linear .find()/
+  // .filter() over the whole month's attendance array per employee per cell
+  // (previously O(employees x days x records)) gets slow fast. Both indexes
+  // are built once per attendance fetch instead of per lookup.
+  const attendanceByKey = useMemo(() => {
+    const map = new Map<string, string>();
+    attendance.forEach(record => {
+      map.set(`${record.employee_id}_${record.date}`, record.status);
+    });
+    return map;
+  }, [attendance]);
+
+  const attendanceByEmployee = useMemo(() => {
+    const map = new Map<string, AttendanceRecord[]>();
+    attendance.forEach(record => {
+      const existing = map.get(record.employee_id);
+      if (existing) {
+        existing.push(record);
+      } else {
+        map.set(record.employee_id, [record]);
+      }
+    });
+    return map;
+  }, [attendance]);
+
   // ===== GET ATTENDANCE STATUS =====
   const getAttendanceStatus = useCallback((employeeId: string, date: string): string => {
-    const record = attendance.find(a => a.employee_id === employeeId && a.date === date);
-    return record?.status || '-';
-  }, [attendance]);
+    return attendanceByKey.get(`${employeeId}_${date}`) || '-';
+  }, [attendanceByKey]);
 
   // ===== GET EMPLOYEE STATS =====
   const getEmployeeStats = useCallback((employeeId: string) => {
-    const employeeAttendance = attendance.filter(a => a.employee_id === employeeId);
+    const employeeAttendance = attendanceByEmployee.get(employeeId) || [];
     const counts = { P: 0, A: 0, L: 0, LV: 0, SL: 0 };
     employeeAttendance.forEach(record => {
       if (record.status && counts[record.status as keyof typeof counts] !== undefined) {
@@ -425,19 +414,19 @@ export function AttendancePage() {
     });
     const total = counts.P + counts.A + counts.L + counts.LV + counts.SL;
     return { ...counts, total };
-  }, [attendance]);
+  }, [attendanceByEmployee]);
 
   // ===== CALCULATE DEDUCTIONS =====
   const calculateEmployeeDeductions = useCallback((employeeId: string) => {
-    const employeeAttendance = attendance.filter(a => a.employee_id === employeeId);
+    const employeeAttendance = attendanceByEmployee.get(employeeId) || [];
     const counts = { A: 0, L: 0 };
     let lectureMissedCount = 0;
-    
+
     employeeAttendance.forEach(record => {
       if (record.status === 'A') counts.A++;
       if (record.status === 'L') counts.L++;
     });
-    
+
     const datesArr = getDatesForMonth(selectedMonth);
     datesArr.forEach(date => {
       const dateObj = new Date(date);
@@ -450,8 +439,8 @@ export function AttendancePage() {
       }
     });
     
-    const absentDeduction = counts.A * deductionSettings.absentDeduction;
-    const lateDeduction = counts.L * deductionSettings.lateDeduction;
+    const absentDeduction = counts.A * DEDUCTION_SETTINGS.absentDeduction;
+    const lateDeduction = counts.L * DEDUCTION_SETTINGS.lateDeduction;
     const attendanceDeduction = absentDeduction + lateDeduction;
     
     let lectureDeduction = 0;
@@ -462,13 +451,13 @@ export function AttendancePage() {
       }).length;
       
       if (lectureMissedCount === totalLectures && totalLectures > 0) {
-        lectureDeduction = deductionSettings.lectureFullMonthDeduction;
+        lectureDeduction = DEDUCTION_SETTINGS.lectureFullMonthDeduction;
       } else {
-        lectureDeduction = lectureMissedCount * deductionSettings.lectureDeduction;
+        lectureDeduction = lectureMissedCount * DEDUCTION_SETTINGS.lectureDeduction;
       }
     }
     
-    const appearanceDeduction = deductionSettings.appearanceDeduction;
+    const appearanceDeduction = DEDUCTION_SETTINGS.appearanceDeduction;
     const totalDeductions = attendanceDeduction + lectureDeduction + appearanceDeduction;
     
     return {
@@ -482,7 +471,7 @@ export function AttendancePage() {
       appearanceDeduction,
       totalDeductions
     };
-  }, [attendance, selectedMonth, deductionSettings, getDatesForMonth, getAttendanceStatus]);
+  }, [attendanceByEmployee, selectedMonth, getDatesForMonth, getAttendanceStatus]);
 
   // ===== FILTER EMPLOYEES =====
   const filteredEmployees = useMemo(() => {
@@ -567,13 +556,7 @@ export function AttendancePage() {
   const copyFromPreviousMonth = useCallback(async (sourceMonth: string) => {
     const sourceDates = getDatesForMonth(sourceMonth);
     const targetDates = getDatesForMonth(selectedMonth);
-    
-    const tenantId = userProfile?.tenant_id;
-    if (!tenantId) {
-      alert('Unable to copy attendance: Missing tenant information');
-      return;
-    }
-    
+
     let sourceQuery = supabase
       .from('attendance')
       .select('*')
@@ -600,6 +583,8 @@ export function AttendancePage() {
     }
     
     if (sourceData && sourceData.length > 0) {
+      // tenant_id is omitted -- it defaults to the current user's own tenant
+      // via the DB column default, same convention as processSingleUpdate.
       const newRecords = sourceData.map(record => {
         const originalDate = new Date(record.date);
         const dayOfMonth = originalDate.getDate();
@@ -607,17 +592,16 @@ export function AttendancePage() {
           employee_id: record.employee_id,
           date: targetDates[dayOfMonth - 1],
           status: record.status,
-          tenant_id: tenantId
         };
       }).filter(record => record.date);
-      
+
       const { error: insertError } = await supabase
         .from('attendance')
         .insert(newRecords);
-      
+
       if (insertError) {
         console.error('Error copying data:', insertError);
-        alert('Failed to copy data: ' + insertError.message);
+        showNotification('Failed to copy data: ' + insertError.message, 'error');
       } else {
         await logAudit({
           action: 'CREATE',
@@ -629,14 +613,13 @@ export function AttendancePage() {
           },
           region_id: userProfile?.region_id
         });
-        
+
         await fetchData();
-        setHasData(true);
-        alert(`Attendance data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}`);
+        showNotification(`Attendance data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}`, 'success');
         setShowCopyModal(false);
       }
     } else {
-      alert('No attendance data found in the source month.');
+      showNotification('No attendance data found in the source month.', 'error');
     }
   }, [selectedMonth, userProfile, getDatesForMonth, fetchData]);
 
@@ -694,7 +677,7 @@ export function AttendancePage() {
       try {
         const { data: existingRecord, error: checkError } = await supabase
           .from('employee_deductions')
-          .select('id')
+          .select('*')
           .eq('employee_id', selectedEmployee.id)
           .eq('month', selectedMonth)
           .maybeSingle();
@@ -1081,7 +1064,7 @@ export function AttendancePage() {
         <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Attendance Rate</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.attendanceRate}%</p><Badge color={parseFloat(metrics.attendanceRate) > 80 ? 'green' : parseFloat(metrics.attendanceRate) > 60 ? 'yellow' : 'red'}>↑ {parseFloat(metrics.attendanceRate) > 80 ? 'Excellent' : parseFloat(metrics.attendanceRate) > 60 ? 'Good' : 'Needs Improvement'}</Badge></div><div className="w-12 h-12 rounded-xl bg-emerald-100 text-emerald-600 flex items-center justify-center"><CheckCircle2 size={22} /></div></div></Card>
         <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Absenteeism</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.absenteeism}%</p><Badge color={parseFloat(metrics.absenteeism) < 20 ? 'green' : parseFloat(metrics.absenteeism) < 40 ? 'yellow' : 'red'}>Manageable</Badge></div><div className="w-12 h-12 rounded-xl bg-red-100 text-red-600 flex items-center justify-center"><XCircle size={22} /></div></div></Card>
         <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Late Arrivals</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.late}</p><p className="text-xs text-slate-500 mt-1">this month</p></div><div className="w-12 h-12 rounded-xl bg-[#FFF1CC] text-[#D4A017] flex items-center justify-center"><Clock size={22} /></div></div></Card>
-        <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Leave Requests</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.leaveRequests}</p><Badge color="blue">3 Approved</Badge></div><div className="w-12 h-12 rounded-xl bg-blue-100 text-blue-600 flex items-center justify-center"><Plane size={22} /></div></div></Card>
+        <Card className="p-5"><div className="flex items-center justify-between"><div><p className="text-xs text-slate-500">Leave Days</p><p className="text-2xl font-bold text-slate-800 mt-1">{metrics.leaveRequests}</p><p className="text-xs text-slate-500 mt-1">this month</p></div><div className="w-12 h-12 rounded-xl bg-blue-100 text-blue-600 flex items-center justify-center"><Plane size={22} /></div></div></Card>
       </div>
 
       <Card className="p-4">
@@ -1112,6 +1095,15 @@ export function AttendancePage() {
           </Badge>
         )}
       </Card>
+
+      {!hasData && isCurrentMonth && (
+        <EmptyState
+          title="No Attendance Records Yet"
+          message={`No attendance has been recorded for ${getMonthLabel(selectedMonth)} yet.`}
+          actionLabel={availableMonths.filter(m => m < selectedMonth).length > 0 ? "Copy from Previous Month" : ""}
+          onAction={() => setShowCopyModal(true)}
+        />
+      )}
 
       <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
         <div className="overflow-x-auto">
@@ -1194,7 +1186,13 @@ export function AttendancePage() {
         onItemsPerPageChange={setAttendanceItemsPerPage}
       />
 
-      <EmployeeModal />
+      {/* Called as a plain function, not <EmployeeModal />: this "component" is
+          a useCallback closure so it can capture selectedEmployee/attendance
+          directly. Rendering it as JSX would make React treat every identity
+          change of that callback as a brand-new component type and remount
+          the modal (losing the in-progress lecture/appearance deduction
+          edits) any time attendance data changes elsewhere on the page. */}
+      {EmployeeModal()}
       <CopyFromPreviousModal
         open={showCopyModal}
         onClose={() => setShowCopyModal(false)}
