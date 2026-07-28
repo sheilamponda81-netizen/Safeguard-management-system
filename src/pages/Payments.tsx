@@ -7,12 +7,13 @@ import { getCurrentProfile } from '../utils/currentProfile';
 import { formatKwacha } from '../data';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
-import { 
-  getSystemCurrentMonth, 
-  getMonthLabel, 
-  getNextMonth, 
+import {
+  getSystemCurrentMonth,
+  getMonthLabel,
+  getNextMonth,
   getPreviousMonth,
-  getAvailableMonthsFromSystem
+  getAvailableMonthsFromSystem,
+  normalizeMonthKey
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
@@ -127,17 +128,22 @@ export function PaymentsPage() {
       // Approved payroll is the real source of truth for net pay. Only fall back
       // to the 0.65-of-basic-salary estimate when no approved payroll run exists
       // yet for this month (e.g. before Payroll has been processed/approved).
+      // Matched by normalized month key rather than exact string equality --
+      // payroll.month has historically been written in more than one format
+      // ("YYYY-MM" vs "Month YYYY") depending on which code path wrote it.
       const { data: payrollData, error: payrollError } = await supabase
         .from('payroll')
-        .select('employee_id, net_pay')
-        .eq('month', selectedMonth)
+        .select('employee_id, net_pay, month')
         .eq('approval_status', 'approved');
 
       if (payrollError) {
         console.error('Payroll table error:', payrollError);
       }
+      const targetMonthKey = normalizeMonthKey(selectedMonth);
       const approvedNetPayByEmployee = new Map(
-        (payrollData || []).map(r => [r.employee_id, r.net_pay])
+        (payrollData || [])
+          .filter(r => normalizeMonthKey(r.month) === targetMonthKey)
+          .map(r => [r.employee_id, r.net_pay])
       );
 
       const employeesWithPay = (employeesData || []).map(emp => {
