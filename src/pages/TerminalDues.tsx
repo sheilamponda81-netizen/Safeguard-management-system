@@ -1,18 +1,11 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Calculator, Users, Search, Download, Printer, FileText, Calendar, Clock, AlertCircle, CheckCircle, XCircle, User, Building2, Wallet, Percent, Receipt, Briefcase, Eye, Edit2, Save, X, ChevronDown, ChevronLeft, ChevronRight } from '../utils/icons';
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input } from '../components/ui';
+import { Calculator, Search, CheckCircle, Wallet, Eye, Edit2, Save, ChevronDown } from '../utils/icons';
+import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
-import {
-  getSystemCurrentMonth, 
-  getMonthLabel, 
-  getNextMonth, 
-  getPreviousMonth,
-  getAvailableMonthsFromSystem
-} from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
 
 interface Employee {
@@ -77,6 +70,19 @@ const terminationTypes = [
   { value: 'end_of_contract', label: 'End of Contract' }
 ];
 
+// Fresh, blank form state for a new calculation. Deductions default to 0 --
+// not a guessed amount -- since whether (and how much) to deduct is specific
+// to each case's circumstances, not something every termination shares.
+const getInitialFormData = () => ({
+  employee_id: '',
+  date_left: new Date().toISOString().split('T')[0],
+  reason: '',
+  termination_type: 'disciplinary',
+  deductions: 0,
+  uniform_refund: 0,
+  other_benefits: 0
+});
+
 export function TerminalDuesPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -103,15 +109,7 @@ export function TerminalDuesPage() {
   const inputRef = useRef<HTMLInputElement>(null);
   
   // Form data
-  const [formData, setFormData] = useState({
-    employee_id: '',
-    date_left: new Date().toISOString().split('T')[0],
-    reason: '',
-    termination_type: 'disciplinary',
-    deductions: 40000,
-    uniform_refund: 80000,
-    other_benefits: 0
-  });
+  const [formData, setFormData] = useState(getInitialFormData);
 
   // Preview calculation state
   const [previewCalculation, setPreviewCalculation] = useState<TerminalDue | null>(null);
@@ -399,6 +397,7 @@ export function TerminalDuesPage() {
       setShowCalculateModal(false);
       setEmployeeSearch('');
       setSelectedEmployee(null);
+      setFormData(getInitialFormData());
       await fetchCalculations();
     }
   }, [selectedEmployee, calculateTerminalDues, userProfile, fetchCalculations]);
@@ -763,6 +762,7 @@ export function TerminalDuesPage() {
         setEmployeeSearch('');
         setSelectedEmployee(null);
         setShowEmployeeDropdown(false);
+        setFormData(getInitialFormData());
       }} title="Calculate Terminal Dues" size="lg">
         <div className="space-y-4">
           {/* Searchable Employee Selector */}
@@ -991,6 +991,7 @@ export function TerminalDuesPage() {
               setPreviewCalculation(null);
               setEmployeeSearch('');
               setSelectedEmployee(null);
+              setFormData(getInitialFormData());
             }}>Cancel</Button>
             <Button variant="secondary" onClick={saveCalculation} disabled={!selectedEmployee}>
               <Save size={14} className="mr-1" /> Save Calculation
