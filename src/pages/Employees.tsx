@@ -111,6 +111,63 @@ const calculateAge = (dob: string): number => {
   return age;
 };
 
+// ===== Shared Add/Edit employee form validation =====
+// Every textbox on the form is mandatory -- this is the single place that
+// list lives, so the Add and Edit forms (which duplicate the same fields)
+// never drift out of sync on what's required. Returns the label of the first
+// missing/invalid field so the caller can show a notification naming it, or
+// null when the form is valid.
+const REQUIRED_EMPLOYEE_FIELDS: { key: string; label: string }[] = [
+  { key: 'fullName', label: 'Full Name' },
+  { key: 'dob', label: 'Date of Birth' },
+  { key: 'gender', label: 'Gender' },
+  { key: 'nationalId', label: 'National ID' },
+  { key: 'phone', label: 'Phone Number' },
+  { key: 'address', label: 'Residential Address' },
+  { key: 'position', label: 'Position' },
+  { key: 'department', label: 'Department' },
+  { key: 'qualification', label: 'Qualification' },
+  { key: 'dateHired', label: 'Date Hired' },
+  { key: 'contractType', label: 'Contract Type' },
+  { key: 'pay_point', label: 'Pay Point' },
+  { key: 'account_number', label: 'Bank Account / Mobile Money Number' },
+  { key: 'next_of_kin_name', label: 'Next of Kin Full Name' },
+  { key: 'next_of_kin_relationship', label: 'Next of Kin Relationship' },
+  { key: 'next_of_kin_phone', label: 'Next of Kin Phone Number' },
+  { key: 'next_of_kin_address', label: 'Next of Kin Address' },
+];
+
+const validateEmployeeForm = (form: any, isSuperAdmin?: boolean): string | null => {
+  if (!form.employeeNumber || String(form.employeeNumber).trim() === '') {
+    return 'Employee Number (select a Region first so it can be generated)';
+  }
+
+  for (const { key, label } of REQUIRED_EMPLOYEE_FIELDS) {
+    if (!form[key] || String(form[key]).trim() === '') {
+      return label;
+    }
+  }
+
+  if (isSuperAdmin && !form.region_id) return 'Region';
+  if (form.assignment_type === 'company' && !form.company) return 'Company Name';
+  if (form.assignment_type === 'resident') {
+    if (!form.resident_name) return 'Resident Name';
+    if (!form.resident_contact) return 'Resident Contact';
+  }
+
+  if (String(form.nationalId).trim().length !== 8) {
+    return 'National ID (must be exactly 8 characters)';
+  }
+  if (String(form.phone).trim().length !== 10) {
+    return 'Phone Number (must be exactly 10 digits)';
+  }
+  if (String(form.next_of_kin_phone).trim().length !== 10) {
+    return 'Next of Kin Phone Number (must be exactly 10 digits)';
+  }
+
+  return null;
+};
+
 export function EmployeesPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -262,41 +319,61 @@ export function EmployeesPage() {
   }, [userProfile, filterRegionId, debouncedFilterCompany, debouncedFilterWorkstation, filterPayPoint]);
 
   // ===== CHECK DUPLICATES =====
-  const checkDuplicates = useCallback(async (phone: string, accountNumber: string, employeeId?: string) => {
+  // National ID, phone, and bank account/mobile money number are the three
+  // "must never collide" fields across the whole employee base (soon to be
+  // ~2000 records) -- checked against active (non-deleted) employees only, so
+  // a soft-deleted record's old details never blocks reusing them.
+  const checkDuplicates = useCallback(async (nationalId: string, phone: string, accountNumber: string, employeeId?: string) => {
+    let nationalIdExists = false;
     let phoneExists = false;
     let accountExists = false;
-    
+
+    if (nationalId) {
+      let query = supabase
+        .from('employees')
+        .select('id')
+        .eq('national_id', nationalId)
+        .eq('is_deleted', false);
+
+      if (employeeId) {
+        query = query.neq('id', employeeId);
+      }
+
+      const { data: nationalIdData } = await query;
+      nationalIdExists = !!(nationalIdData && nationalIdData.length > 0);
+    }
+
     if (phone) {
       let query = supabase
         .from('employees')
         .select('id')
         .eq('phone', phone)
         .eq('is_deleted', false);
-      
+
       if (employeeId) {
         query = query.neq('id', employeeId);
       }
-      
+
       const { data: phoneData } = await query;
-      phoneExists = (phoneData && phoneData.length > 0);
+      phoneExists = !!(phoneData && phoneData.length > 0);
     }
-    
+
     if (accountNumber) {
       let query = supabase
         .from('employees')
         .select('id')
         .eq('account_number', accountNumber)
         .eq('is_deleted', false);
-      
+
       if (employeeId) {
         query = query.neq('id', employeeId);
       }
-      
+
       const { data: accountData } = await query;
-      accountExists = (accountData && accountData.length > 0);
+      accountExists = !!(accountData && accountData.length > 0);
     }
-    
-    return { phoneExists, accountExists };
+
+    return { nationalIdExists, phoneExists, accountExists };
   }, []);
 
   // ===== ADD EMPLOYEE =====
@@ -341,18 +418,23 @@ export function EmployeesPage() {
       return;
     }
     
-    const { phoneExists, accountExists } = await checkDuplicates(safeEmp.phone, safeEmp.account_number);
-    
+    const { nationalIdExists, phoneExists, accountExists } = await checkDuplicates(safeEmp.nationalId, safeEmp.phone, safeEmp.account_number);
+
+    if (nationalIdExists) {
+      showNotification(`National ID ${safeEmp.nationalId} is already in use by another employee!`, 'error');
+      return;
+    }
+
     if (phoneExists) {
       showNotification(`Phone number ${safeEmp.phone} is already in use by another employee!`, 'error');
       return;
     }
-    
+
     if (accountExists) {
       showNotification(`Account number ${safeEmp.account_number} is already in use by another employee!`, 'error');
       return;
     }
-    
+
     // Format company and workstation based on assignment type
     const formattedCompany = safeEmp.assignment_type === 'company' && safeEmp.company ? formatText(safeEmp.company) : null;
     const formattedWorkstation = safeEmp.workstation ? formatText(safeEmp.workstation) : null;
@@ -483,26 +565,31 @@ export function EmployeesPage() {
       next_of_kin_address: sanitizeInput(emp.next_of_kin_address),
     };
     
-    const { phoneExists, accountExists } = await checkDuplicates(safeEmp.phone, safeEmp.account_number, editingEmployee.id);
-    
+    const { nationalIdExists, phoneExists, accountExists } = await checkDuplicates(safeEmp.nationalId, safeEmp.phone, safeEmp.account_number, editingEmployee.id);
+
+    if (nationalIdExists) {
+      showNotification(`National ID ${safeEmp.nationalId} is already in use by another employee!`, 'error');
+      return;
+    }
+
     if (phoneExists) {
       showNotification(`Phone number ${safeEmp.phone} is already in use by another employee!`, 'error');
       return;
     }
-    
+
     if (accountExists) {
       showNotification(`Account number ${safeEmp.account_number} is already in use by another employee!`, 'error');
       return;
     }
-    
+
     const formattedCompany = safeEmp.assignment_type === 'company' && safeEmp.company ? formatText(safeEmp.company) : null;
     const formattedWorkstation = safeEmp.workstation ? formatText(safeEmp.workstation) : null;
     const formattedResidentName = safeEmp.assignment_type === 'resident' ? formatText(safeEmp.resident_name) : null;
     const formattedResidentContact = safeEmp.assignment_type === 'resident' ? sanitizeInput(safeEmp.resident_contact) : null;
-    
+
     const uniformDeduction = parseInt(safeEmp.uniform_deduction) || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
-    
+
     const { data, error } = await supabase
       .from('employees')
       .update({
@@ -1405,28 +1492,15 @@ function AddEmployeeForm({
     // Prevent multiple submissions
     if (isSubmitting) return;
     
-    // Validation
-    if (!form.employeeNumber || !form.fullName) {
-      showNotification("Please fill in Employee Number and Full Name", "error");
+    // Validation -- every field on this form is mandatory; validateEmployeeForm
+    // returns the label of the first missing/invalid one so the notification
+    // tells the admin exactly which box to fill in.
+    const missingField = validateEmployeeForm(form, isSuperAdmin);
+    if (missingField) {
+      showNotification(`Please fill in: ${missingField}`, "error");
       return;
     }
-    if (!form.phone) {
-      showNotification("Please enter phone number", "error");
-      return;
-    }
-    if (isSuperAdmin && !form.region_id) {
-      showNotification("Please select a region", "error");
-      return;
-    }
-    if (form.assignment_type === 'company' && !form.company) {
-      showNotification("Please enter the company name", "error");
-      return;
-    }
-    if (form.assignment_type === 'resident' && !form.resident_name) {
-      showNotification("Please enter the resident name", "error");
-      return;
-    }
-    
+
     // Set submitting state
     setIsSubmitting(true);
     
@@ -1451,9 +1525,10 @@ function AddEmployeeForm({
     type = "text",
     required = false,
     options?: { label: string; value: string }[],
+    maxLength?: number,
   ) => {
     const fieldKey = `field-${k}`;
-    
+
     return (
       <div key={fieldKey}>
         <label className="block text-sm font-medium text-slate-700 mb-1.5">
@@ -1490,6 +1565,7 @@ function AddEmployeeForm({
             onChange={(e) => update(k, e.target.value)}
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             required={required}
+            maxLength={maxLength}
             disabled={isSubmitting}
           />
         )}
@@ -1527,15 +1603,15 @@ function AddEmployeeForm({
             <p className="text-xs text-slate-400 mt-1">Auto-generated after selecting region</p>
           </div>
           {field("fullName", "Full Name", "text", true)}
-          {field("dob", "Date of Birth", "date")}
-          {field("gender", "Gender", "text", false, [
+          {field("dob", "Date of Birth", "date", true)}
+          {field("gender", "Gender", "text", true, [
             { label: "Male", value: "Male" },
             { label: "Female", value: "Female" },
           ])}
-          {field("nationalId", "National ID")}
-          {field("phone", "Phone Number", "tel", true)}
+          {field("nationalId", "National ID", "text", true, undefined, 8)}
+          {field("phone", "Phone Number", "tel", true, undefined, 10)}
         </div>
-        <div className="mt-4">{field("address", "Residential Address")}</div>
+        <div className="mt-4">{field("address", "Residential Address", "text", true)}</div>
       </div>
 
       <div>
@@ -1545,19 +1621,19 @@ function AddEmployeeForm({
             "position",
             "Position",
             "text",
-            false,
+            true,
             positions.map((p) => ({ label: p.name, value: p.name })),
           )}
           {field(
             "department",
             "Department",
             "text",
-            false,
+            true,
             departments.map((d) => ({ label: d, value: d })),
           )}
-          {field("qualification", "Qualification")}
-          {field("dateHired", "Date Hired", "date")}
-          {field("contractType", "Contract Type", "text", false, [
+          {field("qualification", "Qualification", "text", true)}
+          {field("dateHired", "Date Hired", "date", true)}
+          {field("contractType", "Contract Type", "text", true, [
             { label: "Permanent", value: "Permanent" },
             { label: "Contract", value: "Contract" },
             { label: "Part-time", value: "Part-time" },
@@ -1788,7 +1864,7 @@ function AddEmployeeForm({
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Pay Point</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Pay Point <span className="text-red-500">*</span></label>
             <select
               value={form.pay_point || ""}
               onChange={(e) => update("pay_point", e.target.value)}
@@ -1842,7 +1918,7 @@ function AddEmployeeForm({
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Next of Kin</h4>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Full Name</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Full Name <span className="text-red-500">*</span></label>
             <input
               type="text"
               value={form.next_of_kin_name || ""}
@@ -1853,7 +1929,7 @@ function AddEmployeeForm({
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Relationship</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Relationship <span className="text-red-500">*</span></label>
             <select
               value={form.next_of_kin_relationship || ""}
               onChange={(e) => update("next_of_kin_relationship", e.target.value)}
@@ -1869,18 +1945,19 @@ function AddEmployeeForm({
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number <span className="text-red-500">*</span></label>
             <input
               type="tel"
               value={form.next_of_kin_phone || ""}
               onChange={(e) => update("next_of_kin_phone", e.target.value)}
               disabled={isSubmitting}
+              maxLength={10}
               placeholder="Enter next of kin phone number"
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Address</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Address <span className="text-red-500">*</span></label>
             <input
               type="text"
               value={form.next_of_kin_address || ""}
@@ -1901,7 +1978,7 @@ function AddEmployeeForm({
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Bank Account</h4>
         <div className="grid grid-cols-1 gap-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Bank Account / Mobile Money Number</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Bank Account / Mobile Money Number <span className="text-red-500">*</span></label>
             <input
               type="text"
               value={form.account_number || ""}
@@ -2141,27 +2218,18 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
     // Prevent multiple submissions
     if (isSubmitting) return;
     
-    // Validation
-    if (!form.employeeNumber || !form.fullName) {
-      showNotification('Please fill in Employee Number and Full Name', 'error');
+    // Validation -- every field on this form is mandatory; validateEmployeeForm
+    // returns the label of the first missing/invalid one so the notification
+    // tells the admin exactly which box to fill in.
+    const missingField = validateEmployeeForm(form, isSuperAdmin);
+    if (missingField) {
+      showNotification(`Please fill in: ${missingField}`, 'error');
       return;
     }
-    if (!form.phone) {
-      showNotification('Please enter phone number', 'error');
-      return;
-    }
-    if (form.assignment_type === 'company' && !form.company) {
-      showNotification("Please enter the company name", 'error');
-      return;
-    }
-    if (form.assignment_type === 'resident' && !form.resident_name) {
-      showNotification("Please enter the resident name", 'error');
-      return;
-    }
-    
+
     // Set submitting state
     setIsSubmitting(true);
-    
+
     try {
       // Call the parent onSubmit
       await onSubmit(form);
@@ -2177,16 +2245,16 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
   };
 
   // ===== FIELD HELPER =====
-  const field = (k: string, label: string, type = 'text', required = false, options?: { label: string; value: string }[]) => {
+  const field = (k: string, label: string, type = 'text', required = false, options?: { label: string; value: string }[], maxLength?: number) => {
     const fieldId = `edit-field-${k}`;
-    
+
     return (
       <div key={fieldId}>
         <label className="block text-sm font-medium text-slate-700 mb-1.5">{label}{required && <span className="text-red-500 ml-1">*</span>}</label>
         {options ? (
-          <select 
-            value={form[k] || ''} 
-            onChange={e => update(k, e.target.value)} 
+          <select
+            value={form[k] || ''}
+            onChange={e => update(k, e.target.value)}
             disabled={isSubmitting}
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white disabled:opacity-50"
           >
@@ -2194,13 +2262,14 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
             {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         ) : (
-          <input 
-            type={type} 
-            value={form[k] || ''} 
-            onChange={e => update(k, e.target.value)} 
+          <input
+            type={type}
+            value={form[k] || ''}
+            onChange={e => update(k, e.target.value)}
             disabled={isSubmitting}
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50" 
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50"
             required={required}
+            maxLength={maxLength}
           />
         )}
       </div>
@@ -2230,24 +2299,24 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
             />
           </div>
           {field('fullName', 'Full Name', 'text', true)}
-          {field('dob', 'Date of Birth', 'date')}
-          {field('gender', 'Gender', 'text', false, [
+          {field('dob', 'Date of Birth', 'date', true)}
+          {field('gender', 'Gender', 'text', true, [
             { label: 'Male', value: 'Male' }, { label: 'Female', value: 'Female' }
           ])}
-          {field('nationalId', 'National ID')}
-          {field('phone', 'Phone Number', 'tel', true)}
+          {field('nationalId', 'National ID', 'text', true, undefined, 8)}
+          {field('phone', 'Phone Number', 'tel', true, undefined, 10)}
         </div>
-        <div className="mt-4">{field('address', 'Residential Address')}</div>
+        <div className="mt-4">{field('address', 'Residential Address', 'text', true)}</div>
       </div>
 
       <div>
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Employment Information</h4>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {field('position', 'Position', 'text', false, positions.map(p => ({ label: p.name, value: p.name })))}
-          {field('department', 'Department', 'text', false, departments.map(d => ({ label: d, value: d })))}
-          {field('qualification', 'Qualification')}
-          {field('dateHired', 'Date Hired', 'date')}
-          {field('contractType', 'Contract Type', 'text', false, [
+          {field('position', 'Position', 'text', true, positions.map(p => ({ label: p.name, value: p.name })))}
+          {field('department', 'Department', 'text', true, departments.map(d => ({ label: d, value: d })))}
+          {field('qualification', 'Qualification', 'text', true)}
+          {field('dateHired', 'Date Hired', 'date', true)}
+          {field('contractType', 'Contract Type', 'text', true, [
             { label: 'Permanent', value: 'Permanent' }, 
             { label: 'Contract', value: 'Contract' }, 
             { label: 'Part-time', value: 'Part-time' }
@@ -2478,9 +2547,9 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Pay Point</label>
-            <select 
-              value={form.pay_point || ''} 
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Pay Point <span className="text-red-500">*</span></label>
+            <select
+              value={form.pay_point || ''}
               onChange={e => update('pay_point', e.target.value)} 
               disabled={isSubmitting}
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white disabled:opacity-50"
@@ -2532,7 +2601,7 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Next of Kin</h4>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Full Name</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Full Name <span className="text-red-500">*</span></label>
             <input
               type="text"
               value={form.next_of_kin_name || ""}
@@ -2543,7 +2612,7 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Relationship</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Relationship <span className="text-red-500">*</span></label>
             <select
               value={form.next_of_kin_relationship || ""}
               onChange={(e) => update("next_of_kin_relationship", e.target.value)}
@@ -2559,18 +2628,19 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number <span className="text-red-500">*</span></label>
             <input
               type="tel"
               value={form.next_of_kin_phone || ""}
               onChange={(e) => update("next_of_kin_phone", e.target.value)}
               disabled={isSubmitting}
+              maxLength={10}
               placeholder="Enter next of kin phone number"
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] disabled:opacity-50"
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Address</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Address <span className="text-red-500">*</span></label>
             <input
               type="text"
               value={form.next_of_kin_address || ""}
@@ -2591,10 +2661,10 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Bank Account</h4>
         <div className="grid grid-cols-1 gap-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Bank Account / Mobile Money Number</label>
-            <input 
-              type="text" 
-              value={form.account_number || ''} 
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Bank Account / Mobile Money Number <span className="text-red-500">*</span></label>
+            <input
+              type="text"
+              value={form.account_number || ''}
               onChange={e => update('account_number', e.target.value)}
               disabled={isSubmitting}
               placeholder="e.g., 5063532125021 or 0888123456"
