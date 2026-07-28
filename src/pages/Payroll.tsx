@@ -11,6 +11,7 @@ import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates } from '../utils/payrollSettings';
+import { calculateLivePayroll } from '../utils/payrollCalculations';
 
 interface Employee {
   id: string;
@@ -310,42 +311,31 @@ export function PayrollPage() {
   // ===== CALCULATE PAYROLL =====
   const calculatePayroll = useCallback((employee: Employee, customValues?: Partial<PayrollRecord>): PayrollRecord => {
     const basicSalary = customValues?.basic_salary ?? employee.basic_salary;
-    // Allowances default to 0
     const allowances = customValues?.allowances ?? 0;
-    // Overtime default to 0
     const overtime = customValues?.overtime ?? 0;
     const bonus = customValues?.bonus ?? 0;
-    const grossPay = basicSalary + allowances + overtime + bonus;
 
-    // PAYE/pension rates come from Settings (system_settings via getPayrollRates),
-    // not hardcoded -- and PAYE applies only to gross pay above the threshold,
-    // matching the policy Settings itself states.
-    const paye = customValues?.paye ?? Math.round(Math.max(0, grossPay - payrollRates.payeThreshold) * payrollRates.payeRate);
-    const pension = customValues?.pension ?? Math.round(grossPay * payrollRates.pensionEmployeeRate);
-
-    // Uniform deduction only applies to positions marked "Requires Uniform" in
-    // Settings -> Positions (defaults to true for positions with no explicit
-    // setting yet). `?? 10000`, not `|| 10000`, so an employee whose deduction
-    // was intentionally set to 0 isn't silently overridden back to 10000.
-    const positionRequiresUniform = positionsRequiringUniform.get(employee.position) ?? true;
-    const uniformDeductionValue = positionRequiresUniform ? (employee.uniform_deduction ?? 10000) : 0;
-
-    // Absent/late deductions are now always derived live from the actual
-    // attendance table for this month -- no separate "save deductions" step
-    // is required for them to count. lecture/appearance deductions have no
-    // attendance-grid equivalent and still come from employee_deductions.
+    // Delegates to the shared calculateLivePayroll utility so Payroll and
+    // Payments never diverge on what an unprocessed/unapproved month's numbers
+    // should be -- Payments uses the exact same function for its live estimate.
     const deduction = getEmployeeDeduction(employee.id);
-    const attendance = attendanceCounts.get(employee.id);
-    const absentDays = attendance?.absentDays || 0;
-    const lateDays = attendance?.lateDays || 0;
-    const absentDeduction = absentDays * 4200;
-    const lateDeduction = lateDays * 4200;
-    const lectureDeduction = deduction?.lecture_deduction || 0;
-    const appearanceDeduction = deduction?.appearance_deduction || 0;
-    const totalAttendanceDeductions = absentDeduction + lateDeduction + lectureDeduction + appearanceDeduction;
-    const totalUniformDeduction = uniformDeductionValue + totalAttendanceDeductions;
+    const live = calculateLivePayroll({
+      basicSalary,
+      allowances,
+      overtime,
+      bonus,
+      position: employee.position,
+      employeeUniformDeduction: employee.uniform_deduction,
+      positionsRequiringUniform,
+      payrollRates,
+      attendance: attendanceCounts.get(employee.id),
+      lectureDeduction: deduction?.lecture_deduction,
+      appearanceDeduction: deduction?.appearance_deduction,
+    });
 
-    const netPay = grossPay - paye - pension - totalUniformDeduction;
+    const paye = customValues?.paye ?? live.paye;
+    const pension = customValues?.pension ?? live.pension;
+    const netPay = live.grossPay - paye - pension - live.uniformDeduction;
 
     return {
       id: '',
@@ -355,10 +345,10 @@ export function PayrollPage() {
       allowances,
       overtime,
       bonus,
-      gross_pay: grossPay,
+      gross_pay: live.grossPay,
       paye,
       pension,
-      uniform_deduction: totalUniformDeduction,
+      uniform_deduction: live.uniformDeduction,
       net_pay: netPay,
       processed_at: new Date().toISOString(),
       approval_status: 'pending',
