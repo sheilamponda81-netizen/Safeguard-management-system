@@ -17,6 +17,8 @@ import {
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
+import { getPayrollRates } from '../utils/payrollSettings';
+import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
 
 export function PaymentsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
@@ -126,8 +128,8 @@ export function PaymentsPage() {
       if (empError) throw empError;
 
       // Approved payroll is the real source of truth for net pay. Only fall back
-      // to the 0.65-of-basic-salary estimate when no approved payroll run exists
-      // yet for this month (e.g. before Payroll has been processed/approved).
+      // to a live calculated estimate when no approved payroll run exists yet
+      // for this month (e.g. before Payroll has been processed/approved).
       // Matched by normalized month key rather than exact string equality --
       // payroll.month has historically been written in more than one format
       // ("YYYY-MM" vs "Month YYYY") depending on which code path wrote it.
@@ -146,13 +148,68 @@ export function PaymentsPage() {
           .map(r => [r.employee_id, r.net_pay])
       );
 
+      // The estimate (when no approved payroll exists yet) uses the exact same
+      // calculateLivePayroll formula Payroll.tsx uses, so this page never shows
+      // a different number for the same unprocessed month.
+      const payrollRates = await getPayrollRates();
+
+      const { data: positionsData } = await supabase
+        .from('positions')
+        .select('name, requires_uniform');
+      const positionsRequiringUniform = new Map(
+        (positionsData || []).map(p => [p.name, p.requires_uniform !== false])
+      );
+
+      const [yearStr, monthStr] = selectedMonth.split('-');
+      const year = parseInt(yearStr, 10);
+      const monthNum = parseInt(monthStr, 10);
+      const monthStart = `${selectedMonth}-01`;
+      const lastDay = new Date(year, monthNum, 0).getDate();
+      const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
+      const employeeIds = (employeesData || []).map(e => e.id);
+
+      const liveAttendanceCounts = new Map<string, AttendanceCount>();
+      if (employeeIds.length > 0) {
+        const { data: attendanceData } = await supabase
+          .from('attendance')
+          .select('employee_id, status')
+          .gte('date', monthStart)
+          .lte('date', monthEnd)
+          .in('employee_id', employeeIds);
+
+        (attendanceData || []).forEach(record => {
+          const existing = liveAttendanceCounts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
+          if (record.status === 'A') existing.absentDays += 1;
+          if (record.status === 'L') existing.lateDays += 1;
+          liveAttendanceCounts.set(record.employee_id, existing);
+        });
+      }
+
+      const { data: deductionsData } = await supabase
+        .from('employee_deductions')
+        .select('employee_id, lecture_deduction, appearance_deduction')
+        .eq('month', selectedMonth);
+      const deductionsByEmployee = new Map((deductionsData || []).map(d => [d.employee_id, d]));
+
       const employeesWithPay = (employeesData || []).map(emp => {
         const approvedNetPay = approvedNetPayByEmployee.get(emp.id);
-        return {
-          ...emp,
-          net_pay: approvedNetPay ?? Math.round((emp.basic_salary || 0) * 0.65),
-          net_pay_is_estimate: approvedNetPay === undefined,
-        };
+        if (approvedNetPay !== undefined) {
+          return { ...emp, net_pay: approvedNetPay, net_pay_is_estimate: false };
+        }
+
+        const deduction = deductionsByEmployee.get(emp.id);
+        const live = calculateLivePayroll({
+          basicSalary: emp.basic_salary || 0,
+          position: emp.position,
+          employeeUniformDeduction: emp.uniform_deduction,
+          positionsRequiringUniform,
+          payrollRates,
+          attendance: liveAttendanceCounts.get(emp.id),
+          lectureDeduction: deduction?.lecture_deduction,
+          appearanceDeduction: deduction?.appearance_deduction,
+        });
+
+        return { ...emp, net_pay: live.netPay, net_pay_is_estimate: true };
       });
 
       setEmployees(employeesWithPay);
@@ -915,7 +972,7 @@ export function PaymentsPage() {
               {p.net_pay_is_estimate && (
                 <span
                   className="ml-1 text-[10px] font-normal text-amber-500 align-top"
-                  title="No approved payroll run found for this month yet — showing an estimate (65% of basic salary), not the approved net pay."
+                  title="No approved payroll run found for this month yet — showing a live calculated estimate (same formula as the Payroll page), not the final approved net pay."
                 >
                   (est.)
                 </span>
