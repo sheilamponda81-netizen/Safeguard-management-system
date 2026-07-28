@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, Download, DollarSign, CheckCircle, XCircle, Clock, Banknote, Smartphone, CreditCard, Edit2, Save, X, Filter, Building2, MapPin, Wallet, RefreshCw, AlertCircle, Undo, Repeat, ChevronLeft, ChevronRight, Calendar, Lock } from '../utils/icons';
+import { Search, Download, DollarSign, CheckCircle, XCircle, Clock, Banknote, Smartphone, CreditCard, Edit2, Save, Wallet, RefreshCw, Undo, Repeat, ChevronLeft, ChevronRight, Calendar, Lock } from '../utils/icons';
 
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input } from '../components/ui';
+import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { formatKwacha } from '../data';
@@ -23,7 +23,6 @@ import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculati
 export function PaymentsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [payments, setPayments] = useState<any[]>([]);
-  const [employees, setEmployees] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [selectedMonth, setSelectedMonth] = useState('');
@@ -55,7 +54,6 @@ export function PaymentsPage() {
 
   const statusOptions = ['all', 'pending', 'processing', 'paid', 'confirmed', 'failed'];
   const payPointOptions = ['all', 'national_bank', 'standard_bank', 'nbs_bank', 'centenary_bank', 'fdh_bank', 'first_capital_bank', 'airtel_money', 'tnm_mpamba'];
-  const statusOrder = ['pending', 'processing', 'paid', 'confirmed'];
 
   // ===== MEMOIZED VALUES =====
   const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
@@ -75,6 +73,15 @@ export function PaymentsPage() {
   }), [payments]);
 
   const monthDisplayLabel = useMemo(() => getMonthLabel(selectedMonth), [selectedMonth]);
+
+  // With ~2000 employees, a linear .find() over `payments` per lookup adds up
+  // fast -- especially in bulkUpdateStatus, which previously did one such
+  // scan per selected employee (O(selected x payments)).
+  const paymentsByEmployee = useMemo(() => {
+    const map = new Map<string, any>();
+    payments.forEach(p => map.set(p.employee_id, p));
+    return map;
+  }, [payments]);
 
   // ===== PAGINATED PAYMENTS =====
   const paginatedPayments = useMemo(() => {
@@ -212,8 +219,6 @@ export function PaymentsPage() {
         return { ...emp, net_pay: live.netPay, net_pay_is_estimate: true };
       });
 
-      setEmployees(employeesWithPay);
-
       const uniqueCompanies = [...new Set(employeesWithPay.map(e => e.company).filter(Boolean))];
       setCompanies(uniqueCompanies);
 
@@ -230,8 +235,9 @@ export function PaymentsPage() {
         console.error('Payment table error:', payError);
       }
 
+      const paymentDataByEmployee = new Map((paymentData || []).map(p => [p.employee_id, p]));
       const merged = employeesWithPay.map(emp => {
-        const existing = paymentData?.find(p => p.employee_id === emp.id);
+        const existing = paymentDataByEmployee.get(emp.id);
         return {
           id: existing?.id || '',
           employee_id: emp.id,
@@ -334,7 +340,7 @@ export function PaymentsPage() {
     }
 
     try {
-      const existing = payments.find(p => p.employee_id === employeeId);
+      const existing = paymentsByEmployee.get(employeeId);
       const oldStatus = existing?.status || 'pending';
       const employeeName = existing?.full_name || 'Unknown';
       const employeeNumber = existing?.employee_number || 'N/A';
@@ -418,8 +424,8 @@ export function PaymentsPage() {
     }
 
     try {
-      const existing = payments.find(p => p.employee_id === payment.employee_id);
-      
+      const existing = paymentsByEmployee.get(payment.employee_id);
+
       const oldData = existing ? { 
         account_number: existing.account_number, 
         notes: existing.notes, 
@@ -496,7 +502,7 @@ export function PaymentsPage() {
     const updatedEmployees: any[] = [];
     
     for (const employeeId of selectedEmployees) {
-      const payment = payments.find(p => p.employee_id === employeeId);
+      const payment = paymentsByEmployee.get(employeeId);
       const oldStatus = payment?.status || 'pending';
       const employeeName = payment?.full_name || 'Unknown';
       const employeeNumber = payment?.employee_number || 'N/A';
@@ -722,16 +728,16 @@ export function PaymentsPage() {
       />
 
       {!isCurrentMonth && (
-        <Card className={`p-3 border ${selectedMonth > systemMonth ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
+        <Card className={`p-3 border ${isFutureMonthSelected ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
           <div className="flex items-start gap-3">
-            <Calendar size={18} className={`shrink-0 mt-0.5 ${selectedMonth > systemMonth ? 'text-blue-600' : 'text-amber-600'}`} />
+            <Calendar size={18} className={`shrink-0 mt-0.5 ${isFutureMonthSelected ? 'text-blue-600' : 'text-amber-600'}`} />
             <div>
-              <p className={`text-sm font-medium ${selectedMonth > systemMonth ? 'text-blue-800' : 'text-amber-800'}`}>
-                {selectedMonth > systemMonth ? 'Viewing Future Month' : 'Viewing Past Month'}
+              <p className={`text-sm font-medium ${isFutureMonthSelected ? 'text-blue-800' : 'text-amber-800'}`}>
+                {isFutureMonthSelected ? 'Viewing Future Month' : 'Viewing Past Month'}
               </p>
-              <p className={`text-sm ${selectedMonth > systemMonth ? 'text-blue-700' : 'text-amber-700'}`}>
-                {selectedMonth > systemMonth 
-                  ? 'You are viewing a future month. Payments can only be edited for the current month.' 
+              <p className={`text-sm ${isFutureMonthSelected ? 'text-blue-700' : 'text-amber-700'}`}>
+                {isFutureMonthSelected
+                  ? 'You are viewing a future month. Payments can only be edited for the current month.'
                   : 'You are viewing a past month. Payments can only be edited for the current month.'}
                 {!isCurrentMonth && (
                   <button 
@@ -837,20 +843,28 @@ export function PaymentsPage() {
             id="filterCompany"
             name="filterCompany"
             type="text"
+            list="companySuggestions"
             value={filterCompany}
             onChange={e => setFilterCompany(e.target.value.toUpperCase())}
             placeholder="Company..."
             className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
           />
+          <datalist id="companySuggestions">
+            {companies.map(c => <option key={c} value={c} />)}
+          </datalist>
           <input
             id="filterWorkstation"
             name="filterWorkstation"
             type="text"
+            list="workstationSuggestions"
             value={filterWorkstation}
             onChange={e => setFilterWorkstation(e.target.value.toUpperCase())}
             placeholder="Workstation..."
             className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
           />
+          <datalist id="workstationSuggestions">
+            {workstations.map(w => <option key={w} value={w} />)}
+          </datalist>
           <Button variant="outline" onClick={() => {
             setFilterCompany('');
             setFilterWorkstation('');
