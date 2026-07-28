@@ -299,14 +299,37 @@ export function PayrollPage() {
     getPayrollRates().then(setPayrollRatesState);
   }, []);
 
-  // ===== GET EMPLOYEE DATA =====
-  const getPayrollForEmployee = useCallback((employeeId: string): PayrollRecord | null => {
-    return payrollRecords.find(p => p.employee_id === employeeId) || null;
+  // ===== LOOKUP INDEXES =====
+  // With ~2000 employees, a linear .find() over payrollRecords/
+  // employeeDeductions per employee (called from totals, from every render
+  // of every table row, and from calculatePayroll for each employee during
+  // processing) turns into millions of comparisons. Built once per fetch.
+  const payrollByEmployee = useMemo(() => {
+    const map = new Map<string, PayrollRecord>();
+    payrollRecords.forEach(r => map.set(r.employee_id, r));
+    return map;
   }, [payrollRecords]);
 
-  const getEmployeeDeduction = useCallback((employeeId: string): EmployeeDeduction | null => {
-    return employeeDeductions.find(d => d.employee_id === employeeId) || null;
+  const deductionsByEmployee = useMemo(() => {
+    const map = new Map<string, EmployeeDeduction>();
+    employeeDeductions.forEach(d => map.set(d.employee_id, d));
+    return map;
   }, [employeeDeductions]);
+
+  const employeesById = useMemo(() => {
+    const map = new Map<string, Employee>();
+    employees.forEach(e => map.set(e.id, e));
+    return map;
+  }, [employees]);
+
+  // ===== GET EMPLOYEE DATA =====
+  const getPayrollForEmployee = useCallback((employeeId: string): PayrollRecord | null => {
+    return payrollByEmployee.get(employeeId) || null;
+  }, [payrollByEmployee]);
+
+  const getEmployeeDeduction = useCallback((employeeId: string): EmployeeDeduction | null => {
+    return deductionsByEmployee.get(employeeId) || null;
+  }, [deductionsByEmployee]);
 
   // ===== CALCULATE PAYROLL =====
   const calculatePayroll = useCallback((employee: Employee, customValues?: Partial<PayrollRecord>): PayrollRecord => {
@@ -463,7 +486,7 @@ export function PayrollPage() {
   // ===== COPY FROM PREVIOUS MONTH =====
   const copyFromPreviousMonth = useCallback(async (sourceMonth: string) => {
     if (!canProcessPayroll) {
-      alert('You do not have permission to copy payroll data.');
+      showNotification('You do not have permission to copy payroll data.', 'error');
       return;
     }
     
@@ -486,12 +509,12 @@ export function PayrollPage() {
       
       if (sourceError) {
         console.error('Error fetching source data:', sourceError);
-        alert('Failed to fetch source data: ' + sourceError.message);
+        showNotification('Failed to fetch source data: ' + sourceError.message, 'error');
         return;
       }
       
       if (!sourceData || sourceData.length === 0) {
-        alert('No data found in the selected source month.');
+        showNotification('No data found in the selected source month.', 'error');
         return;
       }
       
@@ -521,7 +544,7 @@ export function PayrollPage() {
       
       if (insertError) {
         console.error('Error inserting records:', insertError);
-        alert('Failed to copy data: ' + insertError.message);
+        showNotification('Failed to copy data: ' + insertError.message, 'error');
         return;
       }
       
@@ -541,10 +564,10 @@ export function PayrollPage() {
       setHasData(true);
       setIsApproved(false);
       setShowCopyModal(false);
-      alert(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${inserted?.length || 0} records copied.`);
+      showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${inserted?.length || 0} records copied.`, 'success');
     } catch (err: any) {
       console.error('Error copying data:', err);
-      alert('Failed to copy data: ' + err.message);
+      showNotification('Failed to copy data: ' + err.message, 'error');
     } finally {
       setProcessingStatus('');
     }
@@ -553,17 +576,17 @@ export function PayrollPage() {
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
     if (!canApprovePayroll) {
-      alert('You do not have permission to approve payroll. Only managers and admins can approve.');
+      showNotification('You do not have permission to approve payroll. Only managers and admins can approve.', 'error');
       return;
     }
 
     if (payrollRecords.length === 0) {
-      alert('No payroll records to approve. Please process payroll first.');
+      showNotification('No payroll records to approve. Please process payroll first.', 'error');
       return;
     }
 
     if (status === 'rejected' && !approvalNotes.trim()) {
-      alert('Please provide a reason for rejection.');
+      showNotification('Please provide a reason for rejection.', 'error');
       return;
     }
 
@@ -616,7 +639,7 @@ export function PayrollPage() {
 
     } catch (err: any) {
       console.error('Error approving payroll:', err);
-      alert('Failed to approve payroll: ' + err.message);
+      showNotification('Failed to approve payroll: ' + err.message, 'error');
     } finally {
       setProcessing(false);
       setProcessingStatus('');
@@ -627,15 +650,15 @@ export function PayrollPage() {
   const processPayroll = useCallback(async () => {
     if (!isCurrentMonth) {
       if (isFutureMonthSelected) {
-        alert('Cannot process payroll for future months. Please wait until the month arrives.');
+        showNotification('Cannot process payroll for future months. Please wait until the month arrives.', 'error');
       } else {
-        alert('Cannot process payroll for past months. Please switch to the current month.');
+        showNotification('Cannot process payroll for past months. Please switch to the current month.', 'error');
       }
       return;
     }
 
     if (!canProcessPayroll) {
-      alert('You do not have permission to process payroll. Only Super Admins can process payroll.');
+      showNotification('You do not have permission to process payroll. Only Super Admins can process payroll.', 'error');
       return;
     }
     
@@ -701,7 +724,7 @@ export function PayrollPage() {
       
       if (insertError) {
         console.error('❌ Error inserting records:', insertError);
-        alert('Failed to save payroll: ' + insertError.message);
+        showNotification('Failed to save payroll: ' + insertError.message, 'error');
         setProcessing(false);
         setProcessingStatus('');
         return;
@@ -732,11 +755,11 @@ export function PayrollPage() {
       
       setTimeout(() => setProcessed(false), 5000);
       
-      alert(`✅ Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${insertedData?.length || 0} employees processed.\n\n⚠️ The payroll is now pending approval by a manager or admin.`);
+      showNotification(`Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${insertedData?.length || 0} employees processed. The payroll is now pending approval by a manager or admin.`, 'success');
       
     } catch (err: any) {
       console.error('❌ Error processing payroll:', err);
-      alert('Failed to process payroll: ' + err.message);
+      showNotification('Failed to process payroll: ' + err.message, 'error');
     } finally {
       setProcessing(false);
       setProcessingStatus('');
@@ -1077,13 +1100,18 @@ export function PayrollPage() {
           <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
             <Calculator size={16} className="text-[#D4A017]" /> Gross Pay Formula
           </h3>
-          <p className="text-sm text-slate-600">= Basic Salary + Allowances (0%) + Overtime (0%) + Bonus</p>
+          <p className="text-sm text-slate-600">= Basic Salary + Allowances + Overtime + Bonus</p>
         </Card>
         <Card className="p-5">
           <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
             <Calculator size={16} className="text-[#D4A017]" /> Net Pay Formula
           </h3>
-          <p className="text-sm text-slate-600">= Gross Pay - PAYE (30%) - Pension (5%) - Uniform Deduction - Attendance Deductions</p>
+          {/* Rates come from live payrollRates (Settings), not hardcoded --
+              a stale "PAYE (30%)" label here would contradict whatever an
+              admin has actually configured. */}
+          <p className="text-sm text-slate-600">
+            = Gross Pay - PAYE ({(payrollRates.payeRate * 100).toFixed(0)}% above {formatKwacha(payrollRates.payeThreshold)}) - Pension ({(payrollRates.pensionEmployeeRate * 100).toFixed(0)}%) - Uniform Deduction - Attendance Deductions
+          </p>
           <p className="text-xs text-slate-500 mt-2">Attendance Deductions: Absent (MK4,200/day) + Late (MK4,200/day) + Lecture + Appearance</p>
         </Card>
       </div>
@@ -1125,7 +1153,7 @@ export function PayrollPage() {
           actionLabel={copySourceMonths.length > 0 ? "Copy from Previous Month" : ""}
           onAction={() => {
             if (copySourceMonths.length === 0) {
-              alert('No previous months available to copy from.');
+              showNotification('No previous months available to copy from.', 'error');
               return;
             }
             setShowCopyModal(true);
@@ -1158,8 +1186,9 @@ export function PayrollPage() {
                 const uniformAmount = positionRequiresUniform ? (emp.uniform_deduction ?? 10000) : 0;
                 const hasUniform = uniformAmount > 0;
                 const hasAnyDeduction = p.uniform_deduction > 0;
-                const isEditable = canEditPayroll && !payrollRecords.find(r => r.employee_id === emp.id) && isCurrentMonth && !isMonthProcessed && !isApproved;
-                
+                const existingRecord = payrollByEmployee.get(emp.id);
+                const isEditable = canEditPayroll && !existingRecord && isCurrentMonth && !isMonthProcessed && !isApproved;
+
                 return (
                   <TR key={emp.id}>
                     <TD>
@@ -1173,7 +1202,7 @@ export function PayrollPage() {
                           {hasAnyDeduction && (
                             <Badge color="red" className="text-[10px] mt-0.5">Deductions</Badge>
                           )}
-                          {!isEditable && payrollRecords.find(r => r.employee_id === emp.id) && (
+                          {!isEditable && existingRecord && (
                             <Badge color="gray" className="text-[10px] mt-0.5">Processed</Badge>
                           )}
                           {isApproved && (
@@ -1402,7 +1431,7 @@ export function PayrollPage() {
               </thead>
               <tbody>
                 {payrollRecords.slice(0, 10).map(record => {
-                  const emp = employees.find(e => e.id === record.employee_id);
+                  const emp = employeesById.get(record.employee_id);
                   return (
                     <tr key={record.id} className="border-t border-slate-100">
                       <td className="px-3 py-2 text-xs">{emp?.full_name || 'Unknown'}</td>
