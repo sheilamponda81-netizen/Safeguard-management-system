@@ -1329,23 +1329,12 @@ function AddEmployeeForm({
       const region = regions.find((r) => r.id === regionId);
       if (!region) return;
 
-      let prefix = "";
-      switch (region.code) {
-        case "NORTH":
-          prefix = "N";
-          break;
-        case "SOUTH":
-          prefix = "S";
-          break;
-        case "CENTRAL":
-          prefix = "C";
-          break;
-        case "EAST":
-          prefix = "E";
-          break;
-        default:
-          prefix = "X";
-      }
+      // Region letter comes from the region's own `code` (set in Settings ->
+      // Regions) if there is one, otherwise falls back to the first letter
+      // of the region's name -- so "Northern Region" still gets "N" even if
+      // nobody has set an explicit one-letter code yet.
+      const regionLetter = (region.code?.trim() || region.name?.trim() || "X").charAt(0).toUpperCase();
+      const prefix = `SF-${regionLetter}-`;
 
       const { data } = await supabase
         .from("employees")
