@@ -123,10 +123,30 @@ export function PaymentsPage() {
       const { data: employeesData, error: empError } = await employeesQuery;
       if (empError) throw empError;
 
-      const employeesWithPay = (employeesData || []).map(emp => ({
-        ...emp,
-        net_pay: Math.round((emp.basic_salary || 0) * 0.65)
-      }));
+      // Approved payroll is the real source of truth for net pay. Only fall back
+      // to the 0.65-of-basic-salary estimate when no approved payroll run exists
+      // yet for this month (e.g. before Payroll has been processed/approved).
+      const { data: payrollData, error: payrollError } = await supabase
+        .from('payroll')
+        .select('employee_id, net_pay')
+        .eq('month', selectedMonth)
+        .eq('approval_status', 'approved');
+
+      if (payrollError) {
+        console.error('Payroll table error:', payrollError);
+      }
+      const approvedNetPayByEmployee = new Map(
+        (payrollData || []).map(r => [r.employee_id, r.net_pay])
+      );
+
+      const employeesWithPay = (employeesData || []).map(emp => {
+        const approvedNetPay = approvedNetPayByEmployee.get(emp.id);
+        return {
+          ...emp,
+          net_pay: approvedNetPay ?? Math.round((emp.basic_salary || 0) * 0.65),
+          net_pay_is_estimate: approvedNetPay === undefined,
+        };
+      });
 
       setEmployees(employeesWithPay);
 
@@ -159,7 +179,8 @@ export function PaymentsPage() {
           workstation: emp.workstation,
           pay_point: emp.pay_point,
           account_number: existing?.account_number || emp.account_number || '',
-          net_pay: existing?.net_pay || emp.net_pay,
+          net_pay: existing?.net_pay ?? emp.net_pay,
+          net_pay_is_estimate: existing?.net_pay === undefined && emp.net_pay_is_estimate,
           status: existing?.status || 'pending',
           payment_date: existing?.payment_date || '',
           transaction_id: existing?.transaction_id || '',
@@ -282,12 +303,13 @@ export function PaymentsPage() {
       };
       
       if (existing?.id) {
-        await supabase
+        const { error } = await supabase
           .from('payment_status')
           .update(updateData)
           .eq('id', existing.id);
+        if (error) throw error;
       } else {
-        await supabase
+        const { error } = await supabase
           .from('payment_status')
           .insert([{
             employee_id: employeeId,
@@ -296,8 +318,9 @@ export function PaymentsPage() {
             status: newStatus,
             payment_date: newStatus === 'paid' ? new Date().toISOString().split('T')[0] : null,
           }]);
+        if (error) throw error;
       }
-      
+
       await logAudit({
         action: 'UPDATE',
         entity_type: 'payment_status',
@@ -351,14 +374,15 @@ export function PaymentsPage() {
       
       if (existing?.id) {
         entityId = existing.id;
-        await supabase
+        const { error } = await supabase
           .from('payment_status')
           .update(updateData)
           .eq('id', existing.id);
+        if (error) throw error;
       } else {
         action = 'CREATE';
         entityId = payment.employee_id;
-        await supabase
+        const { error } = await supabase
           .from('payment_status')
           .insert([{
             employee_id: payment.employee_id,
@@ -369,6 +393,7 @@ export function PaymentsPage() {
             transaction_id: payment.transaction_id,
             status: 'pending',
           }]);
+        if (error) throw error;
       }
       
       await logAudit({
@@ -419,12 +444,13 @@ export function PaymentsPage() {
         }
         
         if (payment?.id) {
-          await supabase
+          const { error } = await supabase
             .from('payment_status')
             .update(updateData)
             .eq('id', payment.id);
+          if (error) throw error;
         } else {
-          await supabase
+          const { error } = await supabase
             .from('payment_status')
             .insert([{
               employee_id: employeeId,
@@ -433,6 +459,7 @@ export function PaymentsPage() {
               status: newStatus,
               payment_date: newStatus === 'paid' ? new Date().toISOString().split('T')[0] : null,
             }]);
+          if (error) throw error;
         }
         successCount++;
         updatedEmployees.push({
@@ -878,6 +905,14 @@ export function PaymentsPage() {
             </TD>
             <TD className="text-right font-semibold text-[#D4A017]">
               {formatKwacha(p.net_pay)}
+              {p.net_pay_is_estimate && (
+                <span
+                  className="ml-1 text-[10px] font-normal text-amber-500 align-top"
+                  title="No approved payroll run found for this month yet — showing an estimate (65% of basic salary), not the approved net pay."
+                >
+                  (est.)
+                </span>
+              )}
             </TD>
             <TD>{getStatusBadge(p.status)}</TD>
             <TD className="text-right">

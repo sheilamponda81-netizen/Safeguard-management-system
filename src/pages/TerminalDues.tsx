@@ -215,9 +215,15 @@ export function TerminalDuesPage() {
           .eq('region_id', userProfile.region_id)
           .eq('is_deleted', false);
         const employeeIds = regionEmployees?.map(e => e.id) || [];
-        if (employeeIds.length > 0) {
-          query = query.in('employee_id', employeeIds);
+        // A region with zero active employees must return zero terminal-dues
+        // records for a non-super-admin -- never fall through to an
+        // unfiltered, cross-region query.
+        if (employeeIds.length === 0) {
+          setCalculations([]);
+          setLoading(false);
+          return;
         }
+        query = query.in('employee_id', employeeIds);
       }
 
       const { data, error } = await query;
