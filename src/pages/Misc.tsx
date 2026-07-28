@@ -107,6 +107,12 @@ export function SettingsPage() {
     default_salary: 150000,
     is_active: true
   });
+
+  // Regions state
+  const [regions, setRegions] = useState<any[]>([]);
+  const [showRegionModal, setShowRegionModal] = useState(false);
+  const [editingRegion, setEditingRegion] = useState<any>(null);
+  const [regionForm, setRegionForm] = useState({ name: '', code: '' });
   
   // Month settings state
   const [currentMonth, setCurrentMonth] = useState<string>('');
@@ -177,6 +183,7 @@ export function SettingsPage() {
     { id: 'payroll', label: 'Payroll' },
     { id: 'month', label: 'Month Settings' },  // <-- ADDED THIS TAB
     { id: 'positions', label: 'Positions' },
+    { id: 'regions', label: 'Regions' },
     { id: 'users', label: 'User Management' },
     { id: 'roles', label: 'User Roles' },
     { id: 'system', label: 'System' }
@@ -322,6 +329,109 @@ const handleDeletePosition = async (position: any) => {
       is_active: position.is_active
     });
     setShowPositionModal(true);
+  };
+
+  // Load regions from Supabase
+  const loadRegions = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('regions')
+        .select('*')
+        .order('name');
+      if (error) throw error;
+      setRegions(data || []);
+    } catch (error) {
+      console.error('Error loading regions:', error);
+    }
+  };
+
+  const handleSaveRegion = async () => {
+    if (!regionForm.name.trim()) {
+      alert('Please enter a region name');
+      return;
+    }
+
+    try {
+      if (editingRegion) {
+        const { error } = await supabase
+          .from('regions')
+          .update({
+            name: regionForm.name,
+            code: regionForm.code || null,
+          })
+          .eq('id', editingRegion.id);
+        if (error) throw error;
+
+        await logAudit({
+          action: 'UPDATE',
+          entity_type: 'regions',
+          entity_id: editingRegion.id,
+          old_data: { name: editingRegion.name, code: editingRegion.code },
+          new_data: regionForm
+        });
+
+        alert('Region updated successfully');
+      } else {
+        // tenant_id is omitted on insert -- it defaults to the current user's
+        // own tenant, same pattern as handleSavePosition above.
+        const { data, error } = await supabase
+          .from('regions')
+          .insert([{
+            name: regionForm.name,
+            code: regionForm.code || null,
+          }])
+          .select();
+        if (error) throw error;
+
+        await logAudit({
+          action: 'CREATE',
+          entity_type: 'regions',
+          entity_id: data?.[0]?.id || 'new',
+          new_data: regionForm
+        });
+
+        alert('Region added successfully');
+      }
+
+      await loadRegions();
+      setShowRegionModal(false);
+      setEditingRegion(null);
+      setRegionForm({ name: '', code: '' });
+    } catch (error: any) {
+      console.error('Error saving region:', error);
+      alert(`Failed to save region: ${error.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleDeleteRegion = async (region: any) => {
+    if (confirm(`Are you sure you want to delete "${region.name}"? Employees and users assigned to this region will become unassigned, not deleted.`)) {
+      try {
+        const { error } = await supabase
+          .from('regions')
+          .delete()
+          .eq('id', region.id);
+        if (error) throw error;
+
+        await logAudit({
+          action: 'DELETE',
+          entity_type: 'regions',
+          entity_id: region.id,
+          old_data: { name: region.name, code: region.code }
+        });
+
+        await loadRegions();
+        alert('Region deleted successfully');
+      } catch (error: any) {
+        console.error('Error deleting region:', error);
+        alert(`Failed to delete region: ${error.message || 'Unknown error'}`);
+      }
+    }
+  };
+
+  const handleEditRegion = (region: any) => {
+    setEditingRegion(region);
+    setRegionForm({ name: region.name, code: region.code || '' });
+    setShowRegionModal(true);
   };
 
   // Load roles from Supabase
@@ -592,6 +702,7 @@ const handleDeletePosition = async (position: any) => {
     
     loadRoles();
     loadPositions();
+    loadRegions();
   }, []);
 
   const RoleModal = () => (
@@ -704,6 +815,44 @@ const handleDeletePosition = async (position: any) => {
         <Button variant="outline" onClick={() => setShowPositionModal(false)}>Cancel</Button>
         <Button variant="secondary" onClick={handleSavePosition}>
           <CheckCircle size={14} className="mr-1" /> {editingPosition ? 'Update Position' : 'Create Position'}
+        </Button>
+      </div>
+    </Modal>
+  );
+
+  // Region Modal
+  const RegionModal = () => (
+    <Modal open={showRegionModal} onClose={() => setShowRegionModal(false)} title={editingRegion ? 'Edit Region' : 'New Region'} size="md">
+      <div className="space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1">Region Name *</label>
+          <input
+            type="text"
+            value={regionForm.name}
+            onChange={(e) => setRegionForm({...regionForm, name: e.target.value})}
+            className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            placeholder="e.g., Northern Region"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1">Code (optional)</label>
+          <input
+            type="text"
+            value={regionForm.code}
+            onChange={(e) => setRegionForm({...regionForm, code: e.target.value})}
+            className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+            placeholder="e.g., N"
+          />
+          <p className="text-xs text-slate-400 mt-1">
+            The first letter is used as this region's prefix in auto-generated employee numbers (e.g. "N" for Northern gives SF-N-001). Leave blank to use the first letter of the region name instead.
+          </p>
+        </div>
+      </div>
+      <div className="flex justify-end gap-2 mt-6">
+        <Button variant="outline" onClick={() => setShowRegionModal(false)}>Cancel</Button>
+        <Button variant="secondary" onClick={handleSaveRegion}>
+          <CheckCircle size={14} className="mr-1" /> {editingRegion ? 'Update Region' : 'Create Region'}
         </Button>
       </div>
     </Modal>
@@ -920,7 +1069,72 @@ const handleDeletePosition = async (position: any) => {
           </div>
         </Card>
       )}
-      
+
+      {/* Regions Tab */}
+      {tab === 'regions' && (
+        <Card className="p-6">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="font-semibold text-slate-800">Regions</h3>
+              <p className="text-xs text-slate-500">Manage the regions employees and users can be assigned to</p>
+            </div>
+            <Button variant="secondary" onClick={() => {
+              setEditingRegion(null);
+              setRegionForm({ name: '', code: '' });
+              setShowRegionModal(true);
+            }}>
+              <Plus size={14} className="mr-1" /> New Region
+            </Button>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50">
+                <tr>
+                  <th className="px-4 py-2 text-left">Region Name</th>
+                  <th className="px-4 py-2 text-left">Code</th>
+                  <th className="px-4 py-2 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {regions.length === 0 ? (
+                  <tr>
+                    <td colSpan={3} className="text-center py-8 text-slate-500">
+                      No regions found. Click "New Region" to add one.
+                    </td>
+                  </tr>
+                ) : (
+                  regions.map((region) => (
+                    <tr key={region.id} className="border-t border-slate-100 hover:bg-slate-50">
+                      <td className="px-4 py-2 font-medium">{region.name}</td>
+                      <td className="px-4 py-2">{region.code || '-'}</td>
+                      <td className="px-4 py-2 text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            onClick={() => handleEditRegion(region)}
+                            className="w-7 h-7 rounded-lg hover:bg-slate-100 text-amber-600"
+                            title="Edit Region"
+                          >
+                            <Edit2 size={14} />
+                          </button>
+                          <button
+                            onClick={() => handleDeleteRegion(region)}
+                            className="w-7 h-7 rounded-lg hover:bg-red-50 text-red-500"
+                            title="Delete Region"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
       {tab === 'users' && <UserManagement />}
       
       {tab === 'roles' && (
@@ -981,8 +1195,19 @@ const handleDeletePosition = async (position: any) => {
         </Card>
       )}
       
-      <RoleModal />
-      <PositionModal />
+      {/* Rendered via direct call, not <RoleModal /> etc. -- these are defined
+          as closures inside this component (not hoisted to module scope) so
+          they can capture all the enclosing form state directly. Invoking
+          them as JSX elements (<RoleModal />) would make React treat the
+          function's fresh identity on every render as a brand-new component
+          type and remount the whole modal (including the <input>s) on every
+          keystroke, losing focus after each character. Calling them as plain
+          functions inlines their returned JSX directly into this tree, so
+          reconciliation is based on the stable Modal/input types inside them
+          instead. */}
+      {RoleModal()}
+      {PositionModal()}
+      {RegionModal()}
     </div>
   );
 }
