@@ -1603,33 +1603,17 @@ function AddEmployeeForm({
   useEffect(() => {
     const fetchPositions = async () => {
       try {
-        const { data } = await supabase
+        const { data, error } = await supabase
           .from("positions")
           .select("name")
           .eq("is_active", true)
           .order("name");
-        if (data && data.length > 0) {
-          setPositions(data);
-        } else {
-          setPositions([
-            { name: "Security Guard" },
-            { name: "Senior Security Officer" },
-            { name: "Supervisor" },
-            { name: "Manager" },
-            { name: "Staff" },
-            { name: "HR" },
-          ]);
-        }
+        if (error) throw error;
+        setPositions(data || []);
       } catch (err) {
         console.error("Error fetching positions:", err);
-        setPositions([
-          { name: "Security Guard" },
-          { name: "Senior Security Officer" },
-          { name: "Supervisor" },
-          { name: "Manager" },
-          { name: "Staff" },
-          { name: "HR" },
-        ]);
+        showNotification("Failed to load positions from Settings", "error");
+        setPositions([]);
       }
     };
     fetchPositions();
@@ -1779,7 +1763,10 @@ function AddEmployeeForm({
             "Position",
             "text",
             true,
-            positions.map((p) => ({ label: p.name, value: p.name })),
+            (positions.some((p) => p.name === form.position) || !form.position
+              ? positions
+              : [{ name: form.position }, ...positions]
+            ).map((p) => ({ label: p.name, value: p.name })),
           )}
           {field(
             "department",
@@ -2358,12 +2345,19 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
 
   useEffect(() => {
     const fetchPositions = async () => {
-      const { data } = await supabase
-        .from('positions')
-        .select('name')
-        .eq('is_active', true)
-        .order('name');
-      setPositions(data || []);
+      try {
+        const { data, error } = await supabase
+          .from('positions')
+          .select('name')
+          .eq('is_active', true)
+          .order('name');
+        if (error) throw error;
+        setPositions(data || []);
+      } catch (err) {
+        console.error('Error fetching positions:', err);
+        showNotification('Failed to load positions from Settings', 'error');
+        setPositions([]);
+      }
     };
     fetchPositions();
   }, []);
@@ -2476,7 +2470,12 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
       <div>
         <h4 className="font-semibold text-slate-800 mb-3 text-sm">Employment Information</h4>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {field('position', 'Position', 'text', true, positions.map(p => ({ label: p.name, value: p.name })))}
+          {field('position', 'Position', 'text', true,
+            (positions.some(p => p.name === form.position) || !form.position
+              ? positions
+              : [{ name: form.position }, ...positions]
+            ).map(p => ({ label: p.name, value: p.name }))
+          )}
           {field('department', 'Department', 'text', true, departments.map(d => ({ label: d, value: d })))}
           {field('qualification', 'Qualification', 'text', true)}
           {field('dateHired', 'Date Hired', 'date', true)}
