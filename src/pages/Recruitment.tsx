@@ -1,19 +1,11 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, UserCheck, XCircle, CheckCircle2, Eye, UserPlus, FileText, ChevronLeft, ChevronRight, Calendar } from '../utils/icons';
+import { Search, UserCheck, XCircle, CheckCircle2, Eye, UserPlus, FileText } from '../utils/icons';
 
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Input } from '../components/ui';
-import { formatKwacha } from '../data';
+import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { showNotification } from '../utils/clickHandlers';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { logAudit } from '../utils/auditLogger';
-import {
-  getSystemCurrentMonth,
-  getMonthLabel, 
-  getNextMonth, 
-  getPreviousMonth,
-  getAvailableMonthsFromSystem
-} from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
 
 interface Applicant {
@@ -86,12 +78,11 @@ export function RecruitmentPage() {
   const fetchApplicants = useCallback(async () => {
     setLoading(true);
     let query = supabase.from('applicants').select('*').order('created_at', { ascending: false });
-    
+
     if (!userProfile?.is_super_admin && userProfile?.region_id) {
-      // If applicants table has region_id column, uncomment below
-      // query = query.eq('region_id', userProfile.region_id);
+      query = query.eq('region_id', userProfile.region_id);
     }
-    
+
     const { data, error } = await query;
     
     if (error) {
@@ -178,7 +169,7 @@ export function RecruitmentPage() {
         decision: 'Pending',
         application_date: new Date().toISOString().split('T')[0],
         cover_letter: newApplicant.coverLetter || null,
-        // region_id: userProfile?.region_id || null  // If applicants have region_id
+        region_id: userProfile?.region_id || null,
       }])
       .select();
     
@@ -540,7 +531,13 @@ export function RecruitmentPage() {
               <p className="text-slate-600">{view.cover_letter || 'No cover letter provided.'}</p>
             </div>
             <div className="flex flex-wrap gap-2 pt-4 border-t border-slate-100">
-              <Button variant="outline"><FileText size={14} /> View CV</Button>
+              <Button
+                variant="outline"
+                disabled={!view.cv_url}
+                onClick={() => { if (view.cv_url) window.open(view.cv_url, '_blank', 'noopener,noreferrer'); }}
+              >
+                <FileText size={14} /> {view.cv_url ? 'View CV' : 'No CV Uploaded'}
+              </Button>
               <Button type="button" onClick={() => { update(view.id, 'Shortlisted'); setView(null); }}><UserCheck size={14} /> Shortlist</Button>
               <Button variant="secondary" type="button" onClick={() => { update(view.id, 'Accepted', 'Hire'); setView(null); }}><CheckCircle2 size={14} /> Hire Employee</Button>
               <Button variant="danger" type="button" onClick={() => { update(view.id, 'Rejected', 'Reject'); setView(null); }}><XCircle size={14} /> Reject</Button>
@@ -549,7 +546,12 @@ export function RecruitmentPage() {
         )}
       </Modal>
 
-      <AddApplicantModal />
+      {/* Called as a plain function, not <AddApplicantModal />: this
+          "component" is a useCallback closure (depending on addApplicant,
+          which changes identity whenever `applicants` updates). Rendering it
+          as JSX would make React remount it -- and reset the in-progress
+          form -- any time the applicants list refreshes while it's open. */}
+      {AddApplicantModal()}
     </div>
   );
 }
