@@ -366,11 +366,34 @@ export function AttendancePage() {
     }
   }, [employees, userProfile, selectedMonth, systemMonth, updating, processUpdateQueue]);
 
-  // ===== DEBOUNCED UPDATE =====
-  const debouncedUpdate = useMemo(
-    () => debounce(updateAttendance, 150),
-    [updateAttendance]
-  );
+  // ===== DEBOUNCED UPDATE (per cell) =====
+  // A single shared debounce instance (as this used to be, memoized on
+  // updateAttendance and recreated every time an update actually commits)
+  // has one internal timer regardless of which cell it's called for.
+  // Clicking employee A's cell then employee B's cell within the same
+  // ~150ms window would cancel A's pending call in favor of B's, silently
+  // dropping A's click with no error and no visual change -- a very live
+  // risk on this page, since marking several employees' attendance in quick
+  // succession is the normal workflow. Keying a separate debounced function
+  // per `employeeId-date` cell means each cell's clicks only ever compete
+  // with themselves.
+  const updateAttendanceRef = useRef(updateAttendance);
+  useEffect(() => {
+    updateAttendanceRef.current = updateAttendance;
+  }, [updateAttendance]);
+
+  const debouncedUpdatesByKey = useRef<Map<string, (employeeId: string, date: string, currentStatus: string) => void>>(new Map());
+
+  const getDebouncedUpdate = useCallback((updateKey: string) => {
+    let fn = debouncedUpdatesByKey.current.get(updateKey);
+    if (!fn) {
+      fn = debounce((employeeId: string, date: string, currentStatus: string) => {
+        updateAttendanceRef.current(employeeId, date, currentStatus);
+      }, 150);
+      debouncedUpdatesByKey.current.set(updateKey, fn);
+    }
+    return fn;
+  }, []);
 
   // ===== ATTENDANCE LOOKUP INDEXES =====
   // With the employee base heading toward ~2000 records, a linear .find()/
@@ -660,10 +683,29 @@ export function AttendancePage() {
       const safeValue = Math.max(0, Number(value) || 0);
       setEditableDeductions(prev => {
         const updated = { ...prev, [field]: safeValue };
-        updated.totalDeductions = 
-          (updated.absentDeduction || 0) + 
-          (updated.lateDeduction || 0) + 
-          (updated.lectureDeduction || 0) + 
+        // Editing the Lectures Missed count previously had no effect on the
+        // Lecture Deduction (MK) figure sitting right next to it -- an admin
+        // bumping the count up or down would see the MK amount just stay
+        // put, even though the two fields are presented as if one drives
+        // the other. Recompute it the same way calculateEmployeeDeductions
+        // does (flat full-month rate if every lecture this month was
+        // missed, otherwise per-lecture), while still leaving Lecture
+        // Deduction itself directly editable for a manual override.
+        if (field === 'lectureMissed') {
+          const totalLecturesThisMonth = getDatesForMonth(selectedMonth).filter(d => {
+            const dayOfWeek = new Date(d).getDay();
+            return dayOfWeek === 3 || dayOfWeek === 4;
+          }).length;
+          updated.lectureDeduction = safeValue === 0
+            ? 0
+            : safeValue === totalLecturesThisMonth
+              ? DEDUCTION_SETTINGS.lectureFullMonthDeduction
+              : safeValue * DEDUCTION_SETTINGS.lectureDeduction;
+        }
+        updated.totalDeductions =
+          (updated.absentDeduction || 0) +
+          (updated.lateDeduction || 0) +
+          (updated.lectureDeduction || 0) +
           (updated.appearanceDeduction || 0);
         return updated;
       });
@@ -960,7 +1002,7 @@ export function AttendancePage() {
         </div>
       </Modal>
     );
-  }, [selectedEmployee, getEmployeeStats, calculateEmployeeDeductions, selectedMonth, userProfile, fetchData]);
+  }, [selectedEmployee, getEmployeeStats, calculateEmployeeDeductions, selectedMonth, userProfile, fetchData, getDatesForMonth]);
 
   // ===== RENDER =====
   if (loading) {
@@ -1150,7 +1192,7 @@ export function AttendancePage() {
                         <td key={i} className="px-1 py-3 text-center" onClick={(e) => { 
                           e.stopPropagation(); 
                           if (isEditable && !isUpdating) {
-                            debouncedUpdate(emp.id, date, status);
+                            getDebouncedUpdate(updateKey)(emp.id, date, status);
                           } else if (!isEditable) {
                             showNotification('Attendance can only be edited for the current month.', 'info');
                           }
