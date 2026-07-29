@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { FileDown, FileSpreadsheet, FileText, TrendingUp, Users, DollarSign, Calendar, UserCheck, Building2, Briefcase, MapPin, PieChart, ChevronLeft, ChevronRight, Home, Building } from '../utils/icons';
+import { FileDown, FileSpreadsheet, Users, DollarSign, Calendar, UserCheck, Building2, MapPin, PieChart, ChevronLeft, ChevronRight, Home } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -8,6 +8,9 @@ import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, get
 import { EmptyState } from '../components/EmptyState';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
+import { showNotification } from '../utils/clickHandlers';
+import { getPayrollRates, PayrollRates } from '../utils/payrollSettings';
+import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
 
@@ -27,6 +30,7 @@ interface Employee {
   resident_name?: string;
   resident_contact?: string;
   company_id?: string;
+  uniform_deduction?: number;
 }
 
 interface PayrollRecord {
@@ -73,12 +77,28 @@ export function ReportsPage() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [payrollRecords, setPayrollRecords] = useState<PayrollRecord[]>([]);
   const [applicants, setApplicants] = useState<Applicant[]>([]);
-  const [companies, setCompanies] = useState<any[]>([]);
   const [selectedMonth, setSelectedMonth] = useState('');
   const [systemMonth, setSystemMonth] = useState('');
   const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [hasData, setHasData] = useState(true);
   const [userProfile, setUserProfile] = useState<any>(null);
+  // Same shared rates/gates Payroll.tsx and Payments.tsx use, so a report for
+  // an unprocessed month shows the same live-calculated figures those pages
+  // show -- not a naive "basic salary as net pay" guess.
+  const [payrollRates, setPayrollRates] = useState<PayrollRates>({
+    payeRate: 0.30,
+    payeThreshold: 50000,
+    pensionEmployeeRate: 0.05,
+  });
+  const [positionsRequiringUniform, setPositionsRequiringUniform] = useState<Map<string, boolean>>(new Map());
+  // Absent/late day counts per employee for this month, used by
+  // calculateLivePayroll's deduction math.
+  const [attendanceCountsByEmployee, setAttendanceCountsByEmployee] = useState<Map<string, AttendanceCount>>(new Map());
+  // Real present/total-recorded-day counts per employee for this month, used
+  // for the Attendance Report and Department Report's attendance rate --
+  // never a fabricated random percentage.
+  const [attendanceRateByEmployee, setAttendanceRateByEmployee] = useState<Map<string, { present: number; total: number }>>(new Map());
+  const [deductionsByEmployee, setDeductionsByEmployee] = useState<Map<string, { lecture_deduction?: number; appearance_deduction?: number }>>(new Map());
 
   // ===== MEMOIZED VALUES =====
   const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
@@ -90,26 +110,69 @@ export function ReportsPage() {
     return employees.filter(emp => !emp.is_deleted);
   }, [employees]);
 
+  // O(1) lookup instead of a repeated linear .find() over payrollRecords in
+  // every report's aggregation below (was O(employees x payrollRecords) in
+  // up to four separate places).
+  const payrollByEmployee = useMemo(() => {
+    const map = new Map<string, PayrollRecord>();
+    payrollRecords.forEach(r => map.set(r.employee_id, r));
+    return map;
+  }, [payrollRecords]);
+
+  // Real payroll figures for an employee: the actual processed record if one
+  // exists for this month, otherwise the same live calculation Payroll.tsx
+  // and Payments.tsx use -- never a raw "basic salary as net pay" guess.
+  const getEmployeeFigures = useCallback((emp: Employee) => {
+    const payroll = payrollByEmployee.get(emp.id);
+    if (payroll) {
+      return { gross_pay: payroll.gross_pay, paye: payroll.paye, pension: payroll.pension, net_pay: payroll.net_pay };
+    }
+    const deduction = deductionsByEmployee.get(emp.id);
+    const live = calculateLivePayroll({
+      basicSalary: emp.basic_salary || 0,
+      position: emp.position,
+      employeeUniformDeduction: emp.uniform_deduction,
+      positionsRequiringUniform,
+      payrollRates,
+      attendance: attendanceCountsByEmployee.get(emp.id),
+      lectureDeduction: deduction?.lecture_deduction,
+      appearanceDeduction: deduction?.appearance_deduction,
+    });
+    return { gross_pay: live.grossPay, paye: live.paye, pension: live.pension, net_pay: live.netPay };
+  }, [payrollByEmployee, deductionsByEmployee, positionsRequiringUniform, payrollRates, attendanceCountsByEmployee]);
+
+  // Real attendance rate for an employee this month -- 0% (not a random
+  // percentage) when no attendance has been recorded yet.
+  const getEmployeeAttendanceRate = useCallback((emp: Employee) => {
+    const stats = attendanceRateByEmployee.get(emp.id);
+    if (!stats || stats.total === 0) return 0;
+    return (stats.present / stats.total) * 100;
+  }, [attendanceRateByEmployee]);
+
   // ===== COMPUTED DATA =====
   const departmentData = useMemo(() => {
-    const deptMap: Record<string, { count: number; totalPayroll: number }> = {};
+    const deptMap: Record<string, { count: number; totalPayroll: number; present: number; total: number }> = {};
     activeEmployees.forEach(emp => {
       const deptName = emp.department || 'Other';
       if (!deptMap[deptName]) {
-        deptMap[deptName] = { count: 0, totalPayroll: 0 };
+        deptMap[deptName] = { count: 0, totalPayroll: 0, present: 0, total: 0 };
       }
       deptMap[deptName].count++;
-      const payroll = payrollRecords.find(p => p.employee_id === emp.id);
-      deptMap[deptName].totalPayroll += payroll?.net_pay || emp.basic_salary || 0;
+      deptMap[deptName].totalPayroll += getEmployeeFigures(emp).net_pay;
+      const stats = attendanceRateByEmployee.get(emp.id);
+      if (stats) {
+        deptMap[deptName].present += stats.present;
+        deptMap[deptName].total += stats.total;
+      }
     });
     return Object.entries(deptMap).map(([name, data]) => ({
       name,
       employees: data.count,
       totalPayroll: data.totalPayroll,
       average: data.totalPayroll / data.count,
-      attendance: (94 + Math.random() * 5).toFixed(1)
+      attendance: (data.total > 0 ? (data.present / data.total) * 100 : 0).toFixed(1)
     }));
-  }, [activeEmployees, payrollRecords]);
+  }, [activeEmployees, getEmployeeFigures, attendanceRateByEmployee]);
 
   // ===== COMPANY DATA - Using companies table and assignment_type =====
   const companyData = useMemo(() => {
@@ -151,10 +214,10 @@ export function ReportsPage() {
       if (emp.status === 'Active') {
         companyMap[entityId].activeEmployees++;
       }
-      
-      const payroll = payrollRecords.find(p => p.employee_id === emp.id);
-      companyMap[entityId].totalPayroll += payroll?.net_pay || emp.basic_salary || 0;
-      
+
+      const netPay = getEmployeeFigures(emp).net_pay;
+      companyMap[entityId].totalPayroll += netPay;
+
       const workstationName = emp.workstation ? sanitizeInput(emp.workstation) : 'No Site';
       if (!companyMap[entityId].workstations[workstationName]) {
         companyMap[entityId].workstations[workstationName] = {
@@ -168,14 +231,14 @@ export function ReportsPage() {
       if (emp.status === 'Active') {
         companyMap[entityId].workstations[workstationName].activeCount++;
       }
-      companyMap[entityId].workstations[workstationName].payrollTotal += payroll?.net_pay || emp.basic_salary || 0;
+      companyMap[entityId].workstations[workstationName].payrollTotal += netPay;
     });
-    
+
     return Object.values(companyMap).map(company => ({
       ...company,
       workstations: Object.values(company.workstations)
     }));
-  }, [activeEmployees, payrollRecords]);
+  }, [activeEmployees, getEmployeeFigures]);
 
   // ===== WORKSTATION DATA =====
   const workstationData = useMemo(() => {
@@ -214,10 +277,9 @@ export function ReportsPage() {
       if (emp.status === 'Active') {
         workstationMap[workstationName].activeCount++;
       }
-      
-      const payroll = payrollRecords.find(p => p.employee_id === emp.id);
-      workstationMap[workstationName].payrollTotal += payroll?.net_pay || emp.basic_salary || 0;
-      
+
+      workstationMap[workstationName].payrollTotal += getEmployeeFigures(emp).net_pay;
+
       if (!workstationMap[workstationName].entities[entityKey]) {
         workstationMap[workstationName].entities[entityKey] = {
           name: entityName,
@@ -235,24 +297,22 @@ export function ReportsPage() {
       totalPayroll: data.payrollTotal,
       entities: data.entities
     })).sort((a, b) => b.totalEmployees - a.totalEmployees);
-  }, [activeEmployees, payrollRecords]);
+  }, [activeEmployees, getEmployeeFigures]);
 
   const payrollSummary = useMemo(() => {
     let totalGross = 0, totalNet = 0, totalPAYE = 0, totalPension = 0;
-    payrollRecords.forEach(record => {
-      totalGross += record.gross_pay || 0;
-      totalNet += record.net_pay || 0;
-      totalPAYE += record.paye || 0;
-      totalPension += record.pension || 0;
+    // Sums getEmployeeFigures per employee (real processed record if one
+    // exists, otherwise the live calculation) so a partially-processed month
+    // -- some employees processed, some not -- is never silently undercounted.
+    activeEmployees.forEach(emp => {
+      const figures = getEmployeeFigures(emp);
+      totalGross += figures.gross_pay;
+      totalNet += figures.net_pay;
+      totalPAYE += figures.paye;
+      totalPension += figures.pension;
     });
-    if (payrollRecords.length === 0) {
-      activeEmployees.forEach(emp => {
-        totalGross += emp.basic_salary || 0;
-        totalNet += emp.basic_salary || 0;
-      });
-    }
     return { totalGross, totalNet, totalPAYE, totalPension };
-  }, [payrollRecords, activeEmployees]);
+  }, [activeEmployees, getEmployeeFigures]);
 
   const totalCompanies = useMemo(() => companyData.length, [companyData]);
   const totalWorkstations = useMemo(() => workstationData.length, [workstationData]);
@@ -262,19 +322,6 @@ export function ReportsPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
-  }, []);
-
-  const fetchCompanies = useCallback(async () => {
-    try {
-      const { data, error } = await supabase
-        .from('companies')
-        .select('*')
-        .order('name');
-      if (error) throw error;
-      setCompanies(data || []);
-    } catch (err) {
-      console.error('Error fetching companies:', err);
-    }
   }, []);
 
   const fetchData = useCallback(async () => {
@@ -305,17 +352,70 @@ export function ReportsPage() {
       const { data: payrollData, error: payError } = await payrollQuery;
       if (payError) throw payError;
       setPayrollRecords(payrollData || []);
-      
+
+      // ===== Real payroll rates, uniform eligibility, attendance, and
+      // lecture/appearance deductions -- so any employee without a processed
+      // payroll record this month still gets an accurate live-calculated
+      // figure (same formula as Payroll.tsx/Payments.tsx), not a naive
+      // "basic salary as net pay" guess, and attendance rates are real
+      // instead of random. =====
+      const [rates, { data: positionsData }] = await Promise.all([
+        getPayrollRates(),
+        supabase.from('positions').select('name, requires_uniform'),
+      ]);
+      setPayrollRates(rates);
+      setPositionsRequiringUniform(
+        new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
+      );
+
+      const employeeIds = (employeesData || []).map(e => e.id);
+      const [yearStr, monthStr] = selectedMonth.split('-');
+      const year = parseInt(yearStr, 10);
+      const monthNum = parseInt(monthStr, 10);
+      const monthStart = `${selectedMonth}-01`;
+      const lastDay = new Date(year, monthNum, 0).getDate();
+      const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
+
+      const deductionCounts = new Map<string, AttendanceCount>();
+      const rateStats = new Map<string, { present: number; total: number }>();
+      if (employeeIds.length > 0) {
+        const { data: attendanceData } = await supabase
+          .from('attendance')
+          .select('employee_id, status')
+          .gte('date', monthStart)
+          .lte('date', monthEnd)
+          .in('employee_id', employeeIds);
+
+        (attendanceData || []).forEach(record => {
+          const dc = deductionCounts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
+          if (record.status === 'A') dc.absentDays += 1;
+          if (record.status === 'L') dc.lateDays += 1;
+          deductionCounts.set(record.employee_id, dc);
+
+          if (record.status !== '-') {
+            const rs = rateStats.get(record.employee_id) || { present: 0, total: 0 };
+            rs.total += 1;
+            if (record.status === 'P') rs.present += 1;
+            rateStats.set(record.employee_id, rs);
+          }
+        });
+      }
+      setAttendanceCountsByEmployee(deductionCounts);
+      setAttendanceRateByEmployee(rateStats);
+
+      const { data: deductionsData } = await supabase
+        .from('employee_deductions')
+        .select('employee_id, lecture_deduction, appearance_deduction')
+        .eq('month', selectedMonth);
+      setDeductionsByEmployee(new Map((deductionsData || []).map(d => [d.employee_id, d])));
+
       const { data: applicantsData, error: appError } = await supabase
         .from('applicants')
         .select('*')
         .order('created_at', { ascending: false });
       if (appError) throw appError;
       setApplicants(applicantsData || []);
-      
-      // Fetch companies for reference
-      await fetchCompanies();
-      
+
       // Check data exists for payroll
       if (activeReport === 'payroll') {
         setHasData((payrollData?.length || 0) > 0);
@@ -331,7 +431,7 @@ export function ReportsPage() {
     } finally {
       setLoading(false);
     }
-  }, [userProfile, selectedMonth, activeReport, fetchCompanies]);
+  }, [userProfile, selectedMonth, activeReport]);
 
   // ===== INITIALIZATION =====
   useEffect(() => {
@@ -429,7 +529,7 @@ export function ReportsPage() {
           title: 'Payroll Report',
           headers: ['Name', 'Position', 'Department', 'Company/Resident', 'Gross Pay', 'PAYE', 'Pension', 'Net Pay'],
           rows: activeEmployees.map(emp => {
-            const payroll = payrollRecords.find(p => p.employee_id === emp.id);
+            const figures = getEmployeeFigures(emp);
             let entityName = '-';
             if (emp.assignment_type === 'resident' && emp.resident_name) {
               entityName = sanitizeInput(emp.resident_name);
@@ -441,10 +541,10 @@ export function ReportsPage() {
               sanitizeInput(emp.position),
               sanitizeInput(emp.department || '-'),
               entityName,
-              formatKwacha(payroll?.gross_pay || emp.basic_salary || 0),
-              formatKwacha(payroll?.paye || 0),
-              formatKwacha(payroll?.pension || 0),
-              formatKwacha(payroll?.net_pay || emp.basic_salary || 0)
+              formatKwacha(figures.gross_pay),
+              formatKwacha(figures.paye),
+              formatKwacha(figures.pension),
+              formatKwacha(figures.net_pay)
             ];
           })
         };
@@ -464,7 +564,7 @@ export function ReportsPage() {
               sanitizeInput(emp.position),
               sanitizeInput(emp.department || '-'),
               entityName,
-              `${(85 + Math.random() * 10).toFixed(1)}%`,
+              `${getEmployeeAttendanceRate(emp).toFixed(1)}%`,
               sanitizeInput(emp.status)
             ];
           })
@@ -503,7 +603,7 @@ export function ReportsPage() {
             ws.totalEmployees,
             ws.activeEmployees,
             formatKwacha(ws.totalPayroll),
-            Object.entries(ws.entities).map(([key, entity]) => 
+            Object.values(ws.entities).map(entity =>
               `${entity.type === 'resident' ? '🏠' : '🏢'} ${sanitizeInput(entity.name)}: ${entity.count}`
             ).join(' | ')
           ])
@@ -521,7 +621,7 @@ export function ReportsPage() {
           ])
         };
     }
-  }, [activeReport, activeEmployees, payrollRecords, applicants, companyData, workstationData, departmentData]);
+  }, [activeReport, activeEmployees, applicants, companyData, workstationData, departmentData, getEmployeeFigures, getEmployeeAttendanceRate]);
 
   // ===== EXPORT REPORT =====
   const exportReport = useCallback(async () => {
@@ -566,7 +666,7 @@ export function ReportsPage() {
       region_id: userProfile?.region_id
     });
     
-    alert(`${activeReport.toUpperCase()} Report exported!`);
+    showNotification(`${activeReport.toUpperCase()} Report exported!`, 'success');
   }, [currentData, activeReport, selectedMonth, userProfile, payrollSummary, departmentData, activeEmployees, companyData, workstationData]);
 
   // ===== REPORT TABS =====
