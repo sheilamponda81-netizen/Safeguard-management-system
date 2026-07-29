@@ -111,6 +111,90 @@ const calculateAge = (dob: string): number => {
   return age;
 };
 
+// ===== Explicit Day / Month / Year date picker =====
+// Native <input type="date"> displays its segment order (DD/MM/YYYY vs
+// MM/DD/YYYY) according to the browser/OS locale -- invisible to us and
+// inconsistent across devices, so an admin expecting DD/MM/YYYY can end up
+// typing what they mean as the day into a segment the browser treats as the
+// month, producing an out-of-range value like "20" where a month belongs.
+// Three explicit Day/Month/Year selects remove the ambiguity entirely: the
+// month is always chosen by name, so it can never be misread as a day.
+const DATE_MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+];
+
+const parseISODateParts = (iso?: string) => {
+  if (!iso) return { day: '', month: '', year: '' };
+  const [year, month, day] = iso.split('-');
+  return { day: day || '', month: month || '', year: year || '' };
+};
+
+const daysInMonth = (month: string, year: string): number => {
+  if (!month) return 31;
+  const y = year ? parseInt(year, 10) : new Date().getFullYear();
+  return new Date(y, parseInt(month, 10), 0).getDate();
+};
+
+function DateFieldDMY({ value, onChange, required, disabled }: {
+  value: string;
+  onChange: (isoDate: string) => void;
+  required?: boolean;
+  disabled?: boolean;
+}) {
+  const { day, month, year } = parseISODateParts(value);
+  const dayOptions = Array.from({ length: daysInMonth(month, year) }, (_, i) => String(i + 1).padStart(2, '0'));
+  const currentYear = new Date().getFullYear();
+  const yearOptions = Array.from({ length: 90 }, (_, i) => String(currentYear - i));
+
+  const emit = (nextDay: string, nextMonth: string, nextYear: string) => {
+    onChange(nextDay && nextMonth && nextYear ? `${nextYear}-${nextMonth}-${nextDay}` : '');
+  };
+
+  const selectClass = "px-2 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white disabled:opacity-50";
+
+  return (
+    <div className="grid grid-cols-3 gap-2">
+      <select aria-label="Day" value={day} onChange={(e) => emit(e.target.value, month, year)} required={required} disabled={disabled} className={selectClass}>
+        <option value="">Day</option>
+        {dayOptions.map(d => <option key={d} value={d}>{d}</option>)}
+      </select>
+      <select
+        aria-label="Month"
+        value={month}
+        onChange={(e) => {
+          const nextMonth = e.target.value;
+          const maxDay = daysInMonth(nextMonth, year);
+          const clampedDay = day && parseInt(day, 10) > maxDay ? String(maxDay).padStart(2, '0') : day;
+          emit(clampedDay, nextMonth, year);
+        }}
+        required={required}
+        disabled={disabled}
+        className={selectClass}
+      >
+        <option value="">Month</option>
+        {DATE_MONTH_NAMES.map((m, i) => <option key={m} value={String(i + 1).padStart(2, '0')}>{m}</option>)}
+      </select>
+      <select
+        aria-label="Year"
+        value={year}
+        onChange={(e) => {
+          const nextYear = e.target.value;
+          const maxDay = daysInMonth(month, nextYear);
+          const clampedDay = day && parseInt(day, 10) > maxDay ? String(maxDay).padStart(2, '0') : day;
+          emit(clampedDay, month, nextYear);
+        }}
+        required={required}
+        disabled={disabled}
+        className={selectClass}
+      >
+        <option value="">Year</option>
+        {yearOptions.map(y => <option key={y} value={y}>{y}</option>)}
+      </select>
+    </div>
+  );
+}
+
 // ===== Shared Add/Edit employee form validation =====
 // Every textbox on the form is mandatory -- this is the single place that
 // list lives, so the Add and Edit forms (which duplicate the same fields)
@@ -324,57 +408,56 @@ export function EmployeesPage() {
   // ~2000 records) -- checked against active (non-deleted) employees only, so
   // a soft-deleted record's old details never blocks reusing them.
   const checkDuplicates = useCallback(async (nationalId: string, phone: string, accountNumber: string, employeeId?: string) => {
-    let nationalIdExists = false;
-    let phoneExists = false;
-    let accountExists = false;
-
-    if (nationalId) {
-      let query = supabase
-        .from('employees')
-        .select('id')
-        .eq('national_id', nationalId)
-        .eq('is_deleted', false);
-
+    // Independent lookups -- run in parallel instead of three sequential
+    // round trips, which also cuts the window where a network blip during
+    // this step can turn into a "Failed to fetch" partway through adding an
+    // employee.
+    const buildQuery = (column: string, value: string) => {
+      let query = supabase.from('employees').select('id').eq(column, value).eq('is_deleted', false);
       if (employeeId) {
         query = query.neq('id', employeeId);
       }
+      return query;
+    };
 
-      const { data: nationalIdData } = await query;
-      nationalIdExists = !!(nationalIdData && nationalIdData.length > 0);
-    }
+    const [nationalIdResult, phoneResult, accountResult] = await Promise.all([
+      nationalId ? buildQuery('national_id', nationalId) : Promise.resolve({ data: [] as any[] }),
+      phone ? buildQuery('phone', phone) : Promise.resolve({ data: [] as any[] }),
+      accountNumber ? buildQuery('account_number', accountNumber) : Promise.resolve({ data: [] as any[] }),
+    ]);
 
-    if (phone) {
-      let query = supabase
-        .from('employees')
-        .select('id')
-        .eq('phone', phone)
-        .eq('is_deleted', false);
-
-      if (employeeId) {
-        query = query.neq('id', employeeId);
-      }
-
-      const { data: phoneData } = await query;
-      phoneExists = !!(phoneData && phoneData.length > 0);
-    }
-
-    if (accountNumber) {
-      let query = supabase
-        .from('employees')
-        .select('id')
-        .eq('account_number', accountNumber)
-        .eq('is_deleted', false);
-
-      if (employeeId) {
-        query = query.neq('id', employeeId);
-      }
-
-      const { data: accountData } = await query;
-      accountExists = !!(accountData && accountData.length > 0);
-    }
-
-    return { nationalIdExists, phoneExists, accountExists };
+    return {
+      nationalIdExists: !!(nationalIdResult.data && nationalIdResult.data.length > 0),
+      phoneExists: !!(phoneResult.data && phoneResult.data.length > 0),
+      accountExists: !!(accountResult.data && accountResult.data.length > 0),
+    };
   }, []);
+
+  // Same region-prefix + last-number-plus-one logic AddEmployeeForm uses to
+  // show a live preview after picking a region -- extracted here so
+  // addEmployee can call it again, with a fresh read, whenever the number it
+  // was handed collides with one someone else just took.
+  const getNextEmployeeNumberForRegion = useCallback(async (regionId: string): Promise<string> => {
+    const region = regions.find((r) => r.id === regionId);
+    const regionLetter = (region?.code?.trim() || region?.name?.trim() || 'X').charAt(0).toUpperCase();
+    const prefix = `SFG-${regionLetter}-`;
+
+    const { data } = await supabase
+      .from('employees')
+      .select('employee_number')
+      .ilike('employee_number', `${prefix}%`)
+      .order('employee_number', { ascending: false })
+      .limit(1);
+
+    let nextNumber = 1;
+    if (data && data.length > 0) {
+      const match = data[0].employee_number.match(/\d+$/);
+      if (match) {
+        nextNumber = parseInt(match[0]) + 1;
+      }
+    }
+    return `${prefix}${nextNumber.toString().padStart(3, '0')}`;
+  }, [regions]);
 
   // ===== ADD EMPLOYEE =====
   const addEmployee = useCallback(async (emp: any) => {
@@ -406,18 +489,7 @@ export function EmployeesPage() {
       showNotification('Please select a region', 'error');
       return;
     }
-    
-    const { data: existing } = await supabase
-      .from('employees')
-      .select('employee_number')
-      .eq('employee_number', safeEmp.employeeNumber)
-      .single();
-    
-    if (existing) {
-      showNotification(`Employee number ${safeEmp.employeeNumber} already exists!`, 'error');
-      return;
-    }
-    
+
     const { nationalIdExists, phoneExists, accountExists } = await checkDuplicates(safeEmp.nationalId, safeEmp.phone, safeEmp.account_number);
 
     if (nationalIdExists) {
@@ -443,49 +515,100 @@ export function EmployeesPage() {
     
     const uniformDeduction = parseInt(safeEmp.uniform_deduction) || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
-    
-    const { data, error } = await supabase
-      .from('employees')
-      .insert([{
-        employee_number: safeEmp.employeeNumber,
-        full_name: safeEmp.fullName,
-        gender: safeEmp.gender,
-        age: calculatedAge,
-        phone: safeEmp.phone,
-        position: safeEmp.position,
-        department: safeEmp.department,
-        basic_salary: parseFloat(safeEmp.basicSalary),
-        status: safeEmp.status || 'Active',
-        email: safeEmp.email,
-        hire_date: safeEmp.dateHired && safeEmp.dateHired !== '' ? safeEmp.dateHired : new Date().toISOString().split('T')[0],
-        dob: safeEmp.dob && safeEmp.dob !== '' ? safeEmp.dob : null,
-        national_id: safeEmp.nationalId,
-        address: safeEmp.address,
-        qualification: safeEmp.qualification,
-        contract_type: safeEmp.contractType,
-        region_id: assignedRegionId,
-        company: formattedCompany,
-        workstation: formattedWorkstation,
-        pay_point: safeEmp.pay_point,
-        account_number: safeEmp.account_number,
-        uniform_deduction: uniformDeduction,
-        next_of_kin_name: safeEmp.next_of_kin_name,
-        next_of_kin_relationship: safeEmp.next_of_kin_relationship,
-        next_of_kin_phone: safeEmp.next_of_kin_phone,
-        next_of_kin_address: safeEmp.next_of_kin_address,
-        is_deleted: false,
-        deleted_at: null,
-        deleted_reason: null,
-        deleted_by: null,
-        assignment_type: safeEmp.assignment_type || 'company',
-        resident_name: formattedResidentName,
-        resident_contact: formattedResidentContact,
-        // company_id will be set by the trigger
-      }])
-      .select();
-    
+
+    const buildInsertRow = (employeeNumber: string) => ({
+      employee_number: employeeNumber,
+      full_name: safeEmp.fullName,
+      gender: safeEmp.gender,
+      age: calculatedAge,
+      phone: safeEmp.phone,
+      position: safeEmp.position,
+      department: safeEmp.department,
+      basic_salary: parseFloat(safeEmp.basicSalary),
+      status: safeEmp.status || 'Active',
+      email: safeEmp.email,
+      hire_date: safeEmp.dateHired && safeEmp.dateHired !== '' ? safeEmp.dateHired : new Date().toISOString().split('T')[0],
+      dob: safeEmp.dob && safeEmp.dob !== '' ? safeEmp.dob : null,
+      national_id: safeEmp.nationalId,
+      address: safeEmp.address,
+      qualification: safeEmp.qualification,
+      contract_type: safeEmp.contractType,
+      region_id: assignedRegionId,
+      company: formattedCompany,
+      workstation: formattedWorkstation,
+      pay_point: safeEmp.pay_point,
+      account_number: safeEmp.account_number,
+      uniform_deduction: uniformDeduction,
+      next_of_kin_name: safeEmp.next_of_kin_name,
+      next_of_kin_relationship: safeEmp.next_of_kin_relationship,
+      next_of_kin_phone: safeEmp.next_of_kin_phone,
+      next_of_kin_address: safeEmp.next_of_kin_address,
+      is_deleted: false,
+      deleted_at: null,
+      deleted_reason: null,
+      deleted_by: null,
+      assignment_type: safeEmp.assignment_type || 'company',
+      resident_name: formattedResidentName,
+      resident_contact: formattedResidentContact,
+      // company_id will be set by the trigger
+    });
+
+    // The employee number is generated client-side (region prefix + last
+    // number + 1) the moment a region is picked, then the admin spends time
+    // filling out the rest of the form -- plenty of time for someone else
+    // (another admin, another tab, or the same admin adding several people
+    // back to back) to take that same "next" number first. Rather than
+    // surfacing that race as an error the user can't act on, retry with a
+    // freshly generated number a few times. A dropped network connection
+    // (fetch throws instead of returning {error}) is retried too, since
+    // adding several employees in a row makes a transient blip more likely
+    // to land mid-request.
+    let employeeNumberToUse = safeEmp.employeeNumber;
+    let data: any = null;
+    let error: any = null;
+    const MAX_INSERT_ATTEMPTS = 5;
+
+    for (let attempt = 1; attempt <= MAX_INSERT_ATTEMPTS; attempt++) {
+      error = null;
+      try {
+        const result = await supabase
+          .from('employees')
+          .insert([buildInsertRow(employeeNumberToUse)])
+          .select();
+        data = result.data;
+        error = result.error;
+      } catch (networkErr: any) {
+        error = { message: networkErr?.message || 'Network error', isNetworkError: true };
+      }
+
+      if (!error) break;
+
+      const isNumberCollision = error.code === '23505' && /employee_number/i.test(error.message || '');
+      const isLastAttempt = attempt === MAX_INSERT_ATTEMPTS;
+
+      if (isNumberCollision && !isLastAttempt) {
+        employeeNumberToUse = await getNextEmployeeNumberForRegion(assignedRegionId);
+        continue;
+      }
+
+      if (error.isNetworkError && !isLastAttempt) {
+        await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+        continue;
+      }
+
+      break;
+    }
+
     if (error) {
-      showNotification('Error adding employee: ' + error.message, 'error');
+      // Leave the modal open on failure -- closing it here would discard
+      // everything the admin just typed, forcing them to redo the whole
+      // form after a failure that (thanks to the retries above) is now
+      // rarely their fault to begin with.
+      const message = error.isNetworkError
+        ? 'Network error while adding employee. Please check your connection and try again.'
+        : 'Error adding employee: ' + error.message;
+      showNotification(message, 'error');
+      return;
     } else if (data && data[0]) {
       const newEmployee = {
         id: data[0].id,
@@ -538,7 +661,7 @@ export function EmployeesPage() {
       showNotification(`${safeEmp.fullName} has been added`, 'success');
     }
     setShowAdd(false);
-  }, [userProfile, employees, checkDuplicates]);
+  }, [userProfile, employees, checkDuplicates, getNextEmployeeNumberForRegion]);
 
   // ===== UPDATE EMPLOYEE =====
   const updateEmployee = useCallback(async (emp: any) => {
@@ -627,7 +750,9 @@ export function EmployeesPage() {
       .select();
     
     if (error) {
+      // Leave the modal open on failure so the admin's edits aren't discarded.
       showNotification('Error updating employee: ' + error.message, 'error');
+      return;
     } else if (data && data[0]) {
       const updatedEmployee = {
         ...editingEmployee,
@@ -1558,6 +1683,13 @@ function AddEmployeeForm({
             required={required}
             disabled={isSubmitting}
           />
+        ) : type === "date" ? (
+          <DateFieldDMY
+            value={form[k] || ""}
+            onChange={(iso) => update(k, iso)}
+            required={required}
+            disabled={isSubmitting}
+          />
         ) : (
           <input
             type={type}
@@ -2261,6 +2393,13 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
             <option value="">Select {label}</option>
             {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
+        ) : type === 'date' ? (
+          <DateFieldDMY
+            value={form[k] || ''}
+            onChange={(iso) => update(k, iso)}
+            required={required}
+            disabled={isSubmitting}
+          />
         ) : (
           <input
             type={type}
