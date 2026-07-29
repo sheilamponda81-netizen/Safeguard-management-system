@@ -33,6 +33,7 @@ export function RecruitmentPage() {
   const [view, setView] = useState<Applicant | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [userProfile, setUserProfile] = useState<any>(null);
+  const [regions, setRegions] = useState<any[]>([]);
 
   // ===== PAGINATION STATES =====
   const [recruitmentPage, setRecruitmentPage] = useState(1);
@@ -75,6 +76,13 @@ export function RecruitmentPage() {
     setUserProfile(profile);
   }, []);
 
+  // Only needed for a super admin to pick which region a new applicant
+  // belongs to -- regional users are always scoped to their own region.
+  const fetchRegions = useCallback(async () => {
+    const { data } = await supabase.from('regions').select('*');
+    setRegions(data || []);
+  }, []);
+
   const fetchApplicants = useCallback(async () => {
     setLoading(true);
     let query = supabase.from('applicants').select('*').order('created_at', { ascending: false });
@@ -98,9 +106,10 @@ export function RecruitmentPage() {
   useEffect(() => {
     const init = async () => {
       await fetchUserProfile();
+      await fetchRegions();
     };
     init();
-  }, [fetchUserProfile]);
+  }, [fetchUserProfile, fetchRegions]);
 
   useEffect(() => {
     if (userProfile) {
@@ -156,6 +165,19 @@ export function RecruitmentPage() {
 
   // ===== ADD APPLICANT =====
   const addApplicant = useCallback(async (newApplicant: any) => {
+    // A super admin has no region of their own, so they must explicitly pick
+    // one for a new applicant (same requirement Employees.tsx's Add Employee
+    // form already enforces) -- otherwise the applicant would be saved with
+    // region_id: null and become invisible to every regional recruiter's
+    // region-scoped view, effectively orphaned.
+    let assignedRegionId = newApplicant.region_id || null;
+    if (!userProfile?.is_super_admin) {
+      assignedRegionId = userProfile?.region_id || null;
+    } else if (!assignedRegionId) {
+      showNotification('Please select a region', 'error');
+      return;
+    }
+
     const { data, error } = await supabase
       .from('applicants')
       .insert([{
@@ -169,15 +191,15 @@ export function RecruitmentPage() {
         decision: 'Pending',
         application_date: new Date().toISOString().split('T')[0],
         cover_letter: newApplicant.coverLetter || null,
-        region_id: userProfile?.region_id || null,
+        region_id: assignedRegionId,
       }])
       .select();
-    
+
     if (error) {
       showNotification('Error adding applicant: ' + error.message, 'error');
     } else if (data && data[0]) {
       setApplicants([data[0], ...applicants]);
-      
+
       await logAudit({
         action: 'CREATE',
         entity_type: 'applicant',
@@ -191,14 +213,14 @@ export function RecruitmentPage() {
           experience: newApplicant.experience,
           interview_status: 'Pending',
           decision: 'Pending',
-          region_id: userProfile?.region_id || null
+          region_id: assignedRegionId
         },
-        region_id: userProfile?.region_id
+        region_id: assignedRegionId
       });
-      
+
       showNotification(`${newApplicant.name} has been added to recruitment pipeline`, 'success');
+      setShowAddModal(false);
     }
-    setShowAddModal(false);
   }, [applicants, userProfile]);
 
   // ===== VIEW APPLICANT =====
@@ -227,7 +249,8 @@ export function RecruitmentPage() {
       phone: '',
       email: '',
       experience: '',
-      coverLetter: ''
+      coverLetter: '',
+      region_id: ''
     });
 
     return (
@@ -236,6 +259,22 @@ export function RecruitmentPage() {
           {!isSuperAdmin && userRegion && (
             <div className="p-3 rounded-lg bg-[#E8EDF5] text-sm text-slate-700">
               Applicant will be considered for <strong>{userRegion.name}</strong> region
+            </div>
+          )}
+          {isSuperAdmin && (
+            <div>
+              <label htmlFor="applicantRegion" className="block text-sm font-medium text-slate-700 mb-1.5">Region *</label>
+              <select
+                id="applicantRegion"
+                name="applicantRegion"
+                value={formData.region_id}
+                onChange={(e: any) => setFormData({...formData, region_id: e.target.value})}
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg bg-white"
+                required
+              >
+                <option value="">-- Please select a region --</option>
+                {regions.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+              </select>
             </div>
           )}
           <div className="grid grid-cols-2 gap-4">
@@ -327,11 +366,11 @@ export function RecruitmentPage() {
         </div>
         <div className="flex justify-end gap-2 mt-6">
           <button type="button" onClick={() => setShowAddModal(false)} className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium hover:bg-slate-50">Cancel</button>
-          <button type="button" onClick={() => addApplicant(formData)} disabled={!formData.name || !formData.position} className="px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] disabled:opacity-50">Add Applicant</button>
+          <button type="button" onClick={() => addApplicant(formData)} disabled={!formData.name || !formData.position || (isSuperAdmin && !formData.region_id)} className="px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] disabled:opacity-50">Add Applicant</button>
         </div>
       </Modal>
     );
-  }, [showAddModal, isSuperAdmin, userRegion, addApplicant]);
+  }, [showAddModal, isSuperAdmin, userRegion, regions, addApplicant]);
 
   // ===== RENDER =====
   if (loading) {
@@ -404,7 +443,7 @@ export function RecruitmentPage() {
           />
         </div>
         <div className="flex gap-2 flex-wrap">
-          {['all', 'pending', 'shortlisted', 'interviewed', 'accepted'].map(f => (
+          {['all', 'pending', 'shortlisted', 'interviewed', 'accepted', 'rejected'].map(f => (
             <button 
               key={f} 
               type="button"
