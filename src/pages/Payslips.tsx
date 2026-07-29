@@ -7,6 +7,7 @@ import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
+import { getPayrollRates, PayrollRates } from '../utils/payrollSettings';
 import {
   getSystemCurrentMonth,
   getMonthLabel,
@@ -57,6 +58,7 @@ interface PayrollRecord {
   uniform_deduction: number;
   net_pay: number;
   processed_at: string;
+  approval_status?: string;
   employee?: Employee;
 }
 
@@ -82,6 +84,7 @@ interface PayslipTemplate {
   companyName: string;
   companyAddress: string;
   companyPhone: string;
+  companyEmail: string;
   showLogo: boolean;
   showPayPoint: boolean;
   showContractType: boolean;
@@ -95,8 +98,9 @@ interface PayslipTemplate {
 
 const defaultTemplate: PayslipTemplate = {
   companyName: 'SAFEGUARD SECURITY SERVICES',
-  companyAddress: 'Lilongwe, Malawi · (+265) 1 234 567',
-  companyPhone: '(+265) 1 234 567',
+  companyAddress: 'Head Office Tikumbe Building - Naperi, P.O.Box 30158, Chichiri, Blantyre 3, Malawi.',
+  companyPhone: '0882014775 / 0999957834',
+  companyEmail: 'headoffice@safeguardsecurity.mw',
   showLogo: true,
   showPayPoint: true,
   showContractType: true,
@@ -125,6 +129,7 @@ export function PayslipsPage() {
   const [showTemplateModal, setShowTemplateModal] = useState(false);
   const [template, setTemplate] = useState<PayslipTemplate>(defaultTemplate);
   const [downloading, setDownloading] = useState(false);
+  const [payrollRates, setPayrollRates] = useState<PayrollRates>({ payeRate: 0.30, payeThreshold: 50000, pensionEmployeeRate: 0.05 });
 
   // ===== PAGINATION STATES =====
   const [payslipsPage, setPayslipsPage] = useState(1);
@@ -173,6 +178,14 @@ export function PayslipsPage() {
     }
   }, []);
 
+  // ===== SHARED PAYROLL RATES (PAYE rate/threshold, pension rate) FROM SETTINGS =====
+  // Same source of truth Payroll.tsx and Payments.tsx use, so the rate labels
+  // printed on a payslip ("PAYE Tax (X%)") always match what was actually
+  // configured/applied, instead of a hardcoded "30%"/"5%".
+  useEffect(() => {
+    getPayrollRates().then(setPayrollRates);
+  }, []);
+
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
@@ -209,10 +222,21 @@ export function PayslipsPage() {
         payPoint: emp.pay_point || 'N/A',
         contractType: emp.contract_type || 'Permanent',
         region_id: emp.region_id,
-        uniform_deduction: emp.uniform_deduction || 10000
+        uniform_deduction: emp.uniform_deduction ?? 10000
       }));
 
       setEmployees(mappedEmployees);
+      const employeesById = new Map(mappedEmployees.map(e => [e.id, e]));
+
+      // Positions eligible for a uniform deduction -- same flag Payroll.tsx
+      // gates on, so a senior/office position never shows a fabricated
+      // "Uniform Deduction" line here just because their employee record
+      // still has a leftover uniform_deduction value.
+      const { data: positionsData, error: posError } = await supabase
+        .from('positions')
+        .select('name, requires_uniform');
+      if (posError) throw posError;
+      const positionMap = new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]));
 
       // Fetch payroll records
       let payrollQuery = supabase
@@ -227,8 +251,14 @@ export function PayslipsPage() {
         }
       }
 
-      const { data: payrollData, error: payError } = await payrollQuery;
+      const { data: rawPayrollData, error: payError } = await payrollQuery;
       if (payError) throw payError;
+
+      // A rejected payroll run isn't valid pay data -- it's flagged for
+      // rework and its figures may still change, so no payslip should be
+      // generated from it. Pending and approved runs both produce payslips;
+      // only the badge differs (see render below).
+      const payrollData = (rawPayrollData || []).filter((r: any) => r.approval_status !== 'rejected');
 
       // Fetch employee deductions for the month
       const { data: deductionsData, error: dedError } = await supabase
@@ -239,15 +269,15 @@ export function PayslipsPage() {
       if (dedError) throw dedError;
       setEmployeeDeductions(deductionsData || []);
 
-      setPayrollRecords(payrollData || []);
+      setPayrollRecords(payrollData);
 
       const payslipData: PayslipData[] = [];
-      
-      if (payrollData && payrollData.length > 0) {
+
+      if (payrollData.length > 0) {
         payrollData.forEach((payroll: any) => {
-          const employee = mappedEmployees.find((e: Employee) => e.id === payroll.employee_id);
+          const employee = employeesById.get(payroll.employee_id);
           const deduction = deductionsData?.find((d: any) => d.employee_id === payroll.employee_id);
-          
+
           if (employee) {
             // Calculate deduction breakdown
             const absentDays = deduction?.absent_days || 0;
@@ -256,8 +286,9 @@ export function PayslipsPage() {
             const lateDeduction = lateDays * 4200;
             const lectureDeduction = deduction?.lecture_deduction || 0;
             const appearanceDeduction = deduction?.appearance_deduction || 0;
-            const uniformAmount = employee.uniform_deduction || 10000;
-            
+            const positionRequiresUniform = positionMap.get(employee.position) ?? true;
+            const uniformAmount = positionRequiresUniform ? (employee.uniform_deduction ?? 10000) : 0;
+
             payslipData.push({
               employee,
               payroll: {
@@ -274,6 +305,7 @@ export function PayslipsPage() {
                 uniform_deduction: payroll.uniform_deduction || 0,
                 net_pay: payroll.net_pay,
                 processed_at: payroll.processed_at,
+                approval_status: payroll.approval_status || 'pending',
                 absent_days: absentDays,
                 late_days: lateDays,
                 absent_deduction: absentDeduction,
@@ -373,8 +405,11 @@ export function PayslipsPage() {
     const n = p.net_pay;
     const t = customTemplate || template;
     
-    // Calculate deduction breakdowns
-    const uniformAmount = p.uniform_amount || employee.uniform_deduction || 10000;
+    // Calculate deduction breakdowns. uniform_amount was already gated by the
+    // employee's position eligibility in fetchPayslipData -- ?? 0, not ||,
+    // so a legitimate MK 0 (position doesn't require a uniform) isn't
+    // overwritten by a fabricated fallback.
+    const uniformAmount = p.uniform_amount ?? 0;
     const absentDeduction = p.absent_deduction || 0;
     const lateDeduction = p.late_deduction || 0;
     const lectureDeduction = p.lecture_deduction || 0;
@@ -382,7 +417,9 @@ export function PayslipsPage() {
     const absentDays = p.absent_days || 0;
     const lateDays = p.late_days || 0;
     const totalUniformAtt = p.uniform_deduction || 0;
-    
+    const payePct = Math.round(payrollRates.payeRate * 100);
+    const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
+
     return `<!DOCTYPE html>
       <html>
       <head>
@@ -419,6 +456,8 @@ export function PayslipsPage() {
           <div>
             <div class="company-name">${t.companyName}</div>
             <div class="company-sub">${t.companyAddress}</div>
+            <div class="company-sub">Tel: ${t.companyPhone}</div>
+            <div class="company-sub">Email: ${t.companyEmail}</div>
           </div>
           <div>
             <div class="payslip-title">PAYSLIP</div>
@@ -439,15 +478,15 @@ export function PayslipsPage() {
           <div>
             <div class="section-title">Earnings</div>
             <div class="row"><span class="label">Basic Salary</span><span class="amount">${formatKwacha(p.basic_salary)}</span></div>
-            <div class="row"><span class="label">Allowances (10%)</span><span class="amount">${formatKwacha(p.allowances)}</span></div>
-            <div class="row"><span class="label">Overtime (5%)</span><span class="amount">${formatKwacha(p.overtime)}</span></div>
+            <div class="row"><span class="label">Allowances</span><span class="amount">${formatKwacha(p.allowances)}</span></div>
+            <div class="row"><span class="label">Overtime</span><span class="amount">${formatKwacha(p.overtime)}</span></div>
             <div class="row"><span class="label">Bonus</span><span class="amount">${formatKwacha(p.bonus)}</span></div>
             <div class="total-row"><span>Gross Pay</span><span class="amount">${formatKwacha(p.gross_pay)}</span></div>
           </div>
           <div>
             <div class="section-title">Deductions</div>
-            <div class="row deduction-item"><span class="label">PAYE Tax (30%)</span><span class="amount">-${formatKwacha(p.paye)}</span></div>
-            <div class="row deduction-item"><span class="label">Pension (5%)</span><span class="amount">-${formatKwacha(p.pension)}</span></div>
+            <div class="row deduction-item"><span class="label">PAYE Tax (${payePct}%)</span><span class="amount">-${formatKwacha(p.paye)}</span></div>
+            <div class="row deduction-item"><span class="label">Pension (${pensionPct}%)</span><span class="amount">-${formatKwacha(p.pension)}</span></div>
             <div class="row deduction-item" style="border-bottom: none;"><span class="label">Uniform & Attendance</span><span class="amount">-${formatKwacha(totalUniformAtt)}</span></div>
             <div class="deduction-breakdown">
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
@@ -472,7 +511,7 @@ export function PayslipsPage() {
         <div class="footer">${t.footerText}</div>
       </body>
       </html>`;
-  }, [selectedMonth, selectedYear, template]);
+  }, [selectedMonth, selectedYear, template, payrollRates]);
 
   // ===== GENERATE PDF (Lazy Loaded) =====
   const generatePDF = useCallback(async (payslip: PayslipData): Promise<Blob | null> => {
@@ -481,10 +520,13 @@ export function PayslipsPage() {
       
       const employee = payslip.employee;
       const p = payslip.payroll as ExtendedPayrollRecord;
+      const n = p.net_pay;
       const t = template;
-      
-      // Calculate deduction breakdowns
-      const uniformAmount = p.uniform_amount || employee.uniform_deduction || 10000;
+
+      // Calculate deduction breakdowns. uniform_amount was already gated by
+      // the employee's position eligibility in fetchPayslipData -- ?? 0, not
+      // ||, so a legitimate MK 0 isn't overwritten by a fabricated fallback.
+      const uniformAmount = p.uniform_amount ?? 0;
       const absentDeduction = p.absent_deduction || 0;
       const lateDeduction = p.late_deduction || 0;
       const lectureDeduction = p.lecture_deduction || 0;
@@ -492,6 +534,8 @@ export function PayslipsPage() {
       const absentDays = p.absent_days || 0;
       const lateDays = p.late_days || 0;
       const totalUniformAtt = p.uniform_deduction || 0;
+      const payePct = Math.round(payrollRates.payeRate * 100);
+      const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
 
       const container = document.createElement('div');
       container.style.position = 'absolute';
@@ -508,6 +552,8 @@ export function PayslipsPage() {
           <div>
             <div style="font-size: 24px; font-weight: bold; color: ${t.primaryColor};">${t.companyName}</div>
             <div style="font-size: 12px; color: #666;">${t.companyAddress}</div>
+            <div style="font-size: 12px; color: #666;">Tel: ${t.companyPhone}</div>
+            <div style="font-size: 12px; color: #666;">Email: ${t.companyEmail}</div>
           </div>
           <div>
             <div style="font-size: 20px; font-weight: bold; color: ${t.primaryColor}; text-align: right;">PAYSLIP</div>
@@ -528,15 +574,15 @@ export function PayslipsPage() {
           <div>
             <div style="font-size: 13px; font-weight: bold; color: ${t.primaryColor}; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px;">Earnings</div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Basic Salary</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.basic_salary)}</span></div>
-            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Allowances (10%)</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.allowances)}</span></div>
-            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Overtime (5%)</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.overtime)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Allowances</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.allowances)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Overtime</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.overtime)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Bonus</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.bonus)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px;"><span>Gross Pay</span><span style="color: ${t.primaryColor};">${formatKwacha(p.gross_pay)}</span></div>
           </div>
           <div>
             <div style="font-size: 13px; font-weight: bold; color: ${t.primaryColor}; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px;">Deductions</div>
-            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">PAYE Tax (30%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.paye)}</span></div>
-            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Pension (5%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.pension)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">PAYE Tax (${payePct}%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.paye)}</span></div>
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Pension (${pensionPct}%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.pension)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5; border-bottom: none;"><span style="color: #555;">Uniform & Attendance</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(totalUniformAtt)}</span></div>
             <div style="font-size: 11px; color: #dc2626; padding-left: 20px; padding-bottom: 6px;">
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
@@ -585,7 +631,7 @@ export function PayslipsPage() {
       showNotification('Failed to generate PDF: ' + error.message, 'error');
       return null;
     }
-  }, [selectedMonth, selectedYear, template]);
+  }, [selectedMonth, selectedYear, template, payrollRates]);
 
   // ===== DOWNLOAD SINGLE PAYSLIP =====
   const handlePDFDownload = useCallback(async (payslip: PayslipData) => {
@@ -901,7 +947,9 @@ export function PayslipsPage() {
                         <p className="text-xs text-slate-500">{emp.employeeNumber}</p>
                       </div>
                     </div>
-                    <Badge color="green">Processed</Badge>
+                    <Badge color={p.approval_status === 'approved' ? 'green' : 'yellow'}>
+                      {p.approval_status === 'approved' ? 'Processed' : 'Pending'}
+                    </Badge>
                   </div>
                   <div className="border-t border-slate-100 pt-4">
                     <div className="flex justify-between text-xs text-slate-500 mb-1">
@@ -939,7 +987,7 @@ export function PayslipsPage() {
       )}
 
       <Modal open={!!view} onClose={() => setView(null)} title={`Payslip Preview - ${selectedMonth} ${selectedYear}`} size="lg">
-        {view && <PayslipPDF payslip={view} month={selectedMonth} year={selectedYear} onPrint={handlePrint} onDownload={handlePDFDownload} />}
+        {view && <PayslipPDF payslip={view} month={selectedMonth} year={selectedYear} template={template} payrollRates={payrollRates} onPrint={handlePrint} onDownload={handlePDFDownload} />}
       </Modal>
 
       {/* Template Customization Modal */}
@@ -969,6 +1017,31 @@ export function PayslipsPage() {
                 type="text"
                 value={template.companyAddress}
                 onChange={(e) => setTemplate({...template, companyAddress: e.target.value})}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="companyPhone" className="block text-sm font-medium text-slate-700 mb-1">Company Phone</label>
+              <input
+                id="companyPhone"
+                name="companyPhone"
+                type="text"
+                value={template.companyPhone}
+                onChange={(e) => setTemplate({...template, companyPhone: e.target.value})}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+            <div>
+              <label htmlFor="companyEmail" className="block text-sm font-medium text-slate-700 mb-1">Company Email</label>
+              <input
+                id="companyEmail"
+                name="companyEmail"
+                type="text"
+                value={template.companyEmail}
+                onChange={(e) => setTemplate({...template, companyEmail: e.target.value})}
                 className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
               />
             </div>
@@ -1091,14 +1164,18 @@ interface PayslipPDFProps {
   payslip: PayslipData;
   month: string;
   year: string;
+  template: PayslipTemplate;
+  payrollRates: PayrollRates;
   onPrint: (payslip: PayslipData) => void;
   onDownload: (payslip: PayslipData) => void;
 }
 
-function PayslipPDF({ payslip, month, year, onPrint, onDownload }: PayslipPDFProps) {
+function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onDownload }: PayslipPDFProps) {
   const employee = payslip.employee;
   const p = payslip.payroll as ExtendedPayrollRecord;
   const n = p.net_pay;
+  const payePct = Math.round(payrollRates.payeRate * 100);
+  const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
 
   return (
     <div className="space-y-5">
@@ -1109,13 +1186,17 @@ function PayslipPDF({ payslip, month, year, onPrint, onDownload }: PayslipPDFPro
               <Shield size={24} className="text-[#D4A017]" />
             </div>
             <div>
-              <h1 className="text-xl font-bold text-[#081C3A]">SAFEGUARD SECURITY SERVICES</h1>
-              <p className="text-xs text-slate-500">Lilongwe, Malawi · (+265) 1 234 567</p>
+              <h1 className="text-xl font-bold text-[#081C3A]">{template.companyName}</h1>
+              <p className="text-xs text-slate-500">{template.companyAddress}</p>
+              <p className="text-xs text-slate-500">Tel: {template.companyPhone} · Email: {template.companyEmail}</p>
             </div>
           </div>
           <div className="text-right">
             <p className="text-sm font-bold text-[#081C3A]">PAYSLIP</p>
             <p className="text-xs text-slate-500">{month} {year}</p>
+            <Badge color={p.approval_status === 'approved' ? 'green' : 'yellow'}>
+              {p.approval_status === 'approved' ? 'Processed' : 'Pending'}
+            </Badge>
           </div>
         </div>
 
@@ -1136,8 +1217,8 @@ function PayslipPDF({ payslip, month, year, onPrint, onDownload }: PayslipPDFPro
             <div className="space-y-2 text-xs">
               {[
                 ['Basic Salary', p.basic_salary],
-                ['Allowances (10%)', p.allowances],
-                ['Overtime (5%)', p.overtime],
+                ['Allowances', p.allowances],
+                ['Overtime', p.overtime],
                 ['Bonus', p.bonus]
               ].map(([k, v]) => (
                 <div key={String(k)} className="flex justify-between">
@@ -1155,8 +1236,8 @@ function PayslipPDF({ payslip, month, year, onPrint, onDownload }: PayslipPDFPro
             <h3 className="text-xs font-bold text-[#081C3A] uppercase tracking-wider mb-3 pb-2 border-b border-slate-200">Deductions</h3>
             <div className="space-y-2 text-xs">
               {[
-                ['PAYE Tax (30%)', p.paye],
-                ['Pension (5%)', p.pension],
+                [`PAYE Tax (${payePct}%)`, p.paye],
+                [`Pension (${pensionPct}%)`, p.pension],
                 ['Uniform & Attendance', p.uniform_deduction]
               ].map(([k, v]) => (
                 <div key={String(k)} className="flex justify-between">
@@ -1177,13 +1258,15 @@ function PayslipPDF({ payslip, month, year, onPrint, onDownload }: PayslipPDFPro
             <p className="text-xs opacity-80 uppercase tracking-wider">Total Net Pay</p>
             <p className="text-3xl font-bold text-[#D4A017]">{formatKwacha(n)}</p>
           </div>
-          <div className="text-right text-xs">
-            <p className="opacity-80">Payment Method: Bank Transfer</p>
-            <p className="opacity-80">Authorized: William Banda (Admin)</p>
-          </div>
+          {template.showAuthorizedBy && (
+            <div className="text-right text-xs">
+              <p className="opacity-80">Payment Method: Bank Transfer</p>
+              <p className="opacity-80">Authorized: {template.authorizedName} ({template.authorizedTitle})</p>
+            </div>
+          )}
         </div>
 
-        <p className="text-center text-xs text-slate-400 mt-4">This is a system-generated payslip. No signature required.</p>
+        <p className="text-center text-xs text-slate-400 mt-4">{template.footerText}</p>
       </div>
 
       <div className="flex items-center justify-end gap-2">
