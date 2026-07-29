@@ -169,24 +169,31 @@ export function SecurityPage() {
       }
       
       console.log('Fetching security data for region:', profile?.region_id);
-      
+
       // Build the query - exclude deleted employees
       let query = supabase
         .from('employees')
         .select('*')
         .eq('is_deleted', false);
-      
-      // Filter by security-related positions
-      const positionFilter = 'position.ilike.%guard%,position.ilike.%security%,position.ilike.%officer%,position.ilike.%patrol%,position.ilike.%supervisor%';
-      query = query.or(positionFilter);
-      
+
       // Region filter for non-super admins
       if (!profile?.is_super_admin && profile?.region_id) {
         query = query.eq('region_id', profile.region_id);
       }
-      
-      const { data, error } = await query.order('full_name');
-      
+
+      // Membership in this page is driven by the same per-position
+      // "Requires Uniform" flag (Settings -> Positions) that already
+      // distinguishes guards/supervisors/handlers from senior/office staff
+      // for payroll uniform deductions -- not a fragile substring match on
+      // the position title, which would both miss real roles (e.g. "K9
+      // Handler" contains none of "guard/security/officer/patrol/
+      // supervisor") and wrongly include senior titles that happen to
+      // contain one of those words (e.g. "Compliance Officer").
+      const [{ data, error }, { data: positionsData }] = await Promise.all([
+        query.order('full_name'),
+        supabase.from('positions').select('name, requires_uniform'),
+      ]);
+
       if (error) {
         console.error('Error fetching security data:', error);
         setFetchError('Database error: ' + error.message);
@@ -194,16 +201,23 @@ export function SecurityPage() {
         setLoading(false);
         return;
       }
-      
-      console.log('Security data fetched:', data?.length || 0, 'records');
-      
-      if (!data || data.length === 0) {
+
+      const positionsRequiringUniform = new Map(
+        (positionsData || []).map(p => [p.name, p.requires_uniform !== false])
+      );
+      const securityEmployees = (data || []).filter(
+        emp => positionsRequiringUniform.get(emp.position) ?? true
+      );
+
+      console.log('Security data fetched:', securityEmployees.length, 'records');
+
+      if (securityEmployees.length === 0) {
         setSecurityData([]);
         setLoading(false);
         return;
       }
-      
-      const enhancedData = data.map((emp: any, i: number) => ({
+
+      const enhancedData = securityEmployees.map((emp: any) => ({
         id: emp.id,
         full_name: emp.full_name || '',
         employee_number: emp.employee_number || '',
@@ -213,12 +227,12 @@ export function SecurityPage() {
         region_id: emp.region_id || '',
         company: emp.company || '',
         workstation: emp.workstation || '',
-        shift: emp.shift || shiftsList[i % shiftsList.length],
-        supervisor: emp.supervisor || supervisorsList[i % supervisorsList.length],
+        shift: emp.shift || 'Not Assigned',
+        supervisor: emp.supervisor || 'Not Assigned',
         uniform_status: emp.uniform_status || 'Pending',
         uniform_condition: emp.uniform_condition || 'Good',
         shoes_status: emp.shoes_status || 'Good',
-        guardId: emp.guardId || `G-${String(100 + i).slice(1)}`,
+        guardId: emp.guardId || '-',
         licenseStatus: emp.license_status || 'Valid',
         license_expiry: emp.license_expiry || '',
         emergency_contact: emp.next_of_kin_name || '',
@@ -240,7 +254,7 @@ export function SecurityPage() {
         setLoading(false);
       }
     }
-  }, [userProfile, fetchUserProfile, shiftsList, supervisorsList]);
+  }, [userProfile, fetchUserProfile]);
 
   // ===== INITIALIZATION - Run once on mount =====
   useEffect(() => {
@@ -921,6 +935,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
   const [showSupervisorDropdown, setShowSupervisorDropdown] = useState(false);
   const supervisorDropdownRef = useRef<HTMLDivElement>(null);
   const [allSupervisors, setAllSupervisors] = useState<any[]>([]);
+  const [positionOptions, setPositionOptions] = useState<string[]>([]);
 
   // Fetch all employees for search (excluding deleted)
   useEffect(() => {
@@ -932,7 +947,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           .select('id, full_name, employee_number, position, phone, company, workstation, status, region_id')
           .eq('is_deleted', false)
           .order('full_name');
-        
+
         if (error) throw error;
         setAllEmployees(data || []);
       } catch (err) {
@@ -942,6 +957,31 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
       }
     };
     fetchEmployees();
+  }, []);
+
+  // ===== FETCH POSITIONS (only the ones eligible for this page -- same
+  // "Requires Uniform" flag the security personnel list itself filters by,
+  // so a position selected here can never disappear from the list after
+  // saving) =====
+  useEffect(() => {
+    const fetchPositions = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('positions')
+          .select('name, requires_uniform')
+          .eq('is_active', true)
+          .order('name');
+        if (error) throw error;
+        const eligible = (data || [])
+          .filter(p => p.requires_uniform !== false)
+          .map(p => p.name);
+        setPositionOptions(eligible.length > 0 ? eligible : ['Security Guard', 'Patrol Officer', 'Supervisor', 'K9 Handler']);
+      } catch (err) {
+        console.error('Error fetching positions:', err);
+        setPositionOptions(['Security Guard', 'Patrol Officer', 'Supervisor', 'K9 Handler']);
+      }
+    };
+    fetchPositions();
   }, []);
 
   // ===== FETCH SUPERVISORS (only employees with supervisor positions) =====
@@ -1265,18 +1305,16 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             onChange={(e: any) => updateForm('position', e.target.value)}
             disabled={!!selectedEmployee}
           >
-            <option>Security Guard</option>
-            <option>Senior Security Officer</option>
-            <option>Patrol Officer</option>
-            <option>Supervisor</option>
-            <option>K9 Handler</option>
+            {(positionOptions.includes(formData.position) ? positionOptions : [formData.position, ...positionOptions]).map(p => (
+              <option key={p} value={p}>{p}</option>
+            ))}
           </select>
         </div>
-        
+
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">Status</label>
-          <select 
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
+          <select
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             value={formData.status} 
             onChange={(e: any) => updateForm('status', e.target.value)}
           >
@@ -1496,6 +1534,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, u
   const [allSupervisors, setAllSupervisors] = useState<any[]>([]);
   const [showSupervisorDropdown, setShowSupervisorDropdown] = useState(false);
   const supervisorDropdownRef = useRef<HTMLDivElement>(null);
+  const [positionOptions, setPositionOptions] = useState<string[]>([]);
 
   // Fetch supervisors
   useEffect(() => {
@@ -1507,7 +1546,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, u
           .eq('is_deleted', false)
           .or('position.ilike.%supervisor%,position.ilike.%manager%,position.ilike.%lead%')
           .order('full_name');
-        
+
         if (error) throw error;
         setAllSupervisors(data || []);
       } catch (err) {
@@ -1515,6 +1554,30 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, u
       }
     };
     fetchSupervisors();
+  }, []);
+
+  // Fetch positions eligible for this page (same "Requires Uniform" flag the
+  // security personnel list itself filters by, so a position selected here
+  // can never disappear from the list after saving)
+  useEffect(() => {
+    const fetchPositions = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('positions')
+          .select('name, requires_uniform')
+          .eq('is_active', true)
+          .order('name');
+        if (error) throw error;
+        const eligible = (data || [])
+          .filter(p => p.requires_uniform !== false)
+          .map(p => p.name);
+        setPositionOptions(eligible.length > 0 ? eligible : ['Security Guard', 'Patrol Officer', 'Supervisor', 'K9 Handler']);
+      } catch (err) {
+        console.error('Error fetching positions:', err);
+        setPositionOptions(['Security Guard', 'Patrol Officer', 'Supervisor', 'K9 Handler']);
+      }
+    };
+    fetchPositions();
   }, []);
 
   // Filter supervisors based on search
@@ -1601,14 +1664,12 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, u
           <label className="block text-sm font-medium text-slate-700 mb-1.5">Position</label>
           <select 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
-            value={formData.position} 
+            value={formData.position}
             onChange={(e: any) => setFormData({...formData, position: e.target.value})}
           >
-            <option>Security Guard</option>
-            <option>Senior Security Officer</option>
-            <option>Patrol Officer</option>
-            <option>Supervisor</option>
-            <option>K9 Handler</option>
+            {(positionOptions.includes(formData.position) ? positionOptions : [formData.position, ...positionOptions]).map(p => (
+              <option key={p} value={p}>{p}</option>
+            ))}
           </select>
         </div>
         
