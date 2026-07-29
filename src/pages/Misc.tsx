@@ -15,6 +15,7 @@ import { logAudit } from '../utils/auditLogger';
 import { MonthSettings } from '../components/MonthSettings';
 import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
 import { getPayrollRates, setPayrollRates } from '../utils/payrollSettings';
+import { showNotification } from '../utils/clickHandlers';
 
 /* ----------------- PAYSLIPS PAGE ----------------- */
 export function PayslipsPage() {
@@ -215,20 +216,36 @@ const loadPositions = async () => {
 
   // ===== UPDATED: handleSavePosition with proper tenant handling =====
 const handleSavePosition = async () => {
-  if (!positionForm.name.trim()) {
-    alert('Please enter a position name');
+  const trimmedName = positionForm.name.trim();
+  if (!trimmedName) {
+    showNotification('Please enter a position name', 'error');
     return;
   }
-  
+
+  // The table's UNIQUE (tenant_id, name) constraint doesn't care whether an
+  // existing row with the same name is active or inactive -- a position
+  // that was toggled off (rather than deleted) still occupies that name.
+  // Checking the already-loaded list first gives a clear, specific error
+  // immediately instead of a raw Postgres "duplicate key" message, and
+  // covers the common case of not noticing the name already exists further
+  // down the (often long) positions table.
+  const duplicate = positions.find(
+    (p) => p.id !== editingPosition?.id && p.name.trim().toLowerCase() === trimmedName.toLowerCase()
+  );
+  if (duplicate) {
+    showNotification(
+      `A position named "${duplicate.name}" already exists${duplicate.is_active ? '' : ' (currently inactive)'}. Edit it instead, or use a different name.`,
+      'error'
+    );
+    return;
+  }
+
   try {
-    const action = editingPosition ? 'UPDATE' : 'CREATE';
-    const entityId = editingPosition?.id || 'new';
-    
     if (editingPosition) {
       const { error } = await supabase
         .from('positions')
         .update({
-          name: positionForm.name,
+          name: trimmedName,
           category: positionForm.category,
           default_salary: positionForm.default_salary,
           is_active: positionForm.is_active,
@@ -251,16 +268,16 @@ const handleSavePosition = async () => {
           is_active: editingPosition.is_active,
           requires_uniform: editingPosition.requires_uniform
         },
-        new_data: positionForm
+        new_data: { ...positionForm, name: trimmedName }
       });
 
-      alert('Position updated successfully');
+      showNotification('Position updated successfully', 'success');
     } else {
       // ===== FIX: Don't include tenant_id in insert =====
       const { data, error } = await supabase
         .from('positions')
         .insert([{
-          name: positionForm.name,
+          name: trimmedName,
           category: positionForm.category,
           default_salary: positionForm.default_salary,
           is_active: positionForm.is_active,
@@ -275,10 +292,10 @@ const handleSavePosition = async () => {
         action: 'CREATE',
         entity_type: 'positions',
         entity_id: data?.[0]?.id || 'new',
-        new_data: positionForm
+        new_data: { ...positionForm, name: trimmedName }
       });
 
-      alert('Position added successfully');
+      showNotification('Position added successfully', 'success');
     }
 
     await loadPositions();
@@ -287,7 +304,12 @@ const handleSavePosition = async () => {
     setPositionForm({ name: '', category: 'security', default_salary: 150000, is_active: true, requires_uniform: true });
   } catch (error: any) {
     console.error('Error saving position:', error);
-    alert(`Failed to save position: ${error.message || 'Unknown error'}`);
+    // Fallback for the same duplicate-name case if another admin added it
+    // concurrently, after this page's own positions list was last loaded.
+    const message = error.code === '23505'
+      ? `A position named "${trimmedName}" already exists.`
+      : `Failed to save position: ${error.message || 'Unknown error'}`;
+    showNotification(message, 'error');
   }
 };
 
