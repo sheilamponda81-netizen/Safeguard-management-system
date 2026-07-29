@@ -142,12 +142,37 @@ function DateFieldDMY({ value, onChange, required, disabled }: {
   required?: boolean;
   disabled?: boolean;
 }) {
-  const { day, month, year } = parseISODateParts(value);
+  // Day/Month/Year are tracked locally rather than derived purely from
+  // `value`: picking just one of the three (e.g. Month, before Day/Year are
+  // also set) doesn't compose into a complete ISO date yet, so onChange gets
+  // called with '' -- if that '' round-tripped straight back into `value`
+  // and this component re-derived its parts from it, the just-picked Month
+  // would immediately reset back to blank on the very next render, making
+  // every dropdown appear to do nothing until all three happened to be
+  // filled in a single render pass. Local state lets a partial pick stay
+  // visible while the other two are still being chosen.
+  const initial = parseISODateParts(value);
+  const [day, setDay] = useState(initial.day);
+  const [month, setMonth] = useState(initial.month);
+  const [year, setYear] = useState(initial.year);
+
+  // Re-sync if `value` changes from outside this component (e.g. a fresh
+  // employee is loaded into the Edit form, or the Add form is reset).
+  useEffect(() => {
+    const parts = parseISODateParts(value);
+    setDay(parts.day);
+    setMonth(parts.month);
+    setYear(parts.year);
+  }, [value]);
+
   const dayOptions = Array.from({ length: daysInMonth(month, year) }, (_, i) => String(i + 1).padStart(2, '0'));
   const currentYear = new Date().getFullYear();
   const yearOptions = Array.from({ length: 90 }, (_, i) => String(currentYear - i));
 
   const emit = (nextDay: string, nextMonth: string, nextYear: string) => {
+    setDay(nextDay);
+    setMonth(nextMonth);
+    setYear(nextYear);
     onChange(nextDay && nextMonth && nextYear ? `${nextYear}-${nextMonth}-${nextDay}` : '');
   };
 
