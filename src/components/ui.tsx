@@ -166,23 +166,27 @@ export function TD({ children, className = '' }: { children: React.ReactNode; cl
 // ===== UPDATED: Modal with top positioning =====
 export function Modal({ open, onClose, title, children, size = 'md', className = '' }:
   { open: boolean; onClose: () => void; title: string; children: React.ReactNode; size?: 'sm' | 'md' | 'lg' | 'xl'; className?: string }) {
+  // Must run before the `open` early return below so this hook is called on
+  // every render regardless of `open` -- calling it after a conditional
+  // return would violate the Rules of Hooks (this component would call zero
+  // hooks while closed and one while open).
+  useEffect(() => {
+    if (!open) return;
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [open, onClose]);
+
   if (!open) return null;
-  
+
   const sizes: Record<string, string> = {
     sm: 'max-w-md',
     md: 'max-w-2xl',
     lg: 'max-w-4xl',
     xl: 'max-w-6xl'
   };
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    document.addEventListener('keydown', handleEscape);
-    return () => document.removeEventListener('keydown', handleEscape);
-  }, [onClose]);
 
   return (
     <div 

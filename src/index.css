@@ -76,7 +76,7 @@ img, svg {
 
 /* Use will-change sparingly for animations */
 .animate-fade-in {
-  will-change: opacity, transform;
+  will-change: opacity;
 }
 
 /* Prevent layout shifts for loading states */
@@ -103,7 +103,7 @@ img, svg {
 
 /* ===== PERFORMANCE: Optimize transitions ===== */
 .transition-all {
-  will-change: transform, opacity, background-color;
+  will-change: opacity, background-color;
 }
 
 .transition-colors {
@@ -172,12 +172,19 @@ img, svg {
   }
   to {
     opacity: 1;
-    transform: translateY(0);
+    /* Must resolve to the literal keyword "none", not translateY(0) -- with
+       animation-fill-mode: forwards the end-state transform value sticks
+       around after the animation finishes, and ANY non-none transform
+       (even a no-op identity one) makes this element a containing block
+       for position:fixed descendants. That silently breaks any <Modal>
+       nested inside a .animate-fade-in wrapper: it stops covering the
+       viewport and instead gets clipped to this element's own box. */
+    transform: none;
   }
 }
 
 .animate-fade-in {
-  animation: fadeIn 0.25s ease-out forwards;
+  animation: fadeIn 0.25s ease-out;
 }
 
 /* ===== TABLET/MOBILE OPTIMIZATIONS ===== */

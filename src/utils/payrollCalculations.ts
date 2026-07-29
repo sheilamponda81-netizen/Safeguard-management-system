@@ -41,12 +41,12 @@ export function calculateLivePayroll(inputs: LivePayrollInputs): LivePayrollResu
   const pension = Math.round(grossPay * inputs.payrollRates.pensionEmployeeRate);
 
   const positionRequiresUniform = inputs.positionsRequiringUniform.get(inputs.position) ?? true;
-  const uniformDeductionValue = positionRequiresUniform ? (inputs.employeeUniformDeduction ?? 10000) : 0;
+  const uniformDeductionValue = positionRequiresUniform ? (inputs.employeeUniformDeduction ?? inputs.payrollRates.uniformDeduction) : 0;
 
   const absentDays = inputs.attendance?.absentDays || 0;
   const lateDays = inputs.attendance?.lateDays || 0;
-  const absentDeduction = absentDays * 4200;
-  const lateDeduction = lateDays * 4200;
+  const absentDeduction = absentDays * inputs.payrollRates.absentDeduction;
+  const lateDeduction = lateDays * inputs.payrollRates.lateDeduction;
   const lectureDeduction = inputs.lectureDeduction || 0;
   const appearanceDeduction = inputs.appearanceDeduction || 0;
   const totalAttendanceDeductions = absentDeduction + lateDeduction + lectureDeduction + appearanceDeduction;

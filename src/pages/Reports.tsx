@@ -9,7 +9,7 @@ import { EmptyState } from '../components/EmptyState';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
-import { getPayrollRates, PayrollRates } from '../utils/payrollSettings';
+import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
@@ -85,11 +85,7 @@ export function ReportsPage() {
   // Same shared rates/gates Payroll.tsx and Payments.tsx use, so a report for
   // an unprocessed month shows the same live-calculated figures those pages
   // show -- not a naive "basic salary as net pay" guess.
-  const [payrollRates, setPayrollRates] = useState<PayrollRates>({
-    payeRate: 0.30,
-    payeThreshold: 50000,
-    pensionEmployeeRate: 0.05,
-  });
+  const [payrollRates, setPayrollRates] = useState<PayrollRates>(DEFAULT_RATES);
   const [positionsRequiringUniform, setPositionsRequiringUniform] = useState<Map<string, boolean>>(new Map());
   // Absent/late day counts per employee for this month, used by
   // calculateLivePayroll's deduction math.

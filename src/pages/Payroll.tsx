@@ -10,7 +10,7 @@ import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
-import { getPayrollRates, PayrollRates } from '../utils/payrollSettings';
+import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll } from '../utils/payrollCalculations';
 
 interface Employee {
@@ -100,11 +100,7 @@ export function PayrollPage() {
   // Position name -> whether that position's employees should get the uniform
   // deduction at all (Settings -> Positions -> "Requires Uniform").
   const [positionsRequiringUniform, setPositionsRequiringUniform] = useState<Map<string, boolean>>(new Map());
-  const [payrollRates, setPayrollRatesState] = useState<PayrollRates>({
-    payeRate: 0.30,
-    payeThreshold: 50000,
-    pensionEmployeeRate: 0.05,
-  });
+  const [payrollRates, setPayrollRatesState] = useState<PayrollRates>(DEFAULT_RATES);
 
   // ===== PAGINATION STATES =====
   const [payrollPage, setPayrollPage] = useState(1);
@@ -1271,7 +1267,7 @@ export function PayrollPage() {
                 const deduction = getEmployeeDeduction(emp.id);
                 const attendance = attendanceCounts.get(emp.id);
                 const positionRequiresUniform = positionsRequiringUniform.get(emp.position) ?? true;
-                const uniformAmount = positionRequiresUniform ? (emp.uniform_deduction ?? 10000) : 0;
+                const uniformAmount = positionRequiresUniform ? (emp.uniform_deduction ?? payrollRates.uniformDeduction) : 0;
                 const hasUniform = uniformAmount > 0;
                 const hasAnyDeduction = p.uniform_deduction > 0;
                 const existingRecord = payrollByEmployee.get(emp.id);

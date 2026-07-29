@@ -7,7 +7,8 @@ import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
-import { getPayrollRates, PayrollRates } from '../utils/payrollSettings';
+import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
+import { getCompanySettings } from '../utils/companySettings';
 import {
   getSystemCurrentMonth,
   getMonthLabel,
@@ -129,7 +130,7 @@ export function PayslipsPage() {
   const [showTemplateModal, setShowTemplateModal] = useState(false);
   const [template, setTemplate] = useState<PayslipTemplate>(defaultTemplate);
   const [downloading, setDownloading] = useState(false);
-  const [payrollRates, setPayrollRates] = useState<PayrollRates>({ payeRate: 0.30, payeThreshold: 50000, pensionEmployeeRate: 0.05 });
+  const [payrollRates, setPayrollRates] = useState<PayrollRates>(DEFAULT_RATES);
 
   // ===== PAGINATION STATES =====
   const [payslipsPage, setPayslipsPage] = useState(1);
@@ -165,17 +166,34 @@ export function PayslipsPage() {
     setPayslipsPage(1);
   }, [search]);
 
-  // ===== LOAD TEMPLATE FROM LOCAL STORAGE =====
+  // ===== LOAD TEMPLATE: presentation prefs from localStorage, company info
+  // from the shared Settings -> Company source of truth =====
+  // Company name/address/phone/email used to be a separate hardcoded copy
+  // baked into `defaultTemplate` above (and independently editable here),
+  // completely disconnected from Settings -> Company -- an admin updating
+  // the company's phone number in Settings had zero effect on payslips.
+  // Loading it from getCompanySettings() makes this the same single source
+  // of truth Settings itself reads/writes, so both stay in sync everywhere.
   useEffect(() => {
     const savedTemplate = localStorage.getItem('payslipTemplate');
     if (savedTemplate) {
       try {
         const parsed = JSON.parse(savedTemplate);
-        setTemplate({ ...defaultTemplate, ...parsed });
+        setTemplate(prev => ({ ...prev, ...defaultTemplate, ...parsed }));
       } catch (e) {
         console.error('Error loading template:', e);
       }
     }
+
+    getCompanySettings().then(company => {
+      setTemplate(prev => ({
+        ...prev,
+        companyName: company.companyName,
+        companyAddress: company.address,
+        companyPhone: company.phone,
+        companyEmail: company.email,
+      }));
+    });
   }, []);
 
   // ===== SHARED PAYROLL RATES (PAYE rate/threshold, pension rate) FROM SETTINGS =====
@@ -222,7 +240,7 @@ export function PayslipsPage() {
         payPoint: emp.pay_point || 'N/A',
         contractType: emp.contract_type || 'Permanent',
         region_id: emp.region_id,
-        uniform_deduction: emp.uniform_deduction ?? 10000
+        uniform_deduction: emp.uniform_deduction ?? payrollRates.uniformDeduction
       }));
 
       setEmployees(mappedEmployees);
@@ -282,12 +300,12 @@ export function PayslipsPage() {
             // Calculate deduction breakdown
             const absentDays = deduction?.absent_days || 0;
             const lateDays = deduction?.late_days || 0;
-            const absentDeduction = absentDays * 4200;
-            const lateDeduction = lateDays * 4200;
+            const absentDeduction = absentDays * payrollRates.absentDeduction;
+            const lateDeduction = lateDays * payrollRates.lateDeduction;
             const lectureDeduction = deduction?.lecture_deduction || 0;
             const appearanceDeduction = deduction?.appearance_deduction || 0;
             const positionRequiresUniform = positionMap.get(employee.position) ?? true;
-            const uniformAmount = positionRequiresUniform ? (employee.uniform_deduction ?? 10000) : 0;
+            const uniformAmount = positionRequiresUniform ? (employee.uniform_deduction ?? payrollRates.uniformDeduction) : 0;
 
             payslipData.push({
               employee,
@@ -328,7 +346,7 @@ export function PayslipsPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedMonth, selectedYear, userProfile, months]);
+  }, [selectedMonth, selectedYear, userProfile, months, payrollRates]);
 
   // ===== INITIALIZATION =====
   useEffect(() => {
@@ -732,8 +750,13 @@ export function PayslipsPage() {
   }, [payslips, selectedMonth, selectedYear, userProfile, generatePDF]);
 
   // ===== SAVE TEMPLATE =====
+  // Company name/address/phone/email are excluded here -- they come from the
+  // shared Settings -> Company info (see the load effect above) and are no
+  // longer independently editable from this modal, so there's nothing of
+  // theirs to persist locally.
   const saveTemplate = useCallback(() => {
-    localStorage.setItem('payslipTemplate', JSON.stringify(template));
+    const { companyName, companyAddress, companyPhone, companyEmail, ...presentation } = template;
+    localStorage.setItem('payslipTemplate', JSON.stringify(presentation));
     showNotification('Payslip template saved successfully!', 'success');
     setShowTemplateModal(false);
   }, [template]);
@@ -997,54 +1020,14 @@ export function PayslipsPage() {
             <p className="text-slate-700">Customize the payslip layout and appearance. Changes will be saved locally.</p>
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="companyName" className="block text-sm font-medium text-slate-700 mb-1">Company Name</label>
-              <input
-                id="companyName"
-                name="companyName"
-                type="text"
-                value={template.companyName}
-                onChange={(e) => setTemplate({...template, companyName: e.target.value})}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-              />
-            </div>
-            <div>
-              <label htmlFor="companyAddress" className="block text-sm font-medium text-slate-700 mb-1">Company Address</label>
-              <input
-                id="companyAddress"
-                name="companyAddress"
-                type="text"
-                value={template.companyAddress}
-                onChange={(e) => setTemplate({...template, companyAddress: e.target.value})}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="companyPhone" className="block text-sm font-medium text-slate-700 mb-1">Company Phone</label>
-              <input
-                id="companyPhone"
-                name="companyPhone"
-                type="text"
-                value={template.companyPhone}
-                onChange={(e) => setTemplate({...template, companyPhone: e.target.value})}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-              />
-            </div>
-            <div>
-              <label htmlFor="companyEmail" className="block text-sm font-medium text-slate-700 mb-1">Company Email</label>
-              <input
-                id="companyEmail"
-                name="companyEmail"
-                type="text"
-                value={template.companyEmail}
-                onChange={(e) => setTemplate({...template, companyEmail: e.target.value})}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-              />
-            </div>
+          <div className="p-3 border border-slate-200 rounded-lg">
+            <p className="text-sm font-medium text-slate-700 mb-1">Company Details</p>
+            <p className="text-sm text-slate-600">{template.companyName}</p>
+            <p className="text-xs text-slate-500">{template.companyAddress}</p>
+            <p className="text-xs text-slate-500">Tel: {template.companyPhone} &middot; Email: {template.companyEmail}</p>
+            <p className="text-xs text-slate-400 mt-2">
+              Company details are shared across the whole system -- edit them once in Settings &rarr; Company and they'll update here and on every payslip automatically.
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-4">

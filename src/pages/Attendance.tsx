@@ -11,6 +11,7 @@ import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { debounce } from '../utils/debounce';
+import { getPayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -49,26 +50,6 @@ interface AttendanceRecord {
   status: string;
 }
 
-interface DeductionSettings {
-  absentDeduction: number;
-  lateDeduction: number;
-  lectureDeduction: number;
-  lectureFullMonthDeduction: number;
-  appearanceDeduction: number;
-}
-
-// These rates have no Settings UI to configure them (nothing in the app ever
-// wrote to the old `attendanceDeductionSettings` localStorage key they used
-// to be read from), so they're a fixed constant rather than state that can
-// never actually change.
-const DEDUCTION_SETTINGS: DeductionSettings = {
-  absentDeduction: 4200,
-  lateDeduction: 4200,
-  lectureDeduction: 3000,
-  lectureFullMonthDeduction: 15000,
-  appearanceDeduction: 2000,
-};
-
 export function AttendancePage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -84,6 +65,15 @@ export function AttendancePage() {
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<any>(null);
   const [updating, setUpdating] = useState<Record<string, boolean>>({});
+  // Attendance deduction rates -- shared, admin-configurable via Settings ->
+  // System (see payrollSettings.ts), instead of the fixed constant these used
+  // to be. Payroll.tsx/Payslips.tsx read the same source for the figures they
+  // recompute from these attendance records.
+  const [deductionRates, setDeductionRates] = useState(DEFAULT_RATES);
+
+  useEffect(() => {
+    getPayrollRates().then(setDeductionRates);
+  }, []);
 
   // ===== PAGINATION STATES =====
   const [attendancePage, setAttendancePage] = useState(1);
@@ -462,27 +452,27 @@ export function AttendancePage() {
       }
     });
     
-    const absentDeduction = counts.A * DEDUCTION_SETTINGS.absentDeduction;
-    const lateDeduction = counts.L * DEDUCTION_SETTINGS.lateDeduction;
+    const absentDeduction = counts.A * deductionRates.absentDeduction;
+    const lateDeduction = counts.L * deductionRates.lateDeduction;
     const attendanceDeduction = absentDeduction + lateDeduction;
-    
+
     let lectureDeduction = 0;
     if (lectureMissedCount > 0) {
       const totalLectures = datesArr.filter(d => {
         const dayOfWeek = new Date(d).getDay();
         return dayOfWeek === 3 || dayOfWeek === 4;
       }).length;
-      
+
       if (lectureMissedCount === totalLectures && totalLectures > 0) {
-        lectureDeduction = DEDUCTION_SETTINGS.lectureFullMonthDeduction;
+        lectureDeduction = deductionRates.lectureFullMonthDeduction;
       } else {
-        lectureDeduction = lectureMissedCount * DEDUCTION_SETTINGS.lectureDeduction;
+        lectureDeduction = lectureMissedCount * deductionRates.lectureDeduction;
       }
     }
-    
-    const appearanceDeduction = DEDUCTION_SETTINGS.appearanceDeduction;
+
+    const appearanceDeduction = deductionRates.appearanceDeduction;
     const totalDeductions = attendanceDeduction + lectureDeduction + appearanceDeduction;
-    
+
     return {
       absentDays: counts.A,
       lateDays: counts.L,
@@ -494,7 +484,7 @@ export function AttendancePage() {
       appearanceDeduction,
       totalDeductions
     };
-  }, [attendanceByEmployee, selectedMonth, getDatesForMonth, getAttendanceStatus]);
+  }, [attendanceByEmployee, selectedMonth, getDatesForMonth, getAttendanceStatus, deductionRates]);
 
   // ===== FILTER EMPLOYEES =====
   const filteredEmployees = useMemo(() => {
@@ -699,8 +689,8 @@ export function AttendancePage() {
           updated.lectureDeduction = safeValue === 0
             ? 0
             : safeValue === totalLecturesThisMonth
-              ? DEDUCTION_SETTINGS.lectureFullMonthDeduction
-              : safeValue * DEDUCTION_SETTINGS.lectureDeduction;
+              ? deductionRates.lectureFullMonthDeduction
+              : safeValue * deductionRates.lectureDeduction;
         }
         updated.totalDeductions =
           (updated.absentDeduction || 0) +

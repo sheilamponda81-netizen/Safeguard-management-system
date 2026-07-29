@@ -1,12 +1,7 @@
-import { useState, useMemo, useEffect } from 'react';
-import { 
-  Shield, FileDown, FileText, FileSpreadsheet, Download, Printer,
-  Plus, Trash2, Edit2, Search, CheckCircle, Map, Building2,
-  Car, Sparkles, Bot, Percent, CreditCard, Camera, ClipboardList,
-  Calendar  // <-- ADDED Calendar here
-} from 'lucide-react';
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, Input } from '../components/ui';
-import { generateEmployees, formatKwacha, computePayroll, netPay, grossPay, Employee } from '../data';
+import { useState, useEffect } from 'react';
+import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar } from 'lucide-react';
+import { Card, Button, Badge, PageHeader, Modal, Tabs, Input } from '../components/ui';
+import { formatKwacha } from '../data';
 import { UserManagement } from '../components/UserManagement';
 import { supabase } from '../lib/supabase';
 // ===== Import audit logger =====
@@ -15,73 +10,8 @@ import { logAudit } from '../utils/auditLogger';
 import { MonthSettings } from '../components/MonthSettings';
 import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
 import { getPayrollRates, setPayrollRates } from '../utils/payrollSettings';
+import { getCompanySettings, setCompanySettings, DEFAULT_COMPANY_INFO } from '../utils/companySettings';
 import { showNotification } from '../utils/clickHandlers';
-
-/* ----------------- PAYSLIPS PAGE ----------------- */
-export function PayslipsPage() {
-  const employees = useMemo(() => generateEmployees(245), []);
-  const [search, setSearch] = useState('');
-  const [view, setView] = useState<Employee | null>(null);
-  const filtered = employees.filter(e => e.fullName.toLowerCase().includes(search.toLowerCase()) || e.employeeNumber.toLowerCase().includes(search.toLowerCase()));
-
-  return (
-    <div className="space-y-6 animate-fade-in">
-      <PageHeader title="Payslips" subtitle="Generate and print professional payslips" actions={<><Button variant="outline"><FileText size={16} /> November 2025</Button><Button variant="secondary"><FileDown size={16} /> Bulk Download</Button></>} />
-      <Card className="p-4 flex flex-col md:flex-row items-stretch md:items-center gap-3">
-        <div className="relative flex-1"><Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search employees..." className="w-full pl-10 pr-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" /></div>
-        <div className="text-sm text-slate-500">{filtered.length} payslips ready</div>
-      </Card>
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {filtered.slice(0, 18).map(emp => {
-          const p = computePayroll(emp);
-          return (
-            <Card key={emp.id} className="p-5 hover:shadow-lg cursor-pointer transition-shadow" onClick={() => setView(emp)}>
-              <div className="flex items-start justify-between mb-4"><div className="flex items-center gap-3"><div className="w-10 h-10 rounded-lg bg-[#081C3A] text-white text-xs font-bold flex items-center justify-center">{emp.fullName.split(' ').map(n => n[0]).join('').slice(0, 2)}</div><div><p className="font-semibold text-slate-800 text-sm">{emp.fullName}</p><p className="text-xs text-slate-500">{emp.employeeNumber}</p></div></div><Badge color="green">Processed</Badge></div>
-              <div className="border-t border-slate-100 pt-4"><p className="text-xs text-slate-500 mb-1">November 2025 · Net Pay</p><p className="text-2xl font-bold text-[#081C3A]">{formatKwacha(netPay(p))}</p><div className="flex gap-2 mt-4"><Button variant="outline" className="text-xs py-1.5 flex-1"><Printer size={12} /> Print</Button><Button variant="secondary" className="text-xs py-1.5 flex-1"><Download size={12} /> PDF</Button></div></div>
-            </Card>
-          );
-        })}
-      </div>
-      <Modal open={!!view} onClose={() => setView(null)} title="Payslip Preview" size="lg">{view && <PayslipPDF employee={view} />}</Modal>
-    </div>
-  );
-}
-
-function PayslipPDF({ employee }: { employee: Employee }) {
-  const p = computePayroll(employee);
-  const g = grossPay(p);
-  const n = netPay(p);
-  return (
-    <div className="space-y-5">
-      <div className="p-6 rounded-lg border-2 border-slate-200 bg-white" id="payslip-content">
-        <div className="flex items-start justify-between pb-4 border-b-2 border-[#081C3A]"><div className="flex items-center gap-3"><div className="w-14 h-14 rounded-xl bg-[#081C3A] flex items-center justify-center"><Shield size={24} className="text-[#D4A017]" /></div><div><h1 className="text-xl font-bold text-[#081C3A]">SAFEGUARD SECURITY SERVICES</h1><p className="text-xs text-slate-500">Lilongwe, Malawi · (+265) 1 234 567</p></div></div><div className="text-right"><p className="text-sm font-bold text-[#081C3A]">PAYSLIP</p><p className="text-xs text-slate-500">November 2025</p></div></div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 py-4 text-xs border-b border-slate-100"><div><p className="text-slate-500">Employee</p><p className="font-semibold text-slate-800">{employee.fullName}</p></div><div><p className="text-slate-500">Employee No.</p><p className="font-semibold text-slate-800">{employee.employeeNumber}</p></div><div><p className="text-slate-500">Position</p><p className="font-semibold text-slate-800">{employee.position}</p></div><div><p className="text-slate-500">Department</p><p className="font-semibold text-slate-800">{employee.department}</p></div><div><p className="text-slate-500">Pay Period</p><p className="font-semibold text-slate-800">Nov 01 - Nov 30, 2025</p></div><div><p className="text-slate-500">Pay Point</p><p className="font-semibold text-slate-800">{employee.payPoint}</p></div><div><p className="text-slate-500">Contract</p><p className="font-semibold text-slate-800">{employee.contractType}</p></div><div><p className="text-slate-500">Date Paid</p><p className="font-semibold text-slate-800">Nov 30, 2025</p></div></div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 py-4"><div><h3 className="text-xs font-bold text-[#081C3A] uppercase tracking-wider mb-3 pb-2 border-b border-slate-200">Earnings</h3><div className="space-y-2 text-xs">{[['Basic Salary', p.basic], ['Allowances', p.allowances], ['Overtime', p.overtime], ['Bonus', p.bonus]].map(([k, v]) => (<div key={String(k)} className="flex justify-between"><span className="text-slate-600">{k}</span><span className="font-mono text-slate-800">{formatKwacha(v as number)}</span></div>))}<div className="flex justify-between pt-2 mt-2 border-t border-slate-200 font-bold"><span>Gross Pay</span><span className="font-mono text-[#081C3A]">{formatKwacha(g)}</span></div></div></div><div><h3 className="text-xs font-bold text-[#081C3A] uppercase tracking-wider mb-3 pb-2 border-b border-slate-200">Deductions</h3><div className="space-y-2 text-xs">{[['PAYE Tax', p.paye], ['Pension (5%)', p.pension], ['Absenteeism', p.absenteeism], ['Other Deductions', p.otherDeductions]].map(([k, v]) => (<div key={String(k)} className="flex justify-between"><span className="text-slate-600">{k}</span><span className="font-mono text-red-600">-{formatKwacha(v as number)}</span></div>))}<div className="flex justify-between pt-2 mt-2 border-t border-slate-200 font-bold"><span>Total Deductions</span><span className="font-mono text-red-600">-{formatKwacha(p.paye + p.pension)}</span></div></div></div></div>
-        <div className="p-5 rounded-lg bg-gradient-to-r from-[#081C3A] to-[#1a2f5c] text-white flex items-center justify-between"><div><p className="text-xs opacity-80 uppercase tracking-wider">Total Net Pay</p><p className="text-3xl font-bold text-[#D4A017]">{formatKwacha(n)}</p></div><div className="text-right text-xs"><p className="opacity-80">Payment Method: Bank Transfer</p><p className="opacity-80">Authorized: William Banda (Admin)</p></div></div>
-        <p className="text-center text-xs text-slate-400 mt-4">This is a system-generated payslip. No signature required.</p>
-      </div>
-      <div className="flex items-center justify-end gap-2"><Button variant="outline"><Printer size={14} /> Print</Button><Button variant="secondary"><Download size={14} /> Download PDF</Button></div>
-    </div>
-  );
-}
-
-/* ----------------- REPORTS ----------------- */
-export function ReportsPage() {
-  const [active, setActive] = useState('employee');
-  const tabs = [{ id: 'employee', label: 'Employee Report' }, { id: 'payroll', label: 'Payroll Report' }, { id: 'attendance', label: 'Attendance Report' }, { id: 'recruitment', label: 'Recruitment Report' }, { id: 'department', label: 'Department Report' }];
-  const employees = generateEmployees(245);
-  const totalPayroll = employees.reduce((sum, e) => sum + netPay(computePayroll(e)), 0);
-  const byDept: Record<string, { count: number; total: number }> = {};
-  employees.forEach(e => { if (!byDept[e.department]) byDept[e.department] = { count: 0, total: 0 }; byDept[e.department].count++; byDept[e.department].total += netPay(computePayroll(e)); });
-  return (
-    <div className="space-y-6 animate-fade-in">
-      <PageHeader title="Reports & Analytics" subtitle="Comprehensive business intelligence dashboard" actions={<><Button variant="outline"><FileDown size={16} /> PDF</Button><Button variant="outline"><FileSpreadsheet size={16} /> Excel</Button><Button variant="secondary"><FileText size={16} /> CSV</Button></>} />
-      <Card className="p-5"><div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">{[{ l: 'Total Employees', n: employees.length, sub: '245 active personnel' }, { l: 'Total Payroll', n: formatKwacha(totalPayroll), sub: 'November 2025' }, { l: 'Avg. Salary', n: formatKwacha(Math.round(totalPayroll / employees.length)), sub: 'Per employee' }, { l: 'Departments', n: Object.keys(byDept).length, sub: 'Operational units' }].map((s, i) => (<div key={i} className="p-4 rounded-lg bg-slate-50"><p className="text-xs text-slate-500">{s.l}</p><p className="text-xl font-bold text-slate-800 mt-1">{s.n}</p><p className="text-xs text-slate-500 mt-1">{s.sub}</p></div>))}</div></Card>
-      <Tabs tabs={tabs} active={active} onChange={setActive} />
-      <Card className="p-6"><h3 className="font-semibold text-slate-800 mb-4 capitalize">{tabs.find(t => t.id === active)?.label} — November 2025</h3><div className="overflow-x-auto"><table className="w-full text-sm"><THead><TR hover={false}><TH>Department</TH><TH>Employees</TH><TH className="text-right">Total Payroll</TH><TH className="text-right hidden md:table-cell">Average</TH><TH>Attendance</TH><TH className="hidden lg:table-cell">Status</TH></TR></THead><TBody>{Object.entries(byDept).sort((a, b) => b[1].count - a[1].count).map(([dept, data]) => (<TR key={dept}><TD><strong>{dept}</strong></TD><TD>{data.count} employees</TD><TD className="text-right font-mono font-semibold">{formatKwacha(data.total)}</TD><TD className="text-right font-mono hidden md:table-cell">{formatKwacha(Math.round(data.total / data.count))}</TD><TD><Badge color="green">{(94 + Math.floor(Math.random() * 5))}.{Math.floor(Math.random() * 9)}%</Badge></TD><TD className="hidden lg:table-cell"><Badge color={data.count > 20 ? 'green' : 'gold'}>{data.count > 20 ? 'Healthy' : 'Optimal'}</Badge></TD></TR>))}</TBody></table></div></Card>
-    </div>
-  );
-}
 
 /* ----------------- SETTINGS ----------------- */
 export function SettingsPage() {
@@ -135,47 +65,42 @@ export function SettingsPage() {
     { value: 'support', label: 'Support' }
   ];
 
-  const [companyForm, setCompanyForm] = useState({
-    companyName: 'Safeguard Security Services Ltd.',
-    registration: 'REG-123456-MW',
-    address: 'Head Office , Tikumbe, Building - Naperi',
-    phone: '+265 882 014 775',
-    email: 'headoffice@safeguardsecurity.mw',
-    website: 'www.safeguardsecurities.co',
-    taxId: 'MW-12345678',
-    pensionReg: 'NBS-123456'
-  });
-  
+  const [companyForm, setCompanyForm] = useState(DEFAULT_COMPANY_INFO);
+
   const [taxForm, setTaxForm] = useState({
     taxRate: '30',
     taxFreeThreshold: '50000',
     taxAuthority: 'Malawi Revenue Authority',
     filingFrequency: 'Monthly'
   });
-  
+
   const [pensionForm, setPensionForm] = useState({
     employeeContribution: '5',
     employerContribution: '5',
     pensionFund: 'NBS Pension Fund',
     remittanceCycle: 'Monthly'
   });
-  
+
   const [payrollForm, setPayrollForm] = useState({
     defaultPayDate: 'Last working day',
     currency: 'Malawi Kwacha (MK)',
-    allowanceRate: '10',
-    overtimeRate: '5',
     workingDays: '22',
     payPeriod: 'November 2025'
   });
-  
-  const [systemSettings, setSystemSettings] = useState({
-    emailNotifications: true,
-    smsNotifications: false,
-    autoAttendanceSync: true,
-    twoFactorAuth: false,
-    auditLogging: true,
-    dataEncryption: true
+
+  // Attendance/payroll deduction rates -- the actual working "System" settings
+  // (see handleSaveDeductionRates below): these feed real calculations in
+  // Attendance.tsx, payrollCalculations.ts, and Payslips.tsx, unlike the old
+  // System tab's 6 toggles, which never persisted anywhere and didn't gate
+  // any real feature (no email/SMS sending, attendance sync, or 2FA exists
+  // in this app to turn on or off).
+  const [deductionRatesForm, setDeductionRatesForm] = useState({
+    uniformDeduction: '10000',
+    absentDeduction: '4200',
+    lateDeduction: '4200',
+    lectureDeduction: '3000',
+    lectureFullMonthDeduction: '15000',
+    appearanceDeduction: '2000',
   });
 
   const tabs = [
@@ -337,10 +262,10 @@ const handleDeletePosition = async (position: any) => {
       });
       
       await loadPositions();
-      alert('Position deleted successfully');
+      showNotification('Position deleted successfully', 'success');
     } catch (error: any) {
       console.error('Error deleting position:', error);
-      alert(`Failed to delete position: ${error.message || 'Unknown error'}`);
+      showNotification(`Failed to delete position: ${error.message || 'Unknown error'}`, 'error');
     }
   }
 };
@@ -373,9 +298,25 @@ const handleDeletePosition = async (position: any) => {
   };
 
   const handleSaveRegion = async () => {
-    if (!regionForm.name.trim()) {
-      alert('Please enter a region name');
+    const trimmedName = regionForm.name.trim();
+    if (!trimmedName) {
+      showNotification('Please enter a region name', 'error');
       return;
+    }
+
+    // The table's UNIQUE (tenant_id, code) constraint is on code, not name --
+    // two regions can share a name but not a code. Check it up front, same as
+    // handleSavePosition does for position names, for a clear error instead
+    // of a raw duplicate-key message.
+    const trimmedCode = regionForm.code.trim();
+    if (trimmedCode) {
+      const duplicate = regions.find(
+        (r) => r.id !== editingRegion?.id && (r.code || '').trim().toLowerCase() === trimmedCode.toLowerCase()
+      );
+      if (duplicate) {
+        showNotification(`A region named "${duplicate.name}" already uses code "${duplicate.code}". Use a different code.`, 'error');
+        return;
+      }
     }
 
     try {
@@ -383,8 +324,8 @@ const handleDeletePosition = async (position: any) => {
         const { error } = await supabase
           .from('regions')
           .update({
-            name: regionForm.name,
-            code: regionForm.code || null,
+            name: trimmedName,
+            code: trimmedCode || null,
           })
           .eq('id', editingRegion.id);
         if (error) throw error;
@@ -394,18 +335,18 @@ const handleDeletePosition = async (position: any) => {
           entity_type: 'regions',
           entity_id: editingRegion.id,
           old_data: { name: editingRegion.name, code: editingRegion.code },
-          new_data: regionForm
+          new_data: { name: trimmedName, code: trimmedCode }
         });
 
-        alert('Region updated successfully');
+        showNotification('Region updated successfully', 'success');
       } else {
         // tenant_id is omitted on insert -- it defaults to the current user's
         // own tenant, same pattern as handleSavePosition above.
         const { data, error } = await supabase
           .from('regions')
           .insert([{
-            name: regionForm.name,
-            code: regionForm.code || null,
+            name: trimmedName,
+            code: trimmedCode || null,
           }])
           .select();
         if (error) throw error;
@@ -414,10 +355,10 @@ const handleDeletePosition = async (position: any) => {
           action: 'CREATE',
           entity_type: 'regions',
           entity_id: data?.[0]?.id || 'new',
-          new_data: regionForm
+          new_data: { name: trimmedName, code: trimmedCode }
         });
 
-        alert('Region added successfully');
+        showNotification('Region added successfully', 'success');
       }
 
       await loadRegions();
@@ -426,7 +367,10 @@ const handleDeletePosition = async (position: any) => {
       setRegionForm({ name: '', code: '' });
     } catch (error: any) {
       console.error('Error saving region:', error);
-      alert(`Failed to save region: ${error.message || 'Unknown error'}`);
+      const message = error.code === '23505'
+        ? `A region with code "${trimmedCode}" already exists.`
+        : `Failed to save region: ${error.message || 'Unknown error'}`;
+      showNotification(message, 'error');
     }
   };
 
@@ -447,10 +391,10 @@ const handleDeletePosition = async (position: any) => {
         });
 
         await loadRegions();
-        alert('Region deleted successfully');
+        showNotification('Region deleted successfully', 'success');
       } catch (error: any) {
         console.error('Error deleting region:', error);
-        alert(`Failed to delete region: ${error.message || 'Unknown error'}`);
+        showNotification(`Failed to delete region: ${error.message || 'Unknown error'}`, 'error');
       }
     }
   };
@@ -479,26 +423,30 @@ const handleDeletePosition = async (position: any) => {
     }
   };
 
-  // ===== UPDATED: Save Company with audit logging =====
+  // ===== Save Company: shared via system_settings (companySettings.ts), so
+  // every admin's browser -- and Payslips.tsx's PDF template -- see the same
+  // company info an admin actually set here, instead of each having its own
+  // disconnected copy. =====
   const handleSaveCompany = async () => {
     setSaving(true);
     try {
-      const oldData = JSON.parse(localStorage.getItem('companySettings') || '{}');
-      localStorage.setItem('companySettings', JSON.stringify(companyForm));
-      
-      // Audit log
+      const oldData = await getCompanySettings();
+
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        await setCompanySettings(companyForm, user.id);
+      }
+
       await logAudit({
         action: 'UPDATE',
         entity_type: 'company_settings',
-        old_data: Object.keys(oldData).length > 0 ? oldData : null,
+        old_data: oldData,
         new_data: companyForm
       });
-      
-      setTimeout(() => {
-        setSaving(false);
-        setShowSuccess(true);
-        setTimeout(() => setShowSuccess(false), 3000);
-      }, 500);
+
+      setSaving(false);
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 3000);
     } catch (error) {
       console.error('Error saving company settings:', error);
       setSaving(false);
@@ -614,31 +562,90 @@ const handleDeletePosition = async (position: any) => {
     }
   };
 
-  const handleCancel = () => {
-    const savedCompany = localStorage.getItem('companySettings');
-    if (savedCompany) setCompanyForm(JSON.parse(savedCompany));
+  // Each tab's Cancel button discards edits by reloading that tab's own data
+  // from where it's actually saved -- these used to all funnel through one
+  // handleCancel() that only ever reloaded companyForm, so clicking Cancel
+  // on Tax/Pension/Payroll silently did nothing to that tab's own fields.
+  const handleCancelCompany = () => {
+    getCompanySettings().then(setCompanyForm);
   };
 
-  // ===== UPDATED: System settings toggle with audit logging =====
-  const handleToggleSetting = async (index: number) => {
-    const settingKeys = ['emailNotifications', 'smsNotifications', 'autoAttendanceSync', 'twoFactorAuth', 'auditLogging', 'dataEncryption'];
-    const setting = settingKeys[index];
-    const oldValue = systemSettings[setting as keyof typeof systemSettings];
-    const newValue = !oldValue;
-    
-    setSystemSettings(prev => ({ ...prev, [setting]: newValue }));
-    
-    // Audit log for system setting change
+  const handleCancelTax = () => {
+    getPayrollRates().then(rates => {
+      setTaxForm(prev => ({ ...prev, taxRate: String(rates.payeRate * 100), taxFreeThreshold: String(rates.payeThreshold) }));
+    });
+  };
+
+  const handleCancelPension = () => {
+    getPayrollRates().then(rates => {
+      setPensionForm(prev => ({ ...prev, employeeContribution: String(rates.pensionEmployeeRate * 100) }));
+    });
+  };
+
+  const handleCancelPayroll = () => {
+    const savedPayroll = localStorage.getItem('payrollSettings');
+    setPayrollForm(prev => savedPayroll ? { ...prev, ...JSON.parse(savedPayroll) } : prev);
+  };
+
+  // ===== Save deduction rates: the System tab's real, working settings =====
+  // These feed real calculations in Attendance.tsx, payrollCalculations.ts,
+  // and Payslips.tsx (see payrollSettings.ts) -- unlike the 6 toggles this
+  // tab used to show, which weren't even persisted (plain React state, reset
+  // on every page load) and didn't gate any real feature.
+  const handleSaveDeductionRates = async () => {
+    setSaving(true);
     try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('Not signed in');
+
+      const currentRates = await getPayrollRates();
+      const oldData = {
+        uniformDeduction: currentRates.uniformDeduction,
+        absentDeduction: currentRates.absentDeduction,
+        lateDeduction: currentRates.lateDeduction,
+        lectureDeduction: currentRates.lectureDeduction,
+        lectureFullMonthDeduction: currentRates.lectureFullMonthDeduction,
+        appearanceDeduction: currentRates.appearanceDeduction,
+      };
+      const newData = {
+        uniformDeduction: parseFloat(deductionRatesForm.uniformDeduction) || 0,
+        absentDeduction: parseFloat(deductionRatesForm.absentDeduction) || 0,
+        lateDeduction: parseFloat(deductionRatesForm.lateDeduction) || 0,
+        lectureDeduction: parseFloat(deductionRatesForm.lectureDeduction) || 0,
+        lectureFullMonthDeduction: parseFloat(deductionRatesForm.lectureFullMonthDeduction) || 0,
+        appearanceDeduction: parseFloat(deductionRatesForm.appearanceDeduction) || 0,
+      };
+
+      await setPayrollRates({ ...currentRates, ...newData }, user.id);
+
       await logAudit({
         action: 'UPDATE',
         entity_type: 'system_settings',
-        old_data: { [setting]: oldValue },
-        new_data: { [setting]: newValue }
+        old_data: oldData,
+        new_data: newData
       });
+
+      setSaving(false);
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 3000);
     } catch (error) {
-      console.error('Error logging system setting change:', error);
+      console.error('Error saving deduction rates:', error);
+      setSaving(false);
+      showNotification('Failed to save deduction rates', 'error');
     }
+  };
+
+  const handleCancelDeductionRates = () => {
+    getPayrollRates().then(rates => {
+      setDeductionRatesForm({
+        uniformDeduction: String(rates.uniformDeduction),
+        absentDeduction: String(rates.absentDeduction),
+        lateDeduction: String(rates.lateDeduction),
+        lectureDeduction: String(rates.lectureDeduction),
+        lectureFullMonthDeduction: String(rates.lectureFullMonthDeduction),
+        appearanceDeduction: String(rates.appearanceDeduction),
+      });
+    });
   };
 
   // Role Functions
@@ -680,30 +687,29 @@ const handleDeletePosition = async (position: any) => {
         });
         
         await loadRoles();
-        setShowSuccess(true);
-        setTimeout(() => setShowSuccess(false), 3000);
-        alert('Role deleted successfully');
+        showNotification('Role deleted successfully', 'success');
       } catch (error) {
         console.error('Error deleting role:', error);
-        alert('Failed to delete role');
+        showNotification('Failed to delete role', 'error');
       }
     }
   };
 
   // ===== UPDATED: Save role with audit logging =====
   const handleSaveRole = async () => {
-    if (!roleForm.name.trim()) {
-      alert('Please enter a role name');
+    const trimmedName = roleForm.name.trim();
+    if (!trimmedName) {
+      showNotification('Please enter a role name', 'error');
       return;
     }
-    
+
     const newRole = {
-      name: roleForm.name,
+      name: trimmedName,
       users: editingRole ? editingRole.users : 0,
       color: roleForm.color,
       perms: roleForm.perms.filter(p => p.trim() !== '')
     };
-    
+
     try {
       if (editingRole) {
         const oldData = {...editingRole};
@@ -712,7 +718,7 @@ const handleDeletePosition = async (position: any) => {
           .update(newRole)
           .eq('id', editingRole.id);
         if (error) throw error;
-        
+
         // Audit log for update
         await logAudit({
           action: 'UPDATE',
@@ -721,12 +727,12 @@ const handleDeletePosition = async (position: any) => {
           old_data: oldData,
           new_data: newRole
         });
-        
-        alert('Role updated successfully');
+
+        showNotification('Role updated successfully', 'success');
       } else {
         const { data, error } = await supabase.from('user_roles').insert([newRole]).select();
         if (error) throw error;
-        
+
         // Audit log for create
         await logAudit({
           action: 'CREATE',
@@ -734,37 +740,44 @@ const handleDeletePosition = async (position: any) => {
           entity_id: data?.[0]?.id ? String(data[0].id) : 'new',
           new_data: newRole
         });
-        
-        alert('Role created successfully');
+
+        showNotification('Role created successfully', 'success');
       }
-      
+
       await loadRoles();
       setShowRoleModal(false);
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
     } catch (error) {
       console.error('Error saving role:', error);
-      alert('Failed to save role');
+      showNotification('Failed to save role', 'error');
     }
   };
 
   useEffect(() => {
-    const savedCompany = localStorage.getItem('companySettings');
-    if (savedCompany) setCompanyForm(JSON.parse(savedCompany));
     const savedTax = localStorage.getItem('taxSettings');
     if (savedTax) setTaxForm(JSON.parse(savedTax));
     const savedPension = localStorage.getItem('pensionSettings');
     if (savedPension) setPensionForm(JSON.parse(savedPension));
     const savedPayroll = localStorage.getItem('payrollSettings');
-    if (savedPayroll) setPayrollForm(JSON.parse(savedPayroll));
+    if (savedPayroll) setPayrollForm(prev => ({ ...prev, ...JSON.parse(savedPayroll) }));
 
-    // system_settings is the shared source of truth Payroll.tsx actually reads
-    // (localStorage above is only a per-browser cache) -- load it last so it
-    // wins over any stale/different localStorage value from this browser.
+    // system_settings is the shared source of truth Payroll.tsx (and now
+    // Attendance.tsx/Payslips.tsx) actually read -- load it last so it wins
+    // over any stale/different localStorage value cached in this browser.
     getPayrollRates().then(rates => {
       setTaxForm(prev => ({ ...prev, taxRate: String(rates.payeRate * 100), taxFreeThreshold: String(rates.payeThreshold) }));
       setPensionForm(prev => ({ ...prev, employeeContribution: String(rates.pensionEmployeeRate * 100) }));
+      setDeductionRatesForm({
+        uniformDeduction: String(rates.uniformDeduction),
+        absentDeduction: String(rates.absentDeduction),
+        lateDeduction: String(rates.lateDeduction),
+        lectureDeduction: String(rates.lectureDeduction),
+        lectureFullMonthDeduction: String(rates.lectureFullMonthDeduction),
+        appearanceDeduction: String(rates.appearanceDeduction),
+      });
     });
+
+    // Company info is shared (system_settings) too -- see companySettings.ts.
+    getCompanySettings().then(setCompanyForm);
 
     loadRoles();
     loadPositions();
@@ -964,7 +977,7 @@ const handleDeletePosition = async (position: any) => {
             <Input label="Pension Registration" value={companyForm.pensionReg} onChange={(e: any) => setCompanyForm({...companyForm, pensionReg: e.target.value})} />
           </div>
           <div className="flex items-center justify-end gap-2 mt-6">
-            <Button variant="outline" onClick={handleCancel}>Cancel</Button>
+            <Button variant="outline" onClick={handleCancelCompany}>Cancel</Button>
             <Button variant="secondary" onClick={handleSaveCompany} disabled={saving}>
               {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
             </Button>
@@ -986,7 +999,7 @@ const handleDeletePosition = async (position: any) => {
             Current policy: Flat {taxForm.taxRate}% PAYE on gross income above MK {parseInt(taxForm.taxFreeThreshold).toLocaleString()} threshold.
           </div>
           <div className="flex items-center justify-end gap-2 mt-6">
-            <Button variant="outline" onClick={handleCancel}>Cancel</Button>
+            <Button variant="outline" onClick={handleCancelTax}>Cancel</Button>
             <Button variant="secondary" onClick={handleSaveTax} disabled={saving}>
               {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
             </Button>
@@ -1004,7 +1017,7 @@ const handleDeletePosition = async (position: any) => {
             <Input label="Remittance Cycle" value={pensionForm.remittanceCycle} onChange={(e: any) => setPensionForm({...pensionForm, remittanceCycle: e.target.value})} />
           </div>
           <div className="flex items-center justify-end gap-2 mt-6">
-            <Button variant="outline" onClick={handleCancel}>Cancel</Button>
+            <Button variant="outline" onClick={handleCancelPension}>Cancel</Button>
             <Button variant="secondary" onClick={handleSavePension} disabled={saving}>
               {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
             </Button>
@@ -1018,8 +1031,6 @@ const handleDeletePosition = async (position: any) => {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <Input label="Default Pay Date" value={payrollForm.defaultPayDate} onChange={(e: any) => setPayrollForm({...payrollForm, defaultPayDate: e.target.value})} />
             <Input label="Payroll Currency" value={payrollForm.currency} onChange={(e: any) => setPayrollForm({...payrollForm, currency: e.target.value})} />
-            <Input label="Allowance Rate (%)" value={payrollForm.allowanceRate} onChange={(e: any) => setPayrollForm({...payrollForm, allowanceRate: e.target.value})} />
-            <Input label="Overtime Rate (%)" value={payrollForm.overtimeRate} onChange={(e: any) => setPayrollForm({...payrollForm, overtimeRate: e.target.value})} />
             <Input label="Working Days" value={payrollForm.workingDays} onChange={(e: any) => setPayrollForm({...payrollForm, workingDays: e.target.value})} />
             <Input label="Pay Period" value={payrollForm.payPeriod} onChange={(e: any) => setPayrollForm({...payrollForm, payPeriod: e.target.value})} />
           </div>
@@ -1028,7 +1039,7 @@ const handleDeletePosition = async (position: any) => {
             <div><strong>Bank Integration:</strong> National Bank of Malawi · NBS Bank · FDH Bank</div>
           </div>
           <div className="flex items-center justify-end gap-2 mt-6">
-            <Button variant="outline" onClick={handleCancel}>Cancel</Button>
+            <Button variant="outline" onClick={handleCancelPayroll}>Cancel</Button>
             <Button variant="secondary" onClick={handleSavePayroll} disabled={saving}>
               {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
             </Button>
@@ -1106,7 +1117,7 @@ const handleDeletePosition = async (position: any) => {
                       <td className="px-4 py-2">
                         <Badge color={
                           pos.category === 'security' ? 'blue' :
-                          pos.category === 'admin' ? 'purple' :
+                          pos.category === 'admin' ? 'navy' :
                           pos.category === 'management' ? 'gold' : 'gray'
                         }>
                           {pos.category}
@@ -1257,22 +1268,47 @@ const handleDeletePosition = async (position: any) => {
       
       {tab === 'system' && (
         <Card className="p-6">
-          <h3 className="font-semibold text-slate-800 mb-4">System Preferences</h3>
-          <div className="space-y-3">
-            {['Email notifications', 'SMS notifications', 'Auto-attendance sync', 'Two-factor authentication', 'Audit logging', 'Data encryption'].map((label, i) => (
-              <div key={i} className="flex items-start justify-between p-3 rounded-lg hover:bg-slate-50">
-                <div>
-                  <p className="text-sm font-medium text-slate-800">{label}</p>
-                  <p className="text-xs text-slate-500">System setting</p>
-                </div>
-                <button 
-                  onClick={() => handleToggleSetting(i)}
-                  className={`w-11 h-6 rounded-full relative transition-colors ${Object.values(systemSettings)[i] ? 'bg-[#D4A017]' : 'bg-slate-300'}`}
-                >
-                  <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${Object.values(systemSettings)[i] ? 'translate-x-5' : 'translate-x-0.5'}`} />
-                </button>
-              </div>
-            ))}
+          <h3 className="font-semibold text-slate-800 mb-1">Payroll & Attendance Deduction Rates</h3>
+          <p className="text-xs text-slate-500 mb-4">
+            These rates apply automatically wherever deductions are calculated -- Attendance, Payroll, Payments, and Payslips all use these same figures.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Input
+              label="Uniform Deduction (MK/month)"
+              value={deductionRatesForm.uniformDeduction}
+              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, uniformDeduction: e.target.value })}
+            />
+            <Input
+              label="Absent Day Deduction (MK/day)"
+              value={deductionRatesForm.absentDeduction}
+              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, absentDeduction: e.target.value })}
+            />
+            <Input
+              label="Late Day Deduction (MK/day)"
+              value={deductionRatesForm.lateDeduction}
+              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lateDeduction: e.target.value })}
+            />
+            <Input
+              label="Missed Lecture Deduction (MK)"
+              value={deductionRatesForm.lectureDeduction}
+              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lectureDeduction: e.target.value })}
+            />
+            <Input
+              label="Full-Month Lecture Deduction (MK)"
+              value={deductionRatesForm.lectureFullMonthDeduction}
+              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lectureFullMonthDeduction: e.target.value })}
+            />
+            <Input
+              label="Appearance/Grooming Deduction (MK)"
+              value={deductionRatesForm.appearanceDeduction}
+              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, appearanceDeduction: e.target.value })}
+            />
+          </div>
+          <div className="flex items-center justify-end gap-2 mt-6">
+            <Button variant="outline" onClick={handleCancelDeductionRates}>Cancel</Button>
+            <Button variant="secondary" onClick={handleSaveDeductionRates} disabled={saving}>
+              {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
+            </Button>
           </div>
         </Card>
       )}
@@ -1290,19 +1326,6 @@ const handleDeletePosition = async (position: any) => {
       {RoleModal()}
       {PositionModal()}
       {RegionModal()}
-    </div>
-  );
-}
-
-/* ----------------- FUTURE FEATURES ----------------- */
-export function FeaturesPage() {
-  const features = [{ title: 'project i', desc: 'project description', icon: Map, color: 'navy' }, { title: 'project ii', desc: 'description', icon: Building2, color: 'gold' }, { title: 'project iii', desc: 'project description', icon: ClipboardList, color: 'red' }, { title: 'project ii', desc: 'description', icon: Car, color: 'blue' }, { title: 'Project ##', desc: 'description', icon: Bot, color: 'purple' }, { title: 'project iv', desc: 'description', icon: Camera, color: 'emerald' }];
-  const colorMap: Record<string, string> = { navy: 'from-[#081C3A] to-[#1a2f5c]', gold: 'from-[#8B6F0F] to-[#D4A017]', red: 'from-[#7F1D1D] to-[#EF4444]', blue: 'from-[#1E40AF] to-[#3B82F6]', purple: 'from-[#5B21B6] to-[#8B5CF6]', emerald: 'from-[#065F46] to-[#10B981]' };
-  return (
-    <div className="space-y-6 animate-fade-in">
-      <PageHeader title="Future Features Roadmap" subtitle="Upcoming enhancements" />
-      <Card className="p-6 bg-gradient-to-br from-[#081C3A] to-[#1a2f5c] text-white border-0"><div className="flex items-start gap-4"><div className="w-14 h-14 rounded-2xl bg-[#D4A017] flex items-center justify-center"><Sparkles size={28} className="text-[#081C3A]" /></div><div><h2 className="text-2xl font-bold mb-2">Scaling to 1,000+ Employees</h2><p className="text-white/80">Enterprise-ready architecture for future growth</p></div></div></Card>
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">{features.map((f, i) => { const Icon = f.icon; return (<Card key={i} className="overflow-hidden"><div className={`h-2 bg-gradient-to-r ${colorMap[f.color]}`} /><div className="p-6"><div className={`w-12 h-12 rounded-xl bg-gradient-to-br ${colorMap[f.color]} flex items-center justify-center text-white mb-4`}><Icon size={22} /></div><h3 className="text-lg font-bold text-slate-800 mb-2">{f.title}</h3><p className="text-sm text-slate-600 mb-3">{f.desc}</p><Badge color="gold">Coming Soon</Badge></div></Card>); })}</div>
     </div>
   );
 }
