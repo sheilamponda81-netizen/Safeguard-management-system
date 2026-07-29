@@ -194,57 +194,95 @@ export function PayrollPage() {
   // ===== FETCH PROCESSED MONTHS =====
   const fetchProcessedMonths = useCallback(async () => {
     try {
-      const { data, error } = await supabase
-        .from('payroll')
-        .select('month')
-        .order('month', { ascending: false });
-      
+      // payroll has no region_id column of its own -- for a non-super-admin,
+      // scope through their region's employee ids first, otherwise the
+      // "processed" (✅) badges in the month picker would reflect other
+      // regions' processing status, not this admin's own region.
+      let employeeIds: string[] | null = null;
+      if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        const { data: regionEmployees, error: empError } = await supabase
+          .from('employees')
+          .select('id')
+          .eq('region_id', userProfile.region_id)
+          .eq('is_deleted', false);
+        if (empError) throw empError;
+        employeeIds = (regionEmployees || []).map(e => e.id);
+        if (employeeIds.length === 0) {
+          setProcessedMonths([]);
+          return;
+        }
+      }
+
+      let query = supabase.from('payroll').select('month').order('month', { ascending: false });
+      if (employeeIds) {
+        query = query.in('employee_id', employeeIds);
+      }
+
+      const { data, error } = await query;
       if (error) throw error;
-      
+
       const uniqueMonths = [...new Set(data?.map(r => r.month) || [])];
       setProcessedMonths(uniqueMonths);
-      
-      console.log('📊 Processed months (deduplicated):', uniqueMonths);
     } catch (err) {
       console.error('Error fetching processed months:', err);
     }
-  }, []);
+  }, [userProfile]);
 
   // ===== FETCH DATA =====
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      const { data: employeesData, error: empError } = await supabase
+      let employeesQuery = supabase
         .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction')
+        .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id')
         .eq('is_deleted', false)
         .eq('status', 'Active');
 
+      if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+      }
+
+      const { data: employeesData, error: empError } = await employeesQuery;
       if (empError) throw empError;
       setEmployees(employeesData || []);
 
-      const { data: payrollData, error: payError } = await supabase
-        .from('payroll')
-        .select('*')
-        .eq('month', selectedMonth);
+      // payroll/employee_deductions/attendance have no region_id column of
+      // their own, so region scoping for a non-super-admin has to go through
+      // this (already region-scoped) employee id list -- otherwise a regional
+      // payroll manager would see, and could overwrite, every other region's
+      // payroll too.
+      const employeeIds = (employeesData || []).map(e => e.id);
 
-      if (payError) throw payError;
-      setPayrollRecords(payrollData || []);
+      let payrollData: PayrollRecord[] = [];
+      if (employeeIds.length > 0) {
+        const { data, error: payError } = await supabase
+          .from('payroll')
+          .select('*')
+          .eq('month', selectedMonth)
+          .in('employee_id', employeeIds);
+        if (payError) throw payError;
+        payrollData = data || [];
+      }
+      setPayrollRecords(payrollData);
 
-      if (payrollData && payrollData.length > 0) {
+      if (payrollData.length > 0) {
         const allApproved = payrollData.every(r => r.approval_status === 'approved');
         setIsApproved(allApproved);
       } else {
         setIsApproved(false);
       }
 
-      const { data: deductionsData, error: dedError } = await supabase
-        .from('employee_deductions')
-        .select('*')
-        .eq('month', selectedMonth);
-
-      if (dedError) throw dedError;
-      setEmployeeDeductions(deductionsData || []);
+      let deductionsData: EmployeeDeduction[] = [];
+      if (employeeIds.length > 0) {
+        const { data, error: dedError } = await supabase
+          .from('employee_deductions')
+          .select('*')
+          .eq('month', selectedMonth)
+          .in('employee_id', employeeIds);
+        if (dedError) throw dedError;
+        deductionsData = data || [];
+      }
+      setEmployeeDeductions(deductionsData);
 
       // ===== Live attendance-derived absent/late counts for this month =====
       const [yearStr, monthStr] = selectedMonth.split('-');
@@ -253,7 +291,6 @@ export function PayrollPage() {
       const monthStart = `${selectedMonth}-01`;
       const lastDay = new Date(year, monthNum, 0).getDate();
       const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
-      const employeeIds = (employeesData || []).map(e => e.id);
 
       const counts = new Map<string, AttendanceCount>();
       if (employeeIds.length > 0) {
@@ -292,7 +329,7 @@ export function PayrollPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedMonth]);
+  }, [selectedMonth, userProfile]);
 
   // ===== Shared payroll rates (PAYE rate/threshold, pension rate) from Settings =====
   useEffect(() => {
@@ -491,57 +528,97 @@ export function PayrollPage() {
     }
     
     setProcessingStatus('Copying data from ' + getMonthLabel(sourceMonth) + '...');
-    
+
     try {
+      const employeeIds = employees.map(e => e.id);
+      if (employeeIds.length === 0) {
+        showNotification('No employees found to copy payroll for.', 'error');
+        return;
+      }
+
+      // Scoped to this admin's own employee set (their region, or the whole
+      // company for a super admin) -- the payroll table has no region_id
+      // column of its own, so an unscoped delete/read here would touch (or
+      // silently overwrite) every other region's payroll too.
       const { error: deleteError } = await supabase
         .from('payroll')
         .delete()
-        .eq('month', selectedMonth);
-      
+        .eq('month', selectedMonth)
+        .in('employee_id', employeeIds);
+
       if (deleteError) {
         console.error('Error deleting existing data:', deleteError);
       }
-      
+
       const { data: sourceData, error: sourceError } = await supabase
         .from('payroll')
         .select('*')
-        .eq('month', sourceMonth);
-      
+        .eq('month', sourceMonth)
+        .in('employee_id', employeeIds);
+
       if (sourceError) {
         console.error('Error fetching source data:', sourceError);
         showNotification('Failed to fetch source data: ' + sourceError.message, 'error');
         return;
       }
-      
+
       if (!sourceData || sourceData.length === 0) {
         showNotification('No data found in the selected source month.', 'error');
         return;
       }
-      
-      const newRecords = sourceData.map(record => ({
-        employee_id: record.employee_id,
-        month: selectedMonth,
-        basic_salary: record.basic_salary,
-        allowances: record.allowances || 0,
-        overtime: record.overtime || 0,
-        bonus: record.bonus || 0,
-        gross_pay: record.gross_pay,
-        paye: record.paye || 0,
-        pension: record.pension || 0,
-        uniform_deduction: record.uniform_deduction || 0,
-        net_pay: record.net_pay,
-        processed_at: new Date().toISOString(),
-        approval_status: 'pending',
-        approved_by: null,
-        approved_at: null,
-        approval_notes: null
-      }));
-      
+
+      // Carry forward only the manually-entered pay components (basic
+      // salary override, allowances, overtime, bonus) -- everything else
+      // (PAYE, pension, uniform/attendance deductions) is recalculated fresh
+      // for the target month via calculatePayroll using the currently
+      // configured rates and the target month's own attendance. Blindly
+      // copying last month's gross/paye/pension/uniform_deduction would
+      // silently carry forward a stale PAYE rate if it changed since, and
+      // attendance-based deductions in particular are inherently specific
+      // to the month they happened in -- an employee absent 3 days last
+      // month didn't necessarily miss any days this month.
+      const employeesByIdForCopy = new Map(employees.map(e => [e.id, e]));
+      const newRecords = sourceData
+        .map(record => {
+          const employee = employeesByIdForCopy.get(record.employee_id);
+          if (!employee) return null;
+          const payroll = calculatePayroll(employee, {
+            basic_salary: record.basic_salary,
+            allowances: record.allowances || 0,
+            overtime: record.overtime || 0,
+            bonus: record.bonus || 0,
+          });
+          return {
+            employee_id: employee.id,
+            month: selectedMonth,
+            basic_salary: payroll.basic_salary,
+            allowances: payroll.allowances,
+            overtime: payroll.overtime,
+            bonus: payroll.bonus,
+            gross_pay: payroll.gross_pay,
+            paye: payroll.paye,
+            pension: payroll.pension,
+            uniform_deduction: payroll.uniform_deduction,
+            net_pay: payroll.net_pay,
+            processed_at: new Date().toISOString(),
+            approval_status: 'pending',
+            approved_by: null,
+            approved_at: null,
+            approval_notes: null
+          };
+        })
+        .filter((r): r is NonNullable<typeof r> => r !== null);
+
+      if (newRecords.length === 0) {
+        showNotification('None of the source month\'s employees are still active.', 'error');
+        return;
+      }
+
       const { data: inserted, error: insertError } = await supabase
         .from('payroll')
         .insert(newRecords)
         .select();
-      
+
       if (insertError) {
         console.error('Error inserting records:', insertError);
         showNotification('Failed to copy data: ' + insertError.message, 'error');
@@ -571,7 +648,7 @@ export function PayrollPage() {
     } finally {
       setProcessingStatus('');
     }
-  }, [canProcessPayroll, selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
+  }, [canProcessPayroll, selectedMonth, userProfile, employees, calculatePayroll, fetchData, fetchProcessedMonths]);
 
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
@@ -602,11 +679,16 @@ export function PayrollPage() {
         updated_at: new Date().toISOString()
       };
 
-      // Update all payroll records for this month
+      // Update only the payroll records this admin can actually see (their
+      // own region, or the whole company for a super admin) -- payrollRecords
+      // is already scoped that way by fetchData. An unscoped update-by-month
+      // here would also approve/reject every OTHER region's payroll for this
+      // month, since the payroll table has no region_id column of its own.
       const { error } = await supabase
         .from('payroll')
         .update(updateData)
-        .eq('month', selectedMonth);
+        .eq('month', selectedMonth)
+        .in('employee_id', payrollRecords.map(r => r.employee_id));
 
       if (error) throw error;
 
@@ -707,11 +789,17 @@ export function PayrollPage() {
       }
       
       setProcessingStatus('Clearing existing data...');
+      // Scoped to exactly the employees being (re)processed in this run --
+      // for a non-super-admin that's their own region only. An unscoped
+      // delete-by-month here would also wipe every OTHER region's payroll
+      // for this month, since the payroll table has no region_id column of
+      // its own to protect it.
       const { error: deleteError } = await supabase
         .from('payroll')
         .delete()
-        .eq('month', selectedMonth);
-      
+        .eq('month', selectedMonth)
+        .in('employee_id', employees.map(e => e.id));
+
       if (deleteError) {
         console.error('Error deleting existing records:', deleteError);
       }
