@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar, Shield } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar, Shield, AlertTriangle } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, Modal, Tabs, Input } from '../components/ui';
 import { formatKwacha } from '../data';
 import { UserManagement } from '../components/UserManagement';
@@ -12,7 +12,78 @@ import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
 import { getPayrollRates, setPayrollRates } from '../utils/payrollSettings';
 import { getCompanySettings, setCompanySettings, uploadCompanyLogo, DEFAULT_COMPANY_INFO } from '../utils/companySettings';
 import { getDefaultPageSize, setDefaultPageSize } from '../utils/uiSettings';
+import { normalizeForDedup } from '../utils/textNormalize';
 import { showNotification } from '../utils/clickHandlers';
+
+interface DuplicateGroup {
+  normalizedKey: string;
+  // Each distinct raw spelling found, with how many employees currently use it.
+  spellings: { value: string; count: number }[];
+  totalEmployees: number;
+}
+
+function DuplicateGroupSection({ title, emptyMessage, groups, canonicalChoice, setCanonicalChoice, mergingKey, onMerge }: {
+  title: string;
+  emptyMessage: string;
+  groups: DuplicateGroup[];
+  canonicalChoice: Record<string, string>;
+  setCanonicalChoice: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  mergingKey: string | null;
+  onMerge: (group: DuplicateGroup) => void;
+}) {
+  return (
+    <Card className="p-6">
+      <h4 className="font-semibold text-slate-800 mb-3">{title}</h4>
+      {groups.length === 0 ? (
+        <p className="text-sm text-slate-500">{emptyMessage}</p>
+      ) : (
+        <div className="space-y-4">
+          {groups.map(group => {
+            const chosen = canonicalChoice[group.normalizedKey] || group.spellings[0].value;
+            const isMerging = mergingKey === group.normalizedKey;
+            const affectedCount = group.spellings
+              .filter(s => s.value !== chosen)
+              .reduce((sum, s) => sum + s.count, 0);
+
+            return (
+              <div key={group.normalizedKey} className="p-4 rounded-lg border border-slate-200">
+                <div className="flex items-start gap-2 mb-3">
+                  <AlertTriangle size={16} className="text-[#D4A017] shrink-0 mt-0.5" />
+                  <p className="text-sm text-slate-600">
+                    {group.spellings.length} different spellings, {group.totalEmployees} employee{group.totalEmployees === 1 ? '' : 's'} total -- pick the correct one:
+                  </p>
+                </div>
+                <div className="space-y-2 mb-4">
+                  {group.spellings.map(s => (
+                    <label key={s.value} className="flex items-center gap-2 text-sm cursor-pointer">
+                      <input
+                        type="radio"
+                        name={`canonical-${group.normalizedKey}`}
+                        checked={chosen === s.value}
+                        onChange={() => setCanonicalChoice(prev => ({ ...prev, [group.normalizedKey]: s.value }))}
+                        className="w-4 h-4"
+                      />
+                      <span className="font-medium text-slate-800">"{s.value}"</span>
+                      <span className="text-slate-500">-- {s.count} employee{s.count === 1 ? '' : 's'}</span>
+                    </label>
+                  ))}
+                </div>
+                <Button
+                  variant="secondary"
+                  className="text-xs py-1.5"
+                  disabled={isMerging || affectedCount === 0}
+                  onClick={() => onMerge(group)}
+                >
+                  {isMerging ? 'Merging...' : `Merge ${affectedCount} employee${affectedCount === 1 ? '' : 's'} into "${chosen}"`}
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Card>
+  );
+}
 
 /* ----------------- SETTINGS ----------------- */
 export function SettingsPage() {
@@ -49,6 +120,16 @@ export function SettingsPage() {
   
   // Month settings state
   const [currentMonth, setCurrentMonth] = useState<string>('');
+
+  // Data Cleanup state -- groups of company/workstation spellings that are
+  // the same once whitespace/case/punctuation is ignored (see loadDuplicates
+  // below), most likely from different people typing the same place
+  // slightly differently over time.
+  const [companyDuplicates, setCompanyDuplicates] = useState<DuplicateGroup[]>([]);
+  const [workstationDuplicates, setWorkstationDuplicates] = useState<DuplicateGroup[]>([]);
+  const [loadingDuplicates, setLoadingDuplicates] = useState(false);
+  const [canonicalChoice, setCanonicalChoice] = useState<Record<string, string>>({});
+  const [mergingKey, setMergingKey] = useState<string | null>(null);
 
   const colorOptions = [
     { value: 'navy', label: 'Navy Blue', class: 'bg-[#081C3A]' },
@@ -120,7 +201,8 @@ export function SettingsPage() {
     { id: 'regions', label: 'Regions' },
     { id: 'users', label: 'User Management' },
     { id: 'roles', label: 'User Roles' },
-    { id: 'system', label: 'System' }
+    { id: 'system', label: 'System' },
+    { id: 'data-cleanup', label: 'Data Cleanup' }
   ];
 
   // Load current month
@@ -301,6 +383,116 @@ const handleDeletePosition = async (position: any) => {
       setRegions(data || []);
     } catch (error) {
       console.error('Error loading regions:', error);
+    }
+  };
+
+  // Groups raw values from `values` by normalizeForDedup(), keeping only
+  // groups with more than one distinct spelling -- those are the actual
+  // duplicates (e.g. "ACME Corp" / "ACME  Corp" / "acme corp" all collapse to
+  // the same key). A single, consistently-spelled name never shows up here.
+  const groupDuplicates = (values: string[]): DuplicateGroup[] => {
+    const byKey = new Map<string, Map<string, number>>();
+    values.forEach(raw => {
+      const trimmed = (raw || '').trim();
+      if (!trimmed) return;
+      const key = normalizeForDedup(trimmed);
+      if (!key) return;
+      if (!byKey.has(key)) byKey.set(key, new Map());
+      const spellings = byKey.get(key)!;
+      spellings.set(trimmed, (spellings.get(trimmed) || 0) + 1);
+    });
+
+    const groups: DuplicateGroup[] = [];
+    byKey.forEach((spellingCounts, key) => {
+      if (spellingCounts.size <= 1) return;
+      const spellings = Array.from(spellingCounts.entries())
+        .map(([value, count]) => ({ value, count }))
+        .sort((a, b) => b.count - a.count);
+      groups.push({
+        normalizedKey: key,
+        spellings,
+        totalEmployees: spellings.reduce((sum, s) => sum + s.count, 0),
+      });
+    });
+
+    return groups.sort((a, b) => b.totalEmployees - a.totalEmployees);
+  };
+
+  const loadDuplicates = async () => {
+    setLoadingDuplicates(true);
+    try {
+      const { data, error } = await supabase
+        .from('employees')
+        .select('company, workstation, assignment_type')
+        .eq('is_deleted', false);
+      if (error) throw error;
+
+      const companies = (data || [])
+        .filter(e => e.assignment_type === 'company')
+        .map(e => e.company)
+        .filter(Boolean);
+      const workstations = (data || []).map(e => e.workstation).filter(Boolean);
+
+      const companyGroups = groupDuplicates(companies);
+      const workstationGroups = groupDuplicates(workstations);
+      setCompanyDuplicates(companyGroups);
+      setWorkstationDuplicates(workstationGroups);
+
+      // Default each group's canonical choice to its most common spelling
+      // (spellings are already sorted by count, so [0] is the most common).
+      setCanonicalChoice(prev => {
+        const next = { ...prev };
+        [...companyGroups, ...workstationGroups].forEach(g => {
+          if (!next[g.normalizedKey]) next[g.normalizedKey] = g.spellings[0].value;
+        });
+        return next;
+      });
+    } catch (error) {
+      console.error('Error loading duplicate names:', error);
+      showNotification('Failed to load duplicate names', 'error');
+    } finally {
+      setLoadingDuplicates(false);
+    }
+  };
+
+  const handleMergeGroup = async (field: 'company' | 'workstation', group: DuplicateGroup) => {
+    const canonical = canonicalChoice[group.normalizedKey] || group.spellings[0].value;
+    const otherSpellings = group.spellings.map(s => s.value).filter(v => v !== canonical);
+    if (otherSpellings.length === 0) return;
+
+    const affectedCount = group.spellings
+      .filter(s => s.value !== canonical)
+      .reduce((sum, s) => sum + s.count, 0);
+
+    if (!confirm(
+      `Update ${affectedCount} employee record${affectedCount === 1 ? '' : 's'} to use "${canonical}" instead of ${otherSpellings.map(v => `"${v}"`).join(', ')}?`
+    )) {
+      return;
+    }
+
+    setMergingKey(group.normalizedKey);
+    try {
+      const query = field === 'company'
+        ? supabase.from('employees').update({ company: canonical }).in('company', otherSpellings).eq('is_deleted', false)
+        : supabase.from('employees').update({ workstation: canonical }).in('workstation', otherSpellings).eq('is_deleted', false);
+
+      const { error } = await query;
+      if (error) throw error;
+
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: field === 'company' ? 'employees_company_merge' : 'employees_workstation_merge',
+        old_data: { spellings: otherSpellings },
+        new_data: { canonical, affectedCount }
+      });
+
+      showNotification(`Updated ${affectedCount} employee record${affectedCount === 1 ? '' : 's'} to "${canonical}"`, 'success');
+      await loadDuplicates();
+    } catch (error: any) {
+      console.error(`Error merging ${field} names:`, error);
+      showNotification(`Failed to merge: ${error.message || 'Unknown error'}`, 'error');
+    } finally {
+      setMergingKey(null);
     }
   };
 
@@ -822,6 +1014,14 @@ const handleDeletePosition = async (position: any) => {
     loadPositions();
     loadRegions();
   }, []);
+
+  // Loaded lazily, only when the tab is actually opened -- it scans every
+  // employee's company/workstation values, which the other tabs don't need.
+  useEffect(() => {
+    if (tab === 'data-cleanup') {
+      loadDuplicates();
+    }
+  }, [tab]);
 
   const RoleModal = () => (
     <Modal open={showRoleModal} onClose={() => setShowRoleModal(false)} title={editingRole ? 'Edit Role' : 'Create New Role'} size="lg">
@@ -1413,7 +1613,48 @@ const handleDeletePosition = async (position: any) => {
           </div>
         </Card>
       )}
-      
+
+      {tab === 'data-cleanup' && (
+        <div className="space-y-4">
+          <Card className="p-6">
+            <h3 className="font-semibold text-slate-800 mb-1">Data Cleanup</h3>
+            <p className="text-xs text-slate-500">
+              Finds company and workstation names that are almost certainly the same place, entered slightly
+              differently by different people over time (extra spaces, different capitalization, stray
+              punctuation). Pick which spelling should be the correct one for each group, then merge -- every
+              employee using one of the other spellings gets updated to match, immediately.
+            </p>
+          </Card>
+
+          {loadingDuplicates ? (
+            <div className="flex justify-center py-12">
+              <div className="w-8 h-8 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin"></div>
+            </div>
+          ) : (
+            <>
+              <DuplicateGroupSection
+                title="Company Names"
+                emptyMessage="No duplicate company names found."
+                groups={companyDuplicates}
+                canonicalChoice={canonicalChoice}
+                setCanonicalChoice={setCanonicalChoice}
+                mergingKey={mergingKey}
+                onMerge={(group) => handleMergeGroup('company', group)}
+              />
+              <DuplicateGroupSection
+                title="Workstations"
+                emptyMessage="No duplicate workstation names found."
+                groups={workstationDuplicates}
+                canonicalChoice={canonicalChoice}
+                setCanonicalChoice={setCanonicalChoice}
+                mergingKey={mergingKey}
+                onMerge={(group) => handleMergeGroup('workstation', group)}
+              />
+            </>
+          )}
+        </div>
+      )}
+
       {/* Rendered via direct call, not <RoleModal /> etc. -- these are defined
           as closures inside this component (not hoisted to module scope) so
           they can capture all the enclosing form state directly. Invoking
