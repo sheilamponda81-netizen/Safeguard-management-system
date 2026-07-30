@@ -7,6 +7,7 @@ import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
+import { getDefaultPageSize } from '../utils/uiSettings';
 
 interface Employee {
   id: string;
@@ -100,6 +101,7 @@ export function TerminalDuesPage() {
   // ===== PAGINATION STATES =====
   const [duesPage, setDuesPage] = useState(1);
   const [duesItemsPerPage, setDuesItemsPerPage] = useState(20);
+  useEffect(() => { getDefaultPageSize().then(setDuesItemsPerPage); }, []);
 
   // Searchable employee selector states
   const [employeeSearch, setEmployeeSearch] = useState('');

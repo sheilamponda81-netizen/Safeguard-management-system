@@ -12,6 +12,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll } from '../utils/payrollCalculations';
+import { getDefaultPageSize } from '../utils/uiSettings';
 
 interface Employee {
   id: string;
@@ -105,6 +106,7 @@ export function PayrollPage() {
   // ===== PAGINATION STATES =====
   const [payrollPage, setPayrollPage] = useState(1);
   const [payrollItemsPerPage, setPayrollItemsPerPage] = useState(20);
+  useEffect(() => { getDefaultPageSize().then(setPayrollItemsPerPage); }, []);
 
   // ===== MEMOIZED VALUES =====
   const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);

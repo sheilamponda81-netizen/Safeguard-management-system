@@ -7,6 +7,7 @@ import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
+import { getDefaultPageSize } from '../utils/uiSettings';
 
 interface Applicant {
   id: string;
@@ -38,6 +39,7 @@ export function RecruitmentPage() {
   // ===== PAGINATION STATES =====
   const [recruitmentPage, setRecruitmentPage] = useState(1);
   const [recruitmentItemsPerPage, setRecruitmentItemsPerPage] = useState(20);
+  useEffect(() => { getDefaultPageSize().then(setRecruitmentItemsPerPage); }, []);
 
   // ===== MEMOIZED VALUES =====
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);

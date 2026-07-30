@@ -12,6 +12,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { debounce } from '../utils/debounce';
 import { getPayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
+import { getDefaultPageSize } from '../utils/uiSettings';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -78,6 +79,7 @@ export function AttendancePage() {
   // ===== PAGINATION STATES =====
   const [attendancePage, setAttendancePage] = useState(1);
   const [attendanceItemsPerPage, setAttendanceItemsPerPage] = useState(20);
+  useEffect(() => { getDefaultPageSize().then(setAttendanceItemsPerPage); }, []);
 
   // ===== REFS =====
   const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string }>>(new Map());

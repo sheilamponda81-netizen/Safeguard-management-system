@@ -10,6 +10,7 @@ import { logAudit } from '../utils/auditLogger';
 import { getEmployeeAuditData, getChanges } from '../utils/auditHelpers';
 import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
+import { getDefaultPageSize } from '../utils/uiSettings';
 
 interface Employee {
   id: string;
@@ -303,6 +304,7 @@ export function EmployeesPage() {
   // ===== PAGINATION =====
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage, setItemsPerPage] = useState(20);
+  useEffect(() => { getDefaultPageSize().then(setItemsPerPage); }, []);
 
   // ===== MEMOIZED VALUES =====
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);

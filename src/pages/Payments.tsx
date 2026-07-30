@@ -19,6 +19,7 @@ import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { getPayrollRates } from '../utils/payrollSettings';
 import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
+import { getDefaultPageSize } from '../utils/uiSettings';
 
 export function PaymentsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
@@ -51,6 +52,7 @@ export function PaymentsPage() {
   // ===== PAGINATION STATES =====
   const [paymentsPage, setPaymentsPage] = useState(1);
   const [paymentsItemsPerPage, setPaymentsItemsPerPage] = useState(20);
+  useEffect(() => { getDefaultPageSize().then(setPaymentsItemsPerPage); }, []);
 
   const statusOptions = ['all', 'pending', 'processing', 'paid', 'confirmed', 'failed'];
   const payPointOptions = ['all', 'national_bank', 'standard_bank', 'nbs_bank', 'centenary_bank', 'fdh_bank', 'first_capital_bank', 'airtel_money', 'tnm_mpamba'];

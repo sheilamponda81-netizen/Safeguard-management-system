@@ -18,6 +18,7 @@ import {
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
 import JSZip from 'jszip';
+import { getDefaultPageSize } from '../utils/uiSettings';
 
 // ===== PERFORMANCE: Lazy load PDF libraries only when needed =====
 const loadPDFLibraries = async () => {
@@ -86,6 +87,7 @@ interface PayslipTemplate {
   companyAddress: string;
   companyPhone: string;
   companyEmail: string;
+  logoUrl: string;
   showLogo: boolean;
   showPayPoint: boolean;
   showContractType: boolean;
@@ -102,6 +104,7 @@ const defaultTemplate: PayslipTemplate = {
   companyAddress: 'Head Office Tikumbe Building - Naperi, P.O.Box 30158, Chichiri, Blantyre 3, Malawi.',
   companyPhone: '0882014775 / 0999957834',
   companyEmail: 'headoffice@safeguardsecurity.mw',
+  logoUrl: '',
   showLogo: true,
   showPayPoint: true,
   showContractType: true,
@@ -135,6 +138,7 @@ export function PayslipsPage() {
   // ===== PAGINATION STATES =====
   const [payslipsPage, setPayslipsPage] = useState(1);
   const [payslipsItemsPerPage, setPayslipsItemsPerPage] = useState(18);
+  useEffect(() => { getDefaultPageSize().then(setPayslipsItemsPerPage); }, []);
 
   // ===== MEMOIZED VALUES =====
   const months = useMemo(() => ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'], []);
@@ -192,6 +196,7 @@ export function PayslipsPage() {
         companyAddress: company.address,
         companyPhone: company.phone,
         companyEmail: company.email,
+        logoUrl: company.logoUrl,
       }));
     });
   }, []);
@@ -466,16 +471,21 @@ export function PayslipsPage() {
           .deduction-item .amount { color: #dc2626; }
           .deduction-breakdown { font-size: 11px; color: #dc2626; padding-left: 20px; }
           .company-logo { font-size: 28px; font-weight: bold; color: ${t.primaryColor}; }
+          .header-company { display: flex; align-items: center; gap: 12px; }
+          .header-logo { width: 48px; height: 48px; object-fit: contain; border-radius: 8px; flex-shrink: 0; }
           @media print { body { padding: 20px; } }
         </style>
       </head>
       <body>
         <div class="header">
-          <div>
-            <div class="company-name">${t.companyName}</div>
-            <div class="company-sub">${t.companyAddress}</div>
-            <div class="company-sub">Tel: ${t.companyPhone}</div>
-            <div class="company-sub">Email: ${t.companyEmail}</div>
+          <div class="header-company">
+            ${t.showLogo && t.logoUrl ? `<img class="header-logo" src="${t.logoUrl}" alt="Company logo" />` : ''}
+            <div>
+              <div class="company-name">${t.companyName}</div>
+              <div class="company-sub">${t.companyAddress}</div>
+              <div class="company-sub">Tel: ${t.companyPhone}</div>
+              <div class="company-sub">Email: ${t.companyEmail}</div>
+            </div>
           </div>
           <div>
             <div class="payslip-title">PAYSLIP</div>
@@ -755,7 +765,7 @@ export function PayslipsPage() {
   // longer independently editable from this modal, so there's nothing of
   // theirs to persist locally.
   const saveTemplate = useCallback(() => {
-    const { companyName, companyAddress, companyPhone, companyEmail, ...presentation } = template;
+    const { companyName, companyAddress, companyPhone, companyEmail, logoUrl, ...presentation } = template;
     localStorage.setItem('payslipTemplate', JSON.stringify(presentation));
     showNotification('Payslip template saved successfully!', 'success');
     setShowTemplateModal(false);
@@ -1165,9 +1175,15 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
       <div className="p-6 rounded-lg border-2 border-slate-200 bg-white" id="payslip-content">
         <div className="flex items-start justify-between pb-4 border-b-2 border-[#081C3A]">
           <div className="flex items-center gap-3">
-            <div className="w-14 h-14 rounded-xl bg-[#081C3A] flex items-center justify-center">
-              <Shield size={24} className="text-[#D4A017]" />
-            </div>
+            {template.showLogo && (
+              <div className="w-14 h-14 rounded-xl bg-[#081C3A] flex items-center justify-center overflow-hidden shrink-0">
+                {template.logoUrl ? (
+                  <img src={template.logoUrl} alt="Company logo" className="w-full h-full object-contain" />
+                ) : (
+                  <Shield size={24} className="text-[#D4A017]" />
+                )}
+              </div>
+            )}
             <div>
               <h1 className="text-xl font-bold text-[#081C3A]">{template.companyName}</h1>
               <p className="text-xs text-slate-500">{template.companyAddress}</p>
