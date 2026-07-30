@@ -2262,9 +2262,17 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
   
   // ===== NEW: Loading state for edit submit button =====
   const [isSubmitting, setIsSubmitting] = useState(false);
-  
+
+  // Must use the functional updater (prev => ...), not `{ ...form, [k]: v }`.
+  // handleAssignmentTypeChange below calls update() twice in a row (once for
+  // assignment_type, once to clear company/resident_name) -- with the plain
+  // `{ ...form }` spread, both calls read the same stale `form` from this
+  // render, so the second call's spread silently discards the first call's
+  // change instead of building on it. That's why switching Company <-> Resident
+  // looked like it did nothing: the assignment_type update was overwritten by
+  // the very next line clearing the other field.
   const update = (k: string, v: any) => {
-    setForm({ ...form, [k]: v });
+    setForm((prev: any) => ({ ...prev, [k]: v }));
   };
 
   const formatNumberWithCommas = (value: string) => {
