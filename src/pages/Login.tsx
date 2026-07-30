@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Shield, Lock, User, Eye, EyeOff } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { checkRateLimit } from '../utils/rateLimiter';
 // ===== Import audit logger =====
 import { logAudit } from '../utils/auditLogger';
+import { getCompanySettings } from '../utils/companySettings';
 
 export function LoginPage({ onLogin }: { onLogin: () => void }) {
   const [username, setUsername] = useState('');
@@ -11,6 +12,16 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [logoUrl, setLogoUrl] = useState('');
+
+  // Company logo, if one's been uploaded in Settings -> Company. The
+  // logo bucket is public-read (see the company_logo_storage migration),
+  // so this works pre-login same as it does everywhere else; if a tenant's
+  // system_settings row genuinely isn't readable before auth, this just
+  // fails closed to the Shield placeholder below like it always has.
+  useEffect(() => {
+    getCompanySettings().then(info => setLogoUrl(info.logoUrl)).catch(() => {});
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -177,8 +188,12 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
         <div className="hidden lg:flex flex-col justify-between text-white p-10 rounded-2xl bg-white/5 backdrop-blur border border-white/10">
           <div>
             <div className="flex items-center gap-3 mb-10">
-              <div className="w-14 h-14 rounded-2xl bg-[#D4A017] flex items-center justify-center shadow-xl">
-                <Shield size={28} className="text-[#081C3A]" />
+              <div className="w-14 h-14 rounded-2xl bg-[#D4A017] flex items-center justify-center shadow-xl overflow-hidden">
+                {logoUrl ? (
+                  <img src={logoUrl} alt="Company logo" className="w-full h-full object-contain" />
+                ) : (
+                  <Shield size={28} className="text-[#081C3A]" />
+                )}
               </div>
               <div>
                 <h1 className="text-2xl font-bold">Safeguard</h1>
@@ -210,8 +225,12 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
 
         <div className="bg-white rounded-2xl shadow-2xl p-8 md:p-10 flex flex-col justify-center">
           <div className="lg:hidden flex items-center gap-3 mb-8 justify-center">
-            <div className="w-12 h-12 rounded-xl bg-[#081C3A] flex items-center justify-center">
-              <Shield size={24} className="text-[#D4A017]" />
+            <div className="w-12 h-12 rounded-xl bg-[#081C3A] flex items-center justify-center overflow-hidden">
+              {logoUrl ? (
+                <img src={logoUrl} alt="Company logo" className="w-full h-full object-contain" />
+              ) : (
+                <Shield size={24} className="text-[#D4A017]" />
+              )}
             </div>
             <div>
               <h1 className="text-xl font-bold text-slate-800">Safeguard</h1>

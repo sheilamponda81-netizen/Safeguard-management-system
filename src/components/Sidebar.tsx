@@ -9,6 +9,7 @@ import {
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
 import { getCurrentProfile } from "../utils/currentProfile";
+import { getCompanySettings } from "../utils/companySettings";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { ChevronRight } from 'lucide-react';
 
@@ -95,7 +96,14 @@ export function Sidebar({
   const [userName, setUserName] = useState<string>("User");
   const [userEmail, setUserEmail] = useState<string>("");
   const [isMobile, setIsMobile] = useState(false);
-  
+  const [logoUrl, setLogoUrl] = useState('');
+
+  // Real company logo (Settings -> Company), replacing the placeholder
+  // Shield icon below when one has been uploaded.
+  useEffect(() => {
+    getCompanySettings().then(info => setLogoUrl(info.logoUrl));
+  }, []);
+
   // ===== PERFORMANCE: Use matchMedia instead of window.innerWidth =====
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -236,8 +244,12 @@ export function Sidebar({
     <>
       <div className="p-5 border-b border-slate-200 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-[#081C3A] flex items-center justify-center shadow-md">
-            <Shield size={20} className="text-[#D4A017]" />
+          <div className="w-10 h-10 rounded-xl bg-[#081C3A] flex items-center justify-center shadow-md overflow-hidden">
+            {logoUrl ? (
+              <img src={logoUrl} alt="Company logo" className="w-full h-full object-contain" />
+            ) : (
+              <Shield size={20} className="text-[#D4A017]" />
+            )}
           </div>
           <div>
             <p className="font-bold text-slate-800 text-sm leading-tight">

@@ -9,6 +9,7 @@ export interface CompanyInfo {
   website: string;
   taxId: string;
   pensionReg: string;
+  logoUrl: string;
 }
 
 export const DEFAULT_COMPANY_INFO: CompanyInfo = {
@@ -20,6 +21,7 @@ export const DEFAULT_COMPANY_INFO: CompanyInfo = {
   website: 'www.safeguardsecurities.co',
   taxId: 'MW-12345678',
   pensionReg: 'NBS-123456',
+  logoUrl: '',
 };
 
 const KEYS: Record<keyof CompanyInfo, string> = {
@@ -31,7 +33,15 @@ const KEYS: Record<keyof CompanyInfo, string> = {
   website: 'company_website',
   taxId: 'company_tax_id',
   pensionReg: 'company_pension_reg',
+  logoUrl: 'company_logo_url',
 };
+
+// Storage bucket the company logo is uploaded to (see the
+// supabase/migrations/*_company_logo_storage.sql migration for the bucket
+// and its RLS policies) -- public read so it can be shown in the app UI
+// without needing a signed URL, upload/update/delete restricted to
+// authenticated users.
+export const LOGO_STORAGE_BUCKET = 'company-logo';
 
 // Shared, per-tenant company profile -- stored in `system_settings` (same
 // key/value table and upsert pattern as payrollSettings.ts) so every admin's
@@ -100,4 +110,38 @@ export const setCompanySettings = async (info: CompanyInfo, userId: string): Pro
     )
   );
   return results.every(Boolean);
+};
+
+const MAX_LOGO_BYTES = 2 * 1024 * 1024; // 2MB
+const ALLOWED_LOGO_TYPES = ['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp'];
+
+// Uploads a new logo file and returns its public URL -- caller is still
+// responsible for saving that URL via setCompanySettings so it actually
+// takes effect (matches the rest of this form: nothing persists until Save
+// Changes is clicked). Always uploads to the same fixed path so a re-upload
+// simply replaces the previous file instead of accumulating orphaned ones.
+export const uploadCompanyLogo = async (file: File): Promise<{ url: string } | { error: string }> => {
+  if (!ALLOWED_LOGO_TYPES.includes(file.type)) {
+    return { error: 'Logo must be a PNG, JPEG, WEBP, or SVG image.' };
+  }
+  if (file.size > MAX_LOGO_BYTES) {
+    return { error: 'Logo must be smaller than 2MB.' };
+  }
+
+  const ext = file.name.split('.').pop() || 'png';
+  const path = `logo.${ext}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from(LOGO_STORAGE_BUCKET)
+    .upload(path, file, { upsert: true, cacheControl: '3600' });
+
+  if (uploadError) {
+    console.error('Error uploading company logo:', uploadError);
+    return { error: uploadError.message || 'Failed to upload logo' };
+  }
+
+  const { data } = supabase.storage.from(LOGO_STORAGE_BUCKET).getPublicUrl(path);
+  // Cache-bust so every admin's browser picks up a replaced logo immediately
+  // instead of an old cached image at the same URL.
+  return { url: `${data.publicUrl}?t=${Date.now()}` };
 };

@@ -11,6 +11,7 @@ import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
+import { getDefaultPageSize } from '../utils/uiSettings';
 
 interface SecurityPersonnel {
   id: string;
@@ -66,6 +67,7 @@ export function SecurityPage() {
   // ===== PAGINATION =====
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage, setItemsPerPage] = useState(20);
+  useEffect(() => { getDefaultPageSize().then(setItemsPerPage); }, []);
 
   // ===== REFS =====
   const isMounted = useRef(true);

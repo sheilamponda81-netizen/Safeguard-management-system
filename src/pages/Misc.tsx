@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar } from 'lucide-react';
+import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar, Shield } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, Modal, Tabs, Input } from '../components/ui';
 import { formatKwacha } from '../data';
 import { UserManagement } from '../components/UserManagement';
@@ -10,7 +10,8 @@ import { logAudit } from '../utils/auditLogger';
 import { MonthSettings } from '../components/MonthSettings';
 import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
 import { getPayrollRates, setPayrollRates } from '../utils/payrollSettings';
-import { getCompanySettings, setCompanySettings, DEFAULT_COMPANY_INFO } from '../utils/companySettings';
+import { getCompanySettings, setCompanySettings, uploadCompanyLogo, DEFAULT_COMPANY_INFO } from '../utils/companySettings';
+import { getDefaultPageSize, setDefaultPageSize } from '../utils/uiSettings';
 import { showNotification } from '../utils/clickHandlers';
 
 /* ----------------- SETTINGS ----------------- */
@@ -66,6 +67,7 @@ export function SettingsPage() {
   ];
 
   const [companyForm, setCompanyForm] = useState(DEFAULT_COMPANY_INFO);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
 
   const [taxForm, setTaxForm] = useState({
     taxRate: '30',
@@ -88,12 +90,9 @@ export function SettingsPage() {
     payPeriod: 'November 2025'
   });
 
-  // Attendance/payroll deduction rates -- the actual working "System" settings
-  // (see handleSaveDeductionRates below): these feed real calculations in
-  // Attendance.tsx, payrollCalculations.ts, and Payslips.tsx, unlike the old
-  // System tab's 6 toggles, which never persisted anywhere and didn't gate
-  // any real feature (no email/SMS sending, attendance sync, or 2FA exists
-  // in this app to turn on or off).
+  // Attendance/payroll deduction rates -- these feed real calculations in
+  // Attendance.tsx, payrollCalculations.ts, and Payslips.tsx, so they live on
+  // the Payroll tab alongside the rest of payroll configuration.
   const [deductionRatesForm, setDeductionRatesForm] = useState({
     uniformDeduction: '10000',
     absentDeduction: '4200',
@@ -102,6 +101,14 @@ export function SettingsPage() {
     lectureFullMonthDeduction: '15000',
     appearanceDeduction: '2000',
   });
+
+  // The System tab's one real, working setting: the starting page size for
+  // every paginated list in the app (Employees, Attendance, Payroll,
+  // Payslips, Payments, Recruitment, Security, Terminal Dues all read it --
+  // see uiSettings.ts). Replaces the old 6 toggles, none of which persisted
+  // anywhere or gated a real feature (no email/SMS sending, attendance sync,
+  // or 2FA exists in this app to turn on or off).
+  const [pageSizeForm, setPageSizeForm] = useState('20');
 
   const tabs = [
     { id: 'company', label: 'Company' },
@@ -453,6 +460,28 @@ const handleDeletePosition = async (position: any) => {
     }
   };
 
+  // Uploads immediately (so the file is safely in storage as soon as it's
+  // chosen), but only updates local form state -- like every other field
+  // here, the new logo doesn't take effect for anyone else until "Save
+  // Changes" is clicked and handleSaveCompany persists the URL.
+  const handleLogoUpload = async (file: File) => {
+    setUploadingLogo(true);
+    try {
+      const result = await uploadCompanyLogo(file);
+      if ('error' in result) {
+        showNotification(result.error, 'error');
+        return;
+      }
+      setCompanyForm(prev => ({ ...prev, logoUrl: result.url }));
+      showNotification('Logo uploaded -- click Save Changes to apply it everywhere', 'success');
+    } catch (error: any) {
+      console.error('Error uploading logo:', error);
+      showNotification('Failed to upload logo', 'error');
+    } finally {
+      setUploadingLogo(false);
+    }
+  };
+
   // ===== UPDATED: Save Tax with audit logging =====
   const handleSaveTax = async () => {
     setSaving(true);
@@ -537,28 +566,55 @@ const handleDeletePosition = async (position: any) => {
   };
 
   // ===== UPDATED: Save Payroll with audit logging =====
+  // Saves both the informational payroll fields (localStorage) and the
+  // deduction rates (shared system_settings, see payrollSettings.ts) that
+  // feed real calculations in Attendance.tsx, payrollCalculations.ts, and
+  // Payslips.tsx -- unlike the old System tab's 6 toggles, which weren't
+  // even persisted (plain React state, reset on every page load) and didn't
+  // gate any real feature, these immediately affect payroll math everywhere.
   const handleSavePayroll = async () => {
     setSaving(true);
     try {
-      const oldData = JSON.parse(localStorage.getItem('payrollSettings') || '{}');
+      const oldPayrollData = JSON.parse(localStorage.getItem('payrollSettings') || '{}');
       localStorage.setItem('payrollSettings', JSON.stringify(payrollForm));
-      
-      // Audit log
+
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('Not signed in');
+
+      const currentRates = await getPayrollRates();
+      const oldRates = {
+        uniformDeduction: currentRates.uniformDeduction,
+        absentDeduction: currentRates.absentDeduction,
+        lateDeduction: currentRates.lateDeduction,
+        lectureDeduction: currentRates.lectureDeduction,
+        lectureFullMonthDeduction: currentRates.lectureFullMonthDeduction,
+        appearanceDeduction: currentRates.appearanceDeduction,
+      };
+      const newRates = {
+        uniformDeduction: parseFloat(deductionRatesForm.uniformDeduction) || 0,
+        absentDeduction: parseFloat(deductionRatesForm.absentDeduction) || 0,
+        lateDeduction: parseFloat(deductionRatesForm.lateDeduction) || 0,
+        lectureDeduction: parseFloat(deductionRatesForm.lectureDeduction) || 0,
+        lectureFullMonthDeduction: parseFloat(deductionRatesForm.lectureFullMonthDeduction) || 0,
+        appearanceDeduction: parseFloat(deductionRatesForm.appearanceDeduction) || 0,
+      };
+
+      await setPayrollRates({ ...currentRates, ...newRates }, user.id);
+
       await logAudit({
         action: 'UPDATE',
         entity_type: 'payroll_settings',
-        old_data: Object.keys(oldData).length > 0 ? oldData : null,
-        new_data: payrollForm
+        old_data: { ...(Object.keys(oldPayrollData).length > 0 ? oldPayrollData : {}), ...oldRates },
+        new_data: { ...payrollForm, ...newRates }
       });
-      
-      setTimeout(() => {
-        setSaving(false);
-        setShowSuccess(true);
-        setTimeout(() => setShowSuccess(false), 3000);
-      }, 500);
+
+      setSaving(false);
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 3000);
     } catch (error) {
       console.error('Error saving payroll settings:', error);
       setSaving(false);
+      showNotification('Failed to save payroll settings', 'error');
     }
   };
 
@@ -585,57 +641,6 @@ const handleDeletePosition = async (position: any) => {
   const handleCancelPayroll = () => {
     const savedPayroll = localStorage.getItem('payrollSettings');
     setPayrollForm(prev => savedPayroll ? { ...prev, ...JSON.parse(savedPayroll) } : prev);
-  };
-
-  // ===== Save deduction rates: the System tab's real, working settings =====
-  // These feed real calculations in Attendance.tsx, payrollCalculations.ts,
-  // and Payslips.tsx (see payrollSettings.ts) -- unlike the 6 toggles this
-  // tab used to show, which weren't even persisted (plain React state, reset
-  // on every page load) and didn't gate any real feature.
-  const handleSaveDeductionRates = async () => {
-    setSaving(true);
-    try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) throw new Error('Not signed in');
-
-      const currentRates = await getPayrollRates();
-      const oldData = {
-        uniformDeduction: currentRates.uniformDeduction,
-        absentDeduction: currentRates.absentDeduction,
-        lateDeduction: currentRates.lateDeduction,
-        lectureDeduction: currentRates.lectureDeduction,
-        lectureFullMonthDeduction: currentRates.lectureFullMonthDeduction,
-        appearanceDeduction: currentRates.appearanceDeduction,
-      };
-      const newData = {
-        uniformDeduction: parseFloat(deductionRatesForm.uniformDeduction) || 0,
-        absentDeduction: parseFloat(deductionRatesForm.absentDeduction) || 0,
-        lateDeduction: parseFloat(deductionRatesForm.lateDeduction) || 0,
-        lectureDeduction: parseFloat(deductionRatesForm.lectureDeduction) || 0,
-        lectureFullMonthDeduction: parseFloat(deductionRatesForm.lectureFullMonthDeduction) || 0,
-        appearanceDeduction: parseFloat(deductionRatesForm.appearanceDeduction) || 0,
-      };
-
-      await setPayrollRates({ ...currentRates, ...newData }, user.id);
-
-      await logAudit({
-        action: 'UPDATE',
-        entity_type: 'system_settings',
-        old_data: oldData,
-        new_data: newData
-      });
-
-      setSaving(false);
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
-    } catch (error) {
-      console.error('Error saving deduction rates:', error);
-      setSaving(false);
-      showNotification('Failed to save deduction rates', 'error');
-    }
-  };
-
-  const handleCancelDeductionRates = () => {
     getPayrollRates().then(rates => {
       setDeductionRatesForm({
         uniformDeduction: String(rates.uniformDeduction),
@@ -646,6 +651,38 @@ const handleDeletePosition = async (position: any) => {
         appearanceDeduction: String(rates.appearanceDeduction),
       });
     });
+  };
+
+  // ===== System tab: default page size for every paginated list =====
+  const handleSaveSystemSettings = async () => {
+    setSaving(true);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('Not signed in');
+
+      const oldSize = await getDefaultPageSize();
+      const newSize = parseInt(pageSizeForm, 10) || 20;
+      await setDefaultPageSize(newSize, user.id);
+
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'system_settings',
+        old_data: { defaultPageSize: oldSize },
+        new_data: { defaultPageSize: newSize }
+      });
+
+      setSaving(false);
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 3000);
+    } catch (error) {
+      console.error('Error saving system settings:', error);
+      setSaving(false);
+      showNotification('Failed to save system settings', 'error');
+    }
+  };
+
+  const handleCancelSystemSettings = () => {
+    getDefaultPageSize().then(size => setPageSizeForm(String(size)));
   };
 
   // Role Functions
@@ -778,6 +815,8 @@ const handleDeletePosition = async (position: any) => {
 
     // Company info is shared (system_settings) too -- see companySettings.ts.
     getCompanySettings().then(setCompanyForm);
+
+    getDefaultPageSize().then(size => setPageSizeForm(String(size)));
 
     loadRoles();
     loadPositions();
@@ -966,6 +1005,45 @@ const handleDeletePosition = async (position: any) => {
       {tab === 'company' && (
         <Card className="p-6">
           <h3 className="font-semibold text-slate-800 mb-4">Company Information</h3>
+
+          <div className="mb-6 flex items-center gap-4">
+            <div className="w-16 h-16 rounded-xl bg-[#081C3A] flex items-center justify-center shrink-0 overflow-hidden">
+              {companyForm.logoUrl ? (
+                <img src={companyForm.logoUrl} alt="Company logo" className="w-full h-full object-contain" />
+              ) : (
+                <Shield size={28} className="text-[#D4A017]" />
+              )}
+            </div>
+            <div>
+              <label className="inline-block">
+                <span className={`inline-flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border border-slate-200 cursor-pointer hover:bg-slate-50 ${uploadingLogo ? 'opacity-50 pointer-events-none' : ''}`}>
+                  {uploadingLogo ? 'Uploading...' : 'Upload Logo'}
+                </span>
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                  className="hidden"
+                  disabled={uploadingLogo}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleLogoUpload(file);
+                    e.target.value = '';
+                  }}
+                />
+              </label>
+              {companyForm.logoUrl && (
+                <button
+                  type="button"
+                  className="ml-2 text-sm text-red-600 hover:underline"
+                  onClick={() => setCompanyForm({ ...companyForm, logoUrl: '' })}
+                >
+                  Remove
+                </button>
+              )}
+              <p className="text-xs text-slate-400 mt-1">PNG, JPEG, WEBP, or SVG. Max 2MB. Shown in the sidebar and on payslips.</p>
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <Input label="Company Name" value={companyForm.companyName} onChange={(e: any) => setCompanyForm({...companyForm, companyName: e.target.value})} />
             <Input label="Company Registration" value={companyForm.registration} onChange={(e: any) => setCompanyForm({...companyForm, registration: e.target.value})} />
@@ -1038,6 +1116,46 @@ const handleDeletePosition = async (position: any) => {
             <CreditCard size={18} className="text-[#081C3A] shrink-0 mt-0.5" />
             <div><strong>Bank Integration:</strong> National Bank of Malawi · NBS Bank · FDH Bank</div>
           </div>
+
+          <div className="mt-8 pt-6 border-t border-slate-200">
+            <h4 className="font-semibold text-slate-800 mb-1">Deduction Rates</h4>
+            <p className="text-xs text-slate-500 mb-4">
+              Applied automatically wherever deductions are calculated -- Attendance, Payroll, Payments, and Payslips all use these same figures.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <Input
+                label="Uniform Deduction (MK/month)"
+                value={deductionRatesForm.uniformDeduction}
+                onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, uniformDeduction: e.target.value })}
+              />
+              <Input
+                label="Absent Day Deduction (MK/day)"
+                value={deductionRatesForm.absentDeduction}
+                onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, absentDeduction: e.target.value })}
+              />
+              <Input
+                label="Late Day Deduction (MK/day)"
+                value={deductionRatesForm.lateDeduction}
+                onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lateDeduction: e.target.value })}
+              />
+              <Input
+                label="Missed Lecture Deduction (MK)"
+                value={deductionRatesForm.lectureDeduction}
+                onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lectureDeduction: e.target.value })}
+              />
+              <Input
+                label="Full-Month Lecture Deduction (MK)"
+                value={deductionRatesForm.lectureFullMonthDeduction}
+                onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lectureFullMonthDeduction: e.target.value })}
+              />
+              <Input
+                label="Appearance/Grooming Deduction (MK)"
+                value={deductionRatesForm.appearanceDeduction}
+                onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, appearanceDeduction: e.target.value })}
+              />
+            </div>
+          </div>
+
           <div className="flex items-center justify-end gap-2 mt-6">
             <Button variant="outline" onClick={handleCancelPayroll}>Cancel</Button>
             <Button variant="secondary" onClick={handleSavePayroll} disabled={saving}>
@@ -1268,45 +1386,28 @@ const handleDeletePosition = async (position: any) => {
       
       {tab === 'system' && (
         <Card className="p-6">
-          <h3 className="font-semibold text-slate-800 mb-1">Payroll & Attendance Deduction Rates</h3>
+          <h3 className="font-semibold text-slate-800 mb-1">System Preferences</h3>
           <p className="text-xs text-slate-500 mb-4">
-            These rates apply automatically wherever deductions are calculated -- Attendance, Payroll, Payments, and Payslips all use these same figures.
+            General app-wide behavior, independent of any one module.
           </p>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Input
-              label="Uniform Deduction (MK/month)"
-              value={deductionRatesForm.uniformDeduction}
-              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, uniformDeduction: e.target.value })}
-            />
-            <Input
-              label="Absent Day Deduction (MK/day)"
-              value={deductionRatesForm.absentDeduction}
-              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, absentDeduction: e.target.value })}
-            />
-            <Input
-              label="Late Day Deduction (MK/day)"
-              value={deductionRatesForm.lateDeduction}
-              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lateDeduction: e.target.value })}
-            />
-            <Input
-              label="Missed Lecture Deduction (MK)"
-              value={deductionRatesForm.lectureDeduction}
-              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lectureDeduction: e.target.value })}
-            />
-            <Input
-              label="Full-Month Lecture Deduction (MK)"
-              value={deductionRatesForm.lectureFullMonthDeduction}
-              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, lectureFullMonthDeduction: e.target.value })}
-            />
-            <Input
-              label="Appearance/Grooming Deduction (MK)"
-              value={deductionRatesForm.appearanceDeduction}
-              onChange={(e: any) => setDeductionRatesForm({ ...deductionRatesForm, appearanceDeduction: e.target.value })}
-            />
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">Default Rows Per Page</label>
+              <select
+                value={pageSizeForm}
+                onChange={(e) => setPageSizeForm(e.target.value)}
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
+              >
+                {['10', '20', '25', '50', '100'].map(n => <option key={n} value={n}>{n}</option>)}
+              </select>
+              <p className="text-xs text-slate-400 mt-1">
+                Starting page size for every list in the app -- Employees, Attendance, Payroll, Payslips, Payments, Recruitment, Security, and Terminal Dues. Anyone can still change it for their own session from the list itself.
+              </p>
+            </div>
           </div>
           <div className="flex items-center justify-end gap-2 mt-6">
-            <Button variant="outline" onClick={handleCancelDeductionRates}>Cancel</Button>
-            <Button variant="secondary" onClick={handleSaveDeductionRates} disabled={saving}>
+            <Button variant="outline" onClick={handleCancelSystemSettings}>Cancel</Button>
+            <Button variant="secondary" onClick={handleSaveSystemSettings} disabled={saving}>
               {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
             </Button>
           </div>
