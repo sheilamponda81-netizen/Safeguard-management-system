@@ -1195,7 +1195,7 @@ export function EmployeesPage() {
               <TR hover={false}>
                 <TH>Employee</TH>
                 <TH className="hidden lg:table-cell">Company/Resident</TH>
-                <TH className="hidden xl:table-cell">Workstation</TH>
+                <TH className="hidden lg:table-cell">Workstation</TH>
                 <TH className="hidden md:table-cell">Phone</TH>
                 <TH>Position</TH>
                 <TH className="hidden lg:table-cell">Basic Salary</TH>
@@ -1239,7 +1239,7 @@ export function EmployeesPage() {
                       </div>
                     )}
                   </TD>
-                  <TD className="hidden xl:table-cell">{emp.workstation || '-'}</TD>
+                  <TD className="hidden lg:table-cell">{emp.workstation || '-'}</TD>
                   <TD className="hidden md:table-cell">{emp.phone || '-'}</TD>
                   <TD>{emp.position}</TD>
                   <TD className="hidden lg:table-cell font-medium">{formatKwacha(emp.basicSalary)}</TD>
