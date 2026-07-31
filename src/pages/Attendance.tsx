@@ -640,23 +640,29 @@ export function AttendancePage() {
 
   // ===== EMPLOYEE MODAL =====
   const EmployeeModal = useCallback(() => {
-    if (!selectedEmployee) return null;
-    const stats = getEmployeeStats(selectedEmployee.id);
-    const deductions = calculateEmployeeDeductions(selectedEmployee.id);
+    // All hooks below must run unconditionally, before the `if (!selectedEmployee)
+    // return null` further down -- this function is invoked directly as
+    // EmployeeModal() (not rendered as <EmployeeModal />), so its hook calls are
+    // counted as part of AttendancePage's own render. Hooks used to be declared
+    // AFTER that early return, so selecting an employee (or closing the modal
+    // afterward) changed how many hooks got called between renders -- a Rules of
+    // Hooks violation that crashes with "Rendered more hooks than during the
+    // previous render" (React error #310) the moment you click any employee row.
     const [editableDeductions, setEditableDeductions] = useState({
-      absentDays: deductions.absentDays,
-      lateDays: deductions.lateDays,
-      absentDeduction: deductions.absentDeduction,
-      lateDeduction: deductions.lateDeduction,
-      lectureMissed: deductions.lectureMissedCount,
-      lectureDeduction: deductions.lectureDeduction,
-      appearanceDeduction: deductions.appearanceDeduction,
-      totalDeductions: deductions.totalDeductions
+      absentDays: 0,
+      lateDays: 0,
+      absentDeduction: 0,
+      lateDeduction: 0,
+      lectureMissed: 0,
+      lectureDeduction: 0,
+      appearanceDeduction: 0,
+      totalDeductions: 0
     });
     const [saving, setSaving] = useState(false);
     const [savedSuccess, setSavedSuccess] = useState(false);
-    
+
     useEffect(() => {
+      if (!selectedEmployee) return;
       const newDeductions = calculateEmployeeDeductions(selectedEmployee.id);
       setEditableDeductions({
         absentDays: newDeductions.absentDays,
@@ -819,6 +825,9 @@ export function AttendancePage() {
         loadSavedDeductions();
       }
     }, [selectedEmployee]);
+
+    if (!selectedEmployee) return null;
+    const stats = getEmployeeStats(selectedEmployee.id);
 
     return (
       <Modal open={!!selectedEmployee} onClose={() => setSelectedEmployee(null)} title="Attendance & Deductions Summary" size="xl">
