@@ -462,23 +462,32 @@ export function PayrollPage() {
   }, [canEditPayroll, isApproved]);
 
   // ===== INITIALIZATION =====
+  // Runs once on mount only -- fetchProcessedMonths depends on userProfile
+  // (see its own useCallback deps above), and fetchUserProfile sets a fresh
+  // userProfile object every time it runs. Listing fetchProcessedMonths in
+  // this effect's own deps used to mean: userProfile changes -> new
+  // fetchProcessedMonths identity -> this effect re-runs -> calls
+  // fetchUserProfile() again -> sets a new userProfile -> repeat forever.
+  // That infinite loop is what made the page look like it kept reloading.
+  // The effect below (watching selectedMonth/userProfile) already fetches
+  // processed months once those are actually set, so this doesn't need its
+  // own call to fetchProcessedMonths either.
   useEffect(() => {
     const init = async () => {
       const month = await getSystemCurrentMonth();
       setSystemMonth(month);
       setSelectedMonth(month);
-      
+
       const months = getAvailableMonthsFromSystem(month);
       setAvailableMonths(months);
-      
+
       const pastMonths = months.filter(m => m < month);
       setCopySourceMonths(pastMonths);
-      
+
       await fetchUserProfile();
-      await fetchProcessedMonths();
     };
     init();
-  }, [fetchUserProfile, fetchProcessedMonths]);
+  }, []);
 
   useEffect(() => {
     if (userProfile && selectedMonth) {
