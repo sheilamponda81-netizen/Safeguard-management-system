@@ -20,11 +20,20 @@ export const getSystemCurrentMonth = async (): Promise<string> => {
   try {
     console.log('🔍 Fetching current month from system_settings...');
     
+    // .single() throws a 406 whenever zero rows match -- which is exactly
+    // what happens the very first time a tenant loads the app, before this
+    // setting has ever been created. That 406 took the `if (error)` branch
+    // below straight to the hardcoded fallback, on every single page load,
+    // forever -- it never reached the "create the default row" step further
+    // down, since that only ran when there was no error at all. maybeSingle()
+    // returns `data: null` with no error in that same zero-rows case, so the
+    // auto-create path below actually gets to run (once), and subsequent
+    // loads find the row and stop hitting this at all.
     const { data, error } = await supabase
       .from('system_settings')
       .select('value')
       .eq('key', 'current_payroll_month')
-      .single();
+      .maybeSingle();
 
     if (error) {
       console.error('❌ Error fetching current month setting:', error);
@@ -33,7 +42,7 @@ export const getSystemCurrentMonth = async (): Promise<string> => {
       console.log(`⚠️ Using fallback month: ${fallback}`);
       return fallback;
     }
-    
+
     if (data?.value) {
       // Validate that the month is not before July 2026
       const [year, month] = data.value.split('-').map(Number);
