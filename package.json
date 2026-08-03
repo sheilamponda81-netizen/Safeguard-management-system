@@ -4,7 +4,8 @@
   "version": "2.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --force --host",
+    "dev": "vite --host",
+    "dev:force": "vite --force --host",
     "dev:inspect": "vite --inspect",
     "build": "vite build",
     "build:analyze": "npm run build && npx vite-bundle-visualizer",
