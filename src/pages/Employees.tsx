@@ -11,6 +11,7 @@ import { getEmployeeAuditData, getChanges } from '../utils/auditHelpers';
 import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { toCsvRow } from '../utils/csvExport';
 
 interface Employee {
   id: string;
@@ -982,7 +983,7 @@ export function EmployeesPage() {
         e.resident_name || '',
         e.resident_contact || ''
       ])
-    ].map(row => row.join(',')).join('\n');
+    ].map(toCsvRow).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

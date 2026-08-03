@@ -12,6 +12,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { toCsvRow } from '../utils/csvExport';
 
 interface SecurityPersonnel {
   id: string;
@@ -561,7 +562,7 @@ export function SecurityPage() {
         g.emergency_contact || '',
         g.emergency_phone || ''
       ])
-    ].map(row => row.join(',')).join('\n');
+    ].map(toCsvRow).join('\n');
     
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);

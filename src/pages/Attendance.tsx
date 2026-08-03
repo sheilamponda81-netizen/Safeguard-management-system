@@ -13,6 +13,7 @@ import { Pagination } from '../components/Pagination';
 import { debounce } from '../utils/debounce';
 import { getPayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { toCsvRow } from '../utils/csvExport';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -952,19 +953,20 @@ export function AttendancePage() {
 
   // ===== EXPORT REPORT =====
   const exportReport = useCallback(() => {
-    let csv = 'Employee,Position,Department,';
-    dates.forEach((_, i) => { csv += `Day ${i + 1},`; });
-    csv += 'Present,Absent,Late,Leave,Sick,Absent Deduction,Late Deduction,Lecture Deduction,Appearance Deduction,Total Deductions\n';
+    const headerRow = ['Employee', 'Position', 'Department'];
+    dates.forEach((_, i) => headerRow.push(`Day ${i + 1}`));
+    headerRow.push('Present', 'Absent', 'Late', 'Leave', 'Sick', 'Absent Deduction', 'Late Deduction', 'Lecture Deduction', 'Appearance Deduction', 'Total Deductions');
+    let csv = toCsvRow(headerRow) + '\n';
     filteredEmployees.forEach(emp => {
       const stats = getEmployeeStats(emp.id);
       const deductions = calculateEmployeeDeductions(emp.id);
-      csv += `"${emp.full_name}","${emp.position}","${emp.department}",`;
+      const row: (string | number)[] = [emp.full_name, emp.position, emp.department];
       dates.forEach(date => {
-        const status = getAttendanceStatus(emp.id, date);
-        csv += `${status},`;
+        row.push(getAttendanceStatus(emp.id, date));
       });
-      csv += `${stats.P},${stats.A},${stats.L},${stats.LV},${stats.SL},`;
-      csv += `${deductions.absentDeduction},${deductions.lateDeduction},${deductions.lectureDeduction},${deductions.appearanceDeduction},${deductions.totalDeductions}\n`;
+      row.push(stats.P, stats.A, stats.L, stats.LV, stats.SL);
+      row.push(deductions.absentDeduction, deductions.lateDeduction, deductions.lectureDeduction, deductions.appearanceDeduction, deductions.totalDeductions);
+      csv += toCsvRow(row) + '\n';
     });
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);

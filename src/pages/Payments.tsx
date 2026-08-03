@@ -6,6 +6,7 @@ import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { formatKwacha } from '../data';
 import { showNotification } from '../utils/clickHandlers';
+import { toCsvRow } from '../utils/csvExport';
 import { logAudit } from '../utils/auditLogger';
 import {
   getSystemCurrentMonth,
@@ -583,7 +584,7 @@ export function PaymentsPage() {
         p.payment_date || '',
         p.notes || ''
       ])
-    ].map(row => row.join(',')).join('\n');
+    ].map(toCsvRow).join('\n');
     
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);

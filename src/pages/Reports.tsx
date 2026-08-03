@@ -11,6 +11,7 @@ import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
+import { toCsvRow } from '../utils/csvExport';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
 
@@ -627,7 +628,7 @@ export function ReportsPage() {
     
     let csvContent = `${reportData.title}\nGenerated: ${new Date().toLocaleString()}\n\n${reportData.headers.join(',')}\n`;
     reportData.rows.forEach(row => {
-      csvContent += row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',') + '\n';
+      csvContent += toCsvRow(row) + '\n';
     });
     if (activeReport === 'payroll') {
       csvContent += `\n\nSUMMARY\nTotal Gross Pay,${formatKwacha(payrollSummary.totalGross)}\nTotal Net Pay,${formatKwacha(payrollSummary.totalNet)}\n`;

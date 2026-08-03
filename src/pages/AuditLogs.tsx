@@ -24,6 +24,7 @@ import {
 } from "../components/ui";
 import { supabase } from "../lib/supabase";
 import { showNotification } from "../utils/clickHandlers";
+import { toCsvRow } from "../utils/csvExport";
 
 export function AuditLogsPage() {
   const [logs, setLogs] = useState<any[]>([]);
@@ -406,7 +407,7 @@ export function AuditLogsPage() {
       JSON.stringify(log.new_data || log.old_data || {}),
     ]);
 
-    const csv = [headers.join(","), ...rows.map((row) => row.join(","))].join("\n");
+    const csv = [headers, ...rows].map(toCsvRow).join("\n");
 
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
