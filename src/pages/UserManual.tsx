@@ -780,15 +780,7 @@ export function UserManualPage() {
                   </div>
                   <div className="flex items-start gap-2">
                     <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
-                    <span><strong>Two-Factor Authentication:</strong> Optional 2FA adds an extra layer of security to protect accounts.</span>
-                  </div>
-                  <div className="flex items-start gap-2">
-                    <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
-                    <span><strong>Data Isolation:</strong> Regional data isolation ensures employees only access data relevant to their region.</span>
-                  </div>
-                  <div className="flex items-start gap-2">
-                    <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
-                    <span><strong>Backup & Recovery:</strong> Automated daily backups with point-in-time recovery capabilities.</span>
+                    <span><strong>Data Isolation:</strong> The interface displays only the data relevant to your assigned region.</span>
                   </div>
                 </div>
               </div>
