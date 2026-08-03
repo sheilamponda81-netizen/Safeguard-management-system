@@ -326,7 +326,7 @@ export function EmployeesPage() {
     }
     
     // Otherwise show ONLY active employees with optional status filter
-    let data = activeEmployees;
+    const data = activeEmployees;
     
     return data.filter(e => {
       const matchesSearch = e.fullName.toLowerCase().includes(search.toLowerCase()) || 

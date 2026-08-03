@@ -1,7 +1,5 @@
 // src/utils/rateLimiter.ts
 
-import { useState } from 'react';
-
 interface RateLimitStore {
   [key: string]: {
     count: number;
@@ -71,7 +69,6 @@ export const checkRateLimit = (
   }
   
   if (userLimit.count >= finalConfig.maxRequests) {
-    const remainingTime = Math.ceil((blockTime - now) / 1000);
     return { allowed: false, remaining: 0, resetTime: blockTime };
   }
   
@@ -95,9 +92,5 @@ export const withRateLimit = async <T>(
     throw new Error(`Rate limit exceeded. Please try again in ${Math.ceil((result.resetTime - Date.now()) / 1000)} seconds.`);
   }
   
-  try {
-    return await fn();
-  } catch (error) {
-    throw error;
-  }
+  return await fn();
 };

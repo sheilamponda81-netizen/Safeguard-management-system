@@ -305,7 +305,7 @@ export function TerminalDuesPage() {
     const dateJoined = new Date(selectedEmployee.hire_date);
     const dateLeft = new Date(formData.date_left);
 
-    let monthsDiff = (dateLeft.getFullYear() - dateJoined.getFullYear()) * 12 +
+    const monthsDiff = (dateLeft.getFullYear() - dateJoined.getFullYear()) * 12 +
                      (dateLeft.getMonth() - dateJoined.getMonth());
 
     if (monthsDiff <= 0) {
