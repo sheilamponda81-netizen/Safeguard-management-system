@@ -51,6 +51,426 @@ interface AttendanceRecord {
   status: string;
 }
 
+interface EmployeeDeductionCalc {
+  absentDays: number;
+  lateDays: number;
+  absentDeduction: number;
+  lateDeduction: number;
+  attendanceDeduction: number;
+  lectureMissedCount: number;
+  lectureDeduction: number;
+  appearanceDeduction: number;
+  totalDeductions: number;
+}
+
+interface EmployeeStats {
+  P: number;
+  A: number;
+  L: number;
+  LV: number;
+  SL: number;
+  total: number;
+}
+
+interface EmployeeModalProps {
+  selectedEmployee: Employee | null;
+  onClose: () => void;
+  selectedMonth: string;
+  deductionRates: typeof DEFAULT_RATES;
+  userProfile: any;
+  getDatesForMonth: (monthYear: string) => string[];
+  getEmployeeStats: (employeeId: string) => EmployeeStats;
+  calculateEmployeeDeductions: (employeeId: string) => EmployeeDeductionCalc;
+  fetchData: () => Promise<void>;
+}
+
+// A genuine, standalone component (not a useCallback closure invoked as a
+// plain function) so its hooks always belong to its own fiber -- mounting
+// and unmounting independently of whatever AttendancePage itself is doing.
+// This used to be defined as `const EmployeeModal = useCallback(() => {...
+// }, [...])` and invoked directly as `EmployeeModal()`, which put its hook
+// calls on AttendancePage's own hook list; that caused two separate
+// "Rendered more hooks than during the previous render" (React error #310)
+// production incidents (an early return inside this function, and later a
+// second one in AttendancePage itself both skipped calling it under some
+// conditions). Defining it as a module-level function component -- and
+// rendering it as <EmployeeModal ... /> -- removes the entire class of
+// bug: its reference never changes across renders (unlike a useCallback
+// result), so React treats it as the same component type on every render
+// and never remounts it, which was the actual worry that led to the
+// useCallback-as-plain-function pattern in the first place.
+function EmployeeModal({
+  selectedEmployee,
+  onClose,
+  selectedMonth,
+  deductionRates,
+  userProfile,
+  getDatesForMonth,
+  getEmployeeStats,
+  calculateEmployeeDeductions,
+  fetchData
+}: EmployeeModalProps) {
+  const [editableDeductions, setEditableDeductions] = useState({
+    absentDays: 0,
+    lateDays: 0,
+    absentDeduction: 0,
+    lateDeduction: 0,
+    lectureMissed: 0,
+    lectureDeduction: 0,
+    appearanceDeduction: 0,
+    totalDeductions: 0
+  });
+  const [saving, setSaving] = useState(false);
+  const [savedSuccess, setSavedSuccess] = useState(false);
+
+  useEffect(() => {
+    if (!selectedEmployee) return;
+    const newDeductions = calculateEmployeeDeductions(selectedEmployee.id);
+    setEditableDeductions({
+      absentDays: newDeductions.absentDays,
+      lateDays: newDeductions.lateDays,
+      absentDeduction: newDeductions.absentDeduction,
+      lateDeduction: newDeductions.lateDeduction,
+      lectureMissed: newDeductions.lectureMissedCount,
+      lectureDeduction: newDeductions.lectureDeduction,
+      appearanceDeduction: newDeductions.appearanceDeduction,
+      totalDeductions: newDeductions.totalDeductions
+    });
+    setSavedSuccess(false);
+    // `calculateEmployeeDeductions` is itself a useCallback in the parent
+    // that depends on attendance data, so a new reference already implies
+    // attendance changed -- no need for a separate `attendance` dependency
+    // here (this used to list one, redundantly).
+  }, [selectedEmployee, calculateEmployeeDeductions]);
+
+  const handleDeductionChange = (field: string, value: number) => {
+    const safeValue = Math.max(0, Number(value) || 0);
+    setEditableDeductions(prev => {
+      const updated = { ...prev, [field]: safeValue };
+      // Editing the Lectures Missed count previously had no effect on the
+      // Lecture Deduction (MK) figure sitting right next to it -- an admin
+      // bumping the count up or down would see the MK amount just stay
+      // put, even though the two fields are presented as if one drives
+      // the other. Recompute it the same way calculateEmployeeDeductions
+      // does (flat full-month rate if every lecture this month was
+      // missed, otherwise per-lecture), while still leaving Lecture
+      // Deduction itself directly editable for a manual override.
+      if (field === 'lectureMissed') {
+        const totalLecturesThisMonth = getDatesForMonth(selectedMonth).filter(d => {
+          const dayOfWeek = new Date(d).getDay();
+          return dayOfWeek === 3 || dayOfWeek === 4;
+        }).length;
+        updated.lectureDeduction = safeValue === 0
+          ? 0
+          : safeValue === totalLecturesThisMonth
+            ? deductionRates.lectureFullMonthDeduction
+            : safeValue * deductionRates.lectureDeduction;
+      }
+      updated.totalDeductions =
+        (updated.absentDeduction || 0) +
+        (updated.lateDeduction || 0) +
+        (updated.lectureDeduction || 0) +
+        (updated.appearanceDeduction || 0);
+      return updated;
+    });
+    setSavedSuccess(false);
+  };
+
+  const saveDeductions = async () => {
+    if (!selectedEmployee) return;
+
+    setSaving(true);
+    try {
+      const { data: existingRecord, error: checkError } = await supabase
+        .from('employee_deductions')
+        .select('*')
+        .eq('employee_id', selectedEmployee.id)
+        .eq('month', selectedMonth)
+        .maybeSingle();
+
+      if (checkError) throw checkError;
+
+      const oldData = existingRecord ? {
+        absent_days: existingRecord.absent_days || 0,
+        late_days: existingRecord.late_days || 0,
+        absent_deduction: existingRecord.absent_deduction || 0,
+        late_deduction: existingRecord.late_deduction || 0,
+        lecture_missed: existingRecord.lecture_missed || 0,
+        lecture_deduction: existingRecord.lecture_deduction || 0,
+        appearance_deduction: existingRecord.appearance_deduction || 0,
+        total_deductions: existingRecord.total_deductions || 0
+      } : null;
+
+      const deductionData = {
+        employee_id: selectedEmployee.id,
+        month: selectedMonth,
+        absent_days: editableDeductions.absentDays,
+        late_days: editableDeductions.lateDays,
+        absent_deduction: editableDeductions.absentDeduction,
+        late_deduction: editableDeductions.lateDeduction,
+        lecture_missed: editableDeductions.lectureMissed,
+        lecture_deduction: editableDeductions.lectureDeduction,
+        appearance_deduction: editableDeductions.appearanceDeduction,
+        total_deductions: editableDeductions.totalDeductions,
+        updated_at: new Date().toISOString()
+      };
+
+      let result;
+      if (existingRecord) {
+        result = await supabase
+          .from('employee_deductions')
+          .update(deductionData)
+          .eq('id', existingRecord.id);
+      } else {
+        result = await supabase
+          .from('employee_deductions')
+          .insert([{
+            ...deductionData,
+            created_at: new Date().toISOString()
+          }]);
+      }
+
+      if (result.error) throw result.error;
+
+      await logAudit({
+        action: existingRecord ? 'UPDATE' : 'CREATE',
+        entity_type: 'employee_deductions',
+        entity_id: existingRecord?.id || selectedEmployee.id,
+        old_data: oldData,
+        new_data: deductionData,
+        region_id: userProfile?.region_id
+      });
+
+      setSavedSuccess(true);
+      showNotification(`Deductions saved for ${selectedEmployee.full_name}`, 'success');
+      await fetchData();
+      setTimeout(() => {
+        onClose();
+      }, 2000);
+    } catch (err: any) {
+      console.error('Error saving deductions:', err);
+      showNotification('Failed to save deductions: ' + err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const loadSavedDeductions = async () => {
+    if (!selectedEmployee) return;
+
+    try {
+      const { data, error } = await supabase
+        .from('employee_deductions')
+        .select('*')
+        .eq('employee_id', selectedEmployee.id)
+        .eq('month', selectedMonth)
+        .maybeSingle();
+
+      if (error) throw error;
+
+      if (data) {
+        setEditableDeductions({
+          absentDays: data.absent_days || 0,
+          lateDays: data.late_days || 0,
+          absentDeduction: data.absent_deduction || 0,
+          lateDeduction: data.late_deduction || 0,
+          lectureMissed: data.lecture_missed || 0,
+          lectureDeduction: data.lecture_deduction || 0,
+          appearanceDeduction: data.appearance_deduction || 0,
+          totalDeductions: data.total_deductions || 0
+        });
+        setSavedSuccess(true);
+      }
+    } catch (err) {
+      console.error('Error loading saved deductions:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedEmployee) {
+      loadSavedDeductions();
+    }
+  }, [selectedEmployee]);
+
+  if (!selectedEmployee) return null;
+  const stats = getEmployeeStats(selectedEmployee.id);
+
+  return (
+    <Modal open={!!selectedEmployee} onClose={onClose} title="Attendance & Deductions Summary" size="xl">
+      <div className="space-y-6">
+        <div className="flex items-center gap-3">
+          <div className="w-12 h-12 rounded-full bg-[#081C3A] text-white text-lg font-bold flex items-center justify-center">
+            {selectedEmployee.full_name?.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
+          </div>
+          <div>
+            <h3 className="font-bold text-slate-800">{selectedEmployee.full_name}</h3>
+            <p className="text-sm text-slate-500">{selectedEmployee.position} · {selectedEmployee.employee_number}</p>
+            {savedSuccess && (
+              <Badge color="green" className="mt-1">✓ Saved</Badge>
+            )}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          <div className="p-3 bg-emerald-50 rounded-lg flex justify-between items-center">
+            <span className="text-sm">Present</span>
+            <span className="font-bold text-emerald-600">{stats.P} days</span>
+          </div>
+          <div className="p-3 bg-red-50 rounded-lg flex justify-between items-center">
+            <span className="text-sm">Absent</span>
+            <span className="font-bold text-red-600">{stats.A} days</span>
+          </div>
+          <div className="p-3 bg-yellow-50 rounded-lg flex justify-between items-center">
+            <span className="text-sm">Late</span>
+            <span className="font-bold text-yellow-600">{stats.L} days</span>
+          </div>
+          <div className="p-3 bg-blue-50 rounded-lg flex justify-between items-center">
+            <span className="text-sm">Leave</span>
+            <span className="font-bold text-blue-600">{stats.LV} days</span>
+          </div>
+          <div className="p-3 bg-purple-50 rounded-lg flex justify-between items-center">
+            <span className="text-sm">Sick</span>
+            <span className="font-bold text-purple-600">{stats.SL} days</span>
+          </div>
+        </div>
+
+        <div className="border-t border-slate-200 pt-4">
+          <div className="flex items-center justify-between mb-4">
+            <h4 className="font-semibold text-slate-800">Deductions Summary</h4>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                onClick={loadSavedDeductions}
+                disabled={saving}
+                size="sm"
+              >
+                <RefreshCw size={14} className="mr-1" /> Reload
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={saveDeductions}
+                disabled={saving || savedSuccess}
+              >
+                {saving ? (
+                  <span className="flex items-center gap-2">
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    Saving...
+                  </span>
+                ) : savedSuccess ? (
+                  '✓ Saved'
+                ) : (
+                  'Save Deductions'
+                )}
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="p-4 bg-slate-50 rounded-lg">
+              <p className="text-xs text-slate-400 mb-2">
+                Counted automatically from this month's attendance record -- Payroll
+                uses these live, so they're no longer editable here.
+              </p>
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-slate-700">Absent Days</label>
+                  <input
+                    type="number"
+                    value={editableDeductions.absentDays}
+                    disabled
+                    className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
+                    min="0"
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-slate-700">Absent Deduction (MK)</label>
+                  <input
+                    type="number"
+                    value={editableDeductions.absentDeduction}
+                    disabled
+                    className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
+                    min="0"
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-slate-700">Late Days</label>
+                  <input
+                    type="number"
+                    value={editableDeductions.lateDays}
+                    disabled
+                    className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
+                    min="0"
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-slate-700">Late Deduction (MK)</label>
+                  <input
+                    type="number"
+                    value={editableDeductions.lateDeduction}
+                    disabled
+                    className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
+                    min="0"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="p-4 bg-slate-50 rounded-lg">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-slate-700">Lectures Missed</label>
+                  <input
+                    type="number"
+                    value={editableDeductions.lectureMissed}
+                    onChange={(e) => handleDeductionChange('lectureMissed', parseInt(e.target.value) || 0)}
+                    className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                    min="0"
+                  />
+                  <span className="text-xs text-slate-400">(Wed/Thu)</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-slate-700">Lecture Deduction (MK)</label>
+                  <input
+                    type="number"
+                    value={editableDeductions.lectureDeduction}
+                    onChange={(e) => handleDeductionChange('lectureDeduction', parseInt(e.target.value) || 0)}
+                    className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                    min="0"
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-slate-700">Appearance/Hygiene (MK)</label>
+                  <input
+                    type="number"
+                    value={editableDeductions.appearanceDeduction}
+                    onChange={(e) => handleDeductionChange('appearanceDeduction', parseInt(e.target.value) || 0)}
+                    className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                    min="0"
+                  />
+                </div>
+                <div className="flex items-center justify-between pt-3 border-t border-slate-200">
+                  <span className="font-semibold text-slate-800">Total Deductions</span>
+                  <span className="font-bold text-red-600 text-lg">
+                    MK {editableDeductions.totalDeductions.toLocaleString()}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 p-3 bg-amber-50 rounded-lg border border-amber-200">
+            <p className="text-xs text-amber-700 flex items-center gap-2">
+              <Scissors size={14} />
+              <strong>Note:</strong> Appearance deduction (MK 2,000) is applied monthly for uniform cleaning, shaving, and keeping hair short and smart.
+              Lecture deductions (MK 3,000 each) apply for missed Wednesday/Thursday lectures. Full month absence from lectures incurs MK 15,000 deduction.
+            </p>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 export function AttendancePage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -135,7 +555,7 @@ export function AttendancePage() {
       if (datesArr.length > 0 && employeesData && employeesData.length > 0) {
         const employeeIds = employeesData.map(e => e.id);
 
-        let attendanceQuery = supabase
+        const attendanceQuery = supabase
           .from('attendance')
           .select('*')
           .gte('date', datesArr[0])
@@ -638,385 +1058,8 @@ export function AttendancePage() {
     }
   }, [selectedMonth, userProfile, getDatesForMonth, fetchData]);
 
-  // ===== EMPLOYEE MODAL =====
-  const EmployeeModal = useCallback(() => {
-    // All hooks below must run unconditionally, before the `if (!selectedEmployee)
-    // return null` further down -- this function is invoked directly as
-    // EmployeeModal() (not rendered as <EmployeeModal />), so its hook calls are
-    // counted as part of AttendancePage's own render. Hooks used to be declared
-    // AFTER that early return, so selecting an employee (or closing the modal
-    // afterward) changed how many hooks got called between renders -- a Rules of
-    // Hooks violation that crashes with "Rendered more hooks than during the
-    // previous render" (React error #310) the moment you click any employee row.
-    const [editableDeductions, setEditableDeductions] = useState({
-      absentDays: 0,
-      lateDays: 0,
-      absentDeduction: 0,
-      lateDeduction: 0,
-      lectureMissed: 0,
-      lectureDeduction: 0,
-      appearanceDeduction: 0,
-      totalDeductions: 0
-    });
-    const [saving, setSaving] = useState(false);
-    const [savedSuccess, setSavedSuccess] = useState(false);
-
-    useEffect(() => {
-      if (!selectedEmployee) return;
-      const newDeductions = calculateEmployeeDeductions(selectedEmployee.id);
-      setEditableDeductions({
-        absentDays: newDeductions.absentDays,
-        lateDays: newDeductions.lateDays,
-        absentDeduction: newDeductions.absentDeduction,
-        lateDeduction: newDeductions.lateDeduction,
-        lectureMissed: newDeductions.lectureMissedCount,
-        lectureDeduction: newDeductions.lectureDeduction,
-        appearanceDeduction: newDeductions.appearanceDeduction,
-        totalDeductions: newDeductions.totalDeductions
-      });
-      setSavedSuccess(false);
-    }, [selectedEmployee, attendance, calculateEmployeeDeductions]);
-
-    const handleDeductionChange = (field: string, value: number) => {
-      const safeValue = Math.max(0, Number(value) || 0);
-      setEditableDeductions(prev => {
-        const updated = { ...prev, [field]: safeValue };
-        // Editing the Lectures Missed count previously had no effect on the
-        // Lecture Deduction (MK) figure sitting right next to it -- an admin
-        // bumping the count up or down would see the MK amount just stay
-        // put, even though the two fields are presented as if one drives
-        // the other. Recompute it the same way calculateEmployeeDeductions
-        // does (flat full-month rate if every lecture this month was
-        // missed, otherwise per-lecture), while still leaving Lecture
-        // Deduction itself directly editable for a manual override.
-        if (field === 'lectureMissed') {
-          const totalLecturesThisMonth = getDatesForMonth(selectedMonth).filter(d => {
-            const dayOfWeek = new Date(d).getDay();
-            return dayOfWeek === 3 || dayOfWeek === 4;
-          }).length;
-          updated.lectureDeduction = safeValue === 0
-            ? 0
-            : safeValue === totalLecturesThisMonth
-              ? deductionRates.lectureFullMonthDeduction
-              : safeValue * deductionRates.lectureDeduction;
-        }
-        updated.totalDeductions =
-          (updated.absentDeduction || 0) +
-          (updated.lateDeduction || 0) +
-          (updated.lectureDeduction || 0) +
-          (updated.appearanceDeduction || 0);
-        return updated;
-      });
-      setSavedSuccess(false);
-    };
-
-    const saveDeductions = async () => {
-      if (!selectedEmployee) return;
-      
-      setSaving(true);
-      try {
-        const { data: existingRecord, error: checkError } = await supabase
-          .from('employee_deductions')
-          .select('*')
-          .eq('employee_id', selectedEmployee.id)
-          .eq('month', selectedMonth)
-          .maybeSingle();
-
-        if (checkError) throw checkError;
-
-        const oldData = existingRecord ? {
-          absent_days: existingRecord.absent_days || 0,
-          late_days: existingRecord.late_days || 0,
-          absent_deduction: existingRecord.absent_deduction || 0,
-          late_deduction: existingRecord.late_deduction || 0,
-          lecture_missed: existingRecord.lecture_missed || 0,
-          lecture_deduction: existingRecord.lecture_deduction || 0,
-          appearance_deduction: existingRecord.appearance_deduction || 0,
-          total_deductions: existingRecord.total_deductions || 0
-        } : null;
-
-        const deductionData = {
-          employee_id: selectedEmployee.id,
-          month: selectedMonth,
-          absent_days: editableDeductions.absentDays,
-          late_days: editableDeductions.lateDays,
-          absent_deduction: editableDeductions.absentDeduction,
-          late_deduction: editableDeductions.lateDeduction,
-          lecture_missed: editableDeductions.lectureMissed,
-          lecture_deduction: editableDeductions.lectureDeduction,
-          appearance_deduction: editableDeductions.appearanceDeduction,
-          total_deductions: editableDeductions.totalDeductions,
-          updated_at: new Date().toISOString()
-        };
-
-        let result;
-        if (existingRecord) {
-          result = await supabase
-            .from('employee_deductions')
-            .update(deductionData)
-            .eq('id', existingRecord.id);
-        } else {
-          result = await supabase
-            .from('employee_deductions')
-            .insert([{
-              ...deductionData,
-              created_at: new Date().toISOString()
-            }]);
-        }
-
-        if (result.error) throw result.error;
-
-        await logAudit({
-          action: existingRecord ? 'UPDATE' : 'CREATE',
-          entity_type: 'employee_deductions',
-          entity_id: existingRecord?.id || selectedEmployee.id,
-          old_data: oldData,
-          new_data: deductionData,
-          region_id: userProfile?.region_id
-        });
-
-        setSavedSuccess(true);
-        showNotification(`Deductions saved for ${selectedEmployee.full_name}`, 'success');
-        await fetchData();
-        setTimeout(() => {
-          setSelectedEmployee(null);
-        }, 2000);
-      } catch (err: any) {
-        console.error('Error saving deductions:', err);
-        showNotification('Failed to save deductions: ' + err.message, 'error');
-      } finally {
-        setSaving(false);
-      }
-    };
-
-    const loadSavedDeductions = async () => {
-      if (!selectedEmployee) return;
-      
-      try {
-        const { data, error } = await supabase
-          .from('employee_deductions')
-          .select('*')
-          .eq('employee_id', selectedEmployee.id)
-          .eq('month', selectedMonth)
-          .maybeSingle();
-
-        if (error) throw error;
-
-        if (data) {
-          setEditableDeductions({
-            absentDays: data.absent_days || 0,
-            lateDays: data.late_days || 0,
-            absentDeduction: data.absent_deduction || 0,
-            lateDeduction: data.late_deduction || 0,
-            lectureMissed: data.lecture_missed || 0,
-            lectureDeduction: data.lecture_deduction || 0,
-            appearanceDeduction: data.appearance_deduction || 0,
-            totalDeductions: data.total_deductions || 0
-          });
-          setSavedSuccess(true);
-        }
-      } catch (err) {
-        console.error('Error loading saved deductions:', err);
-      }
-    };
-
-    useEffect(() => {
-      if (selectedEmployee) {
-        loadSavedDeductions();
-      }
-    }, [selectedEmployee]);
-
-    if (!selectedEmployee) return null;
-    const stats = getEmployeeStats(selectedEmployee.id);
-
-    return (
-      <Modal open={!!selectedEmployee} onClose={() => setSelectedEmployee(null)} title="Attendance & Deductions Summary" size="xl">
-        <div className="space-y-6">
-          <div className="flex items-center gap-3">
-            <div className="w-12 h-12 rounded-full bg-[#081C3A] text-white text-lg font-bold flex items-center justify-center">
-              {selectedEmployee.full_name?.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
-            </div>
-            <div>
-              <h3 className="font-bold text-slate-800">{selectedEmployee.full_name}</h3>
-              <p className="text-sm text-slate-500">{selectedEmployee.position} · {selectedEmployee.employee_number}</p>
-              {savedSuccess && (
-                <Badge color="green" className="mt-1">✓ Saved</Badge>
-              )}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-            <div className="p-3 bg-emerald-50 rounded-lg flex justify-between items-center">
-              <span className="text-sm">Present</span>
-              <span className="font-bold text-emerald-600">{stats.P} days</span>
-            </div>
-            <div className="p-3 bg-red-50 rounded-lg flex justify-between items-center">
-              <span className="text-sm">Absent</span>
-              <span className="font-bold text-red-600">{stats.A} days</span>
-            </div>
-            <div className="p-3 bg-yellow-50 rounded-lg flex justify-between items-center">
-              <span className="text-sm">Late</span>
-              <span className="font-bold text-yellow-600">{stats.L} days</span>
-            </div>
-            <div className="p-3 bg-blue-50 rounded-lg flex justify-between items-center">
-              <span className="text-sm">Leave</span>
-              <span className="font-bold text-blue-600">{stats.LV} days</span>
-            </div>
-            <div className="p-3 bg-purple-50 rounded-lg flex justify-between items-center">
-              <span className="text-sm">Sick</span>
-              <span className="font-bold text-purple-600">{stats.SL} days</span>
-            </div>
-          </div>
-
-          <div className="border-t border-slate-200 pt-4">
-            <div className="flex items-center justify-between mb-4">
-              <h4 className="font-semibold text-slate-800">Deductions Summary</h4>
-              <div className="flex gap-2">
-                <Button 
-                  variant="outline" 
-                  onClick={loadSavedDeductions}
-                  disabled={saving}
-                  size="sm"
-                >
-                  <RefreshCw size={14} className="mr-1" /> Reload
-                </Button>
-                <Button 
-                  variant="secondary" 
-                  onClick={saveDeductions}
-                  disabled={saving || savedSuccess}
-                >
-                  {saving ? (
-                    <span className="flex items-center gap-2">
-                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                      Saving...
-                    </span>
-                  ) : savedSuccess ? (
-                    '✓ Saved'
-                  ) : (
-                    'Save Deductions'
-                  )}
-                </Button>
-              </div>
-            </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="p-4 bg-slate-50 rounded-lg">
-                <p className="text-xs text-slate-400 mb-2">
-                  Counted automatically from this month's attendance record -- Payroll
-                  uses these live, so they're no longer editable here.
-                </p>
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm text-slate-700">Absent Days</label>
-                    <input
-                      type="number"
-                      value={editableDeductions.absentDays}
-                      disabled
-                      className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
-                      min="0"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm text-slate-700">Absent Deduction (MK)</label>
-                    <input
-                      type="number"
-                      value={editableDeductions.absentDeduction}
-                      disabled
-                      className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
-                      min="0"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm text-slate-700">Late Days</label>
-                    <input
-                      type="number"
-                      value={editableDeductions.lateDays}
-                      disabled
-                      className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
-                      min="0"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm text-slate-700">Late Deduction (MK)</label>
-                    <input
-                      type="number"
-                      value={editableDeductions.lateDeduction}
-                      disabled
-                      className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right bg-slate-100 text-slate-500 cursor-not-allowed"
-                      min="0"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <div className="p-4 bg-slate-50 rounded-lg">
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm text-slate-700">Lectures Missed</label>
-                    <input
-                      type="number"
-                      value={editableDeductions.lectureMissed}
-                      onChange={(e) => handleDeductionChange('lectureMissed', parseInt(e.target.value) || 0)}
-                      className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right"
-                      min="0"
-                    />
-                    <span className="text-xs text-slate-400">(Wed/Thu)</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm text-slate-700">Lecture Deduction (MK)</label>
-                    <input
-                      type="number"
-                      value={editableDeductions.lectureDeduction}
-                      onChange={(e) => handleDeductionChange('lectureDeduction', parseInt(e.target.value) || 0)}
-                      className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right"
-                      min="0"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm text-slate-700">Appearance/Hygiene (MK)</label>
-                    <input
-                      type="number"
-                      value={editableDeductions.appearanceDeduction}
-                      onChange={(e) => handleDeductionChange('appearanceDeduction', parseInt(e.target.value) || 0)}
-                      className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right"
-                      min="0"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between pt-3 border-t border-slate-200">
-                    <span className="font-semibold text-slate-800">Total Deductions</span>
-                    <span className="font-bold text-red-600 text-lg">
-                      MK {editableDeductions.totalDeductions.toLocaleString()}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-4 p-3 bg-amber-50 rounded-lg border border-amber-200">
-              <p className="text-xs text-amber-700 flex items-center gap-2">
-                <Scissors size={14} />
-                <strong>Note:</strong> Appearance deduction (MK 2,000) is applied monthly for uniform cleaning, shaving, and keeping hair short and smart. 
-                Lecture deductions (MK 3,000 each) apply for missed Wednesday/Thursday lectures. Full month absence from lectures incurs MK 15,000 deduction.
-              </p>
-            </div>
-          </div>
-        </div>
-      </Modal>
-    );
-  }, [selectedEmployee, getEmployeeStats, calculateEmployeeDeductions, selectedMonth, userProfile, fetchData, getDatesForMonth]);
 
   // ===== RENDER =====
-  // EmployeeModal() must be called unconditionally, before the loading/error
-  // early returns below -- it's invoked as a plain function (not <EmployeeModal
-  // />), so its internal hooks are counted as part of THIS component's own
-  // render. `loading` starts true and flips to false right after the initial
-  // fetch, so calling EmployeeModal() only in the branch reached after those
-  // early returns meant the very first render skipped its 4 hooks entirely
-  // while every later render called them -- a Rules of Hooks violation
-  // ("Rendered more hooks than during the previous render", React error #310)
-  // that fired on every visit to this page, right as the initial load finished.
-  const employeeModal = EmployeeModal();
-
   if (loading) {
     return <div className="flex justify-center py-12"><div className="w-8 h-8 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin"></div></div>;
   }
@@ -1240,13 +1283,17 @@ export function AttendancePage() {
         onItemsPerPageChange={setAttendanceItemsPerPage}
       />
 
-      {/* Called as a plain function, not <EmployeeModal />: this "component" is
-          a useCallback closure so it can capture selectedEmployee/attendance
-          directly. Rendering it as JSX would make React treat every identity
-          change of that callback as a brand-new component type and remount
-          the modal (losing the in-progress lecture/appearance deduction
-          edits) any time attendance data changes elsewhere on the page. */}
-      {employeeModal}
+      <EmployeeModal
+        selectedEmployee={selectedEmployee}
+        onClose={() => setSelectedEmployee(null)}
+        selectedMonth={selectedMonth}
+        deductionRates={deductionRates}
+        userProfile={userProfile}
+        getDatesForMonth={getDatesForMonth}
+        getEmployeeStats={getEmployeeStats}
+        calculateEmployeeDeductions={calculateEmployeeDeductions}
+        fetchData={fetchData}
+      />
       <CopyFromPreviousModal
         open={showCopyModal}
         onClose={() => setShowCopyModal(false)}

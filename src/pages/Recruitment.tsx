@@ -25,6 +25,160 @@ interface Applicant {
   region_id?: string;
 }
 
+interface AddApplicantModalProps {
+  showAddModal: boolean;
+  onClose: () => void;
+  isSuperAdmin: boolean;
+  userRegion: any;
+  regions: any[];
+  addApplicant: (newApplicant: any) => Promise<void>;
+}
+
+// A genuine, standalone component -- not a useCallback closure invoked as a
+// plain function (`AddApplicantModal()`), which is how this used to be
+// defined. That pattern puts the closure's own hook calls (the `useState`
+// below) on the PARENT's hook list for that render; this page's own
+// `if (loading) return <div>...</div>` early return sits between where the
+// closure was defined and where it was invoked, so the very first render
+// (loading start true) skipped that hook entirely while the next render
+// (loading now false) called it -- a live "Rendered more hooks than during
+// the previous render" (React error #310) crash on every visit to this
+// page, found via the same rules-of-hooks class of bug that had already
+// hit src/pages/Attendance.tsx twice in production. Making this a real
+// component removes the failure mode entirely: its reference is stable
+// across renders, so mounting/unmounting no longer depends on where the
+// parent's early returns happen to sit relative to where it's called.
+function AddApplicantModal({ showAddModal, onClose, isSuperAdmin, userRegion, regions, addApplicant }: AddApplicantModalProps) {
+  const [formData, setFormData] = useState({
+    name: '',
+    position: '',
+    qualification: '',
+    phone: '',
+    email: '',
+    experience: '',
+    coverLetter: '',
+    region_id: ''
+  });
+
+  return (
+    <Modal open={showAddModal} onClose={onClose} title="Add New Applicant" size="lg">
+      <div className="space-y-4">
+        {!isSuperAdmin && userRegion && (
+          <div className="p-3 rounded-lg bg-[#E8EDF5] text-sm text-slate-700">
+            Applicant will be considered for <strong>{userRegion.name}</strong> region
+          </div>
+        )}
+        {isSuperAdmin && (
+          <div>
+            <label htmlFor="applicantRegion" className="block text-sm font-medium text-slate-700 mb-1.5">Region *</label>
+            <select
+              id="applicantRegion"
+              name="applicantRegion"
+              value={formData.region_id}
+              onChange={(e: any) => setFormData({...formData, region_id: e.target.value})}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg bg-white"
+              required
+            >
+              <option value="">-- Please select a region --</option>
+              {regions.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+            </select>
+          </div>
+        )}
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="applicantName" className="block text-sm font-medium text-slate-700 mb-1.5">Full Name *</label>
+            <input
+              id="applicantName"
+              name="applicantName"
+              type="text"
+              value={formData.name}
+              onChange={(e: any) => setFormData({...formData, name: e.target.value})}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+              required
+            />
+          </div>
+          <div>
+            <label htmlFor="applicantPosition" className="block text-sm font-medium text-slate-700 mb-1.5">Position Applied *</label>
+            <input
+              id="applicantPosition"
+              name="applicantPosition"
+              type="text"
+              value={formData.position}
+              onChange={(e: any) => setFormData({...formData, position: e.target.value})}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+              required
+            />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="applicantQualification" className="block text-sm font-medium text-slate-700 mb-1.5">Qualification</label>
+            <input
+              id="applicantQualification"
+              name="applicantQualification"
+              type="text"
+              value={formData.qualification}
+              onChange={(e: any) => setFormData({...formData, qualification: e.target.value})}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+          <div>
+            <label htmlFor="applicantExperience" className="block text-sm font-medium text-slate-700 mb-1.5">Years of Experience</label>
+            <input
+              id="applicantExperience"
+              name="applicantExperience"
+              type="text"
+              value={formData.experience}
+              onChange={(e: any) => setFormData({...formData, experience: e.target.value})}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="applicantPhone" className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number</label>
+            <input
+              id="applicantPhone"
+              name="applicantPhone"
+              type="tel"
+              value={formData.phone}
+              onChange={(e: any) => setFormData({...formData, phone: e.target.value})}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+          <div>
+            <label htmlFor="applicantEmail" className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
+            <input
+              id="applicantEmail"
+              name="applicantEmail"
+              type="email"
+              value={formData.email}
+              onChange={(e: any) => setFormData({...formData, email: e.target.value})}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+        </div>
+        <div>
+          <label htmlFor="applicantCoverLetter" className="block text-sm font-medium text-slate-700 mb-1.5">Cover Letter</label>
+          <textarea
+            id="applicantCoverLetter"
+            name="applicantCoverLetter"
+            rows={3}
+            value={formData.coverLetter}
+            onChange={(e: any) => setFormData({...formData, coverLetter: e.target.value})}
+            placeholder="Write a cover letter or notes about this applicant..."
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+          />
+        </div>
+      </div>
+      <div className="flex justify-end gap-2 mt-6">
+        <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium hover:bg-slate-50">Cancel</button>
+        <button type="button" onClick={() => addApplicant(formData)} disabled={!formData.name || !formData.position || (isSuperAdmin && !formData.region_id)} className="px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] disabled:opacity-50">Add Applicant</button>
+      </div>
+    </Modal>
+  );
+}
+
 export function RecruitmentPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [applicants, setApplicants] = useState<Applicant[]>([]);
@@ -242,137 +396,6 @@ export function RecruitmentPage() {
     });
   }, [userProfile]);
 
-  // ===== ADD APPLICANT MODAL =====
-  const AddApplicantModal = useCallback(() => {
-    const [formData, setFormData] = useState({
-      name: '',
-      position: '',
-      qualification: '',
-      phone: '',
-      email: '',
-      experience: '',
-      coverLetter: '',
-      region_id: ''
-    });
-
-    return (
-      <Modal open={showAddModal} onClose={() => setShowAddModal(false)} title="Add New Applicant" size="lg">
-        <div className="space-y-4">
-          {!isSuperAdmin && userRegion && (
-            <div className="p-3 rounded-lg bg-[#E8EDF5] text-sm text-slate-700">
-              Applicant will be considered for <strong>{userRegion.name}</strong> region
-            </div>
-          )}
-          {isSuperAdmin && (
-            <div>
-              <label htmlFor="applicantRegion" className="block text-sm font-medium text-slate-700 mb-1.5">Region *</label>
-              <select
-                id="applicantRegion"
-                name="applicantRegion"
-                value={formData.region_id}
-                onChange={(e: any) => setFormData({...formData, region_id: e.target.value})}
-                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg bg-white"
-                required
-              >
-                <option value="">-- Please select a region --</option>
-                {regions.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
-              </select>
-            </div>
-          )}
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="applicantName" className="block text-sm font-medium text-slate-700 mb-1.5">Full Name *</label>
-              <input 
-                id="applicantName"
-                name="applicantName"
-                type="text" 
-                value={formData.name} 
-                onChange={(e: any) => setFormData({...formData, name: e.target.value})} 
-                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg" 
-                required
-              />
-            </div>
-            <div>
-              <label htmlFor="applicantPosition" className="block text-sm font-medium text-slate-700 mb-1.5">Position Applied *</label>
-              <input 
-                id="applicantPosition"
-                name="applicantPosition"
-                type="text" 
-                value={formData.position} 
-                onChange={(e: any) => setFormData({...formData, position: e.target.value})} 
-                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg" 
-                required
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="applicantQualification" className="block text-sm font-medium text-slate-700 mb-1.5">Qualification</label>
-              <input 
-                id="applicantQualification"
-                name="applicantQualification"
-                type="text" 
-                value={formData.qualification} 
-                onChange={(e: any) => setFormData({...formData, qualification: e.target.value})} 
-                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg" 
-              />
-            </div>
-            <div>
-              <label htmlFor="applicantExperience" className="block text-sm font-medium text-slate-700 mb-1.5">Years of Experience</label>
-              <input 
-                id="applicantExperience"
-                name="applicantExperience"
-                type="text" 
-                value={formData.experience} 
-                onChange={(e: any) => setFormData({...formData, experience: e.target.value})} 
-                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg" 
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="applicantPhone" className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number</label>
-              <input 
-                id="applicantPhone"
-                name="applicantPhone"
-                type="tel" 
-                value={formData.phone} 
-                onChange={(e: any) => setFormData({...formData, phone: e.target.value})} 
-                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg" 
-              />
-            </div>
-            <div>
-              <label htmlFor="applicantEmail" className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
-              <input 
-                id="applicantEmail"
-                name="applicantEmail"
-                type="email" 
-                value={formData.email} 
-                onChange={(e: any) => setFormData({...formData, email: e.target.value})} 
-                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg" 
-              />
-            </div>
-          </div>
-          <div>
-            <label htmlFor="applicantCoverLetter" className="block text-sm font-medium text-slate-700 mb-1.5">Cover Letter</label>
-            <textarea 
-              id="applicantCoverLetter"
-              name="applicantCoverLetter"
-              rows={3}
-              value={formData.coverLetter} 
-              onChange={(e: any) => setFormData({...formData, coverLetter: e.target.value})}
-              placeholder="Write a cover letter or notes about this applicant..."
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
-            />
-          </div>
-        </div>
-        <div className="flex justify-end gap-2 mt-6">
-          <button type="button" onClick={() => setShowAddModal(false)} className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium hover:bg-slate-50">Cancel</button>
-          <button type="button" onClick={() => addApplicant(formData)} disabled={!formData.name || !formData.position || (isSuperAdmin && !formData.region_id)} className="px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] disabled:opacity-50">Add Applicant</button>
-        </div>
-      </Modal>
-    );
-  }, [showAddModal, isSuperAdmin, userRegion, regions, addApplicant]);
 
   // ===== RENDER =====
   if (loading) {
@@ -587,12 +610,14 @@ export function RecruitmentPage() {
         )}
       </Modal>
 
-      {/* Called as a plain function, not <AddApplicantModal />: this
-          "component" is a useCallback closure (depending on addApplicant,
-          which changes identity whenever `applicants` updates). Rendering it
-          as JSX would make React remount it -- and reset the in-progress
-          form -- any time the applicants list refreshes while it's open. */}
-      {AddApplicantModal()}
+      <AddApplicantModal
+        showAddModal={showAddModal}
+        onClose={() => setShowAddModal(false)}
+        isSuperAdmin={isSuperAdmin}
+        userRegion={userRegion}
+        regions={regions}
+        addApplicant={addApplicant}
+      />
     </div>
   );
 }
