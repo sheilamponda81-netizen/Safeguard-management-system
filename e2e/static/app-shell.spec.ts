@@ -28,7 +28,7 @@ test('loads the app shell without a console error on first paint', async ({ page
 test('renders correctly at a mobile viewport', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 }); // iPhone 12-ish
   await page.goto('/');
-  await expect(page.getByPlaceholder('admin@safeguard.mw')).toBeVisible();
+  await expect(page.getByLabel('Email')).toBeVisible();
 });
 
 test('survives a hard refresh without crashing', async ({ page }) => {
@@ -40,5 +40,5 @@ test('survives a hard refresh without crashing', async ({ page }) => {
   await page.waitForTimeout(500);
 
   expect(pageErrors).toEqual([]);
-  await expect(page.getByPlaceholder('admin@safeguard.mw')).toBeVisible();
+  await expect(page.getByLabel('Email')).toBeVisible();
 });

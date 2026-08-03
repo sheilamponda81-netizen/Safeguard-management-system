@@ -13,28 +13,37 @@ import { test, expect } from '@playwright/test';
 // what's blocked on staging credentials.
 
 test.describe('Login page', () => {
-  test('renders the login form with email, password, and submit', async ({ page }) => {
+  test('renders the login form, reachable via accessible label', async ({ page }) => {
     await page.goto('/');
 
-    // Note: Login.tsx's <label> elements for Email/Password have no
-    // `htmlFor`/`id` association and don't wrap their <input>s (verified
-    // by reading the source), so they are NOT reachable via
-    // getByLabel() -- a real accessibility gap, not a test-authoring
-    // shortcut. Using getByPlaceholder as the only available text-based
-    // selector until that's fixed; flagged in AUDIT_REPORT.md.
-    await expect(page.getByPlaceholder('admin@safeguard.mw')).toBeVisible();
-    await expect(page.getByPlaceholder('••••••••')).toBeVisible();
+    // Login.tsx's Email/Password <label>s previously had no
+    // htmlFor/id association (a real accessibility gap found via a real
+    // Lighthouse run against this same local build -- Lighthouse
+    // accessibility score 70/100, "Buttons do not have an accessible
+    // name" among the flagged audits). Fixed alongside this test: labels
+    // now use htmlFor/id, so getByLabel() is the real, working selector
+    // rather than a placeholder-based workaround.
+    await expect(page.getByLabel('Email')).toBeVisible();
+    await expect(page.getByLabel('Password', { exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: /sign in/i })).toBeVisible();
   });
 
-  test('the password input has no autocomplete attribute (accessibility/UX gap, documented not fixed)', async ({ page }) => {
-    // Chromium itself flags this in the console
-    // ("Input elements should have autocomplete attributes (suggested:
-    // \"current-password\")") -- confirmed by actually loading the page
-    // and reading the real console output, not assumed from the source.
+  test('the password input has an autocomplete attribute', async ({ page }) => {
+    // Was previously missing (Chromium's own console flagged it); fixed
+    // alongside this test, not left as a documented-but-unfixed gap.
     await page.goto('/');
-    const autocomplete = await page.getByPlaceholder('••••••••').getAttribute('autocomplete');
-    expect(autocomplete).toBeNull();
+    const autocomplete = await page.getByLabel('Password', { exact: true }).getAttribute('autocomplete');
+    expect(autocomplete).toBe('current-password');
+  });
+
+  test('the password visibility toggle has an accessible name', async ({ page }) => {
+    // The specific button Lighthouse's "button-name" audit flagged
+    // (an icon-only toggle with no text or aria-label). Fixed alongside
+    // this test.
+    await page.goto('/');
+    await expect(page.getByRole('button', { name: 'Show password' })).toBeVisible();
+    await page.getByRole('button', { name: 'Show password' }).click();
+    await expect(page.getByRole('button', { name: 'Hide password' })).toBeVisible();
   });
 
   test('shows the mapped error message for invalid credentials', async ({ page }) => {
@@ -58,8 +67,8 @@ test.describe('Login page', () => {
     );
 
     await page.goto('/');
-    await page.getByPlaceholder('admin@safeguard.mw').fill('someone@example.com');
-    await page.getByPlaceholder('••••••••').fill('wrong-password');
+    await page.getByLabel('Email').fill('someone@example.com');
+    await page.getByLabel('Password', { exact: true }).fill('wrong-password');
     await page.getByRole('button', { name: /sign in/i }).click();
 
     await expect(page.getByText('Invalid email or password. Please try again.')).toBeVisible();
@@ -75,8 +84,8 @@ test.describe('Login page', () => {
     );
 
     await page.goto('/');
-    await page.getByPlaceholder('admin@safeguard.mw').fill('someone@example.com');
-    await page.getByPlaceholder('••••••••').fill('anything');
+    await page.getByLabel('Email').fill('someone@example.com');
+    await page.getByLabel('Password', { exact: true }).fill('anything');
     await page.getByRole('button', { name: /sign in/i }).click();
 
     await expect(page.getByText('Too many attempts. Please try again later.')).toBeVisible();
