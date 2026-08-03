@@ -39,8 +39,7 @@
     "recharts": "^3.9.0",
     "sonner": "^2.0.7",
     "tailwind-merge": "^2.2.0",
-    "use-sync-external-store": "^1.6.0",
-    "xlsx": "^0.18.5"
+    "use-sync-external-store": "^1.6.0"
   },
   "devDependencies": {
     "@babel/plugin-transform-runtime": "^7.24.0",

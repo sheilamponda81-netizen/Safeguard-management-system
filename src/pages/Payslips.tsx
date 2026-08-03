@@ -17,7 +17,6 @@ import {
   getAvailableMonthsFromSystem
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
-import JSZip from 'jszip';
 import { getDefaultPageSize } from '../utils/uiSettings';
 
 // ===== PERFORMANCE: Lazy load PDF libraries only when needed =====
@@ -708,6 +707,11 @@ export function PayslipsPage() {
 
     setDownloading(true);
     try {
+      // Lazy-loaded, same as the PDF libraries above (loadPDFLibraries) --
+      // this was previously a static top-level import, pulling JSZip into
+      // every visitor's Payslips bundle even though only the bulk-ZIP
+      // download path (this function) ever uses it.
+      const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
       const folder = zip.folder(`Payslips_${selectedMonth}_${selectedYear}`);
       
