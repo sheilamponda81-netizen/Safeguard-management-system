@@ -1,67 +1,73 @@
 # Data Integrity Review — Safeguard HR & Payroll System
 
-**Date:** 2026-08-03. Static review of `supabase/migrations/*.sql` (1,753 lines across 7 files) cross-referenced against how the frontend actually writes to each table. No live database was available to run these constraints against real data — see "Migration execution status" below before assuming anything here has been applied.
+**Last updated:** 2026-08-03 (second pass). Static review of `supabase/migrations/*.sql`. No live database was available to run these against real data.
 
-## Constraints — what exists today
+## Constraints — current state
 
-| Table | Primary key | Foreign keys | Unique constraints | Check constraints | Notes |
-|---|---|---|---|---|---|
-| `employees` | ✓ | `tenant_id→tenants`, `region_id→regions`, `company_id→companies`, `deleted_by→profiles` | `(tenant_id, employee_number)` | none | Soft-delete columns present (`is_deleted`, `deleted_at`, `deleted_reason`, `deleted_by`) and correctly used — verified no `.delete()` call exists anywhere in `Employees.tsx` |
-| `payroll` | ✓ | `tenant_id→tenants`, `employee_id→employees` (CASCADE) | **none** (fixed this pass, unexecuted — see below) | `approval_status IN ('pending','approved','rejected')` | Highest-stakes table with the weakest constraint coverage before this pass |
-| `attendance` | ✓ | `tenant_id→tenants`, `employee_id→employees` (CASCADE) | `(employee_id, date)` | `status IN ('P','A','L','LV','SL','-')` | Already well-constrained |
-| `applicants` | ✓ | `tenant_id→tenants`, `region_id→regions` (assumed, not re-verified column-by-column this pass) | not reviewed in depth this pass | not reviewed in depth this pass | |
-| `payment_status` | ✓ | `tenant_id→tenants`, `employee_id→employees` (CASCADE) | `(employee_id, month)` | `status IN ('pending','processing','paid','confirmed','failed')` | Already well-constrained |
-| `employee_deductions` | not re-verified column-by-column this pass | | | | |
-| `terminal_dues` | not re-verified column-by-column this pass | | | | |
-| `system_settings` | not re-verified column-by-column this pass | | | | |
-| `audit_logs` | ✓ | `tenant_id→tenants` | none needed (append-only by design) | | INSERT-only by RLS, correctly immutable |
-| `profiles` | ✓ (references `auth.users`, CASCADE) | `tenant_id→tenants`, `region_id→regions` | none | none visible | `role_level`/`is_super_admin`/`tenant_id` protected from self-modification by a trigger (pre-existing fix), not by a table constraint |
+| Table | Primary key | Foreign keys | Unique constraints | Check constraints |
+|---|---|---|---|---|
+| `employees` | ✓ | tenant, region, company, deleted_by | `(tenant_id, employee_number)` | none |
+| `payroll` | ✓ | tenant, employee (CASCADE) | **added this session** — `(employee_id, month)`, not yet executed | `approval_status IN (...)` |
+| `attendance` | ✓ | tenant, employee (CASCADE) | `(employee_id, date)` | `status IN (...)` |
+| `payment_status` | ✓ | tenant, employee (CASCADE) | `(employee_id, month)` | `status IN (...)` |
+| `audit_logs` | ✓ | tenant | none needed (append-only) | — |
+| `profiles` | ✓ (→ auth.users, CASCADE) | tenant, region | none | — |
 
-## Indexes
-
-`20240618000000_create_indexes.sql` exists (44 lines) — skimmed, not exhaustively cross-referenced against every actual query pattern in this pass. This needs `EXPLAIN ANALYZE` against realistic data volume to say anything meaningful about whether current indexes actually serve the app's real filter/join patterns (e.g. attendance-by-month-and-employee-list, payroll-by-month). **Unverified — flagged as a follow-up requiring a staging database with representative row counts.**
-
-## Foreign keys and cascade behavior
-
-- `employees.tenant_id`, `payroll.employee_id`, `attendance.employee_id`, `payment_status.employee_id` are all `ON DELETE CASCADE`. This is **appropriate given the app never actually hard-deletes an employee** (soft-delete via `is_deleted`, verified), but it means the DB-level DELETE policy tightening this pass (AUDIT_REPORT.md A5 — `employees` DELETE now super-admin-only) is genuinely important: a hard delete via direct API call, previously reachable by any tenant member, would have cascaded into silently destroying that employee's entire payroll and attendance history. That path is now closed to non-super-admins.
-- `employees.deleted_by→profiles`, `employees.region_id→regions`, `employees.company_id→companies` are all `ON DELETE SET NULL` — reasonable (losing a region/company reference shouldn't cascade-delete the employee record itself).
-- `payroll.approved_by→profiles` is `ON DELETE SET NULL` — if an approving profile is later deleted, historical payroll records keep existing but lose the reference to who approved them. This is a minor historical-accountability gap (you'd know a record was approved but not by whom, if that profile is later removed) — not fixed this pass, flagged for awareness since it interacts with the audit-trail claim in SECURITY_REVIEW.md.
-
-## Duplicate-row risks
+## Duplicate-row risks — status
 
 | Risk | Status |
 |---|---|
-| Duplicate `attendance` rows (same employee, same date) | **Prevented** — `UNIQUE(employee_id, date)` already existed |
-| Duplicate `payment_status` rows (same employee, same month) | **Prevented** — `UNIQUE(employee_id, month)` already existed |
-| Duplicate `payroll` rows (same employee, same month) | **Was NOT prevented** — no unique constraint existed. Fixed this pass via `20260803000001_payroll_unique_constraint.sql`, **not yet executed against any database**. May fail to apply if production already has duplicates for some employee/month — see the migration's own comment for why that's the correct, safe failure mode (it surfaces the problem via a clear constraint-violation error rather than silently corrupting data), and why resolving any such duplicates is a manual, business-judgment task (which row is authoritative?) that shouldn't be automated blind. |
-| Duplicate `employees` (same employee_number) | **Prevented** — `UNIQUE(tenant_id, employee_number)` |
-| Duplicate guard IDs | Column is `"guardId"` (quoted camelCase, on `employees`) — **no unique constraint found**. Not deeply investigated this pass; flagged as a follow-up given the audit brief specifically calls out "duplicate guard IDs" as a concern. |
+| Duplicate `attendance` (employee+date) | Prevented (pre-existing) |
+| Duplicate `payment_status` (employee+month) | Prevented (pre-existing) — and now has a real, executable staging test (`e2e/authenticated/rls-policy-matrix.spec.ts`) confirming a denied UPDATE affects zero rows rather than silently succeeding |
+| Duplicate `payroll` (employee+month) | **Was NOT prevented.** Fixed via `20260803000001_payroll_unique_constraint.sql`. **NOT executed** — may fail to apply if production already has duplicates (a safe failure mode, not corruption — see the migration's own comment) |
+| Duplicate `employees` (employee_number) | Prevented (pre-existing) |
+| Duplicate guard IDs (`employees."guardId"`) | **No unique constraint found.** Not fixed this pass — flagged, not newly investigated in this second pass either |
 
-## Concurrency risks
+## Concurrency and atomicity — the real fix this pass adds
 
-- **`processPayroll`/`copyFromPreviousMonth` (`Payroll.tsx`): non-atomic delete-then-insert.** Two sequential network calls, not wrapped in a database transaction (client-side Supabase calls cannot be atomic across two separate requests without an RPC). If the delete succeeds and the insert then fails (dropped connection, one row violating a constraint, browser tab closing mid-operation), the affected employees' payroll for that month is left **fully deleted with nothing re-inserted** — real data loss, not just a duplicate-row risk. The client-side "Process/Reprocess" button is disabled during the operation and once approved, which prevents the *most obvious* double-click scenario, but does not protect against the partial-failure window described here. **Recommended real fix** (not applied this pass, needs staging verification): a Postgres RPC function that performs the delete+insert (or better, a true `upsert`) inside a single transaction, called via `supabase.rpc(...)` instead of two sequential `.from('payroll')` calls. This changes the actual code path that writes real salary data and should not be done without testing against a staging copy first.
-- **`payment_status` double-click race**: investigated specifically because `updatePaymentStatus` in `Payments.tsx` has no per-row "in flight" disabled state (unlike `Attendance.tsx`'s `updating[key]` pattern). However, the existing `UNIQUE(employee_id, month)` constraint means a genuine race (two concurrent inserts for a brand-new payment record) would have the **second** request fail with a clean constraint-violation error rather than silently create a duplicate row. The UX of that failure (a generic "Failed to update status" toast) isn't great, but the data integrity itself is protected. Not fixed this pass (UX polish, not a data-integrity bug).
-- **RLS policy application itself is not transactional across multiple statements** — each `CREATE POLICY`/`ALTER FUNCTION` in the new migrations is independent; if one statement in `20260803000000_role_level_rls_hardening.sql` fails partway through (e.g. a policy name collision), earlier statements in the same file will have already committed (Postgres migrations in Supabase typically run as a single transaction per migration file, which would actually roll back the whole file atomically — this depends on how the migration runner is invoked; **not verified**, since no execution against a real database was possible in this environment).
+**`processPayroll()`/`copyFromPreviousMonth()`'s delete-then-insert was not atomic** (two separate client-side network calls, no transaction spanning both). If the insert failed after the delete succeeded, that month's payroll for the affected employees was left **fully deleted, nothing re-inserted**.
 
-## Transaction / RPC recommendations
+**Fix: `supabase/migrations/20260803000002_payroll_atomic_process_rpc.sql`**, a `process_payroll_batch(month, records, user_email, audit_context)` Postgres function. What it actually guarantees, and how:
 
-1. **Payroll processing** (see above) — the highest-value candidate for moving to an RPC function, given it's the only unprotected-by-constraint, non-atomic, financial write path found in this review.
-2. **Recruitment "Accept"/"Hire" → employee creation**: not reviewed in depth this pass for whether retrying a hire action after a network failure could create a duplicate employee record. Flagged as an explicit follow-up (the original audit brief calls this out specifically: *"Verify that accepting or hiring an applicant does not create duplicate employees when retried"*) — **unverified in this pass**, should be checked before relying on it.
+| Requirement | How it's met |
+|---|---|
+| Existing payroll not deleted unless replacement succeeds | Both DELETE and INSERT happen inside one function call, which Postgres runs as a single implicit transaction — any exception anywhere rolls back everything, including the delete |
+| Partial insertion impossible | The insert is one `INSERT INTO payroll (...) SELECT ... FROM jsonb_array_elements(p_records)` statement — atomic by construction, not a per-row loop that could succeed for some rows and fail for others |
+| Approved payroll cannot silently return to pending | Validated *before* any destructive change: the function counts existing `approval_status = 'approved'` rows for the targeted employees/month and raises an exception (aborting before the DELETE even runs) if any exist |
+| Reprocessing is idempotent | Same end-state each call: delete-then-insert with the same inputs produces the same final rows. Concurrent calls are serialized (below), so "idempotent" here means safe-to-repeat, not race-free without the lock |
+| Concurrent processing controlled | `pg_advisory_xact_lock(hashtext(tenant_id || ':' || month))` — a second concurrent call for the same tenant+month blocks until the first transaction commits or rolls back |
+| All validation before destructive changes | Role check (Admin/super-admin only) → tenant-membership check on every targeted employee_id → approved-row check, all before the DELETE |
+| Audit-log operation coordinated | The `audit_logs` INSERT happens in the *same* transaction as the payroll DELETE/INSERT — if the payroll write fails, no orphaned audit entry describing a write that didn't happen gets created (unlike today's separate client-side `logAudit()` call, which fires independently of whether the actual write succeeded) |
+| Any failure rolls back everything | Natural Postgres behavior for an unhandled exception inside a single function call — no explicit `BEGIN`/`COMMIT` needed or used |
 
-## Migration execution status (repeated here for emphasis — do not skip)
+**Deliberately does not recompute payroll figures itself** — `calculatePayroll`/`calculateLivePayroll` stay in TypeScript, unchanged, per the standing rule against altering payroll math without a confirmed source. This function only owns the transactional mechanics around persisting already-computed records.
 
-Both new migrations from this audit:
-- `supabase/migrations/20260803000000_role_level_rls_hardening.sql`
-- `supabase/migrations/20260803000001_payroll_unique_constraint.sql`
+**NOT wired up to `Payroll.tsx` yet, deliberately** — seeing rollout-order reasoning in the migration's own header comment and `AUDIT_REPORT.md`'s "Production deployment and rollback order." Changing the frontend to call this RPC before the migration is verified and applied to production would break payroll processing outright if the two ever became out of sync during rollout.
 
-were **written and reviewed but never executed against any database** — this environment has no reachable Docker daemon and no Supabase staging project credentials. Before applying either to production:
+**Rollback SQL** (included directly in the migration file):
+```sql
+REVOKE EXECUTE ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) FROM authenticated;
+DROP FUNCTION IF EXISTS process_payroll_batch(TEXT, JSONB, TEXT, JSONB);
+```
+Safe to run at any time — nothing calls this function yet, so dropping it affects no live code path.
 
-1. Apply both to a **staging** copy of the real schema/data first.
-2. For the unique-constraint migration specifically: check for existing duplicate `(employee_id, month)` rows in `payroll` before it runs, since the migration will fail outright (safely — see its own comment) if any exist, and resolving those requires a business decision about which row is authoritative, not an automated script.
-3. Re-run the app's full test surface (once one exists — see TEST_PLAN.md) against the staging database after applying, specifically exercising payroll processing, terminal dues approval, payment status changes, and recruitment writes as each affected role, to confirm the new role_level restrictions match every legitimate workflow and don't accidentally lock out a role that needs access.
+**Staging test procedure** (also in the migration file, 8 scenarios): happy path, reprocessing, approved-month protection (confirms nothing changes when it should refuse), concurrency (two sessions, confirms the second blocks then proceeds against the first's post-commit state), partial-failure simulation (confirms a bad row aborts the *entire* batch, not just that row), cross-tenant isolation, authorization, audit log correctness.
+
+## Migration execution status (all three, unexecuted)
+
+- `20260803000000_role_level_rls_hardening.sql` — role_level enforcement on 5 tables + search_path pinning.
+- `20260803000001_payroll_unique_constraint.sql` — the missing unique constraint.
+- `20260803000002_payroll_atomic_process_rpc.sql` — the atomic RPC above.
+
+None have run against any database (no reachable Docker/Supabase-local in this environment). See `AUDIT_REPORT.md`'s "Production deployment and rollback order" for the specific sequencing recommended before any of these reach production, and `e2e/authenticated/rls-policy-matrix.spec.ts` / the RPC's own staging test procedure for how to actually verify each one on staging first.
+
+## Schema changes identified for the region/access-control model (documented only — see `SECURITY_REVIEW.md`)
+
+Not implemented, per explicit instruction. Summary (full detail in `SECURITY_REVIEW.md`'s new section):
+- **`profiles.employee_id`** (new column, nullable UUID → `employees(id)`) — needed regardless of any other decision, to make Staff-level "own payslip only" access mean anything at all. Currently there is no link between an auth account and an employee record.
+- **A `profile_regions` join table** (or keep the existing single `profiles.region_id`) — depends entirely on whether Managers/Supervisors ever need more than one region at a time, which is a business question, not a technical one.
+- **A real `workstations` table** (currently `employees.workstation` is free text) plus a `profile_workstations` join — needed only if Supervisor-level workstation authorization is to be enforced by more than string matching.
 
 ## Backup and rollback considerations
 
-- The app's own `supabase/functions/backup`/`rollback` Edge Functions are **not a working backup system** — see AUDIT_REPORT.md Finding A6 (no scheduler, no frontend wiring, restore is a no-op, target storage table doesn't exist). Do not rely on this for actual disaster recovery.
-- Real backup/recovery for this app currently depends entirely on whatever backup mechanism the Supabase project itself provides at the platform level (point-in-time recovery is a paid-plan Supabase feature, not something this repo implements) — **not verified in this pass** (would need Supabase dashboard/billing access to confirm what plan/PITR settings are actually active).
-- For the two new migrations specifically: both are purely additive (new constraints, new policies, a `search_path` pin) with no data deletion or column drops, so rollback is straightforward — `DROP CONSTRAINT`/`DROP POLICY`/recreate the old policy text (all preserved in the prior migration files' own history) would fully revert either one if needed.
+Unchanged from the first pass: the app's own backup/rollback Edge Functions are non-functional (`AUDIT_REPORT.md` A6); real backup/recovery depends entirely on whatever the Supabase project's own plan provides, unverified here. All three of this session's migrations are additive (new constraints/policies/functions, no data deletion or column drops) and each has a documented, low-risk rollback path.

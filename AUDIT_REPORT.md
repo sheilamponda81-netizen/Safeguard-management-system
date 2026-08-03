@@ -1,134 +1,145 @@
 # Safeguard HR & Payroll System — Production Readiness Audit
 
 **Branch:** `audit/full-system-hardening`
-**Date:** 2026-08-03
-**Scope:** Full repository (frontend + Supabase schema/migrations/edge functions). Production URL `https://safeguard-management-system.vercel.app/` referenced for context but not directly tested (see "Access limitations" below).
+**Last updated:** 2026-08-03 (second pass, after a correctness review of the first pass — see "Corrections from the first pass" below)
+**Scope:** Full repository (frontend + Supabase schema/migrations/edge functions). Production URL `https://safeguard-management-system.vercel.app/` referenced for context but not directly tested.
 
-## Access limitations (read this first)
+## Corrections from the first pass
 
-This audit was performed with:
-- Full read/write access to the git repository.
-- **No** Supabase service-role key, dashboard access, or staging database. Docker is present but its daemon is not reachable in this environment, so no local Supabase instance could be started either.
-- **No** test credentials for any of the four roles (Admin/Manager/Supervisor/Staff), and no ability to log into the live production app.
-- **No** Playwright/Vitest/Jest already configured (none existed in this repo before this audit).
+The first version of this report contained real errors, found and fixed only because they were challenged rather than taken on faith. Documented here explicitly rather than quietly edited away:
 
-Consequences, stated plainly rather than glossed over:
-- Every RLS/migration finding below is a **static reading of the SQL migration files**, cross-referenced against what the frontend code actually does. None of it was executed against a real Postgres instance. All new migrations are marked "written, not run" throughout.
-- No live per-role, per-region authorization testing was performed (Phase 5's role/region matrix). The matrix in `SECURITY_REVIEW.md` is derived from `src/App.tsx`'s `rolePages` and each page's own client-side checks, cross-referenced against what the RLS policies actually enforce — not from logging in as each role and clicking around.
-- No E2E test suite exists yet (Phase 7). See `TEST_PLAN.md` for what's covered by manual static review vs. what remains to be automated.
-- No Lighthouse/axe run against a live instance (Phases 9–10 partially covered by build-output analysis and static code grep instead — see `PERFORMANCE_REPORT.md`).
+1. **TypeScript error count.** First pass claimed "218 errors at baseline... unchanged by this audit's fixes." Re-verified by actually checking out `origin/main` into a separate worktree and running `npx tsc --noEmit` there: the true baseline is **218**, and the current branch has **211** — a real reduction of 7, fully reconciled by diffing the two error lists file-by-file: 5 errors disappeared because `src/tests/auth.test.ts` (the file holding the hardcoded credential) was deleted, and 2 disappeared because `src/utils/rateLimiter.ts`'s unused `useState` import and unused `remainingTime` variable were removed as part of an ESLint cleanup commit. **Zero of the 218 real, pre-existing type errors were fixed.** The claim of "unchanged" was wrong; "reduced only as an accidental side effect of unrelated fixes, not touched otherwise" is the accurate statement.
+2. **Critical vulnerability count.** First pass claimed removing `xlsx` brought `npm audit`'s critical count from 1 to 0. Re-verified with `npm audit --json` (reliable) rather than the text-output `grep` the first pass used (unreliable — it silently matched nothing and was read as "zero criticals" without double-checking against the JSON summary). The actual truth, checked at three points in this branch's history:
+   - `origin/main` baseline: 13 vulnerabilities = **1 critical (`jspdf`/`dompurify`)**, 10 high (including `xlsx` as **high**, not critical), 2 moderate.
+   - Immediately after removing `xlsx`: 12 vulnerabilities = **1 critical, still `jspdf`**, 9 high, 2 moderate.
+   - `xlsx` was never the critical vulnerability. Removing it was still worthwhile (it was dead code with real high-severity issues and no fix available), but **the actual critical vulnerability (`jspdf`/`dompurify`) was never fixed and remains critical right now.** A fix exists (`jspdf` 4.2.1) but is a major-version breaking change; this environment has no way to visually verify payslip PDF generation still works after such an upgrade, so it was not attempted blind. See Finding A16 below.
 
-Everywhere this matters, the relevant deliverable says **"unverified — requires [X]"** rather than guessing.
+Both corrections are now reflected everywhere in this document and the other 4. Every verification claim below was re-run and its exact exit code recorded — see "Commands executed" — rather than restated from memory.
+
+## Access limitations
+
+- No Supabase service-role key, dashboard access, or staging database. Docker is present but its daemon is not reachable, so no local Supabase instance could be started either.
+- No test credentials for any of the four roles, and no ability to log into the live production app.
+- Outbound network to the production Vercel domain is blocked by this environment's proxy.
+
+Consequences: every RLS/migration finding is a static reading of the SQL cross-referenced against the frontend, none of it executed against a real Postgres instance. All new migrations are marked "written, not run." A real, running E2E suite now exists (see `TEST_PLAN.md`), but its staging-credential-gated tests report as explicitly **skipped**, verified by actually running them and confirming that outcome — not silently passing.
 
 ## System map
 
-**Stack:** React 18 + TypeScript + Vite SPA (no router library — hand-rolled `nav` state), Supabase (Postgres + Auth + Storage + 2 Deno Edge Functions), deployed to Vercel with `main` as the production branch.
+Unchanged from the first pass — see the "Pages / routes," "Database tables," "Edge functions," and "Storage buckets" material below.
 
-**Roles** (`profiles.role_level`): 1 = Admin, 2 = Manager, 3 = Supervisor, 4 = Staff, plus an orthogonal `is_super_admin` boolean that bypasses tenant/role checks everywhere.
+**Stack:** React 18 + TypeScript + Vite SPA (no router library — hand-rolled `nav` state in `App.tsx`, meaning "direct navigation to a protected route" as a URL-based concept does not apply to this app's architecture; the entire app is one route gated by a client-side `loggedIn` boolean), Supabase (Postgres + Auth + Storage + 2 Deno Edge Functions), deployed to Vercel with `main` as the production branch.
 
-**Regions:** South, Central, North, East — a `regions` lookup table, referenced by `employees.region_id` and `profiles.region_id` (nullable on both).
+**Roles** (`profiles.role_level`): 1 = Admin, 2 = Manager, 3 = Supervisor, 4 = Staff, plus an orthogonal `is_super_admin` boolean.
 
-**Pages / routes** (`src/App.tsx`'s `pageComponents`, each lazy-loaded), with the role access actually enforced client-side via `rolePages`:
+**Regions:** South, Central, North, East — `regions` lookup table, referenced by `employees.region_id` and `profiles.region_id` (both nullable).
 
-| Page (`NavKey`) | Roles allowed (rolePages) | Backing table(s) |
+**Pages / routes** (`src/App.tsx`'s `pageComponents`, `rolePages` for access):
+
+| Page | Roles allowed | Backing table(s) |
 |---|---|---|
-| dashboard | 1,2,3,4 (all) | reads employees/attendance/payroll aggregates |
+| dashboard | 1,2,3,4 | aggregates |
 | employees | 1,2 | `employees` |
 | recruitment | 1,2 | `applicants` |
 | attendance | 1,2,3 | `attendance`, `employee_deductions` |
 | payroll | 1 | `payroll` |
-| payslips | 1,4 | `payroll`, `employees` (PDF generation client-side) |
+| payslips | 1,4 | `payroll`, `employees` — **see Finding A17: no per-employee scoping exists for role 4** |
 | payments | 1,2 | `payment_status` |
 | terminal-dues | 1,2 | `terminal_dues` |
-| reports | 1,2 | reads across tables, CSV export |
+| reports | 1,2 | cross-table, CSV export |
 | settings | 1 | `system_settings`, `regions`, `companies`, `positions` |
 | security | 1,2,3 | `employees` (guard/shift/uniform columns) |
-| features | 1 | static roadmap page (no table) |
+| features | 1 | static |
 | auditlogs | 1 | `audit_logs` |
-| user-manual | 1,2,3,4 (all) | static content |
+| user-manual | 1,2,3,4 | static |
 
-**Database tables** (from `supabase/migrations/20260727000000_reconstructed_base_schema.sql`, itself a prior reverse-engineered reconstruction since the original `CREATE TABLE` statements were never committed): `tenants`, `regions`, `companies`, `positions`, `profiles`, `employees`, `payroll`, `attendance`, `applicants`, `payment_status`, `employee_deductions`, `terminal_dues`, `user_roles`, `system_settings`, `audit_logs`, `backup_logs` (an 8th, `backup_data`, is referenced by the backup edge function but **does not exist** in any migration — see Finding A6).
+**Database tables:** `tenants`, `regions`, `companies`, `positions`, `profiles`, `employees`, `payroll`, `attendance`, `applicants`, `payment_status`, `employee_deductions`, `terminal_dues`, `user_roles`, `system_settings`, `audit_logs`, `backup_logs` (an 8th, `backup_data`, is referenced by the backup edge function but does not exist in any migration).
 
-**Edge functions:** `supabase/functions/backup`, `supabase/functions/rollback` — see Finding A6, neither is wired to the frontend, no scheduler invokes them, and `restoreBackup` doesn't perform a restore at all.
+**Edge functions:** `supabase/functions/backup`, `supabase/functions/rollback` — see Finding A6.
 
 **Storage buckets:** `company-logo` (public read, unrestricted authenticated write — Finding A7).
 
-## Commands executed (all run for real, in this environment)
+## Commands executed (exact, re-run fresh, exit codes recorded)
 
-| Command | Result |
-|---|---|
-| `npm ci` | Succeeds |
-| `npm run build` | Succeeds, no warnings, throughout every fix in this pass |
-| `npx tsc --noEmit` | 218 errors at baseline (unchanged by this audit's fixes — all pre-existing, none touched) |
-| `npm run lint` | **Did not exist as a working command before this audit** — no ESLint config had ever existed in this repo's git history. Added `.eslintrc.cjs`; first real run found 528 problems (10 errors, 518 warnings), including 3 live production-crashing bugs (see Findings A2–A4). After fixes: 0 errors, 518 warnings (all pre-existing `@typescript-eslint/no-explicit-any` / `react-hooks/exhaustive-deps`, not addressed in this pass — see "Remaining risks"). |
-| `npm audit` | Baseline: 13 vulnerabilities (1 critical, 10 high, 2 moderate). After removing unused `xlsx`: 12 (0 critical, 10 high, 2 moderate). |
-| `npm run test` / `test:e2e` | Scripts do not exist; no test runner was ever configured |
-| Docker / Supabase local | Not usable in this environment (daemon unreachable) |
+| Command | Exit code | Result |
+|---|---|---|
+| `npm ci` | 0 | Succeeds |
+| `npm run type-check` | **2** | **211 errors.** (Baseline on `origin/main`, checked in a separate worktree: 218. See "Corrections from the first pass.") This is a genuine failing result — not classified as passing, not glossed over. |
+| `npm run lint` | 0 | 518 warnings, 0 errors. ESLint's own convention is exit 0 with only warnings; the 518 warnings themselves are **not** fixed and remain outstanding (`@typescript-eslint/no-explicit-any`, `react-hooks/exhaustive-deps`). Before this audit, this command **could not run at all** — no config file had ever existed. |
+| `npm run test` | 0 | **39 tests, 39 passed, 2 test files.** This command did not exist before this audit (`npm error: Missing script "test"`, exit 1) — Vitest was added, along with real tests for `calculateLivePayroll` and `csvExport`. Actually executed, not assumed. |
+| `npm run test:e2e` | 0 | **14 tests: 7 passed, 7 skipped, 0 failed.** Did not exist before this audit (same "Missing script" exit 1 failure). Playwright was added. The 7 passing are a static suite needing no credentials; the 7 skipped are an RLS-policy staging matrix that correctly reports as skipped (not passing) without staging credentials — verified by actually running it in this credential-less environment. |
+| `npm run build` | 0 | Succeeds, clean, throughout every commit in this branch |
+| `npm audit` | n/a | 12 vulnerabilities: **1 critical (`jspdf`), 9 high, 2 moderate.** (Was 13: 1 critical, 10 high, 2 moderate — the 1 high removed was `xlsx`.) **The critical vulnerability is not fixed** — see Finding A16. |
 
 ## Findings, by severity
 
 ### P0 — Security / data-integrity
 
-**A1. Hardcoded admin credential committed to git history.**
-`src/tests/auth.test.ts` contained a real-looking email/password pair (git history since commit `58c4a9a`). Not part of the build output (dead code, no test runner ever wired to it), but present in every clone of the repo's history.
-- **Fix status:** File deleted from the current branch. **Git history NOT rewritten** — you did not answer when asked how to handle this, so the safe default was taken (remove going forward only).
-- **Requires your action:** Rotate that account's password in Supabase Auth now, independent of anything else in this report. Separately decide whether to rewrite git history (destructive, affects every clone) — I have not done this and will not without explicit instruction.
+**A1. Hardcoded admin credential committed to git history.** `src/tests/auth.test.ts` (git history since `58c4a9a`). Deleted from the current branch; **git history not rewritten** (no answer received on how to handle this). **Still needs your action: rotate the password in Supabase Auth.**
 
-**A2/A3/A4. Three live "Rendered more hooks than during the previous render" (React error #310) production crashes**, all the same root cause: a modal defined via `useCallback` and invoked as a plain function call (`Modal()` instead of `<Modal />`), which puts the modal's own hook calls onto the *parent's* hook sequence for that render.
-- `Attendance.tsx`'s `EmployeeModal` (fixed prior to this audit branch, in production already — two separate incidents: hooks after an internal early return, then a second instance where the *parent's* `loading`/`error` early returns skipped the call site entirely).
-- `Recruitment.tsx`'s `AddApplicantModal` — **found by this audit**, via the newly-added ESLint config's `react-hooks/rules-of-hooks` rule. Same shape as Attendance's second incident: `RecruitmentPage` has `if (loading) return <div>Loading...</div>` between where the modal closure is defined and where it's invoked. This means **every visit to the Recruitment page crashed**, independent of ever opening the Add Applicant modal, for as long as this code has existed.
-- **Fix status:** Both converted to genuine, standalone, props-based components (module-level, not `useCallback`-wrapped), which removes the entire bug class rather than patching another instance of the early-return symptom. Verified: `npm run lint` reports zero `rules-of-hooks` matches anywhere in the codebase after the fix; `npx tsc --noEmit` and `npm run build` clean for both files.
-- **Remaining risk:** None known for this specific bug class — a repo-wide search after the fix found no further instances. Recommend keeping the ESLint config permanently enabled (e.g., as a CI gate) so this class of regression can't reappear silently.
+**A2–A4. Three live "React error #310" production crashes**, same root cause (a modal defined via `useCallback`, invoked as a plain function, putting its hooks on the parent's render sequence): two in `Attendance.tsx` (already fixed in production before this audit branch existed), one **found by this audit** in `Recruitment.tsx` via a newly-added ESLint config's `react-hooks/rules-of-hooks` rule — this one crashed on every single visit to the Recruitment page, independent of ever opening a modal. Both remaining instances converted to genuine standalone, props-based components. Verified: zero `rules-of-hooks` matches anywhere in the codebase after the fix.
 
-**A5. Systemic gap: `role_level` (the app's real Admin/Manager/Supervisor/Staff distinction) was enforced server-side on only 2 of ~13 tables before this audit** (`profiles` self-escalation and `payroll` insert/update, both fixed in a prior migration, `20260727000001_security_hardening.sql`, before this audit began). Every other table's RLS policy gated only on `tenant_id`/`is_super_admin()` — meaning any authenticated Staff account, via a direct API call (e.g. from a browser console), could bypass every client-side permission check: approve terminal dues, mark payments paid, edit payroll deduction rates in `system_settings`, alter attendance deductions, or write recruitment records, none of which their role can even navigate to in the UI.
-- **Fix status:** `supabase/migrations/20260803000000_role_level_rls_hardening.sql` extends the same enforcement to `payment_status`, `terminal_dues`, `system_settings`, `employee_deductions`, `applicants` (matching each table's role threshold to the exact `rolePages` restriction already in the app), tightens `payroll`/`employees` DELETE to super-admin-only (neither has a delete UI path — `employees` soft-deletes via `.update()`, verified no `.delete()` call exists in `Employees.tsx`), and pins `search_path` on all 4 `SECURITY DEFINER` functions (closing the standard Postgres/Supabase-linter "function_search_path_mutable" risk).
-- **Deliberately not touched, and why:** `employees` INSERT/UPDATE is shared between the Employees page (role_level ≤ 2) and the Security page (role_level ≤ 3, Supervisors manage guard/shift/uniform columns there) — a blanket table-level role check would lock Supervisors out of legitimate Security-page writes. This needs column-level checks (which specific columns each role may touch), which needs a confirmed column list from you before it can be written safely.
-- **NOT executed against any database.** Needs to run on a staging Supabase project and be verified there — in particular, check for existing duplicate rows (see A8) and existing data that might violate the new constraints, before ever touching production.
+**A5. Systemic gap: `role_level` was enforced server-side on only 2 of ~13 tables.** `supabase/migrations/20260803000000_role_level_rls_hardening.sql` extends this to `payment_status`, `terminal_dues`, `system_settings`, `employee_deductions`, `applicants`, and tightens `payroll`/`employees` DELETE to super-admin-only. **A detailed executable staging test matrix now exists**: `e2e/authenticated/rls-policy-matrix.spec.ts`, using real `supabase-js` calls (the same code path the app itself uses) logged in as each of the 4 roles — not a hand-simulated SQL/JWT harness, which risks silently not matching this project's actual Supabase/PostgREST version. It reports every test as skipped (verified) until staging credentials exist. **NOT executed against any database.**
 
-**A6. The User Manual's "Automated daily backups with point-in-time recovery" claim is false.** `supabase/functions/backup/index.ts` exists but: no cron/scheduler anywhere invokes it (confirmed: no `config.toml`, no scheduled trigger config found in the repo); the frontend never calls it (confirmed: no `functions.invoke` for `backup`/`rollback` anywhere in `src/`); its `restoreBackup` handler fetches the backup data and logs, then returns a hardcoded success message **without writing anything back to any table** — it is a no-op that lies about succeeding; and `backupTable` inserts into a `backup_data` table that **does not exist in any migration** (only `backup_logs`, metadata-only, exists), so even a manual invocation by a super-admin would fail with a Postgres "relation does not exist" error.
-- **Fix status:** Not fixed — this is a design gap requiring a decision (build a real backup/restore system, or remove the claim from the User Manual and the dead edge-function code). Flagged for your decision, not guessed at.
+**A6. "Automated daily backups with point-in-time recovery" is false.** No scheduler, no frontend wiring, `restoreBackup` is a no-op, target `backup_data` table doesn't exist. **Fixed the documentation**: removed this claim (and the 2FA claim) from the User Manual rather than leave a false promise live. The underlying non-functional backup code itself is unchanged (a design decision — build vs. remove — still needs your input).
+
+**A16 (new, corrected severity). `jspdf` carries a critical, currently-unfixed vulnerability chain (via `dompurify`)** — confirmed via `npm audit --json`, at every point in this branch's history, including right now. A fix exists (`jspdf` 4.2.1) but is a major-version breaking change from the currently-pinned `^2.5.2`; `jspdf-autotable` and the app's own PDF-generation code (`Payslips.tsx`, `clickHandlers.ts`) would need re-verification against the new major version, which requires actually generating and visually inspecting a payslip PDF — not possible in this environment (no auth, no way to click through the live app). **Not fixed. This needs someone who can run the app, generate a payslip, and confirm the PDF still renders correctly after the upgrade — do not force-upgrade this blind.**
+
+**A17 (new). There is no schema link between a `profiles` row and an `employees` row.** Discovered while writing the region-isolation candidate rules (`SECURITY_REVIEW.md`'s new section). The Payslips page's `rolePages` grants Staff (role_level 4) access specifically for **self-service** payslip viewing, but `Payslips.tsx`'s data-fetching (`fetchPayslipData`) has **zero per-employee scoping** — it fetches every active, non-deleted employee in the user's region (same region-wide filter as every other role), with no email-matching, no `employee_id` link, nothing. **A Staff account can currently view and download every other employee's payslip PDF in their region, not just their own.** This is more severe than the general region-isolation gap (A12) because it isn't just "no DB-level enforcement of an existing app-level scoping rule" — the app-level scoping rule for individual employee self-service **does not exist at all**, at any layer. See `SECURITY_REVIEW.md` for the schema change this requires (a `profiles.employee_id` link, at minimum) before any fix — client-side or RLS — can be written.
 
 ### P1 — Major workflow / integrity risks
 
-**A7. `company-logo` storage bucket allows any authenticated user to INSERT/UPDATE/DELETE with no tenant or role scoping.** Low-value asset (a logo image), but a real, currently-live gap. Not fixed in this pass (deprioritized behind A5's higher-stakes tables) — recommend scoping to `is_super_admin()` or role_level ≤ 2, matching the Settings page's own access level.
+**A8. `payroll` had no `UNIQUE(employee_id, month)` constraint** (unlike `attendance`/`payment_status`, which both already have the equivalent). Fixed via `20260803000001_payroll_unique_constraint.sql`. Additionally, **`processPayroll()`/`copyFromPreviousMonth()`'s underlying delete-then-insert was not atomic** — if the insert half failed after the delete half succeeded, that month's payroll was left fully deleted with nothing re-inserted. Addressed with a new, fully-designed atomic RPC: `supabase/migrations/20260803000002_payroll_atomic_process_rpc.sql`'s `process_payroll_batch()` function. It:
+- Resolves the caller's tenant/role itself (required — `SECURITY DEFINER` bypasses RLS, so it cannot rely on the table's own policies).
+- Takes an advisory transaction lock keyed by tenant+month, serializing concurrent processing attempts.
+- Validates every targeted employee belongs to the caller's tenant, and **refuses outright if any targeted employee already has an approved payroll row for that month** — reprocessing can never silently revert an approval to pending.
+- Only after validation: deletes, then inserts via a single `INSERT...SELECT` (atomic by construction — no partial-insert state is possible), then writes the audit log entry in the *same* transaction as the data change it describes.
+- Any exception at any step rolls back everything, including the delete.
 
-**A8. `payroll` has no `UNIQUE(employee_id, month)` constraint**, unlike `attendance` (`UNIQUE(employee_id, date)`) and `payment_status` (`UNIQUE(employee_id, month)`) which both already have the equivalent protection. Both `processPayroll()` and `copyFromPreviousMonth()` in `Payroll.tsx` work around this with a client-side delete-then-insert sequence that is **not atomic**: if the insert half fails after the delete half already succeeded (dropped connection, one row failing a constraint, the tab closing), that month's payroll for the affected employees is left fully deleted with nothing re-inserted — real, silent data loss.
-- **Fix status:** `supabase/migrations/20260803000001_payroll_unique_constraint.sql` adds the missing constraint. **NOT executed** — may fail to apply if production already has duplicate rows (see the migration's own comment for why that's a safe failure mode, not a dangerous one). The larger fix (switching `Payroll.tsx` to a true `.upsert()` to close the non-atomicity itself) is **deliberately not done** in this pass — it changes the code path that writes real salary data and needs staging verification first.
+Deliberately does **not** recompute payroll figures itself — that logic stays in TypeScript, unchanged, per the standing rule against altering payroll/tax/pension math without a confirmed source. **Deliberately not wired up to `Payroll.tsx` yet** — see the migration's own header comment for the exact rollout order and why (wiring the frontend to an RPC that doesn't yet exist in production would break payroll processing outright). The migration file itself contains a full staging test procedure (8 scenarios) and rollback SQL. **NOT executed against any database.**
 
-**A9. `npm run lint` has never worked** (no ESLint config existed in this repo's git history at all, ever). Fixed by adding `.eslintrc.cjs`. This alone is why A2–A4 went undetected until now — recommend wiring this into CI so it can't silently regress to "not run" again.
+**A9. `npm run lint` never worked.** Fixed (see above). This alone is why A2–A4 went undetected until now.
 
-**A10. `xlsx` carries a critical, unfixable (no patched version exists) prototype-pollution + ReDoS vulnerability** and was a runtime dependency. Confirmed via full-repo grep that it was never actually imported anywhere. Removed — `npm audit` now reports 0 critical (was 1).
+**A18 (new). CSV export had zero escaping on 5 of 6 export sites.** Found while investigating "CSV escaping and formula-injection protection" for `TEST_PLAN.md` (previously flagged as unverified rather than actually checked). `Employees.tsx`, `Payments.tsx`, `Security.tsx`, and both `AuditLogs.tsx` copies did a bare `row.join(',')` with no quoting at all — any field containing a comma silently corrupted the export's column alignment, and the AuditLogs exports were guaranteed to hit this in practice (every row includes a `JSON.stringify(...)` cell). `Reports.tsx` was the one partial exception (quote/escape already present) but had no formula-injection protection (a cell starting with `=`/`+`/`-`/`@` executing as a formula when opened in Excel/Sheets). Fixed: extracted correct behavior into `src/utils/csvExport.ts` (`escapeCsvCell`/`toCsvRow`, 19 passing tests), pointed all 6 sites at it, added formula-injection protection across the board.
 
-**A11. 218 pre-existing TypeScript errors**, concentrated in `Payslips.tsx` (25), `Payroll.tsx` (20), `Security.tsx` (17), `Sidebar.tsx` (17), `App.tsx` (17), `UserManual.tsx` (15). Not fixed in this pass (large, cross-cutting, and mostly pre-existing `Badge`/`Button` prop-type mismatches — see "Remaining risks" below for why these weren't touched wholesale).
+**A11. 211 pre-existing TypeScript errors remain, unfixed** (was 218; see "Corrections from the first pass" for exactly why the count moved and why that's not the same as "fixed"). Concentrated in `Payslips.tsx`, `Payroll.tsx`, `Security.tsx`, `Sidebar.tsx`, `App.tsx`, `UserManual.tsx`.
 
 ### P2 — Functional defects with a workaround / lower-severity gaps
 
-**A12. Regional data isolation is entirely UI-only.** No RLS policy anywhere references `region_id`, even though `employees.region_id` and `profiles.region_id` both exist and multiple pages (`Attendance.tsx`, `Payments.tsx`, `TerminalDues.tsx`, `Recruitment.tsx`) filter by region client-side. Any authenticated user can read/write every region's data via a direct API call. **Deliberately not fixed** in this pass: `profiles.region_id` is nullable, and the existing client-side pattern (`if (!is_super_admin && region_id) filter...`) implies a NULL region means "can see all regions" — a business rule I should not guess at in a migration that could lock legitimate Managers out of data they're supposed to see. **This is the single highest-value follow-up and needs your confirmation on the exact semantics before it can be written.**
+**A12. Regional data isolation is UI-only.** No RLS policy anywhere references `region_id`. **Deliberately not fixed** — `profiles.region_id` is nullable and a NULL appears to mean "all regions" client-side, a business rule this audit should not guess at. **See `SECURITY_REVIEW.md`'s new "Candidate region/access-control model" section for the exact candidate rules (Super Admin/Admin/Manager/Supervisor/Staff) and precisely which schema changes each one needs — documented, not implemented, per your explicit instruction.**
 
-**A13. Two-Factor Authentication is claimed in the User Manual as "optional" but does not exist at all** — confirmed by the codebase's own comment in `Misc.tsx`: *"no 2FA exists in this app."* Not fixed (feature build vs. documentation fix is a decision for you).
+**A7. `company-logo` storage bucket** allows any authenticated user unrestricted INSERT/UPDATE/DELETE. Not fixed (lower priority — a logo image, not sensitive data).
 
-**A14. `withRateLimit` in `src/utils/rateLimiter.ts` is dead code** (never imported anywhere; only `checkRateLimit` is used, from `Login.tsx`). Its useless try/catch and two unused variables were fixed as part of the lint cleanup, but the function itself remains unused — flagged, not deleted, to keep that fix minimal.
+**A14. `withRateLimit` in `rateLimiter.ts` is dead code** (never imported anywhere). Its useless try/catch and 2 unused variables were cleaned up; the function itself remains, flagged not deleted.
 
-**A15. `dev` script used `vite --force --host`**, forcing a full dependency re-optimization on every single dev server start. Verified (by actually starting the dev server both ways) there's no structural reason for this — no linked/monorepo packages, cold start without `--force` is ~270ms and serves the app correctly. Changed the default `dev` script to drop `--force`, kept `dev:force` as a separate script for the rare case someone needs to bust the cache.
+**A15. `dev` script's unnecessary `--force`** — removed, verified (dev server starts in ~270ms and serves correctly without it).
 
 ## What was inspected
 
-Full `package.json`/scripts/lockfile, `tsconfig.json`, `vite.config.ts`, all 7 SQL migration files (1,753 lines total), both Supabase Edge Functions, `src/lib/supabase.ts`, `.gitignore`/`.env.example`, `App.tsx`'s routing/role model, `Sidebar.tsx`, and full manual review of `Attendance.tsx`, `Recruitment.tsx`, `Payroll.tsx`, `Payments.tsx`, `Payslips.tsx`, `Employees.tsx`, `TerminalDues.tsx`, plus a full-codebase ESLint pass across every `.ts`/`.tsx` file.
+Everything from the first pass, plus: a byte-for-byte reconciliation of the TypeScript error count against a clean `origin/main` worktree; `npm audit --json` output at three points in this branch's history; `Payslips.tsx`'s complete data-fetching path (for the new profile↔employee link finding); all 6 CSV export call sites; `Login.tsx`'s complete markup and actual rendered DOM (via a real, running local build — see `TEST_PLAN.md`).
 
 ## What requires business confirmation (not guessed at)
 
-1. **Region-access semantics** (A12): does a NULL `profiles.region_id` really mean "sees all regions," and is that intended for every role or only Admins/Managers? Needed before writing any RLS fix for regional isolation.
-2. **`employees` table column-level access** (see A5): which specific columns should Supervisors (via the Security page) be allowed to write vs. Admin/Manager-only (e.g. `basic_salary`, `account_number`, `region_id`)?
-3. **Backup & Recovery** (A6): build a real system, or correct the User Manual's claim? This is currently non-functional in either direction.
-4. **2FA** (A13): same question — build it, or remove the claim?
-5. **Credential rotation and git-history handling** (A1) — still awaiting your answer from earlier in this session.
+1. **Region-access semantics** (A12) — see `SECURITY_REVIEW.md`'s candidate rules; specifically, does a NULL `profiles.region_id` mean "all regions" for every role, or only some?
+2. **Whether Staff-level payslip self-service should exist at all**, and if so, the `profiles`↔`employees` linking approach (A17) — a schema decision with real implications for how Staff accounts get provisioned.
+3. **`employees` table column-level access** (A5's deferred item) — which columns Supervisors may write via the Security page vs. Admin/Manager-only.
+4. **Backup & Recovery, `jspdf` upgrade** (A6, A16) — build a real backup system or leave the claim removed; schedule dedicated, visually-verified testing time for the `jspdf` major-version upgrade rather than a blind bump.
+5. **Credential rotation and git-history handling** (A1) — still outstanding.
 
-## What requires production monitoring / staging verification before merge
+## Production deployment and rollback order
 
-- Both new migrations (`20260803000000`, `20260803000001`) — written, reviewed, but **never executed against any database**. Must run on a staging Supabase project first, specifically checking for pre-existing duplicate `(employee_id, month)` rows in `payroll` before the unique-constraint migration is applied to production.
-- The `EmployeeModal`/`AddApplicantModal` fixes were verified via lint + typecheck + build, but **not manually clicked through in a running app** (no auth credentials available in this environment) — recommend a manual smoke test of both modals (open, edit, save, cancel) before merging.
+None of this branch's migrations or code changes should reach production in one step. Recommended order:
+
+1. Merge this branch's **code-only** changes (bug fixes, CSV escaping, dependency removal, test suites, doc updates) to `main` and deploy normally — none of these depend on the unexecuted migrations and are independently safe (all verified via lint/typecheck/build in this session).
+2. Apply `20260803000000_role_level_rls_hardening.sql` to a **staging** Supabase project. Run `e2e/authenticated/rls-policy-matrix.spec.ts` against it with real 4-role test credentials (see `TEST_PLAN.md`). Confirm no legitimate workflow is newly blocked.
+3. Apply `20260803000001_payroll_unique_constraint.sql` to staging. **Check for existing duplicate `(employee_id, month)` rows in `payroll` first** — the migration will fail safely (not corrupt anything) if any exist; resolving those is a manual, business-judgment task.
+4. Apply both to production once staging is clean, during a low-traffic window, with a rollback plan ready (`DROP POLICY`/recreate the prior policy text for #1; `DROP CONSTRAINT payroll_employee_month_unique` for #2 — both are trivial to revert, see `DATA_INTEGRITY_REVIEW.md`).
+5. Apply `20260803000002_payroll_atomic_process_rpc.sql` to staging, run its own 8-scenario test procedure (in the migration file itself). Once verified, apply to production. **Only then**, as a separate, deliberately later change, update `Payroll.tsx` to actually call `process_payroll_batch()` instead of its current two-step delete+insert.
+6. Do not attempt the `jspdf` major-version upgrade (A16) as part of this rollout — it needs dedicated, visually-verified testing time on its own, unrelated to the migrations above.
 
 ## What remains uncertain / not covered by this pass
 
-- Phases 6 (business-logic test suite), 7 (E2E), 9 (Lighthouse/Speed Insights), 10 (full accessibility audit) as originally scoped all require either test credentials, a staging database, or a live browser session against a running instance with auth — none available here. See `TEST_PLAN.md` and `PERFORMANCE_REPORT.md` for what could be verified from the repo alone vs. what's explicitly marked unverified.
-- The 218 pre-existing TypeScript errors and 518 lint warnings were catalogued but not fixed wholesale — many are `Badge`/`Button` components being passed props (`className`, extra `color` values) the shared `ui.tsx` components don't actually declare, which is a real but very widespread pattern across the app; fixing all of them is a larger, separate effort than this pass's scope of "confirmed defects."
+- Full Lighthouse/Core Web Vitals measurement (blocked — see `PERFORMANCE_REPORT.md`).
+- Exhaustive audit-log coverage across every sensitive action (spot-checked only).
+- `employee_deductions`/`terminal_dues`/`applicants` DELETE policies, and `regions`/`companies`/`positions` DELETE — not extended with role_level checks this pass (scope-control decision, not an oversight — flagged as follow-up).
+- Full accessibility audit (one concrete finding — Login's unassociated labels, Finding in `SECURITY_REVIEW.md`/E2E tests — but no full axe-core/Lighthouse pass was possible).

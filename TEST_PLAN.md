@@ -1,92 +1,126 @@
 # Test Plan — Safeguard HR & Payroll System
 
-**Status at time of writing:** no automated test suite existed anywhere in this repo before this audit (no Vitest/Jest/Playwright config, no `test`/`test:e2e` npm scripts). None was added in this pass either — see "Why no test suite was added" below before assuming this is an oversight.
+**Last updated:** 2026-08-03 (second pass). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section first. This document now describes a **real, running test setup** — not a plan for one. Every number below comes from actually executing the relevant command in this environment.
 
-## Why no test suite was added in this pass
+## Status: what actually exists now vs. the first pass
 
-Setting up Playwright and writing the 30 E2E scenarios requested in the original audit brief requires:
-- A running instance of the app (local `vite preview` against a build works for this).
-- **Real Supabase credentials for at least one account per role** (Admin/Manager/Supervisor/Staff) to test login, navigation, and permission boundaries — none were available in this environment, and fabricating fake ones would produce tests that either fail immediately (no real backend to hit) or, worse, silently pass without testing anything real.
-- A database with representative seed data (employees, attendance, payroll records) — no staging Supabase project was available to seed.
+The first pass of this audit added no test suite at all and said so honestly. This pass added two: Vitest (unit) and Playwright (E2E). Both are real, both were actually run, and their exact results are recorded below rather than assumed.
 
-Installing the Playwright *package* and writing tests that can't actually run against anything real would just be theater — tests that pass trivially or fail for environment reasons teach nothing and create false confidence. Instead, this plan documents exactly what's covered by the manual static review already done, what a real E2E suite needs once credentials/staging exist, and the commands to run it.
+## Commands, exact output, exit codes
 
-## What was actually verified in this pass, and how
+```
+$ npm run type-check
+```
+Exit code **2**. 211 errors (`grep -c "error TS"` on the output). Not zero, not passing — a genuine failing result. Compare against the true `origin/main` baseline of 218 (verified in a separate git worktree): the 7-error difference is fully explained in `AUDIT_REPORT.md`'s "Corrections from the first pass" and is **not** the result of fixing any of the 211 real, remaining errors.
 
-| Area | Method | Result |
-|---|---|---|
-| Rules-of-Hooks correctness across every page | `npm run lint` (react-hooks/rules-of-hooks) after adding a working ESLint config | Found and fixed 1 additional live crash (Recruitment.tsx); 0 remaining matches repo-wide |
-| Type correctness | `npx tsc --noEmit` | 218 pre-existing errors catalogued, none introduced by this pass's fixes |
-| Build correctness | `npm run build` after every fix | Clean throughout |
-| Payroll/Attendance/Recruitment modal logic | Manual code reading (calculation formulas, state transitions, dependency arrays) | See AUDIT_REPORT.md findings A5, A8, A12 |
-| RLS policy coverage | Full read of all 7 migration files, cross-referenced against `rolePages` and each page's client-side permission checks | See SECURITY_REVIEW.md's authorization matrix |
-| Dependency vulnerabilities | `npm audit` before/after | 13 → 12 (1 critical → 0) |
-| Bundle composition | `npm run build` output, before/after `jszip` lazy-load fix | Payslips chunk: 38.5KB → 9.6KB gzip |
+```
+$ npm run lint
+```
+Exit code **0**. 518 warnings, 0 errors. This command failed outright before this audit (`ESLint couldn't find a configuration file`) — no config had ever existed in this repo's git history.
 
-## Unit-test coverage needed (none exists yet)
+```
+$ npm run test
+```
+Exit code **0**. `Test Files 2 passed (2)`, `Tests 39 passed (39)`. This script did not exist before this audit (`npm error: Missing script: "test"`, exit code 1) — that is a failure, not something to silently classify as N/A, per your explicit instruction.
 
-Priority order, matching AUDIT_REPORT.md's severity ranking:
+```
+$ npm run test:e2e
+```
+Exit code **0**. `14 tests: 7 passed, 7 skipped, 0 failed`. Also did not exist before this audit (same missing-script exit 1 failure).
 
-1. **Payroll calculation** (`calculatePayroll` in `Payroll.tsx`): gross pay, PAYE, pension, uniform deduction, attendance deduction, rounding, zero/negative/very-large salary inputs, month-boundary and leap-year date handling. This is pure-function-shaped (given an employee + attendance data, returns a payroll record) and is the highest-value candidate for unit tests once a test runner exists, since it needs no database or auth to test in isolation.
-2. **Attendance deduction calculation** (`calculateEmployeeDeductions` in `Attendance.tsx`): lecture-missed counting, full-month vs. per-lecture deduction thresholds, Wednesday/Thursday-only lecture-day logic.
-3. **Terminal dues calculation** (`TerminalDues.tsx`): the `monthsDiff` calculation fixed in this pass (prefer-const) is a good candidate to lock in with a regression test once a runner exists, along with gratuity/leave/uniform-refund math.
-4. **CSV/report export escaping** (`Reports.tsx` and wherever CSV strings are built): commas, quotes, newlines, and formula-injection risk (a name starting with `=`, `+`, `-`, or `@`) in exported values — **not verified in this pass at all**; flagged as an unverified area needing a dedicated read of the CSV-building code before either a fix or a "this is already safe" conclusion can be stated.
+```
+$ npm run build
+```
+Exit code **0**. Clean throughout every commit in this branch.
 
-Recommended runner once set up: **Vitest** (already Vite-native, zero extra bundler config, fast) over Jest, given this is a Vite project.
+## Unit-test coverage (Vitest — `src/**/*.test.ts`)
 
-## Integration-test coverage needed
+**`src/utils/payrollCalculations.test.ts` — 18 tests, all passing.** Covers `calculateLivePayroll` (the single source of truth `Payroll.tsx` and `Payments.tsx` both delegate to):
+- Gross pay composition (basic + allowances + overtime + bonus, defaults to 0 for omitted fields)
+- PAYE: zero at/below threshold, taxes only the amount above threshold at `payeRate`, rounds to whole currency
+- Pension: `grossPay * pensionEmployeeRate`, applies with no threshold
+- Uniform deduction eligibility: position-based (map lookup), employee-specific override, zero for non-uniform positions even with an override set, fail-safe default (unlisted position defaults to *requiring* a uniform, matching the `?? true` in the implementation)
+- Attendance/lecture/appearance deductions: additive, zero when omitted (not an error)
+- Net pay: `gross - paye - pension - deductions`, and explicitly **not clamped at zero** — a documented, intentional test of negative net pay as a real scenario, not an assumed-blocked one
+- Edge cases: zero basic salary, very large basic salary (50 million), negative basic salary (documents that the function performs no input validation of its own — a business-rule/UI-validation question for elsewhere, not decided here)
 
-- `processPayroll`/`copyFromPreviousMonth` against a real (staging) Supabase instance: confirm the delete-then-insert sequence behaves correctly, and specifically **test what happens if the insert half is forced to fail after the delete half succeeds** (e.g. by temporarily breaking a constraint) — this directly tests the non-atomicity gap documented in AUDIT_REPORT.md A8 and DATA_INTEGRITY_REVIEW.md.
-- The new `20260803000000`/`20260803000001` migrations, applied to a staging project, then exercised via `supabase-js` calls as each role to confirm the intended role_level restrictions actually take effect (this is the live-testing step this audit could not perform itself).
+**Deliberately does not change `DEFAULT_RATES` or the calculation formula itself** — these tests lock in and document current behavior, per the standing rule against altering payroll/tax/pension logic without a confirmed source. If a future change breaks one of these tests, that's a prompt to go confirm intent, not to edit the test to match.
 
-## End-to-end scenarios (Playwright), to build once credentials/staging exist
+**`src/utils/csvExport.test.ts` — 19 tests, all passing.** Covers `escapeCsvCell`/`toCsvRow` (extracted this pass from Reports.tsx, then applied to 5 other previously-unescaped export sites — see `AUDIT_REPORT.md` Finding A18):
+- Quote-wrapping, doubled internal quotes (RFC 4180), commas, embedded newlines, unicode names, numbers, null/undefined
+- Formula-injection protection for every trigger character (`=`, `+`, `-`, `@`, tab, carriage return), verified it does *not* alter a value merely containing (not starting with) a trigger character
+- A realistic audit-log row containing a JSON blob, verified via a real (if minimal) RFC 4180 round-trip parser written for the test — not a naive comma-split, which is exactly the bug this whole fix addresses and would be circular to use as the test's own verification method. (This parser caught a real flaw in the first draft of this specific test: an earlier version tried to "verify" correctness by counting regex matches for quote-adjacent commas, which itself produced a false failure on a row with multiple internal escaped quotes. Fixed before committing, not glossed over.)
 
-Scaffolding recommendation: `npm install -D @playwright/test`, `npx playwright install --with-deps chromium`, config pointed at `vite preview`'s local build output plus a staging Supabase project's URL/anon key via `.env.test` (never committed).
+**Why `payrollSettings.ts` (and therefore `payrollCalculations.test.ts`) needed a Vitest config change:** `src/lib/supabase.ts` throws at import time if `VITE_SUPABASE_URL`/`VITE_SUPABASE_ANON_KEY` are unset, and `payrollSettings.ts` imports it transitively (for its unrelated, DB-backed `getPayrollRates()` export) even though the pure `DEFAULT_RATES` export under test never touches it. `vitest.config.ts` sets placeholder values (matching `.env.example`'s format, never real credentials) purely to stop the import-time throw.
 
-Test accounts needed (create these in a staging project, not production):
-- One Admin, one Manager, one Supervisor, one Staff account, ideally two of each spread across two different regions, to test the region-isolation gap directly (Finding A12) once it's fixed.
-- Fixture data: a small number of employees per region, one processed-but-not-approved payroll month, one approved payroll month, a few attendance records, a few applicants at different pipeline stages.
+## Integration/E2E coverage (Playwright)
 
-Scenarios, grouped by what they'd actually catch (all currently unimplemented — this is the target list from the original audit brief, kept here rather than discarded):
+### Static suite (`e2e/static/**`) — no credentials needed, 7/7 passing
 
-1. Login/logout, invalid login, session expiration — auth flow correctness.
-2. Direct navigation to a protected route while logged out — redirect correctness.
-3. Each role's navigation across every page it should/shouldn't see — cross-checks `rolePages` against actual reachability.
-4. Cross-region access denial — **this will currently fail**, since region isolation is UI-only (A12); this test's purpose once written is specifically to prove that gap live, and later to confirm the fix.
-5. Add/edit/soft-delete/restore employee; double-submission prevention on the add form.
-6. Recruitment pipeline transitions (Pending → Shortlisted → Interviewed → Accepted/Rejected → Hired); confirm accepting twice doesn't create duplicate employees.
-7. Attendance status cycling, rapid-click/duplicate-update handling (Attendance.tsx already has an `updating[key]` guard for this — confirm it holds under real network latency).
-8. Payroll processing, reprocessing-while-approved denial (button disable already exists client-side — confirm it holds server-side once role_level checks are live), duplicate-processing prevention (now backed by the new unique constraint once applied).
-9. Payslip download (single + bulk ZIP), confirm the lazy-loaded `jszip` path still produces a correct archive.
-10. Payment/terminal-dues status transitions, confirm the existing `UNIQUE(employee_id, month)` constraint on `payment_status` actually prevents the double-click race described in AUDIT_REPORT.md's investigation (expected: second click errors cleanly rather than creating a duplicate row — worth confirming the UI surfaces that error usefully rather than a raw constraint-violation message).
-11. CSV export correctness against known fixture data, specifically injection-risk characters.
-12. Browser refresh on every route (confirms the app doesn't lose critical state / crash on direct load — related to the two `loading`-state hook bugs found this session, since both were specifically about the very first render after a fresh load).
-13. Mobile viewport navigation and layout.
+Runs against `vite preview` of a real production build, with placeholder Supabase env vars (`.env.test.example` → copy to `.env.local` to run locally, or the config's own `webServer` step handles it in CI once that file exists).
 
-## Test data and cleanup
+- `login.spec.ts`: form renders (email/password/submit visible), password input's missing `autocomplete` attribute (a real gap, confirmed via the actual Chromium console warning — not assumed), mapped error message for invalid credentials (mocked via `page.route()` against Supabase Auth's real error response shape — confirmed correct by actually running it and observing the real UI text), mapped message for a rate-limit response.
+- `app-shell.spec.ts`: no console `pageerror` on first paint, mobile viewport (390×844) renders correctly, survives a hard refresh without a console error.
 
-- All fixture data must live in a staging Supabase project, never production. Given `tenant_id` scoping exists, a dedicated test tenant is the cleanest isolation if the staging project is shared.
-- Cleanup: since `employees` soft-deletes and `payroll`/`attendance` cascade-delete from `employees`, a full teardown between test runs means either (a) hard-deleting the test tenant's rows directly via a service-role connection (safe in staging, never production), or (b) resetting the staging database from a known snapshot before each run. Prefer (b) for determinism.
+**What this suite deliberately does NOT and cannot test**: an actual successful login, anything past the login screen, role-based navigation, cross-region access, payroll/attendance/recruitment workflows. All of those need a reachable Supabase project with real data and real accounts.
 
-## Commands to run tests (once set up)
+### Staging-gated suite (`e2e/authenticated/**`) — 7 tests, all correctly SKIPPED
+
+`rls-policy-matrix.spec.ts` — see `SECURITY_REVIEW.md`'s "RLS testing status" for what it covers. Gated by `e2e/fixtures.ts`'s `missingStagingVars()`; every test in the file calls `test.skip(missing.length > 0, ...)` with the exact missing variable names in the skip reason. **Verified by actually running `npm run test:e2e` in this environment (which has none of these variables set) and confirming all 7 report as skipped** — not passing, not a hard failure that would look like a real regression.
+
+### Test accounts and fixtures needed (not fabricated, not present in this environment)
+
+To actually exercise the staging-gated suite, per `e2e/fixtures.ts`:
+```
+E2E_BASE_URL, E2E_SUPABASE_URL, E2E_SUPABASE_ANON_KEY
+E2E_ADMIN_EMAIL / E2E_ADMIN_PASSWORD
+E2E_MANAGER_EMAIL / E2E_MANAGER_PASSWORD
+E2E_SUPERVISOR_EMAIL / E2E_SUPERVISOR_PASSWORD
+E2E_STAFF_EMAIL / E2E_STAFF_PASSWORD
+```
+Ideally two accounts per role in two different regions, to eventually test the region-isolation gap directly (`AUDIT_REPORT.md` A12) once a fix exists to test against.
+
+### Test data cleanup
+
+The RLS matrix test cleans up after itself: `payment_status`/`system_settings` test rows are deleted (or, for the destructive-operation test, the disposable employee created for it is soft-deleted the same way the app itself does it) within the test, not left behind. A full staging teardown between separate test runs would still need either a service-role connection to hard-reset the test tenant's rows (safe in staging, never production) or restoring from a known snapshot.
+
+## The 30-scenario original scope — status against each
+
+Kept honest rather than silently narrowed. ✅ = covered by a real, passing test today. 🔒 = written, correctly gated behind staging credentials that don't exist here. ❌ = not attempted this pass.
+
+1. Login/logout, invalid login — ✅ (invalid login + rate-limit mapping; logout not separately tested)
+2. Session expiration — ❌ (needs a live session over a real token lifetime)
+3. Direct navigation to protected routes — **N/A for this app's architecture** (no URL router; single route gated by client-side boolean — see `AUDIT_REPORT.md`'s system map)
+4–8. Admin/Manager/Supervisor/Staff navigation and permissions, cross-region denial — 🔒 (`rls-policy-matrix.spec.ts` covers the *data-layer* permission boundaries directly via API, which is a stronger test than clicking through the UI would be, but still needs staging credentials to run)
+9. Cross-region access denial — 🔒/❌ — the underlying feature (A12) isn't fixed yet, so there's nothing to verify pass regardless of credentials
+10–13. Employee add/edit/double-submit/delete-restore — ❌
+14. Recruitment status workflow — ❌
+15–16. Attendance status changes, failed-update rollback — ❌
+17–20. Payroll processing/duplicate-prevention/approval/unauthorized-approval — 🔒 for the RLS layer; the atomicity fix itself (A8) has its own staging test procedure written directly in `20260803000002_payroll_atomic_process_rpc.sql`
+21. Payslip download — ❌ (and see A17 — the underlying feature has a real gap to fix first)
+22–23. Payment/terminal-dues workflows — 🔒 (payment_status covered in the RLS matrix)
+24. Security-personnel creation — ❌
+25–26. Report filtering, CSV export — ✅ for CSV escaping/injection specifically (19 unit tests); report *filtering* itself not tested
+27. Audit-log creation — partially ✅ (the RLS matrix's cleanup steps incidentally exercise real writes, but no dedicated audit-log-creation assertion exists yet)
+28. Browser refresh on every route — ✅ for the one route this app has (`app-shell.spec.ts`); "every route" doesn't apply the way it would for a multi-route app
+29. Mobile navigation — ✅ (viewport test; deeper mobile-specific interaction not tested)
+30. Empty/loading/error states — partially ✅ (login error states); loading/empty states elsewhere not tested
+
+## Uncovered areas, still explicit
+
+- Recruitment/Employees/Security/Attendance/Payments/TerminalDues page-level workflows: **not tested**, static code review only (see `AUDIT_REPORT.md`).
+- Accessibility beyond the one Login-page finding: **not tested** (no axe-core/Lighthouse run — see `PERFORMANCE_REPORT.md`).
+- Report filtering correctness against known fixture data: **not tested**.
+- Everything requiring a live database with realistic data volume: **not tested**.
+
+## Commands to run tests
 
 ```bash
-# Unit/integration (once Vitest is added)
-npm run test          # to be added: "vitest run"
-npm run test:watch    # to be added: "vitest"
-
-# E2E (once Playwright is added)
-npm run test:e2e      # to be added: "playwright test"
-npx playwright show-report
-
-# Always, before/after any of the above
+npm run test            # Vitest unit tests
+npm run test:watch      # Vitest, watch mode
+npm run test:e2e        # Playwright (static suite always; authenticated suite needs env vars)
+npm run test:e2e:report # open the last Playwright HTML report
 npm run lint
 npm run type-check
 npm run build
 ```
-
-## Uncovered areas (explicit, not hidden)
-
-- Everything in this document marked "needed"/"to build" is, honestly, **not done** — this plan is the roadmap, not a completed suite. The one thing this audit pass could and did verify without a test runner was static correctness (types, lint, build, RLS-policy reading) and manual code review of the highest-stakes business logic (payroll, attendance, recruitment).
-- CSV/export injection safety: unverified, not even statically reviewed in this pass — highest-priority next static read, doesn't need staging access.
-- Accessibility (keyboard nav, screen reader, focus trapping): not tested at all — see PERFORMANCE_REPORT.md for why (needs a live browser + axe-core, not attempted with confidence via grep alone).

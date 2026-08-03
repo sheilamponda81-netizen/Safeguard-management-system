@@ -1,91 +1,97 @@
 # Security Review — Safeguard HR & Payroll System
 
-**Date:** 2026-08-03. Read `AUDIT_REPORT.md`'s "Access limitations" section first — this review is a **static reading of the codebase and SQL migrations**, not a live penetration test. No Supabase admin access, no per-role test credentials, and no staging database were available. Every claim below states its evidence; anything not directly checkable says so.
+**Last updated:** 2026-08-03 (second pass). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section first — two claims in the original version of this review's sibling document were factually wrong (TypeScript error count, critical vulnerability attribution) and have been corrected throughout. This review remains a **static reading of the codebase and SQL migrations**, not a live penetration test — no Supabase admin access, no per-role test credentials, no staging database. Every claim states its evidence.
 
 ## Authentication review
 
-- Supabase Auth (email/password) via `@supabase/supabase-js`, using the anon key (`src/lib/supabase.ts`) — correct client-side pattern, no service-role key present anywhere in frontend code (confirmed by grep across `src/`).
-- `.env`/`.env.local` are gitignored; only `.env.example` (placeholder values) is tracked. Confirmed via `git ls-files | grep env`.
-- Session expiration / token refresh: handled by `@supabase/supabase-js` internally (its default behavior). Not independently tested — would need a live browser session to observe refresh behavior over a real token lifetime. **Unverified.**
-- Password reset (`src/pages/ResetPassword.tsx` exists): not reviewed line-by-line in this pass for information leakage (e.g. whether it reveals if an email exists). **Unverified — flagged for a follow-up read.**
-- Brute-force protection: `src/utils/rateLimiter.ts`'s `checkRateLimit` is used in `Login.tsx`. This is **client-side only** — it rate-limits based on state held in the browser tab, which a reloading page or a different browser/incognito session trivially resets. It provides no protection against a scripted attacker hitting Supabase Auth directly. Supabase itself has its own platform-level rate limiting on auth endpoints, which is the actual backstop here, not this app-level check. **Not fixed in this pass** (would need Supabase dashboard access to check/configure the platform-level settings — unverified).
-- **A1 (from AUDIT_REPORT.md): a real-looking admin credential was committed to git history** in `src/tests/auth.test.ts` (removed from the current tree; history not rewritten pending your decision). Treat this as compromised — rotate the password regardless of anything else here.
+- Supabase Auth via the anon key (`src/lib/supabase.ts`) — correct pattern, no service-role key anywhere in frontend code.
+- `.env`/`.env.local`/`.env.test` are gitignored; only `.env.example`/`.env.test.example` (placeholders) are tracked.
+- Login form's error-message mapping (`Login.tsx`) is now genuinely tested: `e2e/static/login.spec.ts` mocks Supabase Auth's real error response shape (via Playwright's `page.route()`) and confirms the app maps `"Invalid login credentials"` to a user-facing message and a rate-limit response to a different one — actually run in this environment, both pass.
+- **New finding: `Login.tsx`'s Email/Password `<label>` elements have no `htmlFor`/`id` association and don't wrap their `<input>`s** (confirmed by reading the source and confirmed again by Playwright's `getByLabel()` not finding them, forcing the E2E tests to use `getByPlaceholder` instead). This is a real accessibility gap (WCAG 1.3.1/4.1.2) — a screen reader cannot programmatically associate the visible "Email"/"Password" text with their inputs. Not fixed this pass.
+- **New finding, confirmed by actually loading the app in a real browser**: the password input has no `autocomplete` attribute — Chromium's own DevTools console flags this (`"Input elements should have autocomplete attributes (suggested: \"current-password\")"`), now locked in as a regression test (`e2e/static/login.spec.ts`).
+- Session expiration / token refresh: handled internally by `@supabase/supabase-js`. **Unverified** — needs a live session over a real token lifetime.
+- Password reset flow (`ResetPassword.tsx`): **not reviewed this pass either** — still flagged from the first pass.
+- Login rate limiting (`checkRateLimit` in `rateLimiter.ts`) is client-side only, trivially reset by reloading or using a different browser. Supabase's own platform-level rate limiting is the real backstop; **not verified** (no dashboard access).
+- **A1: hardcoded admin credential in git history** (`src/tests/auth.test.ts`, since `58c4a9a`). Removed from the current tree; history not rewritten. **Still needs password rotation.**
 
 ## Authorization matrix
 
-Derived from `src/App.tsx`'s `rolePages` (client-side page access) cross-referenced against what each table's RLS policy actually enforces, **after** this audit's `20260803000000_role_level_rls_hardening.sql` migration (not yet executed against any database — see below).
+| Table | View | Create | Edit | Delete | DB enforcement status |
+|---|---|---|---|---|---|
+| `profiles` | self + tenant | self | self (sensitive columns blocked) | super-admin only | Covered (pre-existing fix) |
+| `employees` | tenant-wide | tenant-wide, **no role check** | tenant-wide, **no role check** | super-admin only (this audit) | **Gap remains on INSERT/UPDATE** — needs column-level design (Supervisors write guard/shift/uniform columns via Security.tsx; Admins/Managers write everything via Employees.tsx) |
+| `payroll` | tenant-wide | role_level = 1 or super-admin | role_level = 1 or super-admin | super-admin only (this audit) | Covered, plus a new atomic RPC (unwired) closing the non-atomicity gap |
+| `attendance` | tenant-wide | **no role check** | **no role check** | **no role check** | **Not touched this pass** — Staff (role 4), who cannot even see the Attendance page in the UI, can currently write attendance directly via API |
+| `applicants` | tenant-wide | role_level ≤ 2 (this audit) | role_level ≤ 2 (this audit) | role_level ≤ 2 (this audit) | Covered |
+| `payment_status` | tenant-wide | role_level ≤ 2 (this audit) | role_level ≤ 2 (this audit) | no role check | INSERT/UPDATE covered, DELETE not touched. **Now has an executable staging test** (`e2e/authenticated/rls-policy-matrix.spec.ts`) |
+| `terminal_dues` | tenant-wide | role_level ≤ 2 (this audit) | role_level ≤ 2 (this audit) | no role check | INSERT/UPDATE covered, DELETE not touched |
+| `employee_deductions` | tenant-wide | role_level ≤ 3 (this audit) | role_level ≤ 3 (this audit) | no role check | INSERT/UPDATE covered, DELETE not touched |
+| `system_settings` | tenant-wide | role_level = 1 (this audit) | role_level = 1 (this audit) | super-admin only (pre-existing) | Covered. **Now has an executable staging test** |
+| `audit_logs` | tenant-wide | tenant-wide (app writes as acting user) | no policy → denied by default | no policy → denied by default | Already correctly immutable — a real pass, not a gap |
+| `regions`/`companies`/`positions` | tenant-wide | tenant-wide, no role check | tenant-wide, no role check | tenant-wide, no role check | Not touched (lower sensitivity, follow-up) |
+| `company-logo` storage | public | any authenticated user | any authenticated user | any authenticated user | Not touched |
 
-| Table | View | Create | Edit | Delete | Approve | DB enforcement (post-migration, unexecuted) |
-|---|---|---|---|---|---|---|
-| `profiles` (own role/tenant/admin flag) | self + tenant | self | self (other columns only) | super-admin only | n/a | Trigger blocks self-escalation of `role_level`/`is_super_admin`/`tenant_id` (pre-existing fix, `20260727000001`) |
-| `employees` | tenant-wide | tenant-wide | **tenant-wide, no role check** | super-admin only (this migration) | n/a | **Gap remains on INSERT/UPDATE** — see below |
-| `payroll` | tenant-wide | role_level = 1 or super-admin (pre-existing fix) | role_level = 1 or super-admin (pre-existing fix) | super-admin only (this migration) | role_level = 1 or super-admin, via UPDATE policy | Covered |
-| `attendance` | tenant-wide | tenant-wide, no role check | tenant-wide, no role check | tenant-wide, no role check | n/a | **Not touched this pass** — see "Not yet covered" below |
-| `applicants` | tenant-wide | role_level ≤ 2 (this migration) | role_level ≤ 2 (this migration) | role_level ≤ 2 (this migration) | n/a | Covered |
-| `payment_status` | tenant-wide | role_level ≤ 2 (this migration) | role_level ≤ 2 (this migration) | tenant-wide, no role check | n/a | INSERT/UPDATE covered, DELETE not touched |
-| `terminal_dues` | tenant-wide | role_level ≤ 2 (this migration) | role_level ≤ 2 (this migration) | tenant-wide, no role check | n/a | INSERT/UPDATE covered, DELETE not touched |
-| `employee_deductions` | tenant-wide | role_level ≤ 3 (this migration) | role_level ≤ 3 (this migration) | tenant-wide, no role check | n/a | INSERT/UPDATE covered, DELETE not touched |
-| `system_settings` | tenant-wide | role_level = 1 (this migration) | role_level = 1 (this migration) | super-admin only (pre-existing) | n/a | Covered |
-| `audit_logs` | tenant-wide | tenant-wide (app writes as acting user) | **no policy → denied by default** | **no policy → denied by default** | n/a | Already correctly immutable |
-| `regions`/`companies`/`positions` | tenant-wide | tenant-wide, no role check | tenant-wide, no role check | tenant-wide, no role check | n/a | **Not touched this pass** (lower sensitivity, flagged as follow-up) |
-| `company-logo` storage | public | any authenticated user | any authenticated user | any authenticated user | n/a | **Not touched this pass** (A7) |
+**"Covered" still means "migration written and reviewed, not executed."** See "RLS testing status" below.
 
-**Reading this table honestly:** "Covered" means the migration file exists and its SQL mirrors an already-established client-side rule — it does **not** mean this has been executed or verified against a real database. See "Verification status" below.
+## RLS testing status (updated — this is no longer purely hypothetical)
 
-### Gaps intentionally left open this pass (and why)
+`e2e/authenticated/rls-policy-matrix.spec.ts` is a real, runnable Playwright/supabase-js test file exercising:
+- `payment_status`: Admin and Manager can INSERT; Supervisor and Staff cannot; Staff cannot UPDATE an existing row (verified via re-reading the row afterward, since a denied UPDATE under RLS returns no client-visible error but affects zero rows — a subtlety this test explicitly accounts for rather than trusting `error === null`).
+- `system_settings`: Manager cannot UPDATE.
+- `employees`: a non-super-admin Admin cannot hard-DELETE a (disposable, test-created) employee record.
 
-- **`employees` INSERT/UPDATE** has no role_level check at all. This table is written from both the Employees page (role_level ≤ 2) and the Security page (role_level ≤ 3, Supervisors manage guard/shift/uniform columns there). A blanket restriction would lock Supervisors out of legitimate writes. Needs column-level policies (which columns each role may touch) — needs your confirmed column list, not a guess.
-- **`attendance` INSERT/UPDATE/DELETE** — same shape of gap, not yet analyzed for its full role/column matrix in this pass. Flagged as a follow-up; the Attendance page itself is role_level ≤ 3, so a Staff account (role 4) currently *can* write attendance directly via API despite having no UI access to the page at all.
-- **DELETE on `payment_status`/`terminal_dues`/`employee_deductions`/`regions`/`companies`/`positions`** — INSERT/UPDATE were prioritized (higher-impact: creating fraudulent records or approving things); DELETE was not, as a scope-control decision for this pass, not because it's safe.
+Actually run in this environment: **all 7 tests report as SKIPPED**, with a clear reason (`Missing: E2E_BASE_URL, E2E_SUPABASE_URL, ...`), because no staging credentials exist here. This was verified by running it, not assumed. To turn these into a real pass/fail signal, set the env vars listed in `e2e/fixtures.ts` against a real staging Supabase project with the role_level hardening migration applied and 4 seeded test accounts.
 
-## Region isolation testing
+## Candidate region/access-control model (documented, NOT implemented)
 
-**Not tested live** (no test accounts). Verified statically instead: grepped every migration file for `region_id` inside a `CREATE POLICY` — **zero matches**. Every RLS policy in this schema gates only on `tenant_id`/`is_super_admin()`. Region filtering happens exclusively in application code (e.g. `Attendance.tsx` line ~125: `if (!userProfile?.is_super_admin && userProfile?.region_id) { query = query.eq('region_id', userProfile.region_id) }`).
+Requested explicitly: document the following candidate rules and the schema changes each needs, without writing any code or migration for them. Region isolation (A12) stays blocked until you confirm which of these (or some other variant) is actually correct.
 
-**Conclusion: regional data isolation, as advertised in the User Manual ("Regional data isolation ensures employees only access data relevant to their region"), is not implemented at the database layer at all.** Any authenticated user, of any role, in any region, can read or write any other region's data via a direct Supabase client call bypassing the UI entirely. This is the single largest gap this review found and is not fixed — see AUDIT_REPORT.md Finding A12 for why (nullable `region_id` semantics need your confirmation before a fix can be written safely).
+| Role | Candidate rule | Already supported by the schema? | Schema change needed |
+|---|---|---|---|
+| Super Admin | Explicitly authorized global access (all tenants/regions) | **Yes** — `profiles.is_super_admin` already exists and is already the universal bypass in every RLS policy this schema has | None |
+| Admin | All regions within their own tenant | **Yes, implicitly** — every existing RLS policy already scopes to `tenant_id = get_current_tenant_id()` with no region restriction; an Admin (role_level 1) with a NULL `region_id` already behaves this way today, matching the client-side `if (!is_super_admin && region_id)` pattern used throughout the app | None, if "Admin's `region_id` is NULL" is confirmed as the intended way to express "sees all regions in their tenant." If instead Admins should have an *explicit* "all regions" flag distinct from just leaving the column NULL (clearer intent, avoids NULL doing double duty as both "unset" and "unlimited access"), that needs a new boolean column, e.g. `profiles.all_regions_access` |
+| Manager | Assigned region **or regions** (plural) | **Partially** — `profiles.region_id` is a single nullable UUID, singular. The word "regions" (plural) in the requested candidate rule is a real design fork: if a Manager can ever legitimately oversee more than one region (not just "all of them," a specific subset), the current single-column model cannot express that at all | A join table, e.g. `profile_regions (profile_id, region_id)`, replacing or supplementing `profiles.region_id`. This is the single biggest schema decision in this whole model — confirm whether multi-region Managers are a real requirement before building either the join table (if yes) or keeping the simpler single-column model (if no, in which case the existing `region_id` column already suffices and no schema change is needed for Managers specifically) |
+| Supervisor | Assigned region **and authorized workstations** | **Region: same as Manager above (partial). Workstations: no.** `employees.workstation` is a free-text column (not a foreign key to any `workstations`/`positions`-like lookup table), and there is no concept anywhere in the schema of a *Supervisor* being authorized for a specific *subset* of workstations within their region | Two changes, in order of how foundational they are: (1) a real `workstations` table (currently just a free-text field on `employees`) if workstation-level authorization is to be enforced by more than string-matching; (2) a `profile_workstations (profile_id, workstation_id)` join table (or `profile_id, workstation_text` if the free-text approach is kept) recording which workstations a given Supervisor may access |
+| Staff | **Own profile, payslips, and permitted personal information only** | **No — this is the most severe gap found in this whole review.** See Finding A17 in `AUDIT_REPORT.md`: there is no column anywhere linking a `profiles` row (an auth account) to a specific `employees` row (an HR/payroll record). `Payslips.tsx`, the one page Staff can reach for this purpose, currently has **zero per-employee scoping** and shows every employee's payslip in the Staff user's region, not just their own | **A new `profiles.employee_id` column** (nullable UUID, `REFERENCES employees(id)`), populated when a Staff account is provisioned for a specific employee. Without this, no RLS policy or client-side filter can express "Staff sees only their own record" at all — there's nothing to filter *on*. This should be treated as a prerequisite to fixing A17, not an optional nice-to-have. |
+
+**Summary of the schema decision this table is really asking you to make:** do Managers/Supervisors ever need *multiple* regions (plural, as literally requested) rather than one? If yes, `profiles.region_id` needs replacing with a join table before any of this can be built correctly — retrofitting that after RLS policies already depend on the single-column shape is much more disruptive than deciding now. Independent of that question, **`profiles.employee_id` is needed regardless** to make Staff self-service mean anything at all.
 
 ## Secret management review
 
-- No service-role key, database password, or other secret found anywhere in `src/`, `vite.config.ts`, or any tracked file other than `.env.example` (which contains only placeholders).
-- `src/tests/auth.test.ts`'s hardcoded credential (A1) is the one real exposure found, addressed above.
-- Both Edge Functions (`supabase/functions/backup`, `/rollback`) read `SUPABASE_SERVICE_ROLE_KEY` from `Deno.env` server-side — correct pattern, key never reaches the browser.
-- Logs: `console.error`/`console.log` calls throughout the app were spot-checked in the files reviewed this pass (Attendance, Recruitment, Payroll, Payments, Payslips, Employees, TerminalDues) — none observed printing full employee objects, salaries, or tokens; errors are generally logged as `err.message` or the raw Postgres error object. **Not exhaustively checked across the whole codebase** — flagged as a follow-up (a repo-wide grep for `console.log(` combined with variables named `salary`/`token`/`password`/`account` would be a fast next step).
+Unchanged from the first pass: no service-role key or other real secret found anywhere outside `.env.example`/`.env.test.example` (both placeholders only). Both Edge Functions read `SUPABASE_SERVICE_ROLE_KEY` from `Deno.env` server-side correctly. Audit-log message content spot-checked (not exhaustive) across the files reviewed this pass — no salaries/tokens observed being logged in plain console output.
 
 ## Storage policy review
 
-- `company-logo` bucket: public read (deliberate, documented in the migration as equivalent to a public website asset), but INSERT/UPDATE/DELETE are open to **any authenticated user**, no tenant or role scoping (A7, not fixed this pass — lower priority given it's just a logo image, but real and live).
-- No other storage buckets found in the migrations.
+Unchanged: `company-logo` bucket is public-read (deliberate) but has unrestricted authenticated write (A7, not fixed — lower priority, not sensitive data).
 
 ## Audit log integrity
 
-- `audit_logs` has SELECT and INSERT policies only — **no UPDATE or DELETE policy exists**, which under Postgres RLS means those operations are denied by default for any non-owner role. Confirmed by reading the full `CREATE POLICY` block for this table in `20260727000000_reconstructed_base_schema.sql` — nothing past INSERT is defined.
-- **This is a genuine pass**: audit logs are immutable as claimed, without needing any additional fix.
-- Coverage: `logAudit()` calls were confirmed present in `Attendance.tsx` (deduction saves), `Recruitment.tsx` (applicant creation), `Payroll.tsx` (processing, approval), `Payments.tsx` (status changes). **Not verified for every single sensitive action across every page** — a full coverage check (grep for every `.insert(`/`.update(`/`.delete(` call and confirming each has a matching `logAudit`) was not completed in this pass.
+Unchanged and still a genuine pass: `audit_logs` has no UPDATE/DELETE policy at all, meaning those operations are denied by default under RLS. Confirmed by reading the full policy block. Coverage across every sensitive action still not exhaustively verified.
 
-## User Manual security claims — verified against actual implementation
+## User Manual security claims — verified, and now corrected in the app itself
 
-| Claim | Status | Evidence |
+| Claim | Status | Action taken |
 |---|---|---|
-| "Data Encryption: All data is encrypted at rest and in transit using industry-standard TLS/SSL" | **Reasonably substantiated** | Inherent to Supabase (Postgres at rest) + Vercel (HTTPS) hosting, not something the app implements itself, but a fair claim for this stack |
-| "Access Control: Role-based access ensures only authorized personnel can view sensitive information" | **Partially true, was mostly false before this audit** | Server-side enforcement existed on 2/13 tables before this pass; extended to 5 more tables by an unexecuted migration; `employees` and `attendance` still have no role_level check at all (see gaps above) |
-| "Audit Trail: Every action is logged, providing complete accountability" | **Reasonably substantiated** | `audit_logs` is real and immutable; coverage across every action not exhaustively verified |
-| "Two-Factor Authentication: Optional 2FA adds an extra layer of security" | **False** | Confirmed by the codebase's own comment in `Misc.tsx`: *"no 2FA exists in this app"* |
-| "Data Isolation: Regional data isolation ensures employees only access data relevant to their region" | **False at the database layer** | Zero RLS policies reference `region_id` anywhere; UI-only filtering, trivially bypassed via direct API calls |
-| "Backup & Recovery: Automated daily backups with point-in-time recovery capabilities" | **False** | No scheduler, no frontend invocation, `restoreBackup` is a no-op, target storage table doesn't exist in the schema (see AUDIT_REPORT.md A6) |
+| "Data Encryption... TLS/SSL" | Reasonably substantiated (inherent to Supabase/Vercel) | Left as-is |
+| "Access Control: Role-based access" | Partially true, improved by this session's (unexecuted) migrations; `employees`/`attendance` still have no role_level check | Left as-is — the claim isn't false, just not fully realized yet |
+| "Audit Trail" | Reasonably substantiated | Left as-is |
+| "Two-Factor Authentication (optional)" | **False** — confirmed by the codebase's own comment ("no 2FA exists in this app") | **Removed from the User Manual** |
+| "Data Isolation: Regional data isolation ensures employees only access data relevant to their region" | **False as a security guarantee** — real as a UI filter | **Reworded** to "The interface displays only the data relevant to your assigned region" — accurate about what actually happens, without claiming an enforcement guarantee that doesn't exist |
+| "Backup & Recovery: automated daily backups with point-in-time recovery" | **False** | **Removed from the User Manual** |
 
-## Remaining security risks (unranked list, see AUDIT_REPORT.md for severity)
+## Remaining security risks, in order of severity
 
-1. Region isolation is UI-only (A12) — the largest open item.
-2. `employees`/`attendance` writes have no server-side role check (needs column-level design, A5).
-3. Backup/recovery and 2FA are documented but non-functional (A6, A13) — misleading to anyone relying on the User Manual as ground truth.
-4. `company-logo` storage bucket writes are unrestricted (A7).
-5. The credential in git history (A1) — pending your decision on history rewriting.
-6. Password reset flow not reviewed for information leakage.
-7. Rate limiting on login is client-side only; platform-level protection not verified (no dashboard access).
-8. Audit log coverage not exhaustively verified across every sensitive action.
+1. **A17: no `profiles`↔`employees` link at all** — Staff self-service payslips currently expose every employee's payslip in-region, not just the viewer's own. Needs `profiles.employee_id` before any fix is possible.
+2. **A12: region isolation is UI-only** — needs the candidate-rules decision above before a fix can be written.
+3. **A5: `employees`/`attendance` writes have no role_level check** — needs column-level design (which columns Supervisors may touch).
+4. **A16: `jspdf` critical vulnerability, unfixed** — needs a visually-verified major-version upgrade, not a blind bump.
+5. **A6: backup/recovery non-functional** — documentation now corrected; the underlying feature gap (build vs. leave unbuilt) is still an open decision.
+6. **A7: `company-logo` storage bucket** unrestricted writes.
+7. **A1: credential in git history** — pending your decision on history rewriting; password rotation still needed regardless.
+8. Password reset flow, audit-log exhaustive coverage — both still unreviewed.
 
-## Verification status legend (used throughout this review)
+## Verification status legend
 
-- **Verified (static)** — confirmed by reading the actual SQL/code in this repository.
-- **Verified (build/lint)** — confirmed by running `tsc`/`eslint`/`vite build` in this environment.
-- **Unverified** — would require a live database, live browser session, or credentials not available in this environment. Explicitly not guessed at.
+- **Verified (static)** — confirmed by reading the actual SQL/code.
+- **Verified (build/lint/test/E2E)** — confirmed by actually running the relevant command in this environment and recording its real output/exit code.
+- **Unverified** — would require a live database, live browser session, or credentials not available here. Not guessed at.
