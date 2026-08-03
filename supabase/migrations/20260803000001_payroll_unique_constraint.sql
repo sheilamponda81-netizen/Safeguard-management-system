@@ -1,0 +1,49 @@
+-- ============================================================
+-- MIGRATION: Prevent duplicate payroll rows per employee/month
+-- Date: 2026-08-03
+-- ============================================================
+--
+-- `attendance` has UNIQUE (employee_id, date) and `payment_status` has
+-- UNIQUE (employee_id, month) -- both closing exactly this class of
+-- duplicate-row risk -- but `payroll` itself has no equivalent
+-- constraint, despite being the highest-stakes financial table in this
+-- schema. Nothing in the database stops two payroll rows existing for
+-- the same employee in the same month.
+--
+-- src/pages/Payroll.tsx's processPayroll() AND copyFromPreviousMonth()
+-- both work around this today with the same client-side delete-then-
+-- insert dance (delete existing rows for the month/employees, then
+-- insert fresh ones) rather than a real upsert. processPayroll's
+-- "Process/Reprocess Payroll" button is also disabled while a previous
+-- run is still in flight or once the month is approved -- but all of
+-- that is client-side-only protection, and neither flow is atomic: if
+-- the insert half fails after the delete half already succeeded (a
+-- dropped connection, a constraint violation on one row, the tab
+-- closing), that month's payroll for the affected employees is left
+-- fully deleted with nothing re-inserted in its place.
+--
+-- Adding this constraint is safe to attempt but NOT guaranteed to
+-- succeed blind: if production already has duplicate (employee_id,
+-- month) rows for any employee -- entirely possible given the gap this
+-- migration closes -- this ALTER TABLE will fail outright with a clear
+-- Postgres error identifying the constraint, rather than silently
+-- corrupting or deleting anything. That failure is the correct signal
+-- to go find and manually resolve those duplicates (e.g. keep the most
+-- recently approved/processed row per employee/month) BEFORE re-running
+-- this migration -- not something to guess at or automate here.
+--
+-- Deliberately NOT changed here: Payroll.tsx's own delete+insert logic
+-- (switching it to a true .upsert(..., { onConflict: 'employee_id,month'
+-- }) once this constraint exists would be the more robust long-term fix,
+-- and would also close the non-atomic delete-then-insert data-loss
+-- window documented in SECURITY_REVIEW.md/DATA_INTEGRITY_REVIEW.md --
+-- but that changes the actual code path that writes real salary data in
+-- production, and needs to be tested against a staging database before
+-- touching it, not applied blind alongside a schema migration.
+-- ============================================================
+
+ALTER TABLE payroll ADD CONSTRAINT payroll_employee_month_unique UNIQUE (employee_id, month);
+
+-- ============================================================
+-- END OF PAYROLL UNIQUE CONSTRAINT MIGRATION
+-- ============================================================
