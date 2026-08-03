@@ -94,29 +94,29 @@ export function UserManualPage() {
         }
       />
 
-      {/* Hero Banner - Lighter, more professional gradient */}
-      <Card className="p-8 bg-gradient-to-br from-[#246497] via-[#154578] to-[#7d8029] text-white border-0 shadow-xl hover:shadow-2xl transition-all duration-500">
+      {/* Hero Banner */}
+      <Card className="p-8 bg-gradient-to-br from-[#F8FAFC] to-[#FFF9E5] border border-slate-200 shadow-sm hover:shadow-md transition-all duration-500">
         <div className="max-w-4xl">
           <div className="flex items-center gap-4 mb-4">
-            <div className="w-16 h-16 rounded-2xl bg-[#D4A017]/20 backdrop-blur-sm flex items-center justify-center text-3xl border border-[#D4A017]/30 shadow-lg">
+            <div className="w-16 h-16 rounded-2xl bg-[#081C3A] flex items-center justify-center text-3xl shadow-lg">
               <Shield size={32} className="text-[#D4A017]" />
             </div>
             <div>
-              <h1 className="text-2xl md:text-4xl font-bold bg-gradient-to-r from-white to-[#D4A017] bg-clip-text text-transparent">Safeguard HR & Payroll System</h1>
-              <p className="text-white/70 text-sm md:text-base">Version 2.0 · Enterprise Security Management Platform</p>
+              <h1 className="text-2xl md:text-4xl font-bold text-[#081C3A]">Safeguard HR & Payroll System</h1>
+              <p className="text-slate-500 text-sm md:text-base">Version 2.0 · Enterprise Security Management Platform</p>
             </div>
           </div>
-          <p className="text-white/80 text-sm md:text-base leading-relaxed max-w-3xl">
-            Welcome to the Safeguard HR & Payroll System. This comprehensive platform is designed 
-            to streamline human resources, payroll processing, attendance tracking, and security 
-            personnel management for modern security companies. Built with cutting-edge technology 
+          <p className="text-slate-600 text-sm md:text-base leading-relaxed max-w-3xl">
+            Welcome to the Safeguard HR & Payroll System. This comprehensive platform is designed
+            to streamline human resources, payroll processing, attendance tracking, and security
+            personnel management for modern security companies. Built with cutting-edge technology
             to ensure efficiency, accuracy, and scalability.
           </p>
           <div className="flex gap-2 mt-4 flex-wrap">
-            <Badge color="gold" className="bg-[#D4A017]/20 text-[#D4A017] border border-[#D4A017]/30">HR Management</Badge>
-            <Badge color="green" className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">Payroll Processing</Badge>
-            <Badge color="blue" className="bg-blue-500/20 text-blue-400 border border-blue-500/30">Attendance Tracking</Badge>
-            <Badge color="purple" className="bg-purple-500/20 text-purple-470 border border-purple-500/30">Security Personnel</Badge>
+            <Badge color="gold">HR Management</Badge>
+            <Badge color="green">Payroll Processing</Badge>
+            <Badge color="blue">Attendance Tracking</Badge>
+            <Badge color="navy">Security Personnel</Badge>
           </div>
         </div>
       </Card>
@@ -731,20 +731,20 @@ export function UserManualPage() {
         </Card>
       </div>
 
-      {/* ===== ABOUT & CONTACT - Lighter gradient ===== */}
+      {/* ===== ABOUT & CONTACT ===== */}
       <div id="about" className="scroll-mt-20">
-        <Card className="p-6 bg-gradient-to-br from-[#153d94] via-[#493f0b] to-[#1e126f] text-white border-0 shadow-xl hover:shadow-2xl transition-all duration-500">
+        <Card className="p-6 hover:shadow-lg transition-all duration-300">
           <SectionTitle icon={Award}>About Safeguard HR & Payroll System</SectionTitle>
-          
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
             <div>
-              <p className="text-white/80 text-sm leading-relaxed">
-                The Safeguard HR & Payroll System is a comprehensive enterprise solution built 
-                specifically for security companies in Malawi. It represents the cutting edge of 
-                technology-driven security management, combining traditional HR functions with 
+              <p className="text-slate-600 text-sm leading-relaxed">
+                The Safeguard HR & Payroll System is a comprehensive enterprise solution built
+                specifically for security companies in Malawi. It represents the cutting edge of
+                technology-driven security management, combining traditional HR functions with
                 modern digital efficiency.
               </p>
-              <div className="mt-4 space-y-2 text-sm text-white/70">
+              <div className="mt-4 space-y-2 text-sm text-slate-600">
                 <div className="flex items-center gap-3">
                   <Zap size={16} className="text-[#D4A017]" />
                   <span>Built with modern technology stack (React, TypeScript, Supabase)</span>
@@ -760,50 +760,50 @@ export function UserManualPage() {
               </div>
 
               {/* ===== SECURITY & PRIVACY SECTION ===== */}
-              <div className="mt-6 pt-4 border-t border-white/10">
-                <h4 className="font-bold text-white mb-3 flex items-center gap-2">
-                  <Fingerprint size={18} className="text-[#D4A017]" /> 
+              <div className="mt-6 pt-4 border-t border-slate-200">
+                <h4 className="font-bold text-slate-800 mb-3 flex items-center gap-2">
+                  <Fingerprint size={18} className="text-[#D4A017]" />
                   Security & Privacy Protection
                 </h4>
-                <div className="space-y-2 text-xs text-white/70">
+                <div className="space-y-2 text-xs text-slate-600">
                   <div className="flex items-start gap-2">
-                    <CheckCircle size={14} className="text-emerald-400 flex-shrink-0 mt-0.5" />
+                    <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
                     <span><strong>Data Encryption:</strong> All data is encrypted at rest and in transit using industry-standard TLS/SSL protocols.</span>
                   </div>
                   <div className="flex items-start gap-2">
-                    <CheckCircle size={14} className="text-emerald-400 flex-shrink-0 mt-0.5" />
+                    <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
                     <span><strong>Access Control:</strong> Role-based access ensures only authorized personnel can view sensitive information.</span>
                   </div>
                   <div className="flex items-start gap-2">
-                    <CheckCircle size={14} className="text-emerald-400 flex-shrink-0 mt-0.5" />
+                    <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
                     <span><strong>Audit Trail:</strong> Every action is logged, providing complete accountability and the ability to trace any activity.</span>
                   </div>
                   <div className="flex items-start gap-2">
-                    <CheckCircle size={14} className="text-emerald-400 flex-shrink-0 mt-0.5" />
+                    <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
                     <span><strong>Two-Factor Authentication:</strong> Optional 2FA adds an extra layer of security to protect accounts.</span>
                   </div>
                   <div className="flex items-start gap-2">
-                    <CheckCircle size={14} className="text-emerald-400 flex-shrink-0 mt-0.5" />
+                    <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
                     <span><strong>Data Isolation:</strong> Regional data isolation ensures employees only access data relevant to their region.</span>
                   </div>
                   <div className="flex items-start gap-2">
-                    <CheckCircle size={14} className="text-emerald-400 flex-shrink-0 mt-0.5" />
+                    <CheckCircle size={14} className="text-emerald-500 flex-shrink-0 mt-0.5" />
                     <span><strong>Backup & Recovery:</strong> Automated daily backups with point-in-time recovery capabilities.</span>
                   </div>
                 </div>
               </div>
             </div>
 
-            <div className="bg-white/5 rounded-xl p-6 backdrop-blur-sm border border-white/10 hover:bg-white/10 transition-all duration-300">
-              <h4 className="font-bold text-white mb-4 flex items-center gap-2">
-                <User size={18} className="text-[#D4A017]" /> 
+            <div className="bg-[#F8FAFC] rounded-xl p-6 border border-slate-200 hover:bg-[#F1F5F9] transition-all duration-300">
+              <h4 className="font-bold text-slate-800 mb-4 flex items-center gap-2">
+                <User size={18} className="text-[#D4A017]" />
                 Built By
               </h4>
               <div className="space-y-4">
                 <div>
-                  <p className="text-lg font-bold text-white">Razaque Mponda</p>
-                  <p className="text-sm text-[#D4A017]">Full Stack Developer & System Architect</p>
-                  <div className="mt-2 space-y-1 text-sm text-white/70">
+                  <p className="text-lg font-bold text-slate-800">Razaque Mponda</p>
+                  <p className="text-sm text-[#8B6F0F] font-medium">Full Stack Developer & System Architect</p>
+                  <div className="mt-2 space-y-1 text-sm text-slate-600">
                     <div className="flex items-center gap-2">
                       <Smartphone size={14} className="text-[#D4A017]" />
                       <span>0996791776</span>
@@ -818,8 +818,8 @@ export function UserManualPage() {
                     </div>
                   </div>
                 </div>
-                <div className="pt-3 border-t border-white/10">
-                  <p className="text-xs text-white/50">
+                <div className="pt-3 border-t border-slate-200">
+                  <p className="text-xs text-slate-400">
                     <Heart size={12} className="inline mr-1 text-red-400" />
                     Building the future of security management in Malawi
                   </p>
@@ -829,24 +829,24 @@ export function UserManualPage() {
           </div>
 
           {/* Vision Section */}
-          <div className="mt-6 pt-6 border-t border-white/10">
-            <h4 className="font-bold text-white mb-3">Our Vision</h4>
-            <p className="text-white/70 text-sm leading-relaxed">
-              We are committed to making Safeguard Security Services the most technology-driven 
-              security company in Malawi. By leveraging modern software solutions, we aim to 
+          <div className="mt-6 pt-6 border-t border-slate-200">
+            <h4 className="font-bold text-slate-800 mb-3">Our Vision</h4>
+            <p className="text-slate-600 text-sm leading-relaxed">
+              We are committed to making Safeguard Security Services the most technology-driven
+              security company in Malawi. By leveraging modern software solutions, we aim to
               revolutionize how security personnel are managed, paid, and deployed across the nation.
             </p>
             <div className="mt-4 flex flex-wrap gap-3">
-              <div className="px-4 py-2 rounded-lg bg-white/10 border border-white/10 text-xs text-white/80 flex items-center gap-2 hover:bg-white/20 transition-all duration-300">
+              <div className="px-4 py-2 rounded-lg bg-[#FFF9E5] border border-[#FFF1CC] text-xs text-[#8B6F0F] flex items-center gap-2 hover:bg-[#FFF1CC] transition-all duration-300">
                 <Star size={14} className="text-[#D4A017]" /> Technology-Driven
               </div>
-              <div className="px-4 py-2 rounded-lg bg-white/10 border border-white/10 text-xs text-white/80 flex items-center gap-2 hover:bg-white/20 transition-all duration-300">
+              <div className="px-4 py-2 rounded-lg bg-[#FFF9E5] border border-[#FFF1CC] text-xs text-[#8B6F0F] flex items-center gap-2 hover:bg-[#FFF1CC] transition-all duration-300">
                 <Users size={14} className="text-[#D4A017]" /> People-Centered
               </div>
-              <div className="px-4 py-2 rounded-lg bg-white/10 border border-white/10 text-xs text-white/80 flex items-center gap-2 hover:bg-white/20 transition-all duration-300">
+              <div className="px-4 py-2 rounded-lg bg-[#FFF9E5] border border-[#FFF1CC] text-xs text-[#8B6F0F] flex items-center gap-2 hover:bg-[#FFF1CC] transition-all duration-300">
                 <Crown size={14} className="text-[#D4A017]" /> Industry Leader
               </div>
-              <div className="px-4 py-2 rounded-lg bg-white/10 border border-white/10 text-xs text-white/80 flex items-center gap-2 hover:bg-white/20 transition-all duration-300">
+              <div className="px-4 py-2 rounded-lg bg-[#FFF9E5] border border-[#FFF1CC] text-xs text-[#8B6F0F] flex items-center gap-2 hover:bg-[#FFF1CC] transition-all duration-300">
                 <Award size={14} className="text-[#D4A017]" /> Excellence
               </div>
             </div>

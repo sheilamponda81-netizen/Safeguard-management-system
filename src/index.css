@@ -187,6 +187,18 @@ img, svg {
   animation: fadeIn 0.25s ease-out;
 }
 
+/* Staggered card entrance (e.g. roadmap/feature grids): pair with an inline
+   `animationDelay` per item. Needs `animation-fill-mode: backwards` so the
+   element stays hidden for the delay window instead of flashing at full
+   opacity before snapping back to 0 when the animation starts -- `.animate-fade-in`
+   above has no fill-mode, so it isn't safe to combine with a delay directly.
+   The keyframe's own 100% state still resolves to `transform: none` (not
+   translateY(0)) for the same reason noted above, so this stays safe to
+   nest a <Modal> inside. */
+.animate-fade-in-stagger {
+  animation: fadeIn 0.4s ease-out backwards;
+}
+
 /* ===== TABLET/MOBILE OPTIMIZATIONS ===== */
 @media (max-width: 768px) {
   .chart-container {
