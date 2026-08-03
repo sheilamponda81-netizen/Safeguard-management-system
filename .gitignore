@@ -12,6 +12,12 @@ dist-ssr/
 .env
 .env.local
 .env.*.local
+.env.test
+
+# Playwright
+/test-results/
+/playwright-report/
+/playwright/.cache/
 
 # Vercel
 .vercel
