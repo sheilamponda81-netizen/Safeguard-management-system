@@ -1006,6 +1006,17 @@ export function AttendancePage() {
   }, [selectedEmployee, getEmployeeStats, calculateEmployeeDeductions, selectedMonth, userProfile, fetchData, getDatesForMonth]);
 
   // ===== RENDER =====
+  // EmployeeModal() must be called unconditionally, before the loading/error
+  // early returns below -- it's invoked as a plain function (not <EmployeeModal
+  // />), so its internal hooks are counted as part of THIS component's own
+  // render. `loading` starts true and flips to false right after the initial
+  // fetch, so calling EmployeeModal() only in the branch reached after those
+  // early returns meant the very first render skipped its 4 hooks entirely
+  // while every later render called them -- a Rules of Hooks violation
+  // ("Rendered more hooks than during the previous render", React error #310)
+  // that fired on every visit to this page, right as the initial load finished.
+  const employeeModal = EmployeeModal();
+
   if (loading) {
     return <div className="flex justify-center py-12"><div className="w-8 h-8 border-4 border-[#D4A017] border-t-transparent rounded-full animate-spin"></div></div>;
   }
@@ -1235,7 +1246,7 @@ export function AttendancePage() {
           change of that callback as a brand-new component type and remount
           the modal (losing the in-progress lecture/appearance deduction
           edits) any time attendance data changes elsewhere on the page. */}
-      {EmployeeModal()}
+      {employeeModal}
       <CopyFromPreviousModal
         open={showCopyModal}
         onClose={() => setShowCopyModal(false)}
