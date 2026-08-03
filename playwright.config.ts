@@ -11,6 +11,20 @@ import { existsSync } from 'fs';
 //     These are written but gated behind env vars (see e2e/fixtures.ts)
 //     and will report as skipped, not passing, when those aren't set --
 //     never silently green without actually running.
+// This environment pre-installs Chromium at a fixed path rather than
+// letting Playwright download/manage its own -- see the repo's own
+// environment notes. Without this override, Playwright's default browser
+// resolution for device-emulation projects (e.g. "mobile-chrome" below)
+// can look for a *different* pinned build (a "headless_shell" variant)
+// than the one actually installed here, and fail outright -- a real
+// failure this config previously had, caught only by actually running
+// `npm run test:e2e` (which exercises every project) rather than just
+// `--project=chromium` in isolation. Applied at the top level so every
+// project inherits it, instead of duplicating it per-project.
+const chromiumLaunchOptions = existsSync('/opt/pw-browsers/chromium')
+  ? { executablePath: '/opt/pw-browsers/chromium' }
+  : {};
+
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
@@ -21,21 +35,12 @@ export default defineConfig({
     baseURL: process.env.E2E_BASE_URL || 'http://localhost:4173',
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
+    launchOptions: chromiumLaunchOptions,
   },
   projects: [
     {
       name: 'chromium',
-      use: {
-        ...devices['Desktop Chrome'],
-        // This environment pre-installs Chromium at a fixed path rather
-        // than letting Playwright download its own -- see the repo's own
-        // environment notes. Only set this when that path actually
-        // exists, so the config still works unmodified in a normal dev
-        // machine or CI runner that manages its own Playwright browsers.
-        launchOptions: existsSync('/opt/pw-browsers/chromium')
-          ? { executablePath: '/opt/pw-browsers/chromium' }
-          : {},
-      },
+      use: { ...devices['Desktop Chrome'] },
     },
     {
       name: 'mobile-chrome',
