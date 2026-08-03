@@ -13,6 +13,8 @@
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives",
     "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "optimize": "npm run type-check && npm run build",
     "clean": "rm -rf dist node_modules/.vite"
   },
