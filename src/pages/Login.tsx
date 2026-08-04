@@ -5,6 +5,7 @@ import { checkRateLimit } from '../utils/rateLimiter';
 // ===== Import audit logger =====
 import { logAudit } from '../utils/auditLogger';
 import { getCompanySettings } from '../utils/companySettings';
+import { getErrorMessage } from '../utils/errorHandler';
 
 export function LoginPage({ onLogin }: { onLogin: () => void }) {
   const [username, setUsername] = useState('');
@@ -168,9 +169,9 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
 
         onLogin();
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('Login error:', err);
-      
+
       // ===== Log login error =====
       await logAudit({
         action: 'LOGIN',
@@ -178,7 +179,7 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
         new_data: {
           success: false,
           email: username.trim(),
-          error: err.message || 'Unexpected error',
+          error: getErrorMessage(err),
           timestamp: new Date().toISOString()
         }
       });

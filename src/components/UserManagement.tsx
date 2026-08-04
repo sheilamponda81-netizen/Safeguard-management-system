@@ -2,6 +2,7 @@
 import { supabase } from '../lib/supabase';
 import { Button, Input, Modal, Badge } from './ui';
 import { Plus, Trash2, Edit2 } from 'lucide-react';
+import { getErrorMessage } from '../utils/errorHandler';
 
 interface Profile {
   id: string;
@@ -103,8 +104,8 @@ export function UserManagement() {
         setFormData({ email: '', password: '', role_level: 4, full_name: '', department: '' });
         fetchUsers();
       }
-    } catch (error: any) {
-      alert('Error creating user: ' + error.message);
+    } catch (error) {
+      alert('Error creating user: ' + getErrorMessage(error));
     }
   };
 
@@ -190,9 +191,9 @@ export function UserManagement() {
       }
 
       fetchUsers();
-    } catch (error: any) {
+    } catch (error) {
       console.error('Error deleting user:', error);
-      alert('Error deleting user: ' + (error.message || 'Unknown error'));
+      alert('Error deleting user: ' + getErrorMessage(error));
     }
   };
 
@@ -221,7 +222,7 @@ export function UserManagement() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {roleLevels.map(role => (
           <div key={role.level} className="p-3 rounded-lg bg-slate-50 border border-slate-200">
-            <Badge color={role.color as any}>{role.name}</Badge>
+            <Badge color={role.color}>{role.name}</Badge>
             <p className="text-xs text-slate-500 mt-2">{role.desc}</p>
           </div>
         ))}
@@ -293,16 +294,16 @@ export function UserManagement() {
       {/* Add User Modal */}
       <Modal open={showAddModal} onClose={() => setShowAddModal(false)} title="Add New User" size="lg">
         <div className="space-y-4">
-          <Input label="Email" type="email" value={formData.email} onChange={(e: any) => setFormData({...formData, email: e.target.value})} required />
-          <Input label="Password" type="password" value={formData.password} onChange={(e: any) => setFormData({...formData, password: e.target.value})} required />
-          <Input label="Full Name" value={formData.full_name} onChange={(e: any) => setFormData({...formData, full_name: e.target.value})} />
-          <Input label="Department" value={formData.department} onChange={(e: any) => setFormData({...formData, department: e.target.value})} />
+          <Input label="Email" type="email" value={formData.email} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({...formData, email: e.target.value})} required />
+          <Input label="Password" type="password" value={formData.password} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({...formData, password: e.target.value})} required />
+          <Input label="Full Name" value={formData.full_name} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({...formData, full_name: e.target.value})} />
+          <Input label="Department" value={formData.department} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({...formData, department: e.target.value})} />
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1.5">Access Level</label>
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
               value={formData.role_level} 
-              onChange={(e: any) => setFormData({...formData, role_level: parseInt(e.target.value)})}
+              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setFormData({...formData, role_level: parseInt(e.target.value)})}
             >
               {roleLevels.map(r => (
                 <option key={r.level} value={r.level}>{r.name}</option>
@@ -326,7 +327,7 @@ export function UserManagement() {
               <select 
                 className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
                 value={selectedUser.role_level} 
-                onChange={(e: any) => setSelectedUser({...selectedUser, role_level: parseInt(e.target.value)})}
+                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSelectedUser({...selectedUser, role_level: parseInt(e.target.value)})}
               >
                 {roleLevels.map(r => (
                   <option key={r.level} value={r.level}>{r.name}</option>
