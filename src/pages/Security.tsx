@@ -1,11 +1,11 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { 
-  Search, Shield, MapPin, Download, Edit2, Trash2, UserPlus, X, 
-  ChevronLeft, ChevronRight, Calendar, Lock, AlertCircle, RefreshCw,
-  Eye, CheckCircle, XCircle, Clock, User, Briefcase, Building2,
-  Shirt, Footprints, HardHat, ClipboardList, Filter, ChevronDown, Save
+import {
+  Search, Shield, Download, Edit2, Trash2, UserPlus, X,
+  AlertCircle, RefreshCw,
+  Eye, CheckCircle, User,
+  Shirt, Save
 } from '../utils/icons';
-import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Input } from '../components/ui';
+import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader } from '../components/ui';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
@@ -38,17 +38,6 @@ interface SecurityPersonnel {
   created_at: string;
 }
 
-interface Employee {
-  id: string;
-  full_name: string;
-  employee_number: string;
-  position: string;
-  phone: string;
-  company: string;
-  workstation: string;
-  status: string;
-  region_id: string;
-}
 
 export function SecurityPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
@@ -1530,7 +1519,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
 }
 
 // ===== EDIT GUARD FORM =====
-function EditGuardForm({ guard, onSave, onCancel, shiftsList, supervisorsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList }: any) {
+function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList }: any) {
   const [formData, setFormData] = useState(guard);
   const [supervisorSearch, setSupervisorSearch] = useState(guard.supervisor || '');
   const [filteredSupervisors, setFilteredSupervisors] = useState<any[]>([]);
