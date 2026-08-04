@@ -30,7 +30,7 @@ export type NavKey =
   | "user-manual";
 
 // ===== ALL NAV ITEMS =====
-export const allNavItems: { id: NavKey; label: string; icon: any }[] = [
+const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "employees", label: "Employees", icon: Users },
   { id: "terminal-dues", label: "Terminal Dues", icon: Calculator },

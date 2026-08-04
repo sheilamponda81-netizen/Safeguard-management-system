@@ -65,9 +65,11 @@ export function SecurityPage() {
   const initialFetchDone = useRef(false);
 
   // ===== SITES, SHIFTS, SUPERVISORS =====
-  const shiftsList = ['Morning (06-14)', 'Afternoon (14-22)', 'Night (22-06)', '24hr Rotation'];
-  const supervisorsList = ['William Banda', 'Agnes Phiri', 'John Mwanza', 'Felix Soko'];
-  
+  // Static lists -- memoized so their reference stays stable across renders,
+  // since the useCallback below (line ~409) lists them as dependencies.
+  const shiftsList = useMemo(() => ['Morning (06-14)', 'Afternoon (14-22)', 'Night (22-06)', '24hr Rotation'], []);
+  const supervisorsList = useMemo(() => ['William Banda', 'Agnes Phiri', 'John Mwanza', 'Felix Soko'], []);
+
   const uniformStatusList = ['Issued', 'Pending', 'Not Issued', 'Damaged'];
   const uniformConditionList = ['Good', 'Fair', 'Poor', 'Damaged'];
   const shoesStatusList = ['Good', 'Fair', 'Poor', 'Needs Replacement', 'Not Issued'];
@@ -1064,7 +1066,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
         setFormData((prev: any) => (prev.guardId ? prev : { ...prev, guardId }));
       });
     }
-  }, []);
+  }, [formData.guardId]);
 
   // Select employee from dropdown - auto-fill form
   const selectEmployee = (employee: any) => {

@@ -354,6 +354,8 @@ export function TerminalDuesPage() {
     const calculation = calculateTerminalDues();
     if (!calculation) return;
 
+    // `id` is destructured out only to exclude it from the insert payload below.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { id, ...calculationToSave } = calculation;
 
     const { data, error } = await supabase

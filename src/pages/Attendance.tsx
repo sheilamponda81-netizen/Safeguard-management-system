@@ -257,7 +257,7 @@ function EmployeeModal({
     }
   };
 
-  const loadSavedDeductions = async () => {
+  const loadSavedDeductions = useCallback(async () => {
     if (!selectedEmployee) return;
 
     try {
@@ -286,13 +286,13 @@ function EmployeeModal({
     } catch (err) {
       console.error('Error loading saved deductions:', err);
     }
-  };
+  }, [selectedEmployee, selectedMonth]);
 
   useEffect(() => {
     if (selectedEmployee) {
       loadSavedDeductions();
     }
-  }, [selectedEmployee]);
+  }, [selectedEmployee, loadSavedDeductions]);
 
   if (!selectedEmployee) return null;
   const stats = getEmployeeStats(selectedEmployee.id);
@@ -632,43 +632,6 @@ export function AttendancePage() {
     }
   }, [selectedMonth]);
 
-  // ===== PROCESS UPDATE QUEUE =====
-  const processUpdateQueue = useCallback(async () => {
-    if (isProcessingUpdate.current || updateQueue.current.size === 0) return;
-    
-    isProcessingUpdate.current = true;
-    
-    try {
-      const entries = Array.from(updateQueue.current.values());
-      updateQueue.current.clear();
-      
-      // Group updates by employee for efficiency
-      const groupedUpdates: Record<string, any[]> = {};
-      for (const entry of entries) {
-        if (!groupedUpdates[entry.employeeId]) {
-          groupedUpdates[entry.employeeId] = [];
-        }
-        groupedUpdates[entry.employeeId].push(entry);
-      }
-      
-      // Process each employee's updates
-      for (const updates of Object.values(groupedUpdates)) {
-        for (const update of updates) {
-          await processSingleUpdate(update.employeeId, update.date, update.status);
-        }
-      }
-    } catch (err) {
-      console.error('Error processing update queue:', err);
-    } finally {
-      isProcessingUpdate.current = false;
-      
-      // Process any new updates that came in while we were processing
-      if (updateQueue.current.size > 0) {
-        setTimeout(processUpdateQueue, 100);
-      }
-    }
-  }, []);
-
   // ===== PROCESS SINGLE UPDATE =====
   const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string) => {
     try {
@@ -710,6 +673,43 @@ export function AttendancePage() {
       showNotification(`Failed to save attendance: ${err.message || 'Unknown error'}`, 'error');
     }
   }, []);
+
+  // ===== PROCESS UPDATE QUEUE =====
+  const processUpdateQueue = useCallback(async () => {
+    if (isProcessingUpdate.current || updateQueue.current.size === 0) return;
+
+    isProcessingUpdate.current = true;
+
+    try {
+      const entries = Array.from(updateQueue.current.values());
+      updateQueue.current.clear();
+
+      // Group updates by employee for efficiency
+      const groupedUpdates: Record<string, any[]> = {};
+      for (const entry of entries) {
+        if (!groupedUpdates[entry.employeeId]) {
+          groupedUpdates[entry.employeeId] = [];
+        }
+        groupedUpdates[entry.employeeId].push(entry);
+      }
+
+      // Process each employee's updates
+      for (const updates of Object.values(groupedUpdates)) {
+        for (const update of updates) {
+          await processSingleUpdate(update.employeeId, update.date, update.status);
+        }
+      }
+    } catch (err) {
+      console.error('Error processing update queue:', err);
+    } finally {
+      isProcessingUpdate.current = false;
+
+      // Process any new updates that came in while we were processing
+      if (updateQueue.current.size > 0) {
+        setTimeout(processUpdateQueue, 100);
+      }
+    }
+  }, [processSingleUpdate]);
 
   // ===== OPTIMIZED: UPDATE ATTENDANCE WITH OPTIMISTIC UI =====
   const updateAttendance = useCallback(async (employeeId: string, date: string, currentStatus: string) => {

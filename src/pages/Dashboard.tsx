@@ -172,12 +172,6 @@ export function Dashboard() {
     return () => clearInterval(interval);
   }, [getTimeBasedGreeting]);
 
-  useEffect(() => {
-    if (userProfile && selectedMonth) {
-      fetchDashboardData();
-    }
-  }, [userProfile, selectedMonth]);
-
   // ===== PERFORMANCE: Load charts after data is ready =====
   useEffect(() => {
     if (dataReady && !chartsLoadedRef.current && !chartLoading && !chartError) {
@@ -220,15 +214,6 @@ export function Dashboard() {
       setSelectedMonth(month);
     }
   }, [selectedMonth]);
-
-  const refreshData = useCallback(async () => {
-    setRefreshing(true);
-    chartsLoadedRef.current = false;
-    setChartModules(null);
-    await fetchDashboardData();
-    showNotification('Dashboard updated', 'success');
-    setRefreshing(false);
-  }, []);
 
   // ===== OPTIMIZED: Fetch dashboard data with parallel queries =====
   const fetchDashboardData = useCallback(async () => {
@@ -459,6 +444,21 @@ export function Dashboard() {
       setLoading(false);
     }
   }, [selectedMonth, userProfile]);
+
+  useEffect(() => {
+    if (userProfile && selectedMonth) {
+      fetchDashboardData();
+    }
+  }, [userProfile, selectedMonth, fetchDashboardData]);
+
+  const refreshData = useCallback(async () => {
+    setRefreshing(true);
+    chartsLoadedRef.current = false;
+    setChartModules(null);
+    await fetchDashboardData();
+    showNotification('Dashboard updated', 'success');
+    setRefreshing(false);
+  }, [fetchDashboardData]);
 
   const isSuperAdmin = userProfile?.is_super_admin;
   const userRegion = userProfile?.regions;

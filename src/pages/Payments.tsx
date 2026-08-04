@@ -417,7 +417,7 @@ export function PaymentsPage() {
       console.error('Error updating status:', err);
       showNotification('Failed to update status', 'error');
     }
-  }, [canEdit, payments, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== UPDATE PAYMENT DETAILS =====
   const updatePaymentDetails = useCallback(async (payment: any) => {
@@ -486,7 +486,7 @@ export function PaymentsPage() {
       console.error('Error updating:', err);
       showNotification('Failed to update payment details', 'error');
     }
-  }, [canEdit, payments, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== BULK UPDATE STATUS =====
   const bulkUpdateStatus = useCallback(async (newStatus: string) => {
@@ -564,7 +564,7 @@ export function PaymentsPage() {
     setSelectedEmployees([]);
     fetchPaymentData();
     setProcessingBulk(false);
-  }, [canEdit, selectedEmployees, payments, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, selectedEmployees, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== EXPORT PAYMENTS =====
   const exportPayments = useCallback(() => {
@@ -612,7 +612,7 @@ export function PaymentsPage() {
     });
     
     showNotification('Payments exported successfully', 'success');
-  }, [payments, regions, selectedMonth, userProfile]);
+  }, [payments, regions, selectedMonth, userProfile, filterStatus, filterRegion, filterCompany, filterWorkstation, filterPayPoint]);
 
   // ===== TOGGLE SELECT =====
   const toggleSelectAll = useCallback(() => {

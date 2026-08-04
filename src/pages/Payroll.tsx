@@ -488,7 +488,7 @@ export function PayrollPage() {
       await fetchUserProfile();
     };
     init();
-  }, []);
+  }, [fetchUserProfile]);
 
   useEffect(() => {
     if (userProfile && selectedMonth) {

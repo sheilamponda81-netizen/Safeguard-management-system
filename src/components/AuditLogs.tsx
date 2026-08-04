@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Search,
   Download,
@@ -93,13 +93,7 @@ export function AuditLogsPage() {
     fetchUserProfile();
   }, []);
 
-  useEffect(() => {
-    if (userProfile) {
-      fetchAuditLogs();
-    }
-  }, [userProfile, filterAction, filterEntity, filterUser, dateRange]);
-
-  const fetchAuditLogs = async () => {
+  const fetchAuditLogs = useCallback(async () => {
     setLoading(true);
     try {
       let query = supabase
@@ -164,7 +158,13 @@ export function AuditLogsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [filterAction, filterEntity, filterUser, dateRange, userProfile]);
+
+  useEffect(() => {
+    if (userProfile) {
+      fetchAuditLogs();
+    }
+  }, [userProfile, filterAction, filterEntity, filterUser, dateRange, fetchAuditLogs]);
 
   const getActionBadgeColor = (action: string) => {
     switch (action) {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar, Shield, AlertTriangle } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, Modal, Tabs, Input } from '../components/ui';
 import { formatKwacha } from '../data';
@@ -418,7 +418,7 @@ const handleDeletePosition = async (position: any) => {
     return groups.sort((a, b) => b.totalEmployees - a.totalEmployees);
   };
 
-  const loadDuplicates = async () => {
+  const loadDuplicates = useCallback(async () => {
     setLoadingDuplicates(true);
     try {
       const { data, error } = await supabase
@@ -453,7 +453,7 @@ const handleDeletePosition = async (position: any) => {
     } finally {
       setLoadingDuplicates(false);
     }
-  };
+  }, []);
 
   const handleMergeGroup = async (field: 'company' | 'workstation', group: DuplicateGroup) => {
     const canonical = canonicalChoice[group.normalizedKey] || group.spellings[0].value;
@@ -1021,7 +1021,7 @@ const handleDeletePosition = async (position: any) => {
     if (tab === 'data-cleanup') {
       loadDuplicates();
     }
-  }, [tab]);
+  }, [tab, loadDuplicates]);
 
   const RoleModal = () => (
     <Modal open={showRoleModal} onClose={() => setShowRoleModal(false)} title={editingRole ? 'Edit Role' : 'Create New Role'} size="lg">

@@ -111,7 +111,6 @@ export default function App() {
   const [nav, setNav] = useState<NavKey>("dashboard");
   const [mobileOpen, setMobileOpen] = useState(false);
   const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
-  const [sessionChecked, setSessionChecked] = useState(false);
   const [preloaded, setPreloaded] = useState<Set<NavKey>>(new Set());
 
   // ===== OPTIMIZED: Use useCallback for navigation =====
@@ -178,15 +177,23 @@ export default function App() {
 
     const checkSession = async () => {
       try {
+        // This effect runs once on mount (see its own empty dependency
+        // array below), so `sessionChecked` here would always read its
+        // initial `false` value regardless of the several setSessionChecked(true)
+        // calls below -- it was never a meaningful condition, just dead
+        // code left over from an earlier version of this check. Removed
+        // rather than added to this effect's deps (which would instead
+        // introduce a real bug: re-running this whole effect -- including
+        // re-subscribing to onAuthStateChange -- every time sessionChecked
+        // flips, which happens multiple times within this same call).
         const cachedSession = sessionStorage.getItem('sb-session-cache');
-        if (cachedSession && !sessionChecked) {
+        if (cachedSession) {
           try {
             const parsed = JSON.parse(cachedSession);
             if (parsed && parsed.user) {
               setLoggedIn(true);
               setUserRoleLevel(parsed.role_level || 4);
               setLoading(false);
-              setSessionChecked(true);
               return;
             }
           } catch (e) {
@@ -200,7 +207,6 @@ export default function App() {
           console.error('Session error:', error);
           setLoggedIn(false);
           setLoading(false);
-          setSessionChecked(true);
           return;
         }
 
@@ -224,13 +230,11 @@ export default function App() {
             sessionStorage.removeItem('sb-session-cache');
           }
           setLoading(false);
-          setSessionChecked(true);
         }
       } catch (err: any) {
         console.error('Session check failed:', err);
         setLoggedIn(false);
         setLoading(false);
-        setSessionChecked(true);
       }
     };
 
@@ -252,14 +256,12 @@ export default function App() {
           role_level: roleLevel
         }));
         setLoading(false);
-        setSessionChecked(true);
       } else if (event === 'SIGNED_OUT') {
         setLoggedIn(false);
         setUserRoleLevel(4);
         localStorage.removeItem('sb-session');
         sessionStorage.removeItem('sb-session-cache');
         setLoading(false);
-        setSessionChecked(true);
       }
     });
 
@@ -275,7 +277,6 @@ export default function App() {
       if (loading) {
         console.warn('Loading forced to complete after 15 seconds');
         setLoading(false);
-        setSessionChecked(true);
         
         const cachedSession = sessionStorage.getItem('sb-session-cache');
         if (cachedSession) {

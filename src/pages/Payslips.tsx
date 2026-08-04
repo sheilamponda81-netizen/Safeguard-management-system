@@ -762,6 +762,8 @@ export function PayslipsPage() {
   // longer independently editable from this modal, so there's nothing of
   // theirs to persist locally.
   const saveTemplate = useCallback(() => {
+    // Destructured only to exclude these fields from `presentation` below (see comment above).
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { companyName, companyAddress, companyPhone, companyEmail, logoUrl, ...presentation } = template;
     localStorage.setItem('payslipTemplate', JSON.stringify(presentation));
     showNotification('Payslip template saved successfully!', 'success');

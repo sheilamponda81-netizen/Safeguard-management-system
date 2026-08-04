@@ -151,6 +151,11 @@ async function restoreBackup(supabase: any, body: any) {
     const { backup_id } = body;
 
     // Get backup data
+    // NOTE: `backupData` is fetched but never applied below -- this function
+    // is an unfinished stub (see the "simplified version" comment further
+    // down) that reports success without writing anything back to the
+    // target table. Not currently called from any frontend code path.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { data: backupData, error: getError } = await supabase
       .from('backup_data')
       .select('data')
