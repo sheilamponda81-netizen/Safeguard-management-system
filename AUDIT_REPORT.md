@@ -26,6 +26,68 @@ Both corrections are now reflected everywhere in this document and the other 4. 
 
 Consequences: every RLS/migration finding is a static reading of the SQL cross-referenced against the frontend, none of it executed against a real Postgres instance. All new migrations are marked "written, not run." A real, running E2E suite now exists (see `TEST_PLAN.md`), but its staging-credential-gated tests report as explicitly **skipped**, verified by actually running them and confirming that outcome — not silently passing.
 
+## Pre-staging blockers status (this pass's 9-item request)
+
+The most recent request asked for 9 specific items before PR #36 can leave draft. Items 1–2 (jsPDF, ESLint) were fully executable in this environment and are done — see "ESLint warning remediation" above and Finding A16. **Items 3–8 require Supabase dashboard/Auth Admin API access, a reachable staging database, or a Vercel dashboard/API — none of which exist in this environment, confirmed repeatedly across every pass of this audit, not just assumed unavailable.** Rather than guess at their outcome, each is reported honestly below.
+
+**3. Exposed credential rotation.**
+- Rotation confirmed: **No — cannot be verified from this environment.** No Supabase Auth dashboard/Admin API access exists here to check or change the password.
+- Account confirmed active or disabled: **Unknown** — same reason.
+- Git history still contains the old value: **Yes.** Confirmed in prior passes; the file (`src/tests/auth.test.ts`) was deleted from the current branch's tip, but its content remains reachable in every commit before the deletion, and in any prior branch/fork that already pulled it.
+- History rewrite deferred: **Yes**, per this audit's standing instruction not to force-push or rewrite history without explicit authorization, and no such authorization has been given.
+- Recommended follow-up: rotate the password directly in the Supabase Auth dashboard now, independent of this PR; separately decide whether the git history is sensitive enough to warrant a rewrite (`git filter-repo`/BFG) coordinated with everyone who has a clone, since force-pushing a rewritten history to a shared branch is itself a disruptive, hard-to-reverse operation that needs its own explicit go-ahead.
+
+**4. Vercel environment isolation.**
+- **Cannot be verified from this environment** — no Vercel dashboard or API access exists here to inspect the Development/Preview/Production environment-variable assignments directly.
+- What *is* verified (see `TEST_PLAN.md`'s environment-isolation section): no service-role key of any kind appears anywhere in `src/` or `vite.config.ts` (confirmed by `grep`), so nothing server-side-only can leak into a Vite/browser bundle regardless of how Vercel's env vars are configured; the app only ever reads `VITE_SUPABASE_URL`/`VITE_SUPABASE_ANON_KEY`, both anon keys designed to be public per Supabase's own security model.
+- What is **not** verified: whether the Preview environment's `VITE_SUPABASE_URL` points at a separate staging project or at production, and whether `branch audit/full-system-hardening`'s preview deployment specifically uses staging variables.
+- **Per this pass's own explicit instruction, this environment defaults to treating Preview as unsafe for mutation testing until manually confirmed otherwise** — no employee/payroll/attendance/payment action should be run against any preview URL for this branch (including `safeguard-management-system-git-audit-full-system-011468-sheil.vercel.app`, seen in this session's own Vercel webhook notifications) until a human with dashboard access confirms which Supabase project it points at.
+- Recommended follow-up: in the Vercel dashboard, under Project Settings → Environment Variables, confirm `VITE_SUPABASE_URL` differs between Preview and Production, and that the Preview value's project ref matches a project provisioned specifically for staging (see item 5).
+
+**5. Staging Supabase environment.**
+- **Cannot be created from this environment** — no ability to provision external cloud infrastructure or reach the Supabase Admin API.
+- What this pass produced instead: `supabase/staging-seed/seed_staging_data.sql` and `cleanup_staging_data.sql` (new this pass) — a ready-to-adapt synthetic-data template (2 tenants, 4 regions, 8 role-account placeholders, guards/office employees/attendance/applicants, all prefixed `ZZSTAGING_`/`ZZS-` for safe, pattern-based cleanup) for whoever provisions the actual staging project to run. See `supabase/staging-seed/README.md` for the manual auth-user-creation step this SQL cannot do itself (`profiles.id` is a foreign key to `auth.users(id)`, which requires the dashboard or Auth Admin API, not plain SQL).
+- **No real employee personal data was used or referenced anywhere in this template** — every value is fabricated.
+- Recommended follow-up: provision the project, apply this repo's migrations to it (see "Production deployment and rollback order" below — same migrations, staging first), create the 8 auth users, substitute their real UUIDs into the seed script, then run it.
+
+**6. Migrations executed in staging.**
+- **Not executed — no reachable database from this environment**, confirmed across every pass.
+- What already exists: every one of the 5 hardening/generation/payroll migrations has its own `PREFLIGHT SQL`, `VERIFICATION SQL`, and `ROLLBACK SQL` written directly into the migration file (see "Production deployment and rollback order" below for the required apply sequence and `DATA_INTEGRITY_REVIEW.md` for the lock/blocking-risk detail per migration) — the SQL to run the preflight checks (duplicate employee numbers/guard IDs, duplicate payroll employee-month rows, invalid legacy formats, null tenant/region values) already exists and just needs a database to run it against.
+- Recommended follow-up: once staging exists (item 5) and is seeded (or already has representative data), run each migration's own preflight SQL first, record the row counts it returns, then apply migrations one at a time in the timestamp order listed below, recording start/end time, success/failure, lock duration, rows affected, verification-query result, and rollback-test result for each, exactly as the request specifies.
+
+**7. Staging RPC and role tests.**
+- **Not executed — no staging credentials or reachable database.**
+- What already exists, written and verified-as-correctly-skipped (not silently passing): `e2e/authenticated/rls-policy-matrix.spec.ts` (Admin/Manager/Supervisor/Staff × correct/incorrect region × correct/incorrect tenant × anonymous caller, using real `supabase-js` calls under each role's real session) and `e2e/authenticated/rpc-workflow-matrix.spec.ts` (guard-ID/employee-number generation and duplicate prevention, payroll processing/reprocessing/approval-immutability/negative-value/duplicate-employee/invalid-tenant/partial-failure-rollback scenarios, terminal-dues persistence, payment-status transitions). Both report every test as `skipped` with the exact missing env var named, verified by actually running them in this environment.
+- Recommended follow-up: once staging exists and is seeded with the 4 role accounts (item 5), set the env vars `e2e/fixtures.ts` documents as missing, then re-run `npm run test:e2e` — every currently-skipped test in these two files should convert to a real pass/fail, closing this item without writing any new test code.
+
+**8. Regional isolation.**
+- **Business rules remain undecided** — per this pass's own explicit instruction not to implement policy until the rules are confirmed, and no confirmation has been given since `SECURITY_REVIEW.md`'s "Candidate region/access-control model" section was written (still awaiting approval on: what a NULL `profiles.region_id` means for each role, whether Super Admin bypasses region checks entirely, how a user assigned multiple regions or a specific workstation should be scoped).
+- Even once approved, implementation and testing require staging database access this environment does not have.
+- **No client-side filtering is treated as authorization anywhere in this report** — every region-scoping check that exists today is explicitly documented as UI-only (Finding A12), not a security boundary, consistent with this instruction.
+- Recommended follow-up: get the candidate rules in `SECURITY_REVIEW.md` reviewed and approved (or amended) first; only then write and apply the RLS policy as a new migration, tested in staging under both permitted and denied access for every role/region combination before it ever reaches production.
+
+**9. Final pre-merge gate — honest scorecard.**
+
+| Criterion | Status |
+|---|---|
+| TypeScript errors | **0** — met |
+| ESLint errors | **0** — met |
+| High-risk ESLint warnings | **0** — met (all 16 exhaustive-deps + the named auth/payroll/permissions `any` subset fixed; remaining 339 `any` warnings are classified low/moderate risk, see above) |
+| Unit tests all passing | **105/105** — met |
+| Staging integration tests all required tests passing | **Not met — cannot run, no staging access** |
+| E2E tests, no critical workflow skipped | **Not met** — 38 of 54 E2E tests are skipped (staging-gated), including every RLS/RPC/role/concurrency scenario |
+| Production build passing | **0 errors** — met |
+| Critical dependency vulnerabilities | **0** — met (jspdf fixed this pass, Finding A16) |
+| Exposed credential rotated | **Not met — cannot verify from this environment** |
+| Preview environment isolated from production | **Not met — cannot verify from this environment**; treated as unsafe-by-default per instruction |
+| All migrations executed and verified in staging | **Not met — none executed anywhere** |
+| Regional RLS implemented and verified | **Not met — policy undecided, and implementation blocked on that decision** |
+| Payroll atomicity verified in staging | **Not met** — the atomic RPC itself is written, wired, and unit-tested, but never run against a real database |
+| Guard/employee-number concurrency verified in staging | **Not met** — same: written, wired, unit-tested, never run against a real database |
+| Rollback procedures tested | **Not met — no database to test a rollback against** |
+
+**Conclusion: 8 of 15 criteria are met; 7 require infrastructure this environment does not have. PR #36 does not pass its own final gate and must remain a draft**, consistent with this pass's explicit instruction. Nothing above was guessed at or marked "assumed passing" — every "not met" reflects an actual, confirmed inability to execute in this environment, and every "met" reflects a command actually re-run this pass with its real output recorded (see "Commands executed" above).
+
 ## System map
 
 Unchanged from the first pass — see the "Pages / routes," "Database tables," "Edge functions," and "Storage buckets" material below.
