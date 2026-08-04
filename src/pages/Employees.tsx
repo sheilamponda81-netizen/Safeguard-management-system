@@ -13,6 +13,8 @@ import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { toCsvRow } from '../utils/csvExport';
 import { generateEmployeeNumberServerSide } from '../utils/employeeNumberGeneration';
+import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
+import { getErrorMessage } from '../utils/errorHandler';
 
 interface Employee {
   id: string;
@@ -27,17 +29,17 @@ interface Employee {
   status: string;
   email: string;
   dateHired: string;
-  dob?: string;
-  nationalId?: string;
-  address?: string;
-  qualification?: string;
-  contractType?: string;
-  payPoint?: string;
-  region_id?: string;
-  company?: string;
-  workstation?: string;
-  pay_point?: string;
-  account_number?: string;
+  dob?: string | null;
+  nationalId?: string | null;
+  address?: string | null;
+  qualification?: string | null;
+  contractType?: string | null;
+  payPoint?: string | null;
+  region_id?: string | null;
+  company?: string | null;
+  workstation?: string | null;
+  pay_point?: string | null;
+  account_number?: string | null;
   uniform_deduction?: number;
   next_of_kin_name?: string;
   next_of_kin_relationship?: string;
@@ -48,11 +50,89 @@ interface Employee {
   deleted_reason?: string | null;
   deleted_by?: string | null;
   deleted_by_name?: string;
-  created_at?: string;
+  created_at?: string | null;
   assignment_type?: string;
   resident_name?: string;
   resident_contact?: string;
-  company_id?: string;
+  company_id?: string | null;
+}
+
+// Shape of AddEmployeeForm/EditEmployeeForm's own form state -- every field
+// is always initialized (see each form's useState below), so unlike
+// `Employee` (which models a persisted row, where several fields are
+// legitimately optional) none of these are optional here.
+interface EmployeeFormData {
+  employeeNumber: string;
+  fullName: string;
+  dob: string;
+  gender: string;
+  nationalId: string;
+  phone: string;
+  address: string;
+  position: string;
+  department: string;
+  qualification: string;
+  dateHired: string;
+  basicSalary: number;
+  contractType: string;
+  status: string;
+  email: string;
+  region_id: string;
+  assignment_type: string;
+  company: string;
+  workstation: string;
+  resident_name: string;
+  resident_contact: string;
+  pay_point: string;
+  account_number: string;
+  uniform_deduction: number;
+  next_of_kin_name: string;
+  next_of_kin_relationship: string;
+  next_of_kin_phone: string;
+  next_of_kin_address: string;
+}
+
+// Raw `employees` row shape -- only the columns this file actually reads
+// (query below is `select('*')`). No generated Supabase types exist in
+// this project yet (see AUDIT_REPORT.md's "Supabase generated types"
+// section).
+interface EmployeeRow {
+  id: string;
+  employee_number: string;
+  full_name: string;
+  gender: string | null;
+  age: number | null;
+  phone: string | null;
+  position: string;
+  department: string | null;
+  basic_salary: number;
+  status: string | null;
+  email: string | null;
+  hire_date: string | null;
+  dob: string | null;
+  national_id: string | null;
+  address: string | null;
+  qualification: string | null;
+  contract_type: string | null;
+  pay_point: string | null;
+  region_id: string | null;
+  company: string | null;
+  workstation: string | null;
+  account_number: string | null;
+  uniform_deduction: number | null;
+  next_of_kin_name: string | null;
+  next_of_kin_relationship: string | null;
+  next_of_kin_phone: string | null;
+  next_of_kin_address: string | null;
+  is_deleted: boolean | null;
+  deleted_at: string | null;
+  deleted_reason: string | null;
+  deleted_by: string | null;
+  created_at: string | null;
+  assignment_type: string | null;
+  resident_name: string | null;
+  resident_contact: string | null;
+  company_id: string | null;
 }
 
 const departmentOptions = [
@@ -229,7 +309,7 @@ function DateFieldDMY({ value, onChange, required, disabled }: {
 // never drift out of sync on what's required. Returns the label of the first
 // missing/invalid field so the caller can show a notification naming it, or
 // null when the form is valid.
-const REQUIRED_EMPLOYEE_FIELDS: { key: string; label: string }[] = [
+const REQUIRED_EMPLOYEE_FIELDS: { key: keyof Employee; label: string }[] = [
   { key: 'fullName', label: 'Full Name' },
   { key: 'dob', label: 'Date of Birth' },
   { key: 'gender', label: 'Gender' },
@@ -247,7 +327,7 @@ const REQUIRED_EMPLOYEE_FIELDS: { key: string; label: string }[] = [
   { key: 'next_of_kin_phone', label: 'Next of Kin Phone Number' },
 ];
 
-const validateEmployeeForm = (form: any, isSuperAdmin?: boolean): string | null => {
+const validateEmployeeForm = (form: Partial<Employee>, isSuperAdmin?: boolean): string | null => {
   if (!form.employeeNumber || String(form.employeeNumber).trim() === '') {
     return 'Employee Number (select a Region first so it can be generated)';
   }
@@ -290,7 +370,7 @@ export function EmployeesPage() {
   const [showEdit, setShowEdit] = useState(false);
   const [selected, setSelected] = useState<Employee | null>(null);
   const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
-  const [regions, setRegions] = useState<any[]>([]);
+  const [regions, setRegions] = useState<UserProfileRegion[]>([]);
   const [filterRegionId, setFilterRegionId] = useState<string>('');
   const [filterCompany, setFilterCompany] = useState<string>('');
   const [filterWorkstation, setFilterWorkstation] = useState<string>('');
@@ -298,7 +378,7 @@ export function EmployeesPage() {
   // Debounced so typing doesn't refetch the whole employees table per keystroke.
   const debouncedFilterCompany = useDebouncedValue(filterCompany, 300);
   const debouncedFilterWorkstation = useDebouncedValue(filterWorkstation, 300);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [userLoading, setUserLoading] = useState(true);
   const [showDeletedModal, setShowDeletedModal] = useState(false);
   const [selectedDeletedEmployee, setSelectedDeletedEmployee] = useState<Employee | null>(null);
@@ -383,7 +463,7 @@ export function EmployeesPage() {
       const { data, error } = await query.order('full_name');
       if (error) throw error;
       
-      const mappedEmployees = (data || []).map((emp: any) => ({
+      const mappedEmployees = (data || []).map((emp: EmployeeRow) => ({
         id: emp.id,
         employeeNumber: emp.employee_number,
         fullName: emp.full_name,
@@ -423,7 +503,7 @@ export function EmployeesPage() {
         company_id: emp.company_id || null,
       }));
       setEmployees(mappedEmployees);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error fetching employees:', err);
       showNotification('Failed to load employees', 'error');
     } finally {
@@ -450,9 +530,9 @@ export function EmployeesPage() {
     };
 
     const [nationalIdResult, phoneResult, accountResult] = await Promise.all([
-      nationalId ? buildQuery('national_id', nationalId) : Promise.resolve({ data: [] as any[] }),
-      phone ? buildQuery('phone', phone) : Promise.resolve({ data: [] as any[] }),
-      accountNumber ? buildQuery('account_number', accountNumber) : Promise.resolve({ data: [] as any[] }),
+      nationalId ? buildQuery('national_id', nationalId) : Promise.resolve({ data: [] as { id: string }[] }),
+      phone ? buildQuery('phone', phone) : Promise.resolve({ data: [] as { id: string }[] }),
+      accountNumber ? buildQuery('account_number', accountNumber) : Promise.resolve({ data: [] as { id: string }[] }),
     ]);
 
     return {
@@ -472,7 +552,7 @@ export function EmployeesPage() {
   }, [regions]);
 
   // ===== ADD EMPLOYEE =====
-  const addEmployee = useCallback(async (emp: any) => {
+  const addEmployee = useCallback(async (emp: EmployeeFormData) => {
     const safeEmp = {
       ...emp,
       fullName: sanitizeInput(emp.fullName),
@@ -492,7 +572,7 @@ export function EmployeesPage() {
       next_of_kin_address: sanitizeInput(emp.next_of_kin_address),
     };
     
-    let assignedRegionId = safeEmp.region_id;
+    let assignedRegionId: string | null | undefined = safeEmp.region_id;
     if (!userProfile?.is_super_admin) {
       assignedRegionId = userProfile?.region_id;
     }
@@ -525,7 +605,7 @@ export function EmployeesPage() {
     const formattedResidentName = safeEmp.assignment_type === 'resident' ? formatText(safeEmp.resident_name) : null;
     const formattedResidentContact = safeEmp.assignment_type === 'resident' ? sanitizeInput(safeEmp.resident_contact) : null;
     
-    const uniformDeduction = parseInt(safeEmp.uniform_deduction) || 0;
+    const uniformDeduction = safeEmp.uniform_deduction || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
 
     const buildInsertRow = (employeeNumber: string) => ({
@@ -536,7 +616,7 @@ export function EmployeesPage() {
       phone: safeEmp.phone,
       position: safeEmp.position,
       department: safeEmp.department,
-      basic_salary: parseFloat(safeEmp.basicSalary),
+      basic_salary: safeEmp.basicSalary,
       status: safeEmp.status || 'Active',
       email: safeEmp.email,
       hire_date: safeEmp.dateHired && safeEmp.dateHired !== '' ? safeEmp.dateHired : new Date().toISOString().split('T')[0],
@@ -576,8 +656,8 @@ export function EmployeesPage() {
     // adding several employees in a row makes a transient blip more likely
     // to land mid-request.
     let employeeNumberToUse = safeEmp.employeeNumber;
-    let data: any = null;
-    let error: any = null;
+    let data: EmployeeRow[] | null = null;
+    let error: { message: string; code?: string; isNetworkError?: boolean } | null = null;
     const MAX_INSERT_ATTEMPTS = 5;
 
     for (let attempt = 1; attempt <= MAX_INSERT_ATTEMPTS; attempt++) {
@@ -589,8 +669,8 @@ export function EmployeesPage() {
           .select();
         data = result.data;
         error = result.error;
-      } catch (networkErr: any) {
-        error = { message: networkErr?.message || 'Network error', isNetworkError: true };
+      } catch (networkErr) {
+        error = { message: getErrorMessage(networkErr), isNetworkError: true };
       }
 
       if (!error) break;
@@ -599,7 +679,7 @@ export function EmployeesPage() {
       const isLastAttempt = attempt === MAX_INSERT_ATTEMPTS;
 
       if (isNumberCollision && !isLastAttempt) {
-        employeeNumberToUse = await getNextEmployeeNumberForRegion(assignedRegionId);
+        employeeNumberToUse = await getNextEmployeeNumberForRegion(assignedRegionId ?? '');
         continue;
       }
 
@@ -618,7 +698,7 @@ export function EmployeesPage() {
       // rarely their fault to begin with.
       const message = error.isNetworkError
         ? 'Network error while adding employee. Please check your connection and try again.'
-        : 'Error adding employee: ' + error.message;
+        : 'Error adding employee: ' + getErrorMessage(error);
       showNotification(message, 'error');
       return;
     } else if (data && data[0]) {
@@ -630,9 +710,9 @@ export function EmployeesPage() {
         age: data[0].age || 0,
         phone: data[0].phone || '',
         position: data[0].position,
-        department: data[0].department,
+        department: data[0].department || 'Operations',
         basicSalary: data[0].basic_salary,
-        status: data[0].status,
+        status: data[0].status || 'Active',
         email: data[0].email || '',
         dateHired: data[0].hire_date || new Date().toISOString().split('T')[0],
         dob: data[0].dob,
@@ -676,7 +756,7 @@ export function EmployeesPage() {
   }, [userProfile, employees, checkDuplicates, getNextEmployeeNumberForRegion]);
 
   // ===== UPDATE EMPLOYEE =====
-  const updateEmployee = useCallback(async (emp: any) => {
+  const updateEmployee = useCallback(async (emp: EmployeeFormData) => {
     if (!editingEmployee) return;
     
     const oldEmployeeData = { ...editingEmployee };
@@ -722,7 +802,7 @@ export function EmployeesPage() {
     const formattedResidentName = safeEmp.assignment_type === 'resident' ? formatText(safeEmp.resident_name) : null;
     const formattedResidentContact = safeEmp.assignment_type === 'resident' ? sanitizeInput(safeEmp.resident_contact) : null;
 
-    const uniformDeduction = parseInt(safeEmp.uniform_deduction) || 0;
+    const uniformDeduction = safeEmp.uniform_deduction || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
 
     const { data, error } = await supabase
@@ -735,7 +815,7 @@ export function EmployeesPage() {
         phone: safeEmp.phone,
         position: safeEmp.position,
         department: safeEmp.department,
-        basic_salary: parseFloat(safeEmp.basicSalary),
+        basic_salary: safeEmp.basicSalary,
         status: safeEmp.status,
         email: safeEmp.email,
         hire_date: safeEmp.dateHired && safeEmp.dateHired !== '' ? safeEmp.dateHired : null,
@@ -763,7 +843,7 @@ export function EmployeesPage() {
     
     if (error) {
       // Leave the modal open on failure so the admin's edits aren't discarded.
-      showNotification('Error updating employee: ' + error.message, 'error');
+      showNotification('Error updating employee: ' + getErrorMessage(error), 'error');
       return;
     } else if (data && data[0]) {
       const updatedEmployee = {
@@ -774,9 +854,9 @@ export function EmployeesPage() {
         age: data[0].age || 0,
         phone: data[0].phone || '',
         position: data[0].position,
-        department: data[0].department,
+        department: data[0].department || 'Operations',
         basicSalary: data[0].basic_salary,
-        status: data[0].status,
+        status: data[0].status || 'Active',
         email: data[0].email || '',
         dateHired: data[0].hire_date || new Date().toISOString().split('T')[0],
         dob: data[0].dob,
@@ -1405,16 +1485,16 @@ function AddEmployeeForm({
   userRegionName,
   relationshipOptions,
 }: {
-  onSubmit: (e: any) => void;
+  onSubmit: (e: EmployeeFormData) => void;
   onCancel: () => void;
   departments: string[];
-  regions: any[];
-  userRegionId?: string;
+  regions: UserProfileRegion[];
+  userRegionId?: string | null;
   isSuperAdmin?: boolean;
   userRegionName?: string;
   relationshipOptions: string[];
 }) {
-  const [form, setForm] = useState<any>({
+  const [form, setForm] = useState<EmployeeFormData>({
     employeeNumber: "",
     fullName: "",
     dob: "",
@@ -1445,18 +1525,18 @@ function AddEmployeeForm({
     next_of_kin_address: "",
   });
 
-  const [positions, setPositions] = useState<any[]>([]);
+  const [positions, setPositions] = useState<{ name: string }[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
   const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
   const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
   const [showResidentSuggestions, setShowResidentSuggestions] = useState(false);
-  
+
   // ===== NEW: Loading state for submit button =====
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const update = (k: string, v: any) => {
-    setForm((prev: any) => ({ ...prev, [k]: v }));
+  const update = <K extends keyof EmployeeFormData>(k: K, v: EmployeeFormData[K]) => {
+    setForm((prev) => ({ ...prev, [k]: v }));
   };
 
   const formatNumberWithCommas = (value: number) => {
@@ -1607,8 +1687,11 @@ function AddEmployeeForm({
   };
 
   // ===== FIELD HELPER =====
+  // Only ever called with the string-valued fields -- basicSalary/
+  // uniform_deduction have their own dedicated inputs (handleSalaryChange/
+  // handleUniformDeductionChange below) and never go through this helper.
   const field = (
-    k: string,
+    k: Exclude<keyof EmployeeFormData, 'basicSalary' | 'uniform_deduction'>,
     label: string,
     type = "text",
     required = false,
@@ -1637,15 +1720,6 @@ function AddEmployeeForm({
               </option>
             ))}
           </select>
-        ) : type === "salary" ? (
-          <input
-            type="text"
-            value={formatNumberWithCommas(form[k] || 0)}
-            onChange={handleSalaryChange}
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right"
-            required={required}
-            disabled={isSubmitting}
-          />
         ) : type === "date" ? (
           <DateFieldDMY
             value={form[k] || ""}
@@ -2102,11 +2176,11 @@ function AddEmployeeForm({
                 value={form.region_id || ""}
                 onChange={(e) => {
                   const selectedId = e.target.value;
-                  setForm((prev: any) => ({ ...prev, region_id: selectedId }));
+                  setForm((prev) => ({ ...prev, region_id: selectedId }));
                   if (selectedId) {
                     generateEmployeeNumber(selectedId);
                   } else {
-                    setForm((prev: any) => ({ ...prev, employeeNumber: "" }));
+                    setForm((prev) => ({ ...prev, employeeNumber: "" }));
                   }
                 }}
                 disabled={isSubmitting}
@@ -2167,13 +2241,13 @@ function AddEmployeeForm({
 // ===== EditEmployeeForm =====
 function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAdmin, relationshipOptions }: {
   employee: Employee;
-  onSubmit: (e: any) => void;
+  onSubmit: (e: EmployeeFormData) => void;
   onCancel: () => void;
   departments: string[];
   isSuperAdmin?: boolean;
   relationshipOptions: string[];
 }) {
-  const [form, setForm] = useState<any>({
+  const [form, setForm] = useState<EmployeeFormData>({
     employeeNumber: employee.employeeNumber,
     fullName: employee.fullName,
     dob: employee.dob || '',
@@ -2204,12 +2278,12 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAd
     next_of_kin_address: employee.next_of_kin_address || '',
   });
   
-  const [positions, setPositions] = useState<any[]>([]);
+  const [positions, setPositions] = useState<{ name: string }[]>([]);
   const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
   const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
   const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
   const [showResidentSuggestions, setShowResidentSuggestions] = useState(false);
-  
+
   // ===== NEW: Loading state for edit submit button =====
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -2221,8 +2295,8 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAd
   // change instead of building on it. That's why switching Company <-> Resident
   // looked like it did nothing: the assignment_type update was overwritten by
   // the very next line clearing the other field.
-  const update = (k: string, v: any) => {
-    setForm((prev: any) => ({ ...prev, [k]: v }));
+  const update = <K extends keyof EmployeeFormData>(k: K, v: EmployeeFormData[K]) => {
+    setForm((prev) => ({ ...prev, [k]: v }));
   };
 
   const formatNumberWithCommas = (value: string) => {
@@ -2355,7 +2429,10 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAd
   };
 
   // ===== FIELD HELPER =====
-  const field = (k: string, label: string, type = 'text', required = false, options?: { label: string; value: string }[], maxLength?: number) => {
+  // Only ever called with the string-valued fields -- basicSalary/
+  // uniform_deduction have their own dedicated inputs (handleSalaryChange/
+  // handleUniformDeductionChange above) and never go through this helper.
+  const field = (k: Exclude<keyof EmployeeFormData, 'basicSalary' | 'uniform_deduction'>, label: string, type = 'text', required = false, options?: { label: string; value: string }[], maxLength?: number) => {
     const fieldId = `edit-field-${k}`;
 
     return (
