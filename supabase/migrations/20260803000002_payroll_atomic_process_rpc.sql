@@ -69,6 +69,7 @@ DECLARE
   v_approved_count INTEGER;
   v_inserted_count INTEGER;
   v_deleted_count INTEGER;
+  v_old_rows JSONB;
 BEGIN
   IF v_caller_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
@@ -96,6 +97,51 @@ BEGIN
 
   IF p_records IS NULL OR jsonb_array_length(p_records) = 0 THEN
     RAISE EXCEPTION 'No payroll records supplied';
+  END IF;
+
+  -- ============================================================
+  -- STEP 1.5: Validate the FULL payload shape before anything below
+  -- touches the database -- added after a hostile-input security review
+  -- of this function. Every check here is a pure inspection of p_records
+  -- (no table access, no lock needed yet), so it runs first and rejects
+  -- a bad payload before the advisory lock or the DELETE ever execute.
+  -- ============================================================
+
+  -- 1.5a. Reject the same employee_id appearing twice in one call --
+  -- previously relied entirely on the separate UNIQUE(tenant_id,
+  -- employee_id, month) constraint (20260803000001) to catch this,
+  -- which (a) is a different migration that may not be applied yet in
+  -- every environment this function could run in, and (b) would surface
+  -- as an opaque constraint-violation error rather than a clear one.
+  IF (SELECT COUNT(*) FROM jsonb_array_elements(p_records) AS r) <>
+     (SELECT COUNT(DISTINCT r->>'employee_id') FROM jsonb_array_elements(p_records) AS r)
+  THEN
+    RAISE EXCEPTION 'Refusing to process: the same employee_id appears more than once in this batch';
+  END IF;
+
+  -- 1.5b. Every record must have a well-formed UUID employee_id and
+  -- purely numeric (no NaN/Infinity/scientific-notation strings, which
+  -- PostgreSQL's NUMERIC type can otherwise accept) values for every
+  -- monetary field. basic_salary/allowances/overtime/bonus/gross_pay/
+  -- paye/pension/uniform_deduction must be >= 0 -- net_pay is
+  -- deliberately EXCLUDED from the non-negative check, since
+  -- calculateLivePayroll's own tests document negative net pay as a
+  -- real, intentional (not clamped) scenario, not a data error.
+  IF EXISTS (
+    SELECT 1 FROM jsonb_array_elements(p_records) AS r
+    WHERE r->>'employee_id' IS NULL
+       OR NOT (r->>'employee_id' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+       OR r->>'basic_salary' IS NULL OR NOT (r->>'basic_salary' ~ '^[0-9]+(\.[0-9]+)?$')
+       OR r->>'gross_pay' IS NULL OR NOT (r->>'gross_pay' ~ '^[0-9]+(\.[0-9]+)?$')
+       OR (r ? 'allowances' AND r->>'allowances' IS NOT NULL AND NOT (r->>'allowances' ~ '^[0-9]+(\.[0-9]+)?$'))
+       OR (r ? 'overtime' AND r->>'overtime' IS NOT NULL AND NOT (r->>'overtime' ~ '^[0-9]+(\.[0-9]+)?$'))
+       OR (r ? 'bonus' AND r->>'bonus' IS NOT NULL AND NOT (r->>'bonus' ~ '^[0-9]+(\.[0-9]+)?$'))
+       OR (r ? 'paye' AND r->>'paye' IS NOT NULL AND NOT (r->>'paye' ~ '^[0-9]+(\.[0-9]+)?$'))
+       OR (r ? 'pension' AND r->>'pension' IS NOT NULL AND NOT (r->>'pension' ~ '^[0-9]+(\.[0-9]+)?$'))
+       OR (r ? 'uniform_deduction' AND r->>'uniform_deduction' IS NOT NULL AND NOT (r->>'uniform_deduction' ~ '^[0-9]+(\.[0-9]+)?$'))
+       OR r->>'net_pay' IS NULL OR NOT (r->>'net_pay' ~ '^-?[0-9]+(\.[0-9]+)?$')
+  ) THEN
+    RAISE EXCEPTION 'Refusing to process: one or more records has a missing, non-numeric, or negative monetary value (net_pay may be negative; all other amounts must be zero or positive)';
   END IF;
 
   v_employee_ids := ARRAY(
@@ -156,6 +202,17 @@ BEGIN
   -- No explicit BEGIN/COMMIT needed or wanted here.
   -- ============================================================
 
+  -- Snapshot what's about to be deleted BEFORE deleting it, so the audit
+  -- log entry below can record what the figures actually WERE, not just
+  -- how many rows were touched -- added after a review of what makes an
+  -- audit-log entry genuinely trustworthy for this kind of destructive
+  -- operation.
+  SELECT COALESCE(jsonb_agg(to_jsonb(p)), '[]'::JSONB) INTO v_old_rows
+  FROM payroll p
+  WHERE p.month = p_month
+    AND p.tenant_id = v_tenant_id
+    AND p.employee_id = ANY(v_employee_ids);
+
   DELETE FROM payroll
   WHERE month = p_month
     AND tenant_id = v_tenant_id
@@ -168,6 +225,11 @@ BEGIN
   -- the exception propagates to roll back the whole transaction,
   -- including the DELETE above. There is no partial-insert state
   -- possible here, unlike looping insert-per-row in application code.
+  -- ROUND(..., 2) is applied explicitly on every monetary value: the
+  -- `payroll` table's columns are already NUMERIC(14,2), which rounds on
+  -- storage regardless, but rounding explicitly here makes the behavior
+  -- an intentional, visible part of this function's contract rather than
+  -- an incidental side effect of the column's declared type.
   INSERT INTO payroll (
     tenant_id, employee_id, month, basic_salary, allowances, overtime, bonus,
     gross_pay, paye, pension, uniform_deduction, net_pay, processed_at,
@@ -177,15 +239,15 @@ BEGIN
     v_tenant_id,
     (r->>'employee_id')::UUID,
     p_month,
-    (r->>'basic_salary')::NUMERIC,
-    COALESCE((r->>'allowances')::NUMERIC, 0),
-    COALESCE((r->>'overtime')::NUMERIC, 0),
-    COALESCE((r->>'bonus')::NUMERIC, 0),
-    (r->>'gross_pay')::NUMERIC,
-    COALESCE((r->>'paye')::NUMERIC, 0),
-    COALESCE((r->>'pension')::NUMERIC, 0),
-    COALESCE((r->>'uniform_deduction')::NUMERIC, 0),
-    (r->>'net_pay')::NUMERIC,
+    ROUND((r->>'basic_salary')::NUMERIC, 2),
+    ROUND(COALESCE((r->>'allowances')::NUMERIC, 0), 2),
+    ROUND(COALESCE((r->>'overtime')::NUMERIC, 0), 2),
+    ROUND(COALESCE((r->>'bonus')::NUMERIC, 0), 2),
+    ROUND((r->>'gross_pay')::NUMERIC, 2),
+    ROUND(COALESCE((r->>'paye')::NUMERIC, 0), 2),
+    ROUND(COALESCE((r->>'pension')::NUMERIC, 0), 2),
+    ROUND(COALESCE((r->>'uniform_deduction')::NUMERIC, 0), 2),
+    ROUND((r->>'net_pay')::NUMERIC, 2),
     NOW(),
     'pending',
     NULL,
@@ -215,7 +277,7 @@ BEGIN
     'CREATE',
     'payroll',
     NULL,
-    jsonb_build_object('deletedCount', v_deleted_count),
+    jsonb_build_object('deletedCount', v_deleted_count, 'deletedRows', v_old_rows),
     p_audit_context || jsonb_build_object(
       'month', p_month,
       'employeeCount', array_length(v_employee_ids, 1),
@@ -302,5 +364,55 @@ GRANT EXECUTE ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) TO aut
 --    new audit_logs row exists with action='CREATE', entity_type=
 --    'payroll', and new_data containing the month/employeeCount/
 --    recordsSaved/status fields plus whatever was passed in
---    p_audit_context.
+--    p_audit_context. Also confirm old_data.deletedRows on a reprocessing
+--    call (step 2 above) contains the actual prior row(s)' figures, not
+--    just a count -- select the audit_logs row and check
+--    old_data->'deletedRows' is a JSON array with the expected
+--    basic_salary/net_pay/etc. from before the reprocess.
+-- 9. Duplicate employee_id within one payload (added after a hostile-
+--    input security review -- previously relied entirely on the
+--    separate UNIQUE(tenant_id, employee_id, month) constraint from
+--    20260803000001, which this function did not itself verify was even
+--    applied): call with p_records containing the SAME employee_id
+--    twice. Expect: exception ("the same employee_id appears more than
+--    once in this batch"), nothing written -- even if
+--    20260803000001_payroll_unique_constraint.sql has NOT been applied
+--    yet in this environment.
+-- 10. Negative/non-finite monetary values rejected: call with a record
+--    whose basic_salary is -1000, or whose net_pay is the string
+--    "Infinity"/"NaN". Expect: exception ("missing, non-numeric, or
+--    negative monetary value"), nothing written. Then call with a
+--    record whose net_pay is legitimately negative (e.g. -5000, a real,
+--    intentional scenario per calculateLivePayroll's own tests) and
+--    every other field non-negative -- expect SUCCESS, since net_pay is
+--    deliberately excluded from the non-negative check.
+-- 11. Rounding: call with basic_salary = 100000.999. Expect: stored value
+--    is 100001.00 (ROUND(...,2) applied explicitly in the INSERT, and
+--    backstopped by the column's own NUMERIC(14,2) type regardless).
+-- ============================================================
+
+-- ============================================================
+-- PREFLIGHT SQL (run against production BEFORE applying this migration)
+-- ============================================================
+-- This migration only CREATEs/REPLACEs a function and adjusts its
+-- grants -- it does not add any constraint to existing data, so there is
+-- no duplicate-data preflight check specific to this migration itself.
+-- The function's own STEP 1.5 payload validation and the separate
+-- UNIQUE(tenant_id, employee_id, month) constraint
+-- (20260803000001_payroll_unique_constraint.sql) are what actually
+-- guards against duplicate rows -- run THAT migration's own preflight
+-- check before applying it.
+
+-- ============================================================
+-- VERIFICATION SQL (run immediately after applying)
+-- ============================================================
+-- SELECT proname, prosecdef FROM pg_proc WHERE proname = 'process_payroll_batch';
+-- Expected: 1 row, prosecdef = true.
+-- SELECT has_function_privilege('authenticated', 'process_payroll_batch(text, jsonb, text, jsonb)', 'EXECUTE');
+-- Expected: true.
+-- SELECT has_function_privilege('anon', 'process_payroll_batch(text, jsonb, text, jsonb)', 'EXECUTE');
+-- Expected: false (confirms the REVOKE ALL FROM PUBLIC + GRANT only to
+-- authenticated actually took effect -- an anonymous/unauthenticated
+-- caller cannot reach this function at all, before it even gets a chance
+-- to check auth.uid()).
 -- ============================================================

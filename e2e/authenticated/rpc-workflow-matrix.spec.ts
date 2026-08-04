@@ -17,6 +17,17 @@ import { missingStagingVars, getStagingCredentials, StagingCredentials } from '.
 //   E2E_BASE_URL=... E2E_SUPABASE_URL=... E2E_SUPABASE_ANON_KEY=... \
 //   E2E_ADMIN_EMAIL=... E2E_ADMIN_PASSWORD=... (+ manager/supervisor/staff) \
 //   npx playwright test rpc-workflow-matrix
+//
+// NOT covered by this file: true cross-tenant separation for guard-ID/
+// employee-number generation (proving two DIFFERENT tenants' counters
+// are independent). That needs a second tenant/company seeded in the
+// same staging project with its own set of credentials, which
+// e2e/fixtures.ts does not currently provision (it's one tenant's worth
+// of 4 role accounts). Each generation migration's own "STAGING TEST
+// PROCEDURE" comment includes the exact manual SQL for this
+// (authenticate as a user in each of two tenants, compare counters) --
+// see 20260804000000_guard_id_generation.sql /
+// 20260804000001_employee_number_generation.sql.
 
 const missing = missingStagingVars();
 const testMonth = '9999-11'; // far-future month, unlikely to collide with real seeded data
@@ -77,6 +88,18 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       expect(secondNum).toBe(firstNum + 1);
     });
 
+    test('10 simultaneous requests for the same region produce 10 distinct, consecutive numbers', async () => {
+      const results = await Promise.all(
+        Array.from({ length: 10 }, () => clients.admin.rpc('generate_employee_number', { p_region_id: sampleRegionId }))
+      );
+      const values = results.map((r) => {
+        expect(r.error).toBeNull();
+        return parseInt(r.data!.split('-').pop()!, 10);
+      });
+      expect(new Set(values).size).toBe(10); // no duplicates
+      expect(Math.max(...values) - Math.min(...values)).toBe(9); // no gaps
+    });
+
     test('duplicate employee_number is rejected by the UNIQUE(tenant_id, employee_number) constraint', async () => {
       const { data: created, error: createErr } = await clients.admin
         .from('employees')
@@ -110,7 +133,17 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       expect(parseInt(second!.slice(2), 10)).toBe(parseInt(first!.slice(2), 10) + 1);
     });
 
-    test('duplicate "guardId" is rejected by the UNIQUE constraint', async () => {
+    test('10 simultaneous requests produce 10 distinct, consecutive numbers', async () => {
+      const results = await Promise.all(Array.from({ length: 10 }, () => clients.admin.rpc('generate_guard_id')));
+      const values = results.map((r) => {
+        expect(r.error).toBeNull();
+        return parseInt(r.data!.slice(2), 10);
+      });
+      expect(new Set(values).size).toBe(10); // no duplicates
+      expect(Math.max(...values) - Math.min(...values)).toBe(9); // no gaps
+    });
+
+    test('duplicate "guardId" is rejected by the UNIQUE(tenant_id, "guardId") constraint', async () => {
       const { data: guardId } = await clients.admin.rpc('generate_guard_id');
       const { data: created, error: createErr } = await clients.admin
         .from('employees')
@@ -226,6 +259,65 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       });
       expect(error).not.toBeNull();
       expect(error?.message).toMatch(/only admins/i);
+    });
+
+    test('rejects a payload with the same employee_id twice, before touching the database', async () => {
+      const { data: before } = await clients.admin.from('payroll').select('id').eq('month', testMonth).eq('employee_id', payrollEmployeeId);
+      const countBefore = before?.length ?? 0;
+
+      const { error } = await clients.admin.rpc('process_payroll_batch', {
+        p_month: testMonth, p_records: [record(), record()], p_user_email: creds.admin.email,
+      });
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/appears more than once/i);
+
+      const { data: after } = await clients.admin.from('payroll').select('id').eq('month', testMonth).eq('employee_id', payrollEmployeeId);
+      expect(after?.length ?? 0).toBe(countBefore);
+    });
+
+    test('rejects a negative basic_salary but allows a legitimately negative net_pay', async () => {
+      const { error: negSalaryErr } = await clients.admin.rpc('process_payroll_batch', {
+        p_month: testMonth, p_records: [record({ basic_salary: -1000 })], p_user_email: creds.admin.email,
+      });
+      expect(negSalaryErr).not.toBeNull();
+      expect(negSalaryErr?.message).toMatch(/negative monetary value/i);
+
+      const { error: negNetPayErr } = await clients.admin.rpc('process_payroll_batch', {
+        p_month: testMonth, p_records: [record({ net_pay: -5000 })], p_user_email: creds.admin.email,
+      });
+      expect(negNetPayErr).toBeNull(); // net_pay may legitimately be negative -- not rejected
+
+      const { data: row } = await clients.admin.from('payroll').select('net_pay').eq('month', testMonth).eq('employee_id', payrollEmployeeId).single();
+      expect(Number(row?.net_pay)).toBe(-5000);
+    });
+
+    test('rounds monetary values to 2 decimal places on insert', async () => {
+      const { error } = await clients.admin.rpc('process_payroll_batch', {
+        p_month: testMonth, p_records: [record({ basic_salary: 100000.999 })], p_user_email: creds.admin.email,
+      });
+      expect(error).toBeNull();
+      const { data: row } = await clients.admin.from('payroll').select('basic_salary').eq('month', testMonth).eq('employee_id', payrollEmployeeId).single();
+      expect(Number(row?.basic_salary)).toBe(100001);
+    });
+
+    test('audit log records the actual prior figures on a reprocess, not just a count', async () => {
+      await clients.admin.rpc('process_payroll_batch', {
+        p_month: testMonth, p_records: [record({ basic_salary: 111111 })], p_user_email: creds.admin.email,
+      });
+      const { data: result } = await clients.admin.rpc('process_payroll_batch', {
+        p_month: testMonth, p_records: [record({ basic_salary: 222222 })], p_user_email: creds.admin.email,
+      });
+      expect(result.deletedCount).toBe(1);
+
+      const { data: logs } = await clients.admin
+        .from('audit_logs')
+        .select('old_data')
+        .eq('entity_type', 'payroll')
+        .order('created_at', { ascending: false })
+        .limit(1);
+      const deletedRows = logs?.[0]?.old_data?.deletedRows;
+      expect(Array.isArray(deletedRows)).toBe(true);
+      expect(Number(deletedRows[0]?.basic_salary)).toBe(111111);
     });
   });
 

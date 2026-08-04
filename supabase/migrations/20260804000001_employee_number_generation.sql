@@ -169,7 +169,32 @@ GRANT EXECUTE ON FUNCTION generate_employee_number(UUID) TO authenticated;
 -- migration.)
 
 -- ============================================================
--- STAGING TEST PROCEDURE
+-- PREFLIGHT SQL (run against production BEFORE applying this migration)
+-- ============================================================
+-- SELECT tenant_id, employee_number, COUNT(*) FROM employees
+--   GROUP BY tenant_id, employee_number HAVING COUNT(*) > 1;
+-- Expected: 0 rows -- this migration does not itself add the
+-- UNIQUE(tenant_id, employee_number) constraint (that already exists,
+-- from 20260727000000_reconstructed_base_schema.sql), but this function
+-- assumes it's present and enforced; if this query returns rows, that
+-- constraint is somehow not doing its job and must be investigated
+-- before relying on this migration's "backstop" reasoning above.
+
+-- ============================================================
+-- VERIFICATION SQL (run immediately after applying)
+-- ============================================================
+-- SELECT proname, prosecdef FROM pg_proc WHERE proname = 'generate_employee_number';
+-- Expected: 1 row, prosecdef = true.
+-- SELECT has_function_privilege('authenticated', 'generate_employee_number(uuid)', 'EXECUTE');
+-- Expected: true.
+-- SELECT * FROM employee_number_counters LIMIT 5;
+-- Expected: succeeds (confirms the table and its SELECT policy exist);
+-- returns 0 rows immediately after migration (rows are created lazily,
+-- on each prefix's first real call).
+
+-- ============================================================
+-- STAGING TEST PROCEDURE (authenticated as a real user so
+-- get_current_tenant_id() resolves correctly)
 -- ============================================================
 --
 -- 1. SEQUENTIAL GENERATION for a single region -- confirms increment +
@@ -182,47 +207,85 @@ GRANT EXECUTE ON FUNCTION generate_employee_number(UUID) TO authenticated;
 --   -- next value, exactly +1, e.g. SFG-N-002
 --
 -- 2. TWO DIFFERENT REGIONS run independent counters (confirms the
---    per-prefix, not global, scoping):
+--    per-prefix, not global, scoping) -- this IS the region-prefix
+--    separation test:
 --
 --   SELECT generate_employee_number('<region A id>'); -- e.g. SFG-N-001
 --   SELECT generate_employee_number('<region B id>'); -- e.g. SFG-S-001,
 --                                                      -- NOT SFG-S-002
 --
--- 3. CONCURRENT GENERATION for the SAME region/prefix -- confirms the
---    row lock actually serializes concurrent callers (run in two
---    separate sessions/tabs at the same time):
+-- 3. TWO SIMULTANEOUS REQUESTS for the SAME region/prefix -- confirms
+--    the row lock actually serializes concurrent callers (open two
+--    separate staging DB sessions/tabs, run at the same moment):
 --
 --   -- Session A:                           -- Session B (same moment):
 --   SELECT generate_employee_number('<r>');  SELECT generate_employee_number('<r>');
 --
---   Expected: two distinct, consecutive numbers -- never the same value
---   twice. For a stronger automated check within one session:
+--   Expected: two distinct, consecutive numbers -- session B visibly
+--   waits for session A's transaction to commit.
 --
---   SELECT count(DISTINCT v), count(v) FROM (
---     SELECT generate_employee_number('<region id>') AS v FROM generate_series(1, 200)
+-- 4. TEN SIMULTANEOUS REQUESTS -- a stronger automated version of #3
+--    within one session:
+--
+--   SELECT count(DISTINCT v), count(v), max(v) - min(v) FROM (
+--     SELECT (regexp_replace(generate_employee_number('<region id>'), '^SFG-[A-Z]-', ''))::int AS v
+--     FROM generate_series(1, 10)
 --   ) t;
---   -- Expected: both counts equal 200.
+--   -- Expected: count(DISTINCT v) = count(v) = 10, max-min = 9 (10
+--   -- consecutive integers, no gaps, no duplicates). For genuine
+--   -- cross-connection concurrency, use pgbench with 10 concurrent
+--   -- clients each calling this function once for the same region.
 --
--- 4. LEGACY EMPLOYEE NUMBER PRESERVATION -- confirms the seed step
---    protects real existing data (run BEFORE applying this migration to
---    capture the true pre-migration state):
+-- 5. EXISTING LEGACY NUMBERS are never collided with, INCLUDING GAPS in
+--    the existing numbering (e.g. a region with SFG-N-001, SFG-N-005,
+--    SFG-N-047 already present -- from manual entry or deleted-and-
+--    reused numbers -- must seed from the MAX (47), not the count (3)):
 --
+--   -- Run BEFORE applying this migration to capture the true state:
 --   SELECT employee_number FROM employees
 --     WHERE employee_number LIKE 'SFG-N-%' ORDER BY employee_number DESC LIMIT 3;
 --   -- note the highest existing value for that prefix, e.g. SFG-N-047
 --
 --   -- after applying the migration:
 --   SELECT generate_employee_number('<the "N" region id>');
---   -- Expected: SFG-N-048, never SFG-N-001 (which could collide with an
---   -- existing legacy number in that range).
+--   -- Expected: SFG-N-048 (47 + 1), never SFG-N-001 or SFG-N-004 (which
+--   -- would be derived from the row count instead of the max).
 --
--- 5. UNIQUE CONSTRAINT BACKSTOP still rejects a real duplicate (proves
---    the residual race window this migration doesn't fully close is
---    still safe against actual data corruption, even if the app-level
---    retry logic in Employees.tsx were somehow bypassed):
+-- 6. INVALID LEGACY FORMATS are ignored by the seed step, not treated as
+--    errors or as 0 (the seed query's own
+--    `regexp_replace(employee_number, '^' || v_prefix, '') ~ '^[0-9]+$'`
+--    filter must handle a malformed value gracefully):
+--
+--   -- Simulate a malformed legacy value for a not-yet-seeded prefix:
+--   -- UPDATE employees SET employee_number = 'SFG-N-UNKNOWN' WHERE id = '<some employee>';
+--   SELECT generate_employee_number('<the "N" region id>');
+--   -- Expected: succeeds, seeded from the highest VALID (SFG-N-<digits>)
+--   -- legacy value, silently ignoring 'SFG-N-UNKNOWN' rather than
+--   -- erroring on the failed CAST or treating it as the max.
+--
+-- 7. COLLISION RETRIES -- UNIQUE CONSTRAINT BACKSTOP still rejects a
+--    real duplicate (proves the residual race window this migration
+--    doesn't fully close is still safe against actual data corruption,
+--    even if the app-level retry logic in Employees.tsx were somehow
+--    bypassed) -- this is exactly the error Employees.tsx's own
+--    getNextEmployeeNumberForRegion() retry loop reacts to:
 --
 --   INSERT INTO employees (tenant_id, employee_number, full_name, basic_salary)
 --     VALUES (get_current_tenant_id(), (SELECT employee_number FROM employees LIMIT 1), 'Test Duplicate', 0);
 --   -- Expected: ERROR: duplicate key value violates unique constraint
 --   -- on (tenant_id, employee_number)
+--
+-- 8. TENANT SEPARATION -- confirms two different tenants' counters for
+--    the "same" region letter are fully independent (needs a second
+--    tenant/company seeded in the same staging project, each with its
+--    own region using the same letter, e.g. both named "North"):
+--
+--   -- As a user in Tenant A, region "North":
+--   SELECT generate_employee_number('<Tenant A North region id>'); -- e.g. SFG-N-001
+--   -- As a user in Tenant B, region "North":
+--   SELECT generate_employee_number('<Tenant B North region id>'); -- e.g. SFG-N-001 too --
+--                                                                  -- NOT SFG-N-002
+--   SELECT tenant_id, prefix, last_number FROM employee_number_counters WHERE prefix = 'SFG-N-';
+--   -- Expected: two rows, one per tenant, independently incrementing
+--   -- despite sharing the same prefix text.
 -- ============================================================
