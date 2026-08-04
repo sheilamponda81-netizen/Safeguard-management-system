@@ -32,7 +32,7 @@
     "clsx": "^2.0.0",
     "es-toolkit": "^1.49.0",
     "html2canvas": "^1.4.1",
-    "jspdf": "^2.5.2",
+    "jspdf": "^4.2.1",
     "jspdf-autotable": "^5.0.8",
     "jszip": "^3.10.1",
     "lodash-es": "^4.17.21",

@@ -107,7 +107,7 @@ Unchanged and still a genuine pass: `audit_logs` has no UPDATE/DELETE policy at 
 1. **A17: no `profiles`↔`employees` link at all** — Staff self-service payslips currently expose every employee's payslip in-region, not just the viewer's own. Needs `profiles.employee_id` before any fix is possible.
 2. **A12: region isolation is UI-only** — needs the candidate-rules decision above before a fix can be written.
 3. **A5: `employees`/`attendance` writes have no role_level check** — needs column-level design (which columns Supervisors may touch).
-4. **A16: `jspdf` critical vulnerability, unfixed** — needs a visually-verified major-version upgrade, not a blind bump.
+4. **A16: `jspdf` critical vulnerability — RESOLVED.** Upgraded to `^4.2.1`, 0 critical vulnerabilities remaining. A real payslip should still be visually confirmed by someone with staging/production access before this reaches production (this environment has no authenticated session to click through the live app).
 5. **A6: backup/recovery non-functional** — documentation now corrected; the underlying feature gap (build vs. leave unbuilt) is still an open decision.
 6. **A7: `company-logo` storage bucket** unrestricted writes.
 7. **A1: credential in git history** — pending your decision on history rewriting; password rotation still needed regardless.

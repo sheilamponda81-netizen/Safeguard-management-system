@@ -37,7 +37,7 @@ Two more issues fixed alongside `button-name` in the same commit, not separately
 | Chunk | Raw size | Gzip |
 |---|---|---|
 | `vendor-charts-core` (recharts) | 556 KB | 151 KB |
-| `vendor-pdf-core` (jspdf) | 352 KB | 115 KB |
+| `vendor-pdf-core` (jspdf) | 382 KB (was 352 KB — `jspdf` upgraded `^2.5.2`→`^4.2.1` this pass, fixing the critical vulnerability; a newer major version being somewhat larger is expected and was not optimized against, since correctness/security took priority here) | 115 KB (gzip; brotli measured elsewhere in this doc shows ~106 KB post-upgrade) |
 | `vendor-pdf-utils` | 197 KB | 47 KB |
 | `vendor-ui` | 191 KB | 60 KB |
 | `index.es` | 147 KB | 50 KB |
@@ -58,7 +58,7 @@ All page routes already lazy-loaded; `recharts`/`jspdf` already dynamically impo
 
 - `vendor-charts-core` (151 KB gzip) is the single largest chunk. Already lazy; whether a lighter charting approach is viable for what Dashboard actually uses is unassessed — a library swap is out of scope for this pass without the ability to visually verify the charts afterward.
 - `vendor-pdf-core` + `vendor-pdf-utils` (~162 KB gzip combined) — already lazy; no further sub-module tree-shaking investigated.
-- `jspdf`'s critical vulnerability (`AUDIT_REPORT.md` A16) has a fix available but it's a major-version bump needing visual verification of payslip PDF output — not attempted.
+- **RESOLVED this pass**: `jspdf`'s critical vulnerability (`AUDIT_REPORT.md` A16) — upgraded to `^4.2.1`, 0 critical vulnerabilities remaining, compatibility and edge cases verified via `src/utils/pdfGeneration.test.ts`. `vendor-pdf-core` grew ~30KB raw as a result (see the bundle table above) — a reasonable, expected tradeoff for closing a critical vulnerability, not optimized away.
 - **RESOLVED this pass**: the 211 pre-existing TypeScript errors (`Badge`/`Button`/`TD` receiving props those components didn't declare, among others) are now fixed — see `TEST_PLAN.md`'s "TypeScript error resolution." None of these fixes measurably changed bundle size (they were prop/type corrections, not new dependencies or code paths).
 - **`color-contrast`/`target-size` Lighthouse failures** — real, confirmed, not fixed (see above).
 
