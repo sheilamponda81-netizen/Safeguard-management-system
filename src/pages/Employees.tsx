@@ -12,7 +12,7 @@ import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { toCsvRow } from '../utils/csvExport';
-import { buildEmployeeNumberPrefix, nextEmployeeNumber } from '../utils/employeeNumberGeneration';
+import { generateEmployeeNumberServerSide } from '../utils/employeeNumberGeneration';
 
 interface Employee {
   id: string;
@@ -467,25 +467,8 @@ export function EmployeesPage() {
   // addEmployee can call it again, with a fresh read, whenever the number it
   // was handed collides with one someone else just took.
   const getNextEmployeeNumberForRegion = useCallback(async (regionId: string): Promise<string> => {
-    const region = regions.find((r) => r.id === regionId);
-    const regionLetter = (region?.code?.trim() || region?.name?.trim() || 'X').charAt(0).toUpperCase();
-    const prefix = `SFG-${regionLetter}-`;
-
-    const { data } = await supabase
-      .from('employees')
-      .select('employee_number')
-      .ilike('employee_number', `${prefix}%`)
-      .order('employee_number', { ascending: false })
-      .limit(1);
-
-    let nextNumber = 1;
-    if (data && data.length > 0) {
-      const match = data[0].employee_number.match(/\d+$/);
-      if (match) {
-        nextNumber = parseInt(match[0]) + 1;
-      }
-    }
-    return `${prefix}${nextNumber.toString().padStart(3, '0')}`;
+    const region = regions.find((r) => r.id === regionId) || {};
+    return generateEmployeeNumberServerSide(regionId, region);
   }, [regions]);
 
   // ===== ADD EMPLOYEE =====
@@ -1560,16 +1543,7 @@ function AddEmployeeForm({
       const region = regions.find((r) => r.id === regionId);
       if (!region) return;
 
-      const prefix = buildEmployeeNumberPrefix(region);
-
-      const { data } = await supabase
-        .from("employees")
-        .select("employee_number")
-        .ilike("employee_number", `${prefix}%`)
-        .order("employee_number", { ascending: false })
-        .limit(1);
-
-      const formattedNumber = nextEmployeeNumber(prefix, data?.[0]?.employee_number);
+      const formattedNumber = await generateEmployeeNumberServerSide(regionId, region);
       setTimeout(() => {
         update("employeeNumber", formattedNumber);
       }, 10);

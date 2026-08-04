@@ -1,5 +1,24 @@
-import { describe, it, expect } from 'vitest';
-import { getRegionLetter, buildEmployeeNumberPrefix, nextEmployeeNumber } from './employeeNumberGeneration';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const rpcMock = vi.fn();
+const fromResultMock = vi.fn();
+vi.mock('../lib/supabase', () => ({
+  supabase: {
+    rpc: (...args: unknown[]) => rpcMock(...args),
+    from: () => ({
+      select: () => ({
+        ilike: () => ({
+          order: () => ({
+            limit: (...args: unknown[]) => fromResultMock(...args),
+          }),
+        }),
+      }),
+    }),
+  },
+}));
+
+const { getRegionLetter, buildEmployeeNumberPrefix, nextEmployeeNumber, generateEmployeeNumberServerSide } =
+  await import('./employeeNumberGeneration');
 
 describe('getRegionLetter', () => {
   it('uses the region code when one is set', () => {
@@ -39,5 +58,55 @@ describe('nextEmployeeNumber', () => {
 
   it('starts at 001 if the existing value has no trailing digits to increment', () => {
     expect(nextEmployeeNumber('SFG-N-', 'SFG-N-')).toBe('SFG-N-001');
+  });
+});
+
+describe('generateEmployeeNumberServerSide', () => {
+  beforeEach(() => {
+    rpcMock.mockReset();
+    fromResultMock.mockReset();
+  });
+
+  const region = { code: 'N', name: 'Northern' };
+
+  it('calls generate_employee_number with the region id and returns its value verbatim', async () => {
+    rpcMock.mockResolvedValueOnce({ data: 'SFG-N-004', error: null });
+    const result = await generateEmployeeNumberServerSide('region-1', region);
+    expect(result).toBe('SFG-N-004');
+    expect(rpcMock).toHaveBeenCalledWith('generate_employee_number', { p_region_id: 'region-1' });
+    expect(fromResultMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the browser-side highest-existing-number query when the RPC errors', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'function generate_employee_number(uuid) does not exist' } });
+    fromResultMock.mockResolvedValueOnce({ data: [{ employee_number: 'SFG-N-007' }] });
+    const result = await generateEmployeeNumberServerSide('region-1', region);
+    expect(result).toBe('SFG-N-008');
+  });
+
+  it('falls back to "001" when the RPC errors and no employees exist yet for the prefix', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+    fromResultMock.mockResolvedValueOnce({ data: [] });
+    const result = await generateEmployeeNumberServerSide('region-1', region);
+    expect(result).toBe('SFG-N-001');
+  });
+
+  it('falls back when the RPC throws (network failure) rather than returning an {error}', async () => {
+    rpcMock.mockRejectedValueOnce(new Error('network error'));
+    fromResultMock.mockResolvedValueOnce({ data: [{ employee_number: 'SFG-N-002' }] });
+    const result = await generateEmployeeNumberServerSide('region-1', region);
+    expect(result).toBe('SFG-N-003');
+  });
+
+  it('two concurrent calls each get whatever distinct value the database RPC returns', async () => {
+    rpcMock
+      .mockResolvedValueOnce({ data: 'SFG-N-010', error: null })
+      .mockResolvedValueOnce({ data: 'SFG-N-011', error: null });
+    const [first, second] = await Promise.all([
+      generateEmployeeNumberServerSide('region-1', region),
+      generateEmployeeNumberServerSide('region-1', region),
+    ]);
+    expect(first).not.toBe(second);
+    expect([first, second].sort()).toEqual(['SFG-N-010', 'SFG-N-011']);
   });
 });

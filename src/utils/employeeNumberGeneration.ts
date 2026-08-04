@@ -1,9 +1,24 @@
 // Extracted from Employees.tsx's generateEmployeeNumber() so the pure
 // computation (given a region and the highest existing matching number,
-// what's the next one) is unit-testable without a database. The actual
-// Supabase query (fetching the highest existing employee_number for a
-// prefix) stays in Employees.tsx -- this only covers the deterministic
-// part downstream of that fetch.
+// what's the next one) is unit-testable without a database.
+//
+// generateEmployeeNumberServerSide() below supersedes the plain
+// browser-only calculation for anything that actually persists an
+// employee: it calls generate_employee_number() (see
+// supabase/migrations/20260804000001_employee_number_generation.sql), a
+// row-locked, per-prefix counter that's safe under concurrent calls to
+// the function itself, then falls back to the old browser-side
+// "highest existing + 1" query (still using buildEmployeeNumberPrefix/
+// nextEmployeeNumber below) if the RPC call fails for any reason -- e.g.
+// the migration hasn't been applied to this environment yet -- so
+// employee creation never hard-fails because of this call. A residual
+// race window still exists between "a number is generated" and "the
+// browser's INSERT for that employee reaches the database" either way;
+// that gap is guarded by the existing employees UNIQUE(tenant_id,
+// employee_number) constraint plus Employees.tsx's own retry-on-conflict
+// logic (see the migration file's own comment for why full atomicity
+// would require folding employee creation itself into the RPC).
+import { supabase } from '../lib/supabase';
 
 export interface RegionForNumbering {
   code?: string | null;
@@ -41,4 +56,37 @@ export function nextEmployeeNumber(prefix: string, highestExisting?: string | nu
     }
   }
   return `${prefix}${nextNumber.toString().padStart(3, '0')}`;
+}
+
+async function fetchNextEmployeeNumberFromBrowser(region: RegionForNumbering): Promise<string> {
+  const prefix = buildEmployeeNumberPrefix(region);
+  const { data } = await supabase
+    .from('employees')
+    .select('employee_number')
+    .ilike('employee_number', `${prefix}%`)
+    .order('employee_number', { ascending: false })
+    .limit(1);
+  return nextEmployeeNumber(prefix, data?.[0]?.employee_number);
+}
+
+/**
+ * Calls the `generate_employee_number(region_id)` Postgres function (a
+ * row-locked, per-prefix counter -- see the migration referenced above)
+ * so the "next number for this prefix" calculation happens in the
+ * database, serialized against other concurrent calls to the same
+ * function, rather than solely as an unsynchronized read in the browser.
+ * Falls back to the old browser-side calculation (logging the failure)
+ * if the RPC call errors -- e.g. because the migration hasn't been
+ * applied to this environment yet.
+ */
+export async function generateEmployeeNumberServerSide(regionId: string, region: RegionForNumbering): Promise<string> {
+  try {
+    const { data, error } = await supabase.rpc('generate_employee_number', { p_region_id: regionId });
+    if (error) throw error;
+    if (typeof data === 'string' && data.length > 0) return data;
+    throw new Error('generate_employee_number() returned an unexpected value');
+  } catch (err) {
+    console.error('generate_employee_number() RPC failed, falling back to client-side calculation:', err);
+    return fetchNextEmployeeNumberFromBrowser(region);
+  }
 }
