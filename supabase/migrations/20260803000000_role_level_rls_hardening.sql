@@ -200,5 +200,56 @@ ALTER FUNCTION current_user_role_level() SET search_path = public, pg_temp;
 ALTER FUNCTION prevent_profile_privilege_escalation() SET search_path = public, pg_temp;
 
 -- ============================================================
+-- MIGRATION SAFETY NOTES (added after this audit's migration-safety review)
+-- ============================================================
+--
+-- RUN ONCE, SUCCESSFULLY: yes -- every policy change is
+-- `DROP POLICY IF EXISTS` followed by `CREATE POLICY`, and every
+-- function change is `ALTER FUNCTION ... SET search_path`, both
+-- naturally idempotent operations.
+--
+-- RUN TWICE, ACCIDENTALLY: fully safe, no error, no behavior change --
+-- this entire migration is idempotent by construction (every DROP is
+-- guarded with IF EXISTS, every ALTER FUNCTION just re-sets the same
+-- value). Re-running it produces byte-for-byte the same end state.
+--
+-- LOCKS TAKEN / PRODUCTION TRAFFIC IMPACT: `CREATE POLICY`/`DROP POLICY`
+-- take a brief `ACCESS EXCLUSIVE` lock on the affected table (standard
+-- Postgres behavior for any RLS policy change), but only for the
+-- duration of the catalog update itself -- not a table scan like the
+-- UNIQUE constraint migration above, since no existing data is
+-- validated. Expected to be near-instantaneous even on a large table.
+-- `ALTER FUNCTION ... SET search_path` takes a lock on the function
+-- definition itself, similarly brief. Safe to apply during normal
+-- traffic, though a low-traffic window is still the more conservative
+-- choice for any RLS change, since a mistake here changes who can read/
+-- write data immediately.
+--
+-- PREFLIGHT: none needed -- this migration adds/replaces policies and
+-- pins function search_paths; it does not add any constraint that could
+-- fail against existing data.
+--
+-- VERIFICATION SQL (run immediately after applying):
+--   SELECT tablename, policyname FROM pg_policies
+--     WHERE tablename IN ('payment_status','terminal_dues','system_settings','employee_deductions','applicants','payroll','employees')
+--     ORDER BY tablename, policyname;
+--   -- Confirm the expected policy names from this file are present.
+--   SELECT proname, proconfig FROM pg_proc
+--     WHERE proname IN ('get_current_tenant_id','is_super_admin','current_user_role_level','prevent_profile_privilege_escalation');
+--   -- Expected: proconfig contains 'search_path=public, pg_temp' for all 4.
+--
+-- ROLLBACK SQL: revert each policy to its PRE-migration definition (the
+-- exact prior policy text must come from whatever migration originally
+-- created it -- 20240619000000_tenant_isolation.sql /
+-- 20260727000001_security_hardening.sql -- since this migration's own
+-- DROP POLICY statements do not preserve the old policy's SQL text
+-- anywhere; re-create each dropped policy using its original CREATE
+-- POLICY statement from that source file). This is the one rollback in
+-- this migration set that is NOT a trivial one-liner, specifically
+-- because "restore the previous, looser policy" requires knowing what
+-- that policy actually was, not just dropping the new one. No data loss
+-- either way -- rolling back only changes who can read/write, not any
+-- stored data.
+--
 -- END OF ROLE-LEVEL RLS HARDENING MIGRATION
 -- ============================================================

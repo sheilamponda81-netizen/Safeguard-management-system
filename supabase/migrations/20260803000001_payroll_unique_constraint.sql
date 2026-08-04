@@ -45,5 +45,55 @@
 ALTER TABLE payroll ADD CONSTRAINT payroll_employee_month_unique UNIQUE (employee_id, month);
 
 -- ============================================================
+-- MIGRATION SAFETY NOTES (added after this audit's migration-safety review)
+-- ============================================================
+--
+-- RUN ONCE, SUCCESSFULLY: yes, assuming no pre-existing duplicates (see
+-- PREFLIGHT SQL below) -- a single ALTER TABLE ADD CONSTRAINT statement,
+-- no loop, no conditional logic to get wrong.
+--
+-- RUN TWICE, ACCIDENTALLY: the second run FAILS LOUDLY --
+-- `ERROR: constraint "payroll_employee_month_unique" for relation
+-- "payroll" already exists` -- not a silent no-op, but also not
+-- destructive; the correct response is simply "already applied, no
+-- action needed," not a rollback-and-retry.
+--
+-- LOCKS TAKEN / PRODUCTION TRAFFIC IMPACT: `ALTER TABLE ... ADD
+-- CONSTRAINT ... UNIQUE` takes an ACCESS EXCLUSIVE lock on `payroll` for
+-- the duration of the constraint's validation scan (Postgres must read
+-- the whole table once to confirm no existing violation before the
+-- constraint can be created). ACCESS EXCLUSIVE blocks ALL reads and
+-- writes on `payroll` for every other session, including the app itself,
+-- until the scan completes. On a small-to-medium `payroll` table (a
+-- single HR/payroll system's monthly records, not a high-volume
+-- transactional table) this is expected to be sub-second to a few
+-- seconds; it should still be applied during a low-traffic window, never
+-- during active payroll processing.
+-- ============================================================
+
+-- ============================================================
+-- PREFLIGHT SQL (run against production BEFORE applying this migration)
+-- ============================================================
+-- SELECT employee_id, month, COUNT(*) FROM payroll
+--   GROUP BY employee_id, month HAVING COUNT(*) > 1;
+-- Expected: 0 rows. Any row returned identifies a real, pre-existing
+-- duplicate that must be manually resolved (keep the most recently
+-- approved/processed row per employee/month, per this file's own header
+-- comment) BEFORE this migration will apply successfully.
+
+-- ============================================================
+-- VERIFICATION SQL (run immediately after applying)
+-- ============================================================
+-- SELECT conname FROM pg_constraint WHERE conname = 'payroll_employee_month_unique';
+-- Expected: 1 row.
+
+-- ============================================================
+-- ROLLBACK SQL (safe at any time -- drops only the constraint just
+-- added; no data is touched or lost, though rolling back re-opens the
+-- duplicate-row risk this migration exists to close)
+-- ============================================================
+-- ALTER TABLE payroll DROP CONSTRAINT IF EXISTS payroll_employee_month_unique;
+
+-- ============================================================
 -- END OF PAYROLL UNIQUE CONSTRAINT MIGRATION
 -- ============================================================
