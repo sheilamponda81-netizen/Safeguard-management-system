@@ -1,5 +1,5 @@
 ﻿import { useState, useMemo, useEffect, useCallback } from 'react';
-import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, User, Phone, MapPin, Heart, ChevronLeft, ChevronRight, Archive, RotateCcw, Calendar, Clock, AlertCircle, Building2, Home, Loader2 } from 'lucide-react';
+import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, Heart, Archive, RotateCcw, Calendar, AlertCircle, Building2, Home, Loader2 } from 'lucide-react';
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -44,9 +44,9 @@ interface Employee {
   next_of_kin_phone?: string;
   next_of_kin_address?: string;
   is_deleted?: boolean;
-  deleted_at?: string;
-  deleted_reason?: string;
-  deleted_by?: string;
+  deleted_at?: string | null;
+  deleted_reason?: string | null;
+  deleted_by?: string | null;
   deleted_by_name?: string;
   created_at?: string;
   assignment_type?: string;
@@ -1401,8 +1401,7 @@ export function EmployeesPage() {
             employee={editingEmployee}
             onSubmit={updateEmployee} 
             onCancel={() => { setShowEdit(false); setEditingEmployee(null); }} 
-            departments={departmentOptions} 
-            regions={regions}
+            departments={departmentOptions}
             isSuperAdmin={isSuperAdmin}
             relationshipOptions={relationshipOptions}
           />
@@ -1465,12 +1464,10 @@ function AddEmployeeForm({
 
   const [positions, setPositions] = useState<any[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [showResidentFields, setShowResidentFields] = useState(false);
   const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
   const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
   const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
   const [showResidentSuggestions, setShowResidentSuggestions] = useState(false);
-  const [suggestionLoading, setSuggestionLoading] = useState(false);
   
   // ===== NEW: Loading state for submit button =====
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -1502,7 +1499,6 @@ function AddEmployeeForm({
       return;
     }
     
-    setSuggestionLoading(true);
     try {
       const normalized = normalizeText(input);
       const { data } = await supabase
@@ -1516,8 +1512,6 @@ function AddEmployeeForm({
       setShowCompanySuggestions(true);
     } catch (err) {
       console.error('Error fetching company suggestions:', err);
-    } finally {
-      setSuggestionLoading(false);
     }
   }, []);
 
@@ -1528,7 +1522,6 @@ function AddEmployeeForm({
       return;
     }
     
-    setSuggestionLoading(true);
     try {
       const normalized = normalizeText(input);
       const { data } = await supabase
@@ -1543,15 +1536,12 @@ function AddEmployeeForm({
       setShowResidentSuggestions(true);
     } catch (err) {
       console.error('Error fetching resident suggestions:', err);
-    } finally {
-      setSuggestionLoading(false);
     }
   }, []);
 
   // Handle assignment type change
   const handleAssignmentTypeChange = (type: string) => {
     update("assignment_type", type);
-    setShowResidentFields(type === 'resident');
     if (type === 'company') {
       update("resident_name", "");
       update("resident_contact", "");
@@ -2201,12 +2191,11 @@ function AddEmployeeForm({
 }
 
 // ===== EditEmployeeForm =====
-function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, isSuperAdmin, relationshipOptions }: { 
+function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAdmin, relationshipOptions }: {
   employee: Employee;
-  onSubmit: (e: any) => void; 
-  onCancel: () => void; 
-  departments: string[]; 
-  regions: any[];
+  onSubmit: (e: any) => void;
+  onCancel: () => void;
+  departments: string[];
   isSuperAdmin?: boolean;
   relationshipOptions: string[];
 }) {
@@ -2242,7 +2231,6 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
   });
   
   const [positions, setPositions] = useState<any[]>([]);
-  const [showResidentFields, setShowResidentFields] = useState(form.assignment_type === 'resident');
   const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
   const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
   const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
@@ -2283,7 +2271,6 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
 
   const handleAssignmentTypeChange = (type: string) => {
     update("assignment_type", type);
-    setShowResidentFields(type === 'resident');
     if (type === 'company') {
       update("resident_name", "");
       update("resident_contact", "");

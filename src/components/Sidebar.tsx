@@ -1,16 +1,16 @@
-import { 
-  LayoutDashboard, Users, UserCheck, Calendar, DollarSign, 
-  FileText, CreditCard, Receipt, FileBarChart, Settings, 
-  Shield, Sparkles, History, LogOut, Menu, X, ChevronDown, 
-  Building2, MapPin, User, Briefcase, Wallet, Clock, 
-  CheckCircle, AlertCircle, Calculator, ClipboardList, 
+import {
+  LayoutDashboard, Users, DollarSign,
+  FileText, Settings,
+  Shield, History, LogOut, Menu, X,
+  Wallet,
+  Calculator, ClipboardList,
   CalendarCheck, BarChart3, BookOpen
 } from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
 import { getCurrentProfile } from "../utils/currentProfile";
 import { getCompanySettings } from "../utils/companySettings";
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { ChevronRight } from 'lucide-react';
 
 export type NavKey =
@@ -94,7 +94,6 @@ export function Sidebar({
   const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
   const [loading, setLoading] = useState(true);
   const [userName, setUserName] = useState<string>("User");
-  const [userEmail, setUserEmail] = useState<string>("");
   const [isMobile, setIsMobile] = useState(false);
   const [logoUrl, setLogoUrl] = useState('');
 
@@ -155,7 +154,6 @@ export function Sidebar({
           data: { user },
         } = await supabase.auth.getUser();
         if (user) {
-          setUserEmail(user.email || "");
           let profile: any = null;
           let error: any = null;
           try {

@@ -1,4 +1,4 @@
-import { useState, useEffect, lazy, Suspense, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, lazy, Suspense, useCallback, useMemo } from "react";
 import { Toaster } from "sonner";
 import { LoginPage } from "./pages/Login";
 import { Sidebar, TopBar, BottomNav, NavKey } from "./components/Sidebar";
@@ -11,25 +11,27 @@ import { PageLoader } from "./components/PageLoader";
 import { measurePerformance } from "./utils/performance";
 
 // ===== PERFORMANCE: NO PRELOADING - Only load when needed =====
-const safeLazy = (importFn: () => Promise<any>) => {
+// Generic over each page module's own default-export type so `pageComponents`
+// below reflects what these dynamic imports actually resolve to, instead of
+// collapsing every page to `any`.
+const safeLazy = <P extends object>(importFn: () => Promise<{ default: React.ComponentType<P> }>) => {
   return lazy(() =>
     importFn().catch((error) => {
       console.error('Failed to load component:', error);
-      return {
-        default: () => (
-          <div className="p-8 text-center">
-            <div className="text-red-600 text-4xl mb-4">⚠️</div>
-            <p className="text-red-600 font-semibold">Failed to load component</p>
-            <p className="text-sm text-slate-500 mt-2">Please refresh the page</p>
-            <button
-              onClick={() => window.location.reload()}
-              className="mt-4 px-4 py-2 bg-[#081C3A] text-white rounded-lg hover:bg-[#1a2f5c]"
-            >
-              Refresh Page
-            </button>
-          </div>
-        )
-      };
+      const LoadFailed: React.ComponentType<P> = () => (
+        <div className="p-8 text-center">
+          <div className="text-red-600 text-4xl mb-4">⚠️</div>
+          <p className="text-red-600 font-semibold">Failed to load component</p>
+          <p className="text-sm text-slate-500 mt-2">Please refresh the page</p>
+          <button
+            onClick={() => window.location.reload()}
+            className="mt-4 px-4 py-2 bg-[#081C3A] text-white rounded-lg hover:bg-[#1a2f5c]"
+          >
+            Refresh Page
+          </button>
+        </div>
+      );
+      return { default: LoadFailed };
     })
   );
 };
@@ -51,7 +53,7 @@ const FeaturesPage = safeLazy(() => import("./pages/Features"));
 const UserManualPage = safeLazy(() => import("./pages/UserManual"));
 
 // ===== PAGE COMPONENTS MAP =====
-const pageComponents: Record<NavKey, React.LazyExoticComponent<() => JSX.Element>> = {
+const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentType<object>>> = {
   dashboard: Dashboard,
   employees: EmployeesPage,
   recruitment: RecruitmentPage,
@@ -125,11 +127,7 @@ export default function App() {
   // ===== PERFORMANCE: Only preload on hover =====
   const handlePreload = useCallback((key: NavKey) => {
     if (preloaded.has(key)) return;
-    
-    const component = pageComponents[key];
-    if (component) {
-      setPreloaded(prev => new Set(prev).add(key));
-    }
+    setPreloaded(prev => new Set(prev).add(key));
   }, [preloaded]);
 
   // ===== OPTIMIZED: Use useMemo for allowed pages =====
@@ -255,7 +253,7 @@ export default function App() {
         }));
         setLoading(false);
         setSessionChecked(true);
-      } else if (event === 'SIGNED_OUT' || event === 'USER_DELETED') {
+      } else if (event === 'SIGNED_OUT') {
         setLoggedIn(false);
         setUserRoleLevel(4);
         localStorage.removeItem('sb-session');
