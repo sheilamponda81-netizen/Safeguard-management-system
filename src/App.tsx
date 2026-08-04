@@ -231,7 +231,7 @@ export default function App() {
           }
           setLoading(false);
         }
-      } catch (err: any) {
+      } catch (err) {
         console.error('Session check failed:', err);
         setLoggedIn(false);
         setLoading(false);

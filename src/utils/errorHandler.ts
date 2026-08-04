@@ -49,6 +49,16 @@ export class ValidationError extends AppError {
   }
 }
 
+// Narrows a caught `unknown` value down to a displayable string, for the
+// common `catch (err) { showNotification('X failed: ' + getErrorMessage(err)) }`
+// pattern -- without this, call sites fall back to `catch (err: any)` just to
+// reach `err.message`.
+export const getErrorMessage = (error: unknown): string => {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  return 'Unknown error';
+};
+
 export const handleError = (error: any): string => {
   console.error('Error occurred:', error);
   

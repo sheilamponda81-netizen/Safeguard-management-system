@@ -14,6 +14,8 @@ import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSe
 import { calculateLivePayroll } from '../utils/payrollCalculations';
 import { processPayrollBatch } from '../utils/payrollProcessing';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { UserProfile } from '../utils/currentProfile';
+import { getErrorMessage } from '../utils/errorHandler';
 import {
   canProcessPayroll as canProcessPayrollFor,
   canEditPayroll as canEditPayrollFor,
@@ -90,7 +92,7 @@ export function PayrollPage() {
   const [editingValues, setEditingValues] = useState<Record<string, Partial<PayrollRecord>>>({});
   const [showCopyModal, setShowCopyModal] = useState(false);
   const [hasData, setHasData] = useState(false);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [copySourceMonths, setCopySourceMonths] = useState<string[]>([]);
   const [processedMonths, setProcessedMonths] = useState<string[]>([]);
   const [processingStatus, setProcessingStatus] = useState('');
@@ -322,9 +324,9 @@ export function PayrollPage() {
 
       setHasData((payrollData?.length || 0) > 0);
 
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error fetching data:', err);
-      showNotification('Failed to load payroll data: ' + err.message, 'error');
+      showNotification('Failed to load payroll data: ' + getErrorMessage(err), 'error');
     } finally {
       setLoading(false);
     }
@@ -629,9 +631,9 @@ export function PayrollPage() {
       setIsApproved(false);
       setShowCopyModal(false);
       showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${result.insertedCount ?? newRecords.length} records copied.`, 'success');
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error copying data:', err);
-      showNotification('Failed to copy data: ' + err.message, 'error');
+      showNotification('Failed to copy data: ' + getErrorMessage(err), 'error');
     } finally {
       setProcessingStatus('');
     }
@@ -705,9 +707,9 @@ export function PayrollPage() {
       await fetchData();
       await fetchProcessedMonths();
 
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error approving payroll:', err);
-      showNotification('Failed to approve payroll: ' + err.message, 'error');
+      showNotification('Failed to approve payroll: ' + getErrorMessage(err), 'error');
     } finally {
       setProcessing(false);
       setProcessingStatus('');
@@ -809,9 +811,9 @@ export function PayrollPage() {
 
       showNotification(`Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${result.insertedCount ?? payrollToSave.length} employees processed. The payroll is now pending approval by a manager or admin.`, 'success');
 
-    } catch (err: any) {
+    } catch (err) {
       console.error('❌ Error processing payroll:', err);
-      showNotification('Failed to process payroll: ' + err.message, 'error');
+      showNotification('Failed to process payroll: ' + getErrorMessage(err), 'error');
     } finally {
       setProcessing(false);
       setProcessingStatus('');

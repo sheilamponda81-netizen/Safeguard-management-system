@@ -1,13 +1,41 @@
 import { supabase } from '../lib/supabase';
 
-let cache: { userId: string; profile: any } | null = null;
-let inFlight: Promise<any> | null = null;
+export interface UserProfileRegion {
+  id: string;
+  tenant_id: string;
+  name: string;
+  code: string | null;
+  created_at: string;
+}
+
+// Shape of a `profiles` row joined with its `regions` row (see the
+// `.select('*, regions(*)')` query below). Shared across every page that
+// reads the logged-in user's role/region instead of each declaring its own
+// `userProfile: any` state.
+export interface UserProfile {
+  id: string;
+  tenant_id: string;
+  email: string | null;
+  full_name: string | null;
+  role: string | null;
+  role_level: number;
+  department: string | null;
+  is_super_admin: boolean;
+  is_active: boolean;
+  region_id: string | null;
+  deleted_at: string | null;
+  created_at: string;
+  regions: UserProfileRegion | null;
+}
+
+let cache: { userId: string; profile: UserProfile | null } | null = null;
+let inFlight: Promise<UserProfile | null> | null = null;
 
 // Fetches the current user's `profiles` row (joined with their region),
 // cached per session. Nearly every page independently re-fetched this on
 // mount; this shares one cached result across all of them instead of each
 // issuing its own redundant network request for data that rarely changes.
-export async function getCurrentProfile(forceRefresh = false): Promise<any> {
+export async function getCurrentProfile(forceRefresh = false): Promise<UserProfile | null> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) {
     cache = null;
