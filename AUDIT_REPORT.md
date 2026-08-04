@@ -1,7 +1,7 @@
 # Safeguard HR & Payroll System — Production Readiness Audit
 
 **Branch:** `audit/full-system-hardening`
-**Last updated:** 2026-08-03 (second pass, after a correctness review of the first pass — see "Corrections from the first pass" below)
+**Last updated:** 2026-08-04 (third pass — added Finding A19 and refreshed test-suite numbers; see "Corrections from the first pass" below for the second pass's corrections)
 **Scope:** Full repository (frontend + Supabase schema/migrations/edge functions). Production URL `https://safeguard-management-system.vercel.app/` referenced for context but not directly tested.
 
 ## Corrections from the first pass
@@ -66,7 +66,7 @@ Unchanged from the first pass — see the "Pages / routes," "Database tables," "
 | `npm ci` | 0 | Succeeds |
 | `npm run type-check` | **2** | **211 errors.** (Baseline on `origin/main`, checked in a separate worktree: 218. See "Corrections from the first pass.") This is a genuine failing result — not classified as passing, not glossed over. |
 | `npm run lint` | 0 | 518 warnings, 0 errors. ESLint's own convention is exit 0 with only warnings; the 518 warnings themselves are **not** fixed and remain outstanding (`@typescript-eslint/no-explicit-any`, `react-hooks/exhaustive-deps`). Before this audit, this command **could not run at all** — no config file had ever existed. |
-| `npm run test` | 0 | **39 tests, 39 passed, 2 test files.** This command did not exist before this audit (`npm error: Missing script "test"`, exit 1) — Vitest was added, along with real tests for `calculateLivePayroll` and `csvExport`. Actually executed, not assumed. |
+| `npm run test` | 0 | **80 tests, 80 passed, 7 test files.** This command did not exist before this audit (`npm error: Missing script "test"`, exit 1). Second pass added Vitest with tests for `calculateLivePayroll` and `csvExport` (39 tests, 2 files); this third pass added 5 more extracted utilities (`employeeNumberGeneration`, `guardIdGeneration`, `terminalDuesCalculations`, `payrollPermissions`, `attendanceDeductions` — see `TEST_PLAN.md`), bringing the total to 80. Actually executed, not assumed. |
 | `npm run test:e2e` | 0 | **14 tests: 7 passed, 7 skipped, 0 failed.** Did not exist before this audit (same "Missing script" exit 1 failure). Playwright was added. The 7 passing are a static suite needing no credentials; the 7 skipped are an RLS-policy staging matrix that correctly reports as skipped (not passing) without staging credentials — verified by actually running it in this credential-less environment. |
 | `npm run build` | 0 | Succeeds, clean, throughout every commit in this branch |
 | `npm audit` | n/a | 12 vulnerabilities: **1 critical (`jspdf`), 9 high, 2 moderate.** (Was 13: 1 critical, 10 high, 2 moderate — the 1 high removed was `xlsx`.) **The critical vulnerability is not fixed** — see Finding A16. |
@@ -113,6 +113,8 @@ Deliberately does **not** recompute payroll figures itself — that logic stays 
 **A14. `withRateLimit` in `rateLimiter.ts` is dead code** (never imported anywhere). Its useless try/catch and 2 unused variables were cleaned up; the function itself remains, flagged not deleted.
 
 **A15. `dev` script's unnecessary `--force`** — removed, verified (dev server starts in ~270ms and serves correctly without it).
+
+**A19 (new). Recruitment applicant status has no transition validation at any layer.** `Recruitment.tsx` writes `applicants.status` as a plain string field; the only constraint anywhere is a database-level `CHECK` restricting it to a fixed set of allowed values — there is no rule, client-side or server-side, preventing an invalid *sequence* (e.g. `rejected` → `hired`, or skipping an intermediate stage the workflow is meant to require). **Deliberately not fixed and not given a test**: writing either would mean inventing a transition policy this audit has no source for, which the standing instruction against changing/inventing business rules without a confirmed requirement rules out. If a specific transition policy is wanted (e.g. a fixed pipeline order, or certain roles being barred from certain transitions), that's a product decision to make first — then it can be implemented and tested for real, rather than tested into existence here.
 
 ## What was inspected
 

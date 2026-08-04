@@ -1,6 +1,6 @@
 # Security Review — Safeguard HR & Payroll System
 
-**Last updated:** 2026-08-03 (second pass). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section first — two claims in the original version of this review's sibling document were factually wrong (TypeScript error count, critical vulnerability attribution) and have been corrected throughout. This review remains a **static reading of the codebase and SQL migrations**, not a live penetration test — no Supabase admin access, no per-role test credentials, no staging database. Every claim states its evidence.
+**Last updated:** 2026-08-04 (third pass — added a note on `payrollPermissions.test.ts`'s app-level coverage). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section first — two claims in the original version of this review's sibling document were factually wrong (TypeScript error count, critical vulnerability attribution) and have been corrected throughout. This review remains a **static reading of the codebase and SQL migrations**, not a live penetration test — no Supabase admin access, no per-role test credentials, no staging database. Every claim states its evidence.
 
 ## Authentication review
 
@@ -32,6 +32,8 @@
 | `company-logo` storage | public | any authenticated user | any authenticated user | any authenticated user | Not touched |
 
 **"Covered" still means "migration written and reviewed, not executed."** See "RLS testing status" below.
+
+**Note on the `payroll` row's "role_level = 1 or super-admin" app-level gating**: this is now backed by a real unit test (`src/utils/payrollPermissions.test.ts`, 15 tests) covering `canProcessPayroll`/`canEditPayroll`/`canViewPayroll`/`canApprovePayroll` against all 4 role levels plus the super-admin override. This is **frontend** logic only — it controls what the UI shows/allows, and does **not** substitute for the DB-level RLS policy in the same row, which remains the actual enforcement boundary against a direct API call bypassing the UI.
 
 ## RLS testing status (updated — this is no longer purely hypothetical)
 
