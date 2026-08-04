@@ -1,6 +1,8 @@
 # Performance Report — Safeguard HR & Payroll System
 
-**Last updated:** 2026-08-03 (second pass). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section — those corrections were about the TS-error count and vulnerability attribution, not this document, but the same standard applies here: everything below is either an actual command's real output, or explicitly marked unmeasured.
+**Last updated:** 2026-08-04 (third pass — no new performance/bundle findings; see note below). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section — those corrections were about the TS-error count and vulnerability attribution, not this document, but the same standard applies here: everything below is either an actual command's real output, or explicitly marked unmeasured.
+
+**Third-pass note:** this pass's changes (5 pure-function extractions in `src/utils/*` — `employeeNumberGeneration`, `guardIdGeneration`, `terminalDuesCalculations`, `payrollPermissions`, `attendanceDeductions` — for real unit-test coverage, see `TEST_PLAN.md`) are small, non-UI utility modules with no new dependencies and no lazy-loading changes. `npm run build` was re-run and stayed clean, but re-running Lighthouse would not show any real movement from these specific changes, so it wasn't repeated. The numbers below are unchanged from the second pass.
 
 **Update from the first pass: a real Lighthouse run is no longer blocked.** The first pass said Lighthouse couldn't run because the production domain is blocked by this environment's outbound proxy. That's still true for the *production URL specifically*, but nothing stopped running Lighthouse against a **local** production build — which this pass did, twice (before and after a set of accessibility fixes), with real, reproducible numbers.
 

@@ -1,6 +1,6 @@
 # Data Integrity Review — Safeguard HR & Payroll System
 
-**Last updated:** 2026-08-03 (second pass). Static review of `supabase/migrations/*.sql`. No live database was available to run these against real data.
+**Last updated:** 2026-08-04 (third pass — added a unit-test citation confirming the guard-ID collision risk below, no other changes to this document's findings). Static review of `supabase/migrations/*.sql`. No live database was available to run these against real data.
 
 ## Constraints — current state
 
@@ -21,7 +21,7 @@
 | Duplicate `payment_status` (employee+month) | Prevented (pre-existing) — and now has a real, executable staging test (`e2e/authenticated/rls-policy-matrix.spec.ts`) confirming a denied UPDATE affects zero rows rather than silently succeeding |
 | Duplicate `payroll` (employee+month) | **Was NOT prevented.** Fixed via `20260803000001_payroll_unique_constraint.sql`. **NOT executed** — may fail to apply if production already has duplicates (a safe failure mode, not corruption — see the migration's own comment) |
 | Duplicate `employees` (employee_number) | Prevented (pre-existing) |
-| Duplicate guard IDs (`employees."guardId"`) | **No unique constraint found.** Not fixed this pass — flagged, not newly investigated in this second pass either |
+| Duplicate guard IDs (`employees."guardId"`) | **No unique constraint found.** Not fixed this pass. Confirmed mechanically this third pass: `src/utils/guardIdGeneration.ts` (extracted from 5 previously-inconsistent inline generators in `Security.tsx`) and its test `guardIdGeneration.test.ts` prove the generator itself has no de-duplication state — repeated calls are independent random draws from a 1000–9999 range, so nothing at the application layer prevents a collision, and there's still no DB-level constraint to catch one either. Real fix would need a `UNIQUE` constraint plus retry-on-conflict, or a sequence — a schema change, out of scope for this pass |
 
 ## Concurrency and atomicity — the real fix this pass adds
 
