@@ -1,6 +1,6 @@
 # Security Review — Safeguard HR & Payroll System
 
-**Last updated:** 2026-08-04 (third pass — added a note on `payrollPermissions.test.ts`'s app-level coverage). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section first — two claims in the original version of this review's sibling document were factually wrong (TypeScript error count, critical vulnerability attribution) and have been corrected throughout. This review remains a **static reading of the codebase and SQL migrations**, not a live penetration test — no Supabase admin access, no per-role test credentials, no staging database. Every claim states its evidence.
+**Last updated:** 2026-08-04 (fourth pass — payroll RPC now wired to the frontend, guard-ID/employee-number generation added, recruitment transition gap documented). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section first — two claims in the original version of this review's sibling document were factually wrong (TypeScript error count, critical vulnerability attribution) and have been corrected throughout. This review remains a **static reading of the codebase and SQL migrations**, not a live penetration test — no Supabase admin access, no per-role test credentials, no staging database. Every claim states its evidence.
 
 ## Authentication review
 
@@ -20,7 +20,7 @@
 |---|---|---|---|---|---|
 | `profiles` | self + tenant | self | self (sensitive columns blocked) | super-admin only | Covered (pre-existing fix) |
 | `employees` | tenant-wide | tenant-wide, **no role check** | tenant-wide, **no role check** | super-admin only (this audit) | **Gap remains on INSERT/UPDATE** — needs column-level design (Supervisors write guard/shift/uniform columns via Security.tsx; Admins/Managers write everything via Employees.tsx) |
-| `payroll` | tenant-wide | role_level = 1 or super-admin | role_level = 1 or super-admin | super-admin only (this audit) | Covered, plus a new atomic RPC (unwired) closing the non-atomicity gap |
+| `payroll` | tenant-wide | role_level = 1 or super-admin | role_level = 1 or super-admin | super-admin only (this audit) | Covered, plus a new atomic RPC — **now wired into `Payroll.tsx`** this pass, closing the non-atomicity gap (see `AUDIT_REPORT.md` A8) |
 | `attendance` | tenant-wide | **no role check** | **no role check** | **no role check** | **Not touched this pass** — Staff (role 4), who cannot even see the Attendance page in the UI, can currently write attendance directly via API |
 | `applicants` | tenant-wide | role_level ≤ 2 (this audit) | role_level ≤ 2 (this audit) | role_level ≤ 2 (this audit) | Covered |
 | `payment_status` | tenant-wide | role_level ≤ 2 (this audit) | role_level ≤ 2 (this audit) | no role check | INSERT/UPDATE covered, DELETE not touched. **Now has an executable staging test** (`e2e/authenticated/rls-policy-matrix.spec.ts`) |
@@ -30,6 +30,7 @@
 | `audit_logs` | tenant-wide | tenant-wide (app writes as acting user) | no policy → denied by default | no policy → denied by default | Already correctly immutable — a real pass, not a gap |
 | `regions`/`companies`/`positions` | tenant-wide | tenant-wide, no role check | tenant-wide, no role check | tenant-wide, no role check | Not touched (lower sensitivity, follow-up) |
 | `company-logo` storage | public | any authenticated user | any authenticated user | any authenticated user | Not touched |
+| `employee_number_counters` (new this pass) | tenant-wide (SELECT policy only) | **no policy — writes only via `generate_employee_number()`, `SECURITY DEFINER`** | same | same | RLS enabled with a `SELECT`-only policy; INSERT/UPDATE deliberately have no policy for `authenticated` at all, since the only intended writer is the `SECURITY DEFINER` function, which bypasses RLS for its own writes the same way `process_payroll_batch()` does for `payroll`/`audit_logs` |
 
 **"Covered" still means "migration written and reviewed, not executed."** See "RLS testing status" below.
 
@@ -43,6 +44,8 @@
 - `employees`: a non-super-admin Admin cannot hard-DELETE a (disposable, test-created) employee record.
 
 Actually run in this environment: **all 7 tests report as SKIPPED**, with a clear reason (`Missing: E2E_BASE_URL, E2E_SUPABASE_URL, ...`), because no staging credentials exist here. This was verified by running it, not assumed. To turn these into a real pass/fail signal, set the env vars listed in `e2e/fixtures.ts` against a real staging Supabase project with the role_level hardening migration applied and 4 seeded test accounts.
+
+**New this pass: `e2e/authenticated/rpc-workflow-matrix.spec.ts`** (12 scenarios, same skip-gating) adds a role-boundary test the RLS matrix didn't cover: that `process_payroll_batch()`'s own internal role check rejects a Staff caller outright (not via RLS on the `payroll` table directly, since the function is `SECURITY DEFINER` and bypasses RLS — its authorization is self-enforced, so this test specifically exercises that self-enforcement rather than assuming it works because the underlying table policy does). See `TEST_PLAN.md` for the full scenario list.
 
 ## Candidate region/access-control model (documented, NOT implemented)
 
@@ -90,7 +93,9 @@ Unchanged and still a genuine pass: `audit_logs` has no UPDATE/DELETE policy at 
 5. **A6: backup/recovery non-functional** — documentation now corrected; the underlying feature gap (build vs. leave unbuilt) is still an open decision.
 6. **A7: `company-logo` storage bucket** unrestricted writes.
 7. **A1: credential in git history** — pending your decision on history rewriting; password rotation still needed regardless.
-8. Password reset flow, audit-log exhaustive coverage — both still unreviewed.
+8. **A19: recruitment status has no transition validation at any layer** — an Admin/Manager can currently hire a still-`Pending` applicant with one click, or reject an already-`Accepted` one; see `AUDIT_REPORT.md`'s decision table and candidate state machine (documented, not implemented, pending business approval).
+9. **A21: `showNotification()`'s success/error/info distinction is cosmetic only** — every call renders as the same unstyled `alert()`, which is a UX gap, not itself a security issue, but is listed here since it was found during this security-focused pass.
+10. Password reset flow, audit-log exhaustive coverage — both still unreviewed.
 
 ## Verification status legend
 
