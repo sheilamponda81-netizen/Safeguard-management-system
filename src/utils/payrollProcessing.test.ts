@@ -33,7 +33,7 @@ describe('processPayrollBatch', () => {
 
   it('rejects an empty record list without calling the RPC at all', async () => {
     const result = await processPayrollBatch('2026-08', []);
-    expect(result).toEqual({ success: false, error: 'No payroll records supplied' });
+    expect(result).toEqual({ success: false, outcome: 'validation_failed', error: 'No payroll records supplied' });
     expect(rpcMock).not.toHaveBeenCalled();
   });
 
@@ -51,29 +51,69 @@ describe('processPayrollBatch', () => {
   it('returns a structured success result with deleted/inserted counts', async () => {
     rpcMock.mockResolvedValueOnce({ data: { success: true, month: '2026-08', deletedCount: 3, insertedCount: 5 }, error: null });
     const result = await processPayrollBatch('2026-08', [sampleRecord]);
-    expect(result).toEqual({ success: true, month: '2026-08', deletedCount: 3, insertedCount: 5 });
+    expect(result).toEqual({ success: true, outcome: 'success', month: '2026-08', deletedCount: 3, insertedCount: 5 });
   });
 
-  it('surfaces a validation error raised inside the RPC (e.g. already-approved month) as a structured failure, not a thrown exception', async () => {
+  it('surfaces an already-approved-month conflict raised inside the RPC as a structured failure, not a thrown exception', async () => {
     rpcMock.mockResolvedValueOnce({
       data: null,
       error: { message: 'Cannot reprocess 2026-08: 2 of the targeted employees already have approved payroll for this month. Reject the existing approval first.' },
     });
     const result = await processPayrollBatch('2026-08', [sampleRecord]);
     expect(result.success).toBe(false);
+    expect(result.outcome).toBe('approved_conflict');
     expect(result.error).toMatch(/already have approved payroll/);
+  });
+
+  it('classifies an authorization exception raised inside the RPC as "unauthorized"', async () => {
+    rpcMock.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'Only Admins or super admins may process payroll' },
+    });
+    const result = await processPayrollBatch('2026-08', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('unauthorized');
+  });
+
+  it('classifies any other exception raised inside the RPC as "validation_failed"', async () => {
+    rpcMock.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'Refusing to process: the same employee_id appears more than once in this batch' },
+    });
+    const result = await processPayrollBatch('2026-08', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('validation_failed');
+  });
+
+  it('classifies a PGRST202 (function not found) error as "missing_rpc" with a non-technical message, not the raw Postgrest error', async () => {
+    rpcMock.mockResolvedValueOnce({
+      data: null,
+      error: { code: 'PGRST202', message: 'Could not find the function public.process_payroll_batch in the schema cache' },
+    });
+    const result = await processPayrollBatch('2026-08', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('missing_rpc');
+    expect(result.error).not.toMatch(/schema cache/);
   });
 
   it('surfaces a network-level throw as a structured failure too', async () => {
     rpcMock.mockRejectedValueOnce(new Error('network error'));
     const result = await processPayrollBatch('2026-08', [sampleRecord]);
-    expect(result).toEqual({ success: false, error: 'network error' });
+    expect(result).toEqual({ success: false, outcome: 'network_error', error: 'network error' });
   });
 
   it('treats a missing/malformed RPC response as a failure rather than assuming success', async () => {
     rpcMock.mockResolvedValueOnce({ data: null, error: null });
     const result = await processPayrollBatch('2026-08', [sampleRecord]);
     expect(result.success).toBe(false);
+    expect(result.outcome).toBe('unexpected_response');
+  });
+
+  it('treats a response missing a required field (e.g. insertedCount) as unexpected, not success', async () => {
+    rpcMock.mockResolvedValueOnce({ data: { success: true, month: '2026-08', deletedCount: 3 }, error: null });
+    const result = await processPayrollBatch('2026-08', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('unexpected_response');
   });
 
   it('still calls the RPC even when auth.getUser() cannot resolve an email (passes null, matching the RPC default)', async () => {
