@@ -26,7 +26,7 @@ Exit code **0**. `Test Files 9 passed (9)`, `Tests 105 passed (105)` (was 97/8 f
 ```
 $ npm run test:e2e
 ```
-Exit code **0**. `54 tests: 16 passed, 38 skipped, 0 failed` (was 14 skipped/16 passed at the start of this pass; a new staging-gated file, `rpc-workflow-matrix.spec.ts`, added 24 more correctly-skipped tests — 12 scenarios × 2 browser projects).
+Exit code **0**. `66 tests: 16 passed, 50 skipped, 0 failed` (Playwright's own "Running 66 tests" line, re-verified fresh this pass). Previously documented as 54 -- that figure had gone stale/incorrect since no `e2e/` file was touched in the intervening passes; corrected here rather than carried forward unchecked.
 
 ```
 $ npm run build
