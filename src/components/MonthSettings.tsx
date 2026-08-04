@@ -16,13 +16,20 @@ interface MonthSettingsProps {
   onMonthChange?: (month: string) => void;
 }
 
+// Only the 2 columns this component's own query selects -- narrower than
+// the shared UserProfile type, which assumes a `*, regions(*)` select.
+interface MonthSettingsProfile {
+  is_super_admin: boolean;
+  role_level: number;
+}
+
 export function MonthSettings({ onMonthChange }: MonthSettingsProps) {
   const [currentMonth, setCurrentMonth] = useState<string>('');
   const [selectedMonth, setSelectedMonth] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showModal, setShowModal] = useState(false);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<MonthSettingsProfile | null>(null);
   const [error, setError] = useState<string | null>(null);
   
   // Get available months (current and future)
