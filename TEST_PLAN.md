@@ -1,6 +1,6 @@
 # Test Plan — Safeguard HR & Payroll System
 
-**Last updated:** 2026-08-04 (fourth pass — 0 TypeScript errors reached, server-side guard-ID/employee-number generation, payroll RPC wired, new integration test file, utility-to-page wiring reconciliation). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section first. This document describes a **real, running test setup** — not a plan for one. Every number below comes from actually executing the relevant command in this environment.
+**Last updated:** 2026-08-04 (fifth pass — jsPDF upgraded to a patched version with a new real test file, all 16 `react-hooks/exhaustive-deps` warnings fixed as genuine bugs, ESLint warnings classified/partially fixed). Read `AUDIT_REPORT.md`'s "Corrections from the first pass" section first. This document describes a **real, running test setup** — not a plan for one. Every number below comes from actually executing the relevant command in this environment.
 
 ## Status: what actually exists now vs. the first pass
 
@@ -16,12 +16,12 @@ Exit code **0**. **Zero errors** — down from 211 at the start of this pass (21
 ```
 $ npm run lint
 ```
-Exit code **0**. 386 warnings, 0 errors (was 518 warnings at the start of the third pass; down further as dead code was removed while fixing type errors). The remaining warnings are all pre-existing `@typescript-eslint/no-explicit-any` and a couple of `react-hooks/exhaustive-deps` notices — not silenced, still outstanding.
+Exit code **0**. **339 warnings, 0 errors** (was 386 at the start of this pass, 518 at the start of the third). This pass fixed all 16 `react-hooks/exhaustive-deps` (each a real bug — see `AUDIT_REPORT.md`'s "ESLint warning remediation"), all 7 `no-unused-vars`, both `react-refresh/only-export-components`, and 22 of 361 `no-explicit-any`. The remaining 339 are every one `no-explicit-any`, classified by file/risk in `AUDIT_REPORT.md` — not silenced, not globally disabled.
 
 ```
 $ npm run test
 ```
-Exit code **0**. `Test Files 8 passed (8)`, `Tests 97 passed (97)` (was 80/7 files at the start of this pass; 3 new files this pass — `guardIdGeneration`'s server-side additions, `employeeNumberGeneration`'s server-side additions, and new `payrollProcessing.test.ts` — see below).
+Exit code **0**. `Test Files 9 passed (9)`, `Tests 105 passed (105)` (was 97/8 files at the start of this pass; new this pass — `pdfGeneration.test.ts`, 8 tests exercising real, non-mocked jsPDF calls against both API-usage patterns this app has, post-upgrade to `^4.2.1` — see `AUDIT_REPORT.md` Finding A16).
 
 ```
 $ npm run test:e2e
