@@ -12,6 +12,7 @@ import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { toCsvRow } from '../utils/csvExport';
+import { buildEmployeeNumberPrefix, nextEmployeeNumber } from '../utils/employeeNumberGeneration';
 
 interface Employee {
   id: string;
@@ -1569,12 +1570,7 @@ function AddEmployeeForm({
       const region = regions.find((r) => r.id === regionId);
       if (!region) return;
 
-      // Region letter comes from the region's own `code` (set in Settings ->
-      // Regions) if there is one, otherwise falls back to the first letter
-      // of the region's name -- so "Northern Region" still gets "N" even if
-      // nobody has set an explicit one-letter code yet.
-      const regionLetter = (region.code?.trim() || region.name?.trim() || "X").charAt(0).toUpperCase();
-      const prefix = `SFG-${regionLetter}-`;
+      const prefix = buildEmployeeNumberPrefix(region);
 
       const { data } = await supabase
         .from("employees")
@@ -1583,16 +1579,7 @@ function AddEmployeeForm({
         .order("employee_number", { ascending: false })
         .limit(1);
 
-      let nextNumber = 1;
-      if (data && data.length > 0) {
-        const match = data[0].employee_number.match(/\d+$/);
-        if (match) {
-          const lastNumber = parseInt(match[0]);
-          nextNumber = lastNumber + 1;
-        }
-      }
-
-      const formattedNumber = `${prefix}${nextNumber.toString().padStart(3, "0")}`;
+      const formattedNumber = nextEmployeeNumber(prefix, data?.[0]?.employee_number);
       setTimeout(() => {
         update("employeeNumber", formattedNumber);
       }, 10);

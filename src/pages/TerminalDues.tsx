@@ -8,6 +8,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { calculateTerminalDues as calculateTerminalDuesPure } from '../utils/terminalDuesCalculations';
 
 interface Employee {
   id: string;
@@ -302,29 +303,19 @@ export function TerminalDuesPage() {
       return null;
     }
 
-    const dateJoined = new Date(selectedEmployee.hire_date);
-    const dateLeft = new Date(formData.date_left);
+    const result = calculateTerminalDuesPure({
+      hireDate: selectedEmployee.hire_date,
+      dateLeft: formData.date_left,
+      basicSalary: selectedEmployee.basicSalary,
+      uniformRefund: formData.uniform_refund,
+      otherBenefits: formData.other_benefits,
+      deductions: formData.deductions,
+    });
 
-    const monthsDiff = (dateLeft.getFullYear() - dateJoined.getFullYear()) * 12 +
-                     (dateLeft.getMonth() - dateJoined.getMonth());
-
-    if (monthsDiff <= 0) {
+    if (!result) {
       showNotification('Date Left must be after the employee\'s Date Joined', 'error');
       return null;
     }
-
-    const periodMonths = monthsDiff;
-
-    const basicSalary = selectedEmployee.basicSalary ?? 150000;
-
-    const gratuity = Math.round((periodMonths * basicSalary * 10) / 100);
-    // Annual leave payout is a flat one month's basic salary.
-    const annualLeave = basicSalary;
-    const uniformRefund = Number(formData.uniform_refund) || 0;
-    const otherBenefits = Number(formData.other_benefits) || 0;
-    const subtotal = gratuity + annualLeave + uniformRefund + otherBenefits;
-    const deductions = Number(formData.deductions) || 0;
-    const totalPayable = subtotal - deductions;
 
     const calculation: TerminalDue = {
       id: '',
@@ -335,15 +326,15 @@ export function TerminalDuesPage() {
       date_joined: selectedEmployee.hire_date,
       date_left: formData.date_left,
       reason_for_termination: formData.reason,
-      period_months: periodMonths,
-      basic_salary: basicSalary,
-      gratuity: gratuity,
-      annual_leave: annualLeave,
-      uniform_refund: uniformRefund,
-      other_benefits: otherBenefits,
-      subtotal: subtotal,
-      deductions: deductions,
-      total_payable: totalPayable,
+      period_months: result.periodMonths,
+      basic_salary: result.basicSalary,
+      gratuity: result.gratuity,
+      annual_leave: result.annualLeave,
+      uniform_refund: result.uniformRefund,
+      other_benefits: result.otherBenefits,
+      subtotal: result.subtotal,
+      deductions: result.deductions,
+      total_payable: result.totalPayable,
       status: 'pending',
       termination_type: formData.termination_type,
       created_at: new Date().toISOString()

@@ -13,6 +13,13 @@ import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll } from '../utils/payrollCalculations';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import {
+  canProcessPayroll as canProcessPayrollFor,
+  canEditPayroll as canEditPayrollFor,
+  canViewPayroll as canViewPayrollFor,
+  canApprovePayroll as canApprovePayrollFor,
+  isPendingApproval as computeIsPendingApproval,
+} from '../utils/payrollPermissions';
 
 interface Employee {
   id: string;
@@ -113,15 +120,7 @@ export function PayrollPage() {
   const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
   const isMonthProcessed = useMemo(() => processedMonths.includes(selectedMonth), [processedMonths, selectedMonth]);
 
-  const isMonthApproved = useMemo(() => {
-    if (payrollRecords.length === 0) return false;
-    return payrollRecords.every(record => record.approval_status === 'approved');
-  }, [payrollRecords]);
-
-  const isPendingApproval = useMemo(() => {
-    if (payrollRecords.length === 0) return false;
-    return !isMonthApproved && payrollRecords.some(record => record.approval_status !== 'approved');
-  }, [payrollRecords, isMonthApproved]);
+  const isPendingApproval = useMemo(() => computeIsPendingApproval(payrollRecords), [payrollRecords]);
 
   // ===== FILTER EMPLOYEES =====
   const filteredEmployees = useMemo(() => {
@@ -181,11 +180,12 @@ export function PayrollPage() {
       
       const isSuperAdmin = profile?.is_super_admin || false;
       const roleLevel = profile?.role_level || 4;
-      
-      setCanProcessPayroll(isSuperAdmin || roleLevel === 1);
-      setCanEditPayroll(isSuperAdmin || roleLevel <= 2);
-      setCanViewPayroll(isSuperAdmin || roleLevel <= 3);
-      setCanApprovePayroll(isSuperAdmin || roleLevel === 1);
+      const roleContext = { isSuperAdmin, roleLevel };
+
+      setCanProcessPayroll(canProcessPayrollFor(roleContext));
+      setCanEditPayroll(canEditPayrollFor(roleContext));
+      setCanViewPayroll(canViewPayrollFor(roleContext));
+      setCanApprovePayroll(canApprovePayrollFor(roleContext));
     }
   }, []);
 

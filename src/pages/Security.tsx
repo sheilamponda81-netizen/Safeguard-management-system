@@ -13,6 +13,7 @@ import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { toCsvRow } from '../utils/csvExport';
+import { generateGuardId } from '../utils/guardIdGeneration';
 
 interface SecurityPersonnel {
   id: string;
@@ -299,7 +300,7 @@ export function SecurityPage() {
             shoes_status: newGuard.shoes_status || 'Good',
             license_status: newGuard.licenseStatus || 'Valid',
             license_expiry: newGuard.license_expiry || '',
-            guardId: newGuard.guardId || `G-${Math.floor(Math.random() * 1000)}`,
+            guardId: newGuard.guardId || generateGuardId(),
             status: newGuard.status || 'Active'
           })
           .eq('id', newGuard.employee_id);
@@ -331,7 +332,7 @@ export function SecurityPage() {
             uniform_status: updatedEmployee.uniform_status || 'Pending',
             uniform_condition: updatedEmployee.uniform_condition || 'Good',
             shoes_status: updatedEmployee.shoes_status || 'Good',
-            guardId: updatedEmployee.guardId || `G-${Math.floor(Math.random() * 1000)}`,
+            guardId: updatedEmployee.guardId || generateGuardId(),
             licenseStatus: updatedEmployee.license_status || 'Valid',
             license_expiry: updatedEmployee.license_expiry || '',
             emergency_contact: updatedEmployee.next_of_kin_name || '',
@@ -364,7 +365,7 @@ export function SecurityPage() {
             license_expiry: newGuard.license_expiry || '',
             next_of_kin_name: newGuard.emergency_contact || '',
             next_of_kin_phone: newGuard.emergency_phone || '',
-            guardId: newGuard.guardId || `G-${Math.floor(Math.random() * 1000)}`,
+            guardId: newGuard.guardId || generateGuardId(),
             hire_date: new Date().toISOString().split('T')[0],
             department: 'Operations',
             is_deleted: false
@@ -390,7 +391,7 @@ export function SecurityPage() {
             uniform_status: newEmployee.uniform_status || 'Pending',
             uniform_condition: newEmployee.uniform_condition || 'Good',
             shoes_status: newEmployee.shoes_status || 'Good',
-            guardId: newEmployee.guardId || `G-${Math.floor(Math.random() * 1000)}`,
+            guardId: newEmployee.guardId || generateGuardId(),
             licenseStatus: newEmployee.license_status || 'Valid',
             license_expiry: newEmployee.license_expiry || '',
             emergency_contact: newEmployee.next_of_kin_name || '',
@@ -1066,8 +1067,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
   // ===== GENERATE GUARD ID =====
   useEffect(() => {
     if (!formData.guardId) {
-      const randomNum = Math.floor(1000 + Math.random() * 9000);
-      setFormData(prev => ({ ...prev, guardId: `G-${randomNum}` }));
+      setFormData(prev => ({ ...prev, guardId: generateGuardId() }));
     }
   }, []);
 

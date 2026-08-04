@@ -14,6 +14,7 @@ import { debounce } from '../utils/debounce';
 import { getPayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { toCsvRow } from '../utils/csvExport';
+import { calculateAttendanceDeductions } from '../utils/attendanceDeductions';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -855,59 +856,9 @@ export function AttendancePage() {
   // ===== CALCULATE DEDUCTIONS =====
   const calculateEmployeeDeductions = useCallback((employeeId: string) => {
     const employeeAttendance = attendanceByEmployee.get(employeeId) || [];
-    const counts = { A: 0, L: 0 };
-    let lectureMissedCount = 0;
-
-    employeeAttendance.forEach(record => {
-      if (record.status === 'A') counts.A++;
-      if (record.status === 'L') counts.L++;
-    });
-
     const datesArr = getDatesForMonth(selectedMonth);
-    datesArr.forEach(date => {
-      const dateObj = new Date(date);
-      const dayOfWeek = dateObj.getDay();
-      if (dayOfWeek === 3 || dayOfWeek === 4) {
-        const status = getAttendanceStatus(employeeId, date);
-        if (status === 'A') {
-          lectureMissedCount++;
-        }
-      }
-    });
-    
-    const absentDeduction = counts.A * deductionRates.absentDeduction;
-    const lateDeduction = counts.L * deductionRates.lateDeduction;
-    const attendanceDeduction = absentDeduction + lateDeduction;
-
-    let lectureDeduction = 0;
-    if (lectureMissedCount > 0) {
-      const totalLectures = datesArr.filter(d => {
-        const dayOfWeek = new Date(d).getDay();
-        return dayOfWeek === 3 || dayOfWeek === 4;
-      }).length;
-
-      if (lectureMissedCount === totalLectures && totalLectures > 0) {
-        lectureDeduction = deductionRates.lectureFullMonthDeduction;
-      } else {
-        lectureDeduction = lectureMissedCount * deductionRates.lectureDeduction;
-      }
-    }
-
-    const appearanceDeduction = deductionRates.appearanceDeduction;
-    const totalDeductions = attendanceDeduction + lectureDeduction + appearanceDeduction;
-
-    return {
-      absentDays: counts.A,
-      lateDays: counts.L,
-      absentDeduction,
-      lateDeduction,
-      attendanceDeduction,
-      lectureMissedCount,
-      lectureDeduction,
-      appearanceDeduction,
-      totalDeductions
-    };
-  }, [attendanceByEmployee, selectedMonth, getDatesForMonth, getAttendanceStatus, deductionRates]);
+    return calculateAttendanceDeductions(employeeAttendance, datesArr, deductionRates);
+  }, [attendanceByEmployee, selectedMonth, getDatesForMonth, deductionRates]);
 
   // ===== FILTER EMPLOYEES =====
   const filteredEmployees = useMemo(() => {
