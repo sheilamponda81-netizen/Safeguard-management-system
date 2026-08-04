@@ -1,27 +1,7 @@
 ﻿// src/utils/clickHandlers.ts
 
-// ===== SAFE STRINGIFY FUNCTION =====
-const safeStringify = (value: any): string => {
-  try {
-    if (value === null) return 'null';
-    if (value === undefined) return 'undefined';
-    if (typeof value === 'symbol') return value.toString();
-    if (typeof value === 'function') return `[Function: ${value.name || 'anonymous'}]`;
-    if (typeof value === 'object') {
-      try {
-        return JSON.stringify(value);
-      } catch {
-        return Object.prototype.toString.call(value);
-      }
-    }
-    return String(value);
-  } catch {
-    return '[Unable to convert]';
-  }
-};
-
 // ===== SAFE NOTIFICATION FUNCTION =====
-export const showNotification = (message: any, type: 'success' | 'error' | 'info' = 'success') => {
+export const showNotification = (message: any, _type: 'success' | 'error' | 'info' = 'success') => {
   // Ensure message is a string
   let safeMessage = '';
   try {
@@ -232,37 +212,6 @@ export const handleDeleteEmployee = (employeeId: string, employees: any[], setEm
     setEmployees(updated);
     showNotification('Employee deleted successfully', 'success');
   }
-};
-
-// ===== UPDATED: handleHireEmployee with safe data =====
-export const handleHireEmployee = (applicant: any, employees: any[], setEmployees: (emps: any[]) => void, setApplicants: (apps: any[]) => void) => {
-  // Safely extract applicant data
-  const safeName = applicant?.name || applicant?.fullName || 'Unknown';
-  const safePosition = applicant?.position || 'Security Guard';
-  const safeDepartment = applicant?.department || 'Security Operations';
-  const safeSalary = applicant?.expectedSalary || 300000;
-  const safeEmail = applicant?.email || `${safeName.toLowerCase().replace(/\s/g, '.')}@safeguard.mw`;
-  const safePhone = applicant?.phone || '+265 888 XXX XXX';
-  
-  const newEmployee = {
-    id: Date.now(),
-    employeeId: `SG-${Math.floor(Math.random() * 10000)}`,
-    fullName: safeName,
-    position: safePosition,
-    department: safeDepartment,
-    status: 'Active',
-    basicSalary: safeSalary,
-    email: safeEmail,
-    phone: safePhone,
-    hireDate: new Date().toISOString().split('T')[0],
-    guardId: `G-${Math.floor(Math.random() * 1000)}`,
-    deploymentSite: 'To be assigned',
-    shift: 'Rotational'
-  };
-  
-  setEmployees([...employees, newEmployee]);
-  setApplicants((applicants || []).filter((a: any) => a.id !== applicant?.id));
-  showNotification(`🎉 ${safeName} has been hired!`, 'success');
 };
 
 export const handleDownloadPayslip = (employee: any, month: string) => {

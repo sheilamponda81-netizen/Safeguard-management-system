@@ -107,12 +107,12 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
       }
 
       if (data?.user) {
-        const { data: profile, error: profileError } = await supabase
+        const { data: rawProfile, error: profileError } = await supabase
           .from("profiles")
           .select(`
-            role_level, 
-            full_name, 
-            is_super_admin, 
+            role_level,
+            full_name,
+            is_super_admin,
             region_id,
             regions:region_id (
               name
@@ -124,6 +124,19 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
         if (profileError) {
           console.error("Error fetching profile:", profileError);
         }
+
+        // Without generated Supabase types, the client can't infer that
+        // `region_id` is a many-to-one foreign key, so it types the embedded
+        // `regions` resource as an array; at runtime (and per the actual FK
+        // cardinality) PostgREST returns a single object here, never an array.
+        interface ProfileWithRegion {
+          role_level: number;
+          full_name: string;
+          is_super_admin: boolean;
+          region_id: string | null;
+          regions: { name: string } | null;
+        }
+        const profile = rawProfile as unknown as ProfileWithRegion | null;
 
         // Get region name
         const regionName = profile?.regions?.name || null;
@@ -150,7 +163,7 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
             region_name: regionName,
             timestamp: new Date().toISOString()
           },
-          region_id: profile?.region_id
+          region_id: profile?.region_id ?? undefined
         });
 
         onLogin();

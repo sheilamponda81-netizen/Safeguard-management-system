@@ -2,12 +2,6 @@
 // VIRTUAL SCROLLING FOR LARGE LISTS
 // ============================================
 
-interface VirtualScrollOptions {
-  containerHeight: number;
-  itemHeight: number;
-  overscan?: number;
-}
-
 export function getVisibleRange(
   scrollTop: number,
   containerHeight: number,

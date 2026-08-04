@@ -6,9 +6,7 @@ import compression from 'vite-plugin-compression';
 
 export default defineConfig({
   plugins: [
-    react({
-      fastRefresh: true,
-    }),
+    react(),
     compression({
       algorithm: 'gzip',
       ext: '.gz',
@@ -52,6 +50,10 @@ export default defineConfig({
     target: 'es2020',
     chunkSizeWarningLimit: 1000,
     rollupOptions: {
+      treeshake: {
+        moduleSideEffects: false,
+        propertyReadSideEffects: false,
+      },
       output: {
         manualChunks: {
           // React core
@@ -86,10 +88,6 @@ export default defineConfig({
       },
     },
     cssCodeSplit: true,
-    treeshake: {
-      moduleSideEffects: false,
-      propertyReadSideEffects: false,
-    },
   },
   optimizeDeps: {
     include: [

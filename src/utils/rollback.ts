@@ -114,7 +114,7 @@ export class RollbackManager {
 
   private async checkDatabase(): Promise<boolean> {
     try {
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from('employees')
         .select('count', { count: 'exact', head: true });
       
@@ -127,7 +127,7 @@ export class RollbackManager {
 
   private async checkAPI(): Promise<boolean> {
     try {
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from('profiles')
         .select('id')
         .limit(1);

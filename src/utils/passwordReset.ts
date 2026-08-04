@@ -1,8 +1,6 @@
 // src/utils/passwordReset.ts
 
 import { supabase } from '../lib/supabase';
-import { showNotification } from './clickHandlers';
-import { useState } from 'react';
 
 export const validatePasswordStrength = (password: string): { valid: boolean; errors: string[] } => {
   const errors: string[] = [];
@@ -52,7 +50,7 @@ export const requestPasswordReset = async (email: string): Promise<{ success: bo
       };
     }
     
-    const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
       redirectTo: `${window.location.origin}/reset-password`,
     });
     
