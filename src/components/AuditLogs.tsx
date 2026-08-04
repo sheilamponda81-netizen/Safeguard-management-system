@@ -23,16 +23,37 @@ import {
 import { supabase } from "../lib/supabase";
 import { showNotification } from "../utils/clickHandlers";
 import { toCsvRow } from "../utils/csvExport";
+import { UserProfile } from "../utils/currentProfile";
+
+// Raw `audit_logs` row shape (query below is `select('*')`). `old_data`/
+// `new_data` stay `unknown` -- they're a generic per-entity_type payload
+// (see auditLogger.ts), only ever displayed via JSON.stringify or diffed
+// key-by-key here, never assumed to have a fixed shape.
+interface AuditLogRow {
+  id: string;
+  user_id: string | null;
+  user_email: string | null;
+  user_role: string | null;
+  region_id: string | null;
+  action: string;
+  entity_type: string | null;
+  entity_id: string | null;
+  old_data: unknown;
+  new_data: unknown;
+  user_agent: string | null;
+  ip_address: string | null;
+  created_at: string;
+}
 
 export function AuditLogsPage() {
-  const [logs, setLogs] = useState<any[]>([]);
+  const [logs, setLogs] = useState<AuditLogRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [filterAction, setFilterAction] = useState("all");
   const [filterEntity, setFilterEntity] = useState("all");
   const [filterUser, setFilterUser] = useState("all");
-  const [userProfile, setUserProfile] = useState<any>(null);
-  const [selectedLog, setSelectedLog] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [selectedLog, setSelectedLog] = useState<AuditLogRow | null>(null);
   const [userLoading, setUserLoading] = useState(true);
   const [uniqueUsers, setUniqueUsers] = useState<string[]>([]);
   const [dateRange, setDateRange] = useState<{ start: string; end: string }>({
@@ -137,22 +158,22 @@ export function AuditLogsPage() {
       monthAgo.setMonth(monthAgo.getMonth() - 1);
 
       const actionCounts: Record<string, number> = {};
-      logsData.forEach((log: any) => {
+      logsData.forEach((log: AuditLogRow) => {
         actionCounts[log.action] = (actionCounts[log.action] || 0) + 1;
       });
 
       setStats({
         total: logsData.length,
-        today: logsData.filter((l: any) => new Date(l.created_at) >= today).length,
-        thisWeek: logsData.filter((l: any) => new Date(l.created_at) >= weekAgo).length,
-        thisMonth: logsData.filter((l: any) => new Date(l.created_at) >= monthAgo).length,
+        today: logsData.filter((l: AuditLogRow) => new Date(l.created_at) >= today).length,
+        thisWeek: logsData.filter((l: AuditLogRow) => new Date(l.created_at) >= weekAgo).length,
+        thisMonth: logsData.filter((l: AuditLogRow) => new Date(l.created_at) >= monthAgo).length,
         byAction: actionCounts,
       });
 
       // Extract unique users
-      const users = [...new Set(logsData.map((l: any) => l.user_email).filter(Boolean))];
+      const users = [...new Set(logsData.map((l: AuditLogRow) => l.user_email).filter((email): email is string => Boolean(email)))];
       setUniqueUsers(users);
-    } catch (err: any) {
+    } catch (err) {
       console.error("Error fetching audit logs:", err);
       showNotification("Failed to load audit logs", "error");
     } finally {
@@ -216,16 +237,18 @@ export function AuditLogsPage() {
     }
   };
 
-  const formatChanges = (oldData: any, newData: any) => {
+  const formatChanges = (oldData: unknown, newData: unknown) => {
     if (!oldData && !newData) return "No changes tracked";
-    
+
     const changes: string[] = [];
-    
-    if (oldData && newData) {
-      const allKeys = new Set([...Object.keys(oldData), ...Object.keys(newData)]);
+
+    if (oldData && newData && typeof oldData === "object" && typeof newData === "object") {
+      const oldRecord = oldData as Record<string, unknown>;
+      const newRecord = newData as Record<string, unknown>;
+      const allKeys = new Set([...Object.keys(oldRecord), ...Object.keys(newRecord)]);
       allKeys.forEach(key => {
-        const oldVal = oldData[key];
-        const newVal = newData[key];
+        const oldVal = oldRecord[key];
+        const newVal = newRecord[key];
         if (JSON.stringify(oldVal) !== JSON.stringify(newVal)) {
           if (oldVal === undefined) {
             changes.push(`Added ${key}: ${JSON.stringify(newVal)}`);
@@ -559,7 +582,7 @@ export function AuditLogsPage() {
                       <div className="text-xs text-slate-600 max-w-[300px] truncate">
                         {changes}
                       </div>
-                      {log.old_data && log.new_data && (
+                      {!!log.old_data && !!log.new_data && (
                         <div className="flex gap-1 mt-1">
                           <Badge color="gray" className="text-[8px]">Old</Badge>
                           <Badge color="green" className="text-[8px]">New</Badge>
@@ -648,7 +671,7 @@ export function AuditLogsPage() {
             <div className="border-t pt-4">
               <p className="text-slate-500 text-xs mb-2">Changes</p>
               <div className="grid grid-cols-2 gap-4">
-                {selectedLog.old_data && Object.keys(selectedLog.old_data).length > 0 && (
+                {typeof selectedLog.old_data === "object" && selectedLog.old_data !== null && Object.keys(selectedLog.old_data).length > 0 && (
                   <div>
                     <p className="text-xs font-medium text-red-600 mb-1">Previous Data</p>
                     <pre className="bg-red-50 p-3 rounded-lg text-xs overflow-auto max-h-40 border border-red-200">
@@ -656,7 +679,7 @@ export function AuditLogsPage() {
                     </pre>
                   </div>
                 )}
-                {selectedLog.new_data && Object.keys(selectedLog.new_data).length > 0 && (
+                {typeof selectedLog.new_data === "object" && selectedLog.new_data !== null && Object.keys(selectedLog.new_data).length > 0 && (
                   <div>
                     <p className="text-xs font-medium text-green-600 mb-1">New Data</p>
                     <pre className="bg-green-50 p-3 rounded-lg text-xs overflow-auto max-h-40 border border-green-200">

@@ -4,8 +4,8 @@ export const logAudit = async (
   action: 'CREATE' | 'UPDATE' | 'DELETE' | 'LOGIN' | 'LOGOUT' | 'EXPORT',
   entityType: string,
   entityId: string,
-  oldData?: any,
-  newData?: any
+  oldData?: unknown,
+  newData?: unknown
 ) => {
   try {
     await supabase.rpc('log_audit_event', {
