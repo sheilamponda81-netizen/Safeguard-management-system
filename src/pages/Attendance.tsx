@@ -1140,7 +1140,7 @@ export function AttendancePage() {
         </div>
         <div className="text-sm text-slate-500">{filteredEmployees.length} employees</div>
         {!isCurrentMonth && (
-          <Badge color={isFutureMonthSelected ? 'blue' : 'amber'} className="text-xs">
+          <Badge color={isFutureMonthSelected ? 'blue' : 'yellow'} className="text-xs">
             {isFutureMonthSelected ? '🔮 View Only' : '📅 View Only'}
           </Badge>
         )}

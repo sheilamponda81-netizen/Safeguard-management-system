@@ -44,11 +44,8 @@ const ChartErrorFallback = () => (
 
 export function Dashboard() {
   // ===== ALL HOOKS AT TOP LEVEL =====
-  const [employees, setEmployees] = useState<any[]>([]);
-  const [applicantsCount, setApplicantsCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [userName, setUserName] = useState('');
-  const [userInitials, setUserInitials] = useState('');
   const [greeting, setGreeting] = useState('Good morning');
   const [userProfile, setUserProfile] = useState<any>(null);
   const [selectedMonth, setSelectedMonth] = useState('');
@@ -163,8 +160,6 @@ export function Dashboard() {
         setUserProfile(profile);
         const name = profile?.full_name || user.email?.split('@')[0] || 'User';
         setUserName(name);
-        const initials = name.split(' ').map((n: string) => n[0]).join('').slice(0, 2).toUpperCase();
-        setUserInitials(initials || 'U');
       }
     };
     getUserInfo();
@@ -259,7 +254,6 @@ export function Dashboard() {
       ]);
 
       const employeesData = employeesRes.data || [];
-      setEmployees(employeesData);
       const employeeIds = employeesData.map((e: any) => e.id);
 
       // ===== ACCURATE STATS CALCULATIONS =====
@@ -674,7 +668,7 @@ export function Dashboard() {
           {isCurrentMonth ? ' (Current Month)' : ''}
         </p>
         {!isCurrentMonth && (
-          <Badge color={selectedMonth > systemMonth ? 'blue' : 'amber'}>
+          <Badge color={selectedMonth > systemMonth ? 'blue' : 'yellow'}>
             {selectedMonth > systemMonth ? 'Future Month' : 'Past Month'}
           </Badge>
         )}

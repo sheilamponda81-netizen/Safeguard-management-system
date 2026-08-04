@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, Wallet, Calculator, Check, FileText, CheckCircle2, ChevronRight, Save, TrendingUp, Users, DollarSign, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon, UserCheck, Clock, XCircle } from 'lucide-react';
+import { Search, Wallet, Calculator, Check, CheckCircle2, ChevronRight, Save, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon, UserCheck, Clock, XCircle } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -53,9 +53,9 @@ interface PayrollRecord {
   net_pay: number;
   processed_at: string;
   approval_status?: string;
-  approved_by?: string;
-  approved_at?: string;
-  approval_notes?: string;
+  approved_by?: string | null;
+  approved_at?: string | null;
+  approval_notes?: string | null;
 }
 
 interface EmployeeDeduction {
@@ -98,7 +98,6 @@ export function PayrollPage() {
   const [canViewPayroll, setCanViewPayroll] = useState(false);
   const [canApprovePayroll, setCanApprovePayroll] = useState(false);
   const [approvalNotes, setApprovalNotes] = useState('');
-  const [approvalStatus, setApprovalStatus] = useState<'approved' | 'rejected' | null>(null);
   const [isApproved, setIsApproved] = useState(false);
   const [approverName, setApproverName] = useState('');
   // Live attendance-derived absent/late counts for the selected month, keyed by
@@ -145,23 +144,24 @@ export function PayrollPage() {
 
   // ===== FETCH APPROVER NAME =====
   useEffect(() => {
-    if (isApproved && payrollRecords.length > 0 && payrollRecords[0]?.approved_by) {
-      const fetchApproverName = async () => {
+    const approvedBy = payrollRecords[0]?.approved_by;
+    if (isApproved && approvedBy) {
+      const fetchApproverName = async (approvedById: string) => {
         try {
           const { data, error } = await supabase
             .from('profiles')
             .select('full_name')
-            .eq('id', payrollRecords[0].approved_by)
+            .eq('id', approvedById)
             .maybeSingle();
-          
+
           if (error) throw error;
-          setApproverName(data?.full_name || payrollRecords[0].approved_by.slice(0, 8) + '...');
+          setApproverName(data?.full_name || approvedById.slice(0, 8) + '...');
         } catch (err) {
           console.error('Error fetching approver name:', err);
-          setApproverName(payrollRecords[0].approved_by.slice(0, 8) + '...');
+          setApproverName(approvedById.slice(0, 8) + '...');
         }
       };
-      fetchApproverName();
+      fetchApproverName(approvedBy);
     } else {
       setApproverName('');
     }
@@ -722,7 +722,6 @@ export function PayrollPage() {
 
       setShowApprovalModal(false);
       setApprovalNotes('');
-      setApprovalStatus(null);
       await fetchData();
       await fetchProcessedMonths();
 
@@ -933,8 +932,7 @@ export function PayrollPage() {
               <Button 
                 variant="secondary" 
                 onClick={() => {
-                  setApprovalStatus(null);
-                  setApprovalNotes('');
+                              setApprovalNotes('');
                   setShowApprovalModal(true);
                 }}
                 disabled={processing || payrollRecords.length === 0}
@@ -1034,8 +1032,7 @@ export function PayrollPage() {
                 {canApprovePayroll && (
                   <button 
                     onClick={() => {
-                      setApprovalStatus(null);
-                      setApprovalNotes('');
+                                      setApprovalNotes('');
                       setShowApprovalModal(true);
                     }}
                     className="ml-2 text-[#D4A017] hover:underline font-medium"
@@ -1229,7 +1226,7 @@ export function PayrollPage() {
           <Badge color="gray" className="text-xs">🔒 Read Only</Badge>
         )}
         {!isCurrentMonth && (
-          <Badge color={isFutureMonthSelected ? 'blue' : 'amber'} className="text-xs">
+          <Badge color={isFutureMonthSelected ? 'blue' : 'yellow'} className="text-xs">
             {isFutureMonthSelected ? '🔮 Future' : '📅 Past'}
           </Badge>
         )}

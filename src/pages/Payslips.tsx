@@ -1,7 +1,7 @@
-﻿import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
-import { Search, FileText, Download, Printer, Eye, Shield, FileDown, User, Building2, Calendar, Clock, CheckCircle, XCircle, AlertCircle, ChevronLeft, ChevronRight, Settings, Upload, Save, RefreshCw, Archive, FileArchive } from '../utils/icons';
+﻿import { useState, useMemo, useEffect, useCallback } from 'react';
+import { Search, FileText, Download, Printer, Shield, Calendar, ChevronLeft, ChevronRight, Settings, Save } from '../utils/icons';
 import { Archive as ArchiveIcon, FileArchive as FileArchiveIcon } from 'lucide-react';
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
+import { Card, Button, Badge, PageHeader, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
@@ -117,9 +117,6 @@ const defaultTemplate: PayslipTemplate = {
 
 export function PayslipsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
-  const [employees, setEmployees] = useState<Employee[]>([]);
-  const [payrollRecords, setPayrollRecords] = useState<ExtendedPayrollRecord[]>([]);
-  const [employeeDeductions, setEmployeeDeductions] = useState<any[]>([]);
   const [payslips, setPayslips] = useState<PayslipData[]>([]);
   const [search, setSearch] = useState('');
   const [view, setView] = useState<PayslipData | null>(null);
@@ -247,7 +244,6 @@ export function PayslipsPage() {
         uniform_deduction: emp.uniform_deduction ?? payrollRates.uniformDeduction
       }));
 
-      setEmployees(mappedEmployees);
       const employeesById = new Map(mappedEmployees.map(e => [e.id, e]));
 
       // Positions eligible for a uniform deduction -- same flag Payroll.tsx
@@ -289,9 +285,6 @@ export function PayslipsPage() {
         .eq('month', monthYear);
 
       if (dedError) throw dedError;
-      setEmployeeDeductions(deductionsData || []);
-
-      setPayrollRecords(payrollData);
 
       const payslipData: PayslipData[] = [];
 
