@@ -13,7 +13,7 @@ import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { toCsvRow } from '../utils/csvExport';
-import { generateGuardId } from '../utils/guardIdGeneration';
+import { generateGuardId, generateGuardIdServerSide } from '../utils/guardIdGeneration';
 
 interface SecurityPersonnel {
   id: string;
@@ -289,7 +289,7 @@ export function SecurityPage() {
             shoes_status: newGuard.shoes_status || 'Good',
             license_status: newGuard.licenseStatus || 'Valid',
             license_expiry: newGuard.license_expiry || '',
-            guardId: newGuard.guardId || generateGuardId(),
+            guardId: newGuard.guardId || await generateGuardIdServerSide(),
             status: newGuard.status || 'Active'
           })
           .eq('id', newGuard.employee_id);
@@ -354,7 +354,7 @@ export function SecurityPage() {
             license_expiry: newGuard.license_expiry || '',
             next_of_kin_name: newGuard.emergency_contact || '',
             next_of_kin_phone: newGuard.emergency_phone || '',
-            guardId: newGuard.guardId || generateGuardId(),
+            guardId: newGuard.guardId || await generateGuardIdServerSide(),
             hire_date: new Date().toISOString().split('T')[0],
             department: 'Operations',
             is_deleted: false
@@ -1054,9 +1054,15 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
   }, []);
 
   // ===== GENERATE GUARD ID =====
+  // Reserves a real, database-generated guard ID as soon as the form
+  // opens (generateGuardIdServerSide() falls back to the old client-side
+  // random generator if the RPC isn't available yet -- see
+  // guardIdGeneration.ts -- so this never blocks the form from working).
   useEffect(() => {
     if (!formData.guardId) {
-      setFormData(prev => ({ ...prev, guardId: generateGuardId() }));
+      generateGuardIdServerSide().then((guardId) => {
+        setFormData((prev: any) => (prev.guardId ? prev : { ...prev, guardId }));
+      });
     }
   }, []);
 

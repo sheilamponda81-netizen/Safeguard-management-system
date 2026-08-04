@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { generateGuardId } from './guardIdGeneration';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const rpcMock = vi.fn();
+vi.mock('../lib/supabase', () => ({
+  supabase: { rpc: (...args: unknown[]) => rpcMock(...args) },
+}));
+
+const { generateGuardId, generateGuardIdServerSide } = await import('./guardIdGeneration');
 
 describe('generateGuardId', () => {
   it('matches the "G-" + 4-digit pattern', () => {
@@ -32,5 +38,46 @@ describe('generateGuardId', () => {
     } finally {
       Math.random = originalRandom;
     }
+  });
+});
+
+describe('generateGuardIdServerSide', () => {
+  beforeEach(() => {
+    rpcMock.mockReset();
+  });
+
+  it('calls the generate_guard_id RPC and returns its value verbatim', async () => {
+    rpcMock.mockResolvedValueOnce({ data: 'G-0042', error: null });
+    const id = await generateGuardIdServerSide();
+    expect(id).toBe('G-0042');
+    expect(rpcMock).toHaveBeenCalledWith('generate_guard_id');
+  });
+
+  it('falls back to the client-side generator when the RPC returns an error', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'function generate_guard_id() does not exist' } });
+    const id = await generateGuardIdServerSide();
+    // Falls back to generateGuardId()'s own format/range, not the RPC shape.
+    expect(id).toMatch(/^G-\d{4}$/);
+  });
+
+  it('falls back to the client-side generator when the RPC throws (network failure)', async () => {
+    rpcMock.mockRejectedValueOnce(new Error('network error'));
+    const id = await generateGuardIdServerSide();
+    expect(id).toMatch(/^G-\d{4}$/);
+  });
+
+  it('falls back to the client-side generator when the RPC resolves with no data', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: null });
+    const id = await generateGuardIdServerSide();
+    expect(id).toMatch(/^G-\d{4}$/);
+  });
+
+  it('two concurrent calls each get whatever distinct value the database RPC returns -- proves the wrapper does not memoize or coalesce concurrent requests', async () => {
+    rpcMock
+      .mockResolvedValueOnce({ data: 'G-0010', error: null })
+      .mockResolvedValueOnce({ data: 'G-0011', error: null });
+    const [first, second] = await Promise.all([generateGuardIdServerSide(), generateGuardIdServerSide()]);
+    expect(first).not.toBe(second);
+    expect([first, second].sort()).toEqual(['G-0010', 'G-0011']);
   });
 });
