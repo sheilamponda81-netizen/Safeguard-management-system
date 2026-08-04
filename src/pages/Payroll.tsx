@@ -12,6 +12,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll } from '../utils/payrollCalculations';
+import { processPayrollBatch } from '../utils/payrollProcessing';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import {
   canProcessPayroll as canProcessPayrollFor,
@@ -543,20 +544,10 @@ export function PayrollPage() {
         return;
       }
 
-      // Scoped to this admin's own employee set (their region, or the whole
-      // company for a super admin) -- the payroll table has no region_id
-      // column of its own, so an unscoped delete/read here would touch (or
-      // silently overwrite) every other region's payroll too.
-      const { error: deleteError } = await supabase
-        .from('payroll')
-        .delete()
-        .eq('month', selectedMonth)
-        .in('employee_id', employeeIds);
-
-      if (deleteError) {
-        console.error('Error deleting existing data:', deleteError);
-      }
-
+      // The target month's existing rows are no longer deleted here up
+      // front -- process_payroll_batch() (called below, once newRecords is
+      // built) does the delete and insert atomically in one transaction,
+      // scoped to exactly `employeeIds` as before.
       const { data: sourceData, error: sourceError } = await supabase
         .from('payroll')
         .select('*')
@@ -621,41 +612,30 @@ export function PayrollPage() {
         return;
       }
 
-      const { data: inserted, error: insertError } = await supabase
-        .from('payroll')
-        .insert(newRecords)
-        .select();
+      const result = await processPayrollBatch(selectedMonth, newRecords, {
+        sourceMonth,
+        targetMonth: selectedMonth,
+      });
 
-      if (insertError) {
-        console.error('Error inserting records:', insertError);
-        showNotification('Failed to copy data: ' + insertError.message, 'error');
+      if (!result.success) {
+        console.error('Error copying data:', result.error);
+        showNotification('Failed to copy data: ' + result.error, 'error');
         return;
       }
-      
-      await logAudit({
-        action: 'CREATE',
-        entity_type: 'payroll',
-        new_data: {
-          sourceMonth: sourceMonth,
-          targetMonth: selectedMonth,
-          recordsCopied: inserted?.length || 0
-        },
-        region_id: userProfile?.region_id
-      });
-      
+
       await fetchData();
       await fetchProcessedMonths();
       setHasData(true);
       setIsApproved(false);
       setShowCopyModal(false);
-      showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${inserted?.length || 0} records copied.`, 'success');
+      showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${result.insertedCount ?? newRecords.length} records copied.`, 'success');
     } catch (err: any) {
       console.error('Error copying data:', err);
       showNotification('Failed to copy data: ' + err.message, 'error');
     } finally {
       setProcessingStatus('');
     }
-  }, [canProcessPayroll, selectedMonth, userProfile, employees, calculatePayroll, fetchData, fetchProcessedMonths]);
+  }, [canProcessPayroll, selectedMonth, employees, calculatePayroll, fetchData, fetchProcessedMonths]);
 
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
@@ -794,63 +774,41 @@ export function PayrollPage() {
         });
       }
       
-      setProcessingStatus('Clearing existing data...');
-      // Scoped to exactly the employees being (re)processed in this run --
-      // for a non-super-admin that's their own region only. An unscoped
-      // delete-by-month here would also wipe every OTHER region's payroll
-      // for this month, since the payroll table has no region_id column of
-      // its own to protect it.
-      const { error: deleteError } = await supabase
-        .from('payroll')
-        .delete()
-        .eq('month', selectedMonth)
-        .in('employee_id', employees.map(e => e.id));
-
-      if (deleteError) {
-        console.error('Error deleting existing records:', deleteError);
-      }
-      
       setProcessingStatus(`Saving ${payrollToSave.length} records...`);
-      const { data: insertedData, error: insertError } = await supabase
-        .from('payroll')
-        .insert(payrollToSave)
-        .select();
-      
-      if (insertError) {
-        console.error('❌ Error inserting records:', insertError);
-        showNotification('Failed to save payroll: ' + insertError.message, 'error');
+      // Atomic, server-side: validates (role, approved-month protection),
+      // deletes, and inserts all inside one transaction, serialized against
+      // any concurrent processing attempt for the same tenant+month -- see
+      // supabase/migrations/20260803000002_payroll_atomic_process_rpc.sql.
+      // Replaces the previous separate client-side DELETE then INSERT,
+      // which could leave a month's payroll fully deleted with nothing
+      // re-inserted if the INSERT failed after the DELETE had already
+      // succeeded (Finding A8).
+      const result = await processPayrollBatch(selectedMonth, payrollToSave, {
+        totalGross,
+        totalNet,
+        totalDeductions,
+      });
+
+      if (!result.success) {
+        console.error('❌ Error processing payroll:', result.error);
+        showNotification('Failed to save payroll: ' + result.error, 'error');
         setProcessing(false);
         setProcessingStatus('');
         return;
       }
-      
-      await logAudit({
-        action: 'CREATE',
-        entity_type: 'payroll',
-        new_data: {
-          month: selectedMonth,
-          employeeCount: employees.length,
-          totalGross: totalGross,
-          totalNet: totalNet,
-          totalDeductions: totalDeductions,
-          recordsSaved: insertedData?.length || 0,
-          status: 'pending_approval'
-        },
-        region_id: userProfile?.region_id
-      });
-      
+
       await fetchData();
       await fetchProcessedMonths();
-      
+
       setProcessed(true);
       setShowConfirmModal(false);
       setEditingValues({});
       setIsApproved(false);
-      
+
       setTimeout(() => setProcessed(false), 5000);
-      
-      showNotification(`Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${insertedData?.length || 0} employees processed. The payroll is now pending approval by a manager or admin.`, 'success');
-      
+
+      showNotification(`Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${result.insertedCount ?? payrollToSave.length} employees processed. The payroll is now pending approval by a manager or admin.`, 'success');
+
     } catch (err: any) {
       console.error('❌ Error processing payroll:', err);
       showNotification('Failed to process payroll: ' + err.message, 'error');
@@ -858,7 +816,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, editingValues, calculatePayroll, selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
