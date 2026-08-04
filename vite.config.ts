@@ -50,10 +50,6 @@ export default defineConfig({
     target: 'es2020',
     chunkSizeWarningLimit: 1000,
     rollupOptions: {
-      treeshake: {
-        moduleSideEffects: false,
-        propertyReadSideEffects: false,
-      },
       output: {
         manualChunks: {
           // React core
