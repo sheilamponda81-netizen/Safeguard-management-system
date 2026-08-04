@@ -14,6 +14,81 @@ import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { toCsvRow } from '../utils/csvExport';
 import { generateGuardId, generateGuardIdServerSide } from '../utils/guardIdGeneration';
+import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
+import { getErrorMessage } from '../utils/errorHandler';
+
+// Raw `employees` row shape -- only the columns this file actually reads
+// (query below is `select('*')`). No generated Supabase types exist in
+// this project yet (see AUDIT_REPORT.md's "Supabase generated types"
+// section).
+interface EmployeeRow {
+  id: string;
+  full_name: string | null;
+  employee_number: string | null;
+  position: string | null;
+  status: string | null;
+  phone: string | null;
+  region_id: string | null;
+  company: string | null;
+  workstation: string | null;
+  shift: string | null;
+  supervisor: string | null;
+  uniform_status: string | null;
+  uniform_condition: string | null;
+  shoes_status: string | null;
+  guardId: string | null;
+  license_status: string | null;
+  license_expiry: string | null;
+  next_of_kin_name: string | null;
+  next_of_kin_phone: string | null;
+  created_at: string | null;
+}
+
+// AddGuardForm/EditGuardForm's own form state -- every field is always
+// initialized (see each form's useState), unlike a persisted
+// SecurityPersonnel row where some fields may be absent.
+interface GuardFormData {
+  employee_id: string;
+  full_name: string;
+  employee_number: string;
+  position: string;
+  status: string;
+  phone: string;
+  company: string;
+  workstation: string;
+  shift: string;
+  supervisor: string;
+  uniform_status: string;
+  uniform_condition: string;
+  shoes_status: string;
+  licenseStatus: string;
+  license_expiry: string;
+  emergency_contact: string;
+  emergency_phone: string;
+  guardId: string;
+  is_existing_employee: boolean;
+}
+
+// Narrow row shapes for the employee-search / supervisor-search dropdowns
+// (each query below selects only these columns, not `*`).
+interface EmployeeSearchResult {
+  id: string;
+  full_name: string | null;
+  employee_number: string | null;
+  position: string | null;
+  phone: string | null;
+  company: string | null;
+  workstation: string | null;
+  status: string | null;
+  region_id: string | null;
+}
+
+interface SupervisorSearchResult {
+  id: string;
+  full_name: string | null;
+  employee_number: string | null;
+  position: string | null;
+}
 
 interface SecurityPersonnel {
   id: string;
@@ -49,7 +124,7 @@ export function SecurityPage() {
   const [editingItem, setEditingItem] = useState<SecurityPersonnel | null>(null);
   const [viewingItem, setViewingItem] = useState<SecurityPersonnel | null>(null);
   const [loading, setLoading] = useState(true);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [filterShift, setFilterShift] = useState('all');
   const [filterStatus, setFilterStatus] = useState('all');
@@ -191,7 +266,7 @@ export function SecurityPage() {
 
       if (error) {
         console.error('Error fetching security data:', error);
-        setFetchError('Database error: ' + error.message);
+        setFetchError('Database error: ' + getErrorMessage(error));
         setSecurityData([]);
         setLoading(false);
         return;
@@ -212,7 +287,7 @@ export function SecurityPage() {
         return;
       }
 
-      const enhancedData = securityEmployees.map((emp: any) => ({
+      const enhancedData = securityEmployees.map((emp: EmployeeRow) => ({
         id: emp.id,
         full_name: emp.full_name || '',
         employee_number: emp.employee_number || '',
@@ -238,10 +313,10 @@ export function SecurityPage() {
       if (isMounted.current) {
         setSecurityData(enhancedData);
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error in fetchSecurityData:', err);
       if (isMounted.current) {
-        setFetchError('Failed to load security personnel: ' + (err.message || 'Unknown error'));
+        setFetchError('Failed to load security personnel: ' + getErrorMessage(err));
         setSecurityData([]);
       }
     } finally {
@@ -276,7 +351,7 @@ export function SecurityPage() {
   }, [fetchSecurityData]);
 
   // ===== ADD GUARD =====
-  const handleAddGuard = useCallback(async (newGuard: any) => {
+  const handleAddGuard = useCallback(async (newGuard: GuardFormData) => {
     try {
       // Check if this is an existing employee or new
       if (newGuard.is_existing_employee && newGuard.employee_id) {
@@ -404,9 +479,9 @@ export function SecurityPage() {
         new_data: newGuard,
         region_id: userProfile?.region_id
       });
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error adding guard:', err);
-      showNotification('Failed to add guard: ' + err.message, 'error');
+      showNotification('Failed to add guard: ' + getErrorMessage(err), 'error');
     }
   }, [userProfile, shiftsList, supervisorsList]);
 
@@ -435,62 +510,68 @@ export function SecurityPage() {
   }, []);
 
   // ===== SAVE EDIT - UPDATED to sync with employees table =====
-  const saveEdit = useCallback(async () => {
-    if (!editingItem) return;
-    
+  // Takes the edited guard data as a parameter (from EditGuardForm's own
+  // local `formData`) rather than reading `editingItem` -- `editingItem` is
+  // only ever the *original*, pre-edit snapshot passed down as
+  // EditGuardForm's `guard` prop, since that form's edits update its own
+  // local state and never write back into `editingItem`. Reading
+  // `editingItem` here (the previous behavior) meant every field an admin
+  // changed in the Edit Guard form was silently discarded on Save -- the
+  // update always re-saved the unmodified original data.
+  const saveEdit = useCallback(async (updatedGuard: SecurityPersonnel) => {
     try {
-      const oldData = securityData.find(item => item.id === editingItem.id);
-      
+      const oldData = securityData.find(item => item.id === updatedGuard.id);
+
       // Update all fields in the employees table - this will sync everywhere
       const { error } = await supabase
         .from('employees')
         .update({
-          full_name: editingItem.full_name,
-          employee_number: editingItem.employee_number,
-          position: editingItem.position,
-          phone: editingItem.phone,
-          status: editingItem.status,
-          company: editingItem.company,
-          workstation: editingItem.workstation,
-          shift: editingItem.shift,
-          supervisor: editingItem.supervisor,
-          uniform_status: editingItem.uniform_status,
-          uniform_condition: editingItem.uniform_condition,
-          shoes_status: editingItem.shoes_status,
-          license_status: editingItem.licenseStatus,
-          license_expiry: editingItem.license_expiry || null,
-          next_of_kin_name: editingItem.emergency_contact,
-          next_of_kin_phone: editingItem.emergency_phone,
-          guardId: editingItem.guardId
+          full_name: updatedGuard.full_name,
+          employee_number: updatedGuard.employee_number,
+          position: updatedGuard.position,
+          phone: updatedGuard.phone,
+          status: updatedGuard.status,
+          company: updatedGuard.company,
+          workstation: updatedGuard.workstation,
+          shift: updatedGuard.shift,
+          supervisor: updatedGuard.supervisor,
+          uniform_status: updatedGuard.uniform_status,
+          uniform_condition: updatedGuard.uniform_condition,
+          shoes_status: updatedGuard.shoes_status,
+          license_status: updatedGuard.licenseStatus,
+          license_expiry: updatedGuard.license_expiry || null,
+          next_of_kin_name: updatedGuard.emergency_contact,
+          next_of_kin_phone: updatedGuard.emergency_phone,
+          guardId: updatedGuard.guardId
         })
-        .eq('id', editingItem.id);
+        .eq('id', updatedGuard.id);
 
       if (error) {
         console.error('Supabase update error:', error);
-        showNotification('Failed to update guard: ' + error.message, 'error');
+        showNotification('Failed to update guard: ' + getErrorMessage(error), 'error');
         return;
       }
-      
+
       // Update local state
-      setSecurityData(prev => prev.map(item => item.id === editingItem.id ? editingItem : item));
-      showNotification(`${editingItem.full_name} updated successfully`, 'success');
+      setSecurityData(prev => prev.map(item => item.id === updatedGuard.id ? updatedGuard : item));
+      showNotification(`${updatedGuard.full_name} updated successfully`, 'success');
       setShowEditModal(false);
-      
+
       await logAudit({
         action: 'UPDATE',
         entity_type: 'security_guard',
-        entity_id: editingItem.id,
+        entity_id: updatedGuard.id,
         old_data: oldData,
-        new_data: editingItem,
+        new_data: updatedGuard,
         region_id: userProfile?.region_id
       });
-      
+
       setEditingItem(null);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error updating guard:', err);
-      showNotification('Failed to update guard: ' + err.message, 'error');
+      showNotification('Failed to update guard: ' + getErrorMessage(err), 'error');
     }
-  }, [editingItem, securityData, userProfile]);
+  }, [securityData, userProfile]);
 
   // ===== DELETE GUARD =====
   const handleDelete = useCallback(async (item: SecurityPersonnel) => {
@@ -520,9 +601,9 @@ export function SecurityPage() {
           old_data: oldData,
           region_id: userProfile?.region_id
         });
-      } catch (err: any) {
+      } catch (err) {
         console.error('Error deleting guard:', err);
-        showNotification('Failed to delete guard: ' + err.message, 'error');
+        showNotification('Failed to delete guard: ' + getErrorMessage(err), 'error');
       }
     }
   }, [userProfile]);
@@ -875,7 +956,6 @@ export function SecurityPage() {
             onSave={saveEdit} 
             onCancel={() => { setShowEditModal(false); setEditingItem(null); }}
             shiftsList={shiftsList}
-            supervisorsList={supervisorsList}
             uniformStatusList={uniformStatusList}
             uniformConditionList={uniformConditionList}
             shoesStatusList={shoesStatusList}
@@ -894,8 +974,20 @@ export function SecurityPage() {
 }
 
 // ===== ADD GUARD FORM =====
-function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList, userRegion, isSuperAdmin }: any) {
-  const [formData, setFormData] = useState({
+function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList, userRegion, isSuperAdmin }: {
+  onAdd: (guard: GuardFormData) => void;
+  onCancel: () => void;
+  shiftsList: string[];
+  supervisorsList: string[];
+  uniformStatusList: string[];
+  uniformConditionList: string[];
+  shoesStatusList: string[];
+  licenseStatusList: string[];
+  guardStatusList: string[];
+  userRegion?: UserProfileRegion | null;
+  isSuperAdmin?: boolean;
+}) {
+  const [formData, setFormData] = useState<GuardFormData>({
     employee_id: '',
     full_name: '',
     employee_number: '',
@@ -919,17 +1011,17 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
 
   const [employeeSearch, setEmployeeSearch] = useState('');
   const [showEmployeeDropdown, setShowEmployeeDropdown] = useState(false);
-  const [filteredEmployees, setFilteredEmployees] = useState<any[]>([]);
-  const [allEmployees, setAllEmployees] = useState<any[]>([]);
+  const [filteredEmployees, setFilteredEmployees] = useState<EmployeeSearchResult[]>([]);
+  const [allEmployees, setAllEmployees] = useState<EmployeeSearchResult[]>([]);
   const [loadingEmployees, setLoadingEmployees] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const [selectedEmployee, setSelectedEmployee] = useState<any>(null);
+  const [selectedEmployee, setSelectedEmployee] = useState<EmployeeSearchResult | null>(null);
   const [supervisorSearch, setSupervisorSearch] = useState('');
-  const [filteredSupervisors, setFilteredSupervisors] = useState<any[]>([]);
+  const [filteredSupervisors, setFilteredSupervisors] = useState<SupervisorSearchResult[]>([]);
   const [showSupervisorDropdown, setShowSupervisorDropdown] = useState(false);
   const supervisorDropdownRef = useRef<HTMLDivElement>(null);
-  const [allSupervisors, setAllSupervisors] = useState<any[]>([]);
+  const [allSupervisors, setAllSupervisors] = useState<SupervisorSearchResult[]>([]);
   const [positionOptions, setPositionOptions] = useState<string[]>([]);
 
   // Fetch all employees for search (excluding deleted)
@@ -1007,7 +1099,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
     }
     
     const searchLower = supervisorSearch.toLowerCase().trim();
-    const filtered = allSupervisors.filter((sup: any) => {
+    const filtered = allSupervisors.filter((sup: SupervisorSearchResult) => {
       const fullName = (sup.full_name || '').toLowerCase();
       const employeeNumber = (sup.employee_number || '').toLowerCase();
       const position = (sup.position || '').toLowerCase();
@@ -1028,7 +1120,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
     }
     
     const searchLower = employeeSearch.toLowerCase().trim();
-    const filtered = allEmployees.filter((emp: any) => {
+    const filtered = allEmployees.filter((emp: EmployeeSearchResult) => {
       const fullName = (emp.full_name || '').toLowerCase();
       const employeeNumber = (emp.employee_number || '').toLowerCase();
       const position = (emp.position || '').toLowerCase();
@@ -1063,13 +1155,13 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
   useEffect(() => {
     if (!formData.guardId) {
       generateGuardIdServerSide().then((guardId) => {
-        setFormData((prev: any) => (prev.guardId ? prev : { ...prev, guardId }));
+        setFormData((prev) => (prev.guardId ? prev : { ...prev, guardId }));
       });
     }
   }, [formData.guardId]);
 
   // Select employee from dropdown - auto-fill form
-  const selectEmployee = (employee: any) => {
+  const selectEmployee = (employee: EmployeeSearchResult) => {
     setSelectedEmployee(employee);
     setFormData({
       ...formData,
@@ -1109,9 +1201,9 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
   };
 
   // Select supervisor from dropdown
-  const selectSupervisor = (supervisor: any) => {
-    setFormData(prev => ({ ...prev, supervisor: supervisor.full_name }));
-    setSupervisorSearch(supervisor.full_name);
+  const selectSupervisor = (supervisor: SupervisorSearchResult) => {
+    setFormData(prev => ({ ...prev, supervisor: supervisor.full_name || '' }));
+    setSupervisorSearch(supervisor.full_name || '');
     setShowSupervisorDropdown(false);
   };
 
@@ -1122,7 +1214,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
     setShowSupervisorDropdown(false);
   };
 
-  const updateForm = (field: string, value: any) => {
+  const updateForm = <K extends keyof GuardFormData>(field: K, value: GuardFormData[K]) => {
     setFormData(prev => ({ ...prev, [field]: value }));
   };
 
@@ -1201,7 +1293,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
                   </button>
                 </div>
               ) : (
-                filteredEmployees.map((emp: any) => (
+                filteredEmployees.map((emp: EmployeeSearchResult) => (
                   <button
                     key={emp.id}
                     type="button"
@@ -1259,7 +1351,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <input 
             type="text"
             value={formData.full_name} 
-            onChange={(e: any) => updateForm('full_name', e.target.value)} 
+            onChange={(e) => updateForm('full_name', e.target.value)} 
             required 
             disabled={!!selectedEmployee}
             className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
@@ -1270,7 +1362,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <input 
             type="text"
             value={formData.employee_number} 
-            onChange={(e: any) => updateForm('employee_number', e.target.value)} 
+            onChange={(e) => updateForm('employee_number', e.target.value)} 
             disabled={!!selectedEmployee}
             className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
           />
@@ -1280,7 +1372,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <input 
             type="text"
             value={formData.guardId} 
-            onChange={(e: any) => updateForm('guardId', e.target.value)} 
+            onChange={(e) => updateForm('guardId', e.target.value)} 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             placeholder="Auto-generated"
           />
@@ -1291,7 +1383,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <input 
             type="text"
             value={formData.phone} 
-            onChange={(e: any) => updateForm('phone', e.target.value)} 
+            onChange={(e) => updateForm('phone', e.target.value)} 
             disabled={!!selectedEmployee}
             className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
           />
@@ -1302,7 +1394,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <select 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
             value={formData.position} 
-            onChange={(e: any) => updateForm('position', e.target.value)}
+            onChange={(e) => updateForm('position', e.target.value)}
             disabled={!!selectedEmployee}
           >
             {(positionOptions.includes(formData.position) ? positionOptions : [formData.position, ...positionOptions]).map(p => (
@@ -1316,7 +1408,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <select
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             value={formData.status} 
-            onChange={(e: any) => updateForm('status', e.target.value)}
+            onChange={(e) => updateForm('status', e.target.value)}
           >
             {guardStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
           </select>
@@ -1329,7 +1421,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <input 
             type="text"
             value={formData.company} 
-            onChange={(e: any) => updateForm('company', e.target.value)} 
+            onChange={(e) => updateForm('company', e.target.value)} 
             disabled={!!selectedEmployee}
             className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
           />
@@ -1339,7 +1431,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <input 
             type="text"
             value={formData.workstation} 
-            onChange={(e: any) => updateForm('workstation', e.target.value)} 
+            onChange={(e) => updateForm('workstation', e.target.value)} 
             disabled={!!selectedEmployee}
             className={`w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] ${selectedEmployee ? 'bg-slate-50' : ''}`}
           />
@@ -1349,7 +1441,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
           <select 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
             value={formData.shift} 
-            onChange={(e: any) => updateForm('shift', e.target.value)}
+            onChange={(e) => updateForm('shift', e.target.value)}
           >
             {shiftsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
           </select>
@@ -1406,7 +1498,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
                     </button>
                   </div>
                 ) : (
-                  filteredSupervisors.map((sup: any) => (
+                  filteredSupervisors.map((sup: SupervisorSearchResult) => (
                     <button
                       key={sup.id}
                       type="button"
@@ -1450,7 +1542,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
               value={formData.uniform_status} 
-              onChange={(e: any) => updateForm('uniform_status', e.target.value)}
+              onChange={(e) => updateForm('uniform_status', e.target.value)}
             >
               {uniformStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
             </select>
@@ -1460,7 +1552,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
               value={formData.uniform_condition} 
-              onChange={(e: any) => updateForm('uniform_condition', e.target.value)}
+              onChange={(e) => updateForm('uniform_condition', e.target.value)}
             >
               {uniformConditionList.map((s: string) => <option key={s} value={s}>{s}</option>)}
             </select>
@@ -1470,7 +1562,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
               value={formData.shoes_status} 
-              onChange={(e: any) => updateForm('shoes_status', e.target.value)}
+              onChange={(e) => updateForm('shoes_status', e.target.value)}
             >
               {shoesStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
             </select>
@@ -1480,7 +1572,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
               value={formData.licenseStatus} 
-              onChange={(e: any) => updateForm('licenseStatus', e.target.value)}
+              onChange={(e) => updateForm('licenseStatus', e.target.value)}
             >
               {licenseStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
             </select>
@@ -1500,7 +1592,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             <input 
               type="text"
               value={formData.emergency_contact} 
-              onChange={(e: any) => updateForm('emergency_contact', e.target.value)} 
+              onChange={(e) => updateForm('emergency_contact', e.target.value)} 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
           </div>
@@ -1509,7 +1601,7 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
             <input 
               type="text"
               value={formData.emergency_phone} 
-              onChange={(e: any) => updateForm('emergency_phone', e.target.value)} 
+              onChange={(e) => updateForm('emergency_phone', e.target.value)} 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
           </div>
@@ -1527,11 +1619,21 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
 }
 
 // ===== EDIT GUARD FORM =====
-function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList }: any) {
-  const [formData, setFormData] = useState(guard);
+function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList, uniformConditionList, shoesStatusList, licenseStatusList, guardStatusList }: {
+  guard: SecurityPersonnel;
+  onSave: (guard: SecurityPersonnel) => void;
+  onCancel: () => void;
+  shiftsList: string[];
+  uniformStatusList: string[];
+  uniformConditionList: string[];
+  shoesStatusList: string[];
+  licenseStatusList: string[];
+  guardStatusList: string[];
+}) {
+  const [formData, setFormData] = useState<SecurityPersonnel>(guard);
   const [supervisorSearch, setSupervisorSearch] = useState(guard.supervisor || '');
-  const [filteredSupervisors, setFilteredSupervisors] = useState<any[]>([]);
-  const [allSupervisors, setAllSupervisors] = useState<any[]>([]);
+  const [filteredSupervisors, setFilteredSupervisors] = useState<SupervisorSearchResult[]>([]);
+  const [allSupervisors, setAllSupervisors] = useState<SupervisorSearchResult[]>([]);
   const [showSupervisorDropdown, setShowSupervisorDropdown] = useState(false);
   const supervisorDropdownRef = useRef<HTMLDivElement>(null);
   const [positionOptions, setPositionOptions] = useState<string[]>([]);
@@ -1588,7 +1690,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
     }
     
     const searchLower = supervisorSearch.toLowerCase().trim();
-    const filtered = allSupervisors.filter((sup: any) => {
+    const filtered = allSupervisors.filter((sup: SupervisorSearchResult) => {
       const fullName = (sup.full_name || '').toLowerCase();
       const employeeNumber = (sup.employee_number || '').toLowerCase();
       const position = (sup.position || '').toLowerCase();
@@ -1613,9 +1715,9 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
   }, []);
 
   // Select supervisor from dropdown
-  const selectSupervisor = (supervisor: any) => {
-    setFormData({ ...formData, supervisor: supervisor.full_name });
-    setSupervisorSearch(supervisor.full_name);
+  const selectSupervisor = (supervisor: SupervisorSearchResult) => {
+    setFormData({ ...formData, supervisor: supervisor.full_name || '' });
+    setSupervisorSearch(supervisor.full_name || '');
     setShowSupervisorDropdown(false);
   };
 
@@ -1627,7 +1729,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <input 
             type="text"
             value={formData.full_name} 
-            onChange={(e: any) => setFormData({...formData, full_name: e.target.value})} 
+            onChange={(e) => setFormData({...formData, full_name: e.target.value})} 
             required 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
@@ -1637,7 +1739,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <input 
             type="text"
             value={formData.employee_number} 
-            onChange={(e: any) => setFormData({...formData, employee_number: e.target.value})} 
+            onChange={(e) => setFormData({...formData, employee_number: e.target.value})} 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
         </div>
@@ -1646,7 +1748,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <input 
             type="text"
             value={formData.guardId} 
-            onChange={(e: any) => setFormData({...formData, guardId: e.target.value})} 
+            onChange={(e) => setFormData({...formData, guardId: e.target.value})} 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
         </div>
@@ -1655,7 +1757,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <input 
             type="text"
             value={formData.phone} 
-            onChange={(e: any) => setFormData({...formData, phone: e.target.value})} 
+            onChange={(e) => setFormData({...formData, phone: e.target.value})} 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
         </div>
@@ -1665,7 +1767,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <select 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
             value={formData.position}
-            onChange={(e: any) => setFormData({...formData, position: e.target.value})}
+            onChange={(e) => setFormData({...formData, position: e.target.value})}
           >
             {(positionOptions.includes(formData.position) ? positionOptions : [formData.position, ...positionOptions]).map(p => (
               <option key={p} value={p}>{p}</option>
@@ -1678,7 +1780,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <select 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
             value={formData.status} 
-            onChange={(e: any) => setFormData({...formData, status: e.target.value})}
+            onChange={(e) => setFormData({...formData, status: e.target.value})}
           >
             {guardStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
           </select>
@@ -1691,7 +1793,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <input 
             type="text"
             value={formData.company} 
-            onChange={(e: any) => setFormData({...formData, company: e.target.value})} 
+            onChange={(e) => setFormData({...formData, company: e.target.value})} 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
         </div>
@@ -1700,7 +1802,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <input 
             type="text"
             value={formData.workstation} 
-            onChange={(e: any) => setFormData({...formData, workstation: e.target.value})} 
+            onChange={(e) => setFormData({...formData, workstation: e.target.value})} 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
         </div>
@@ -1709,7 +1811,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
           <select 
             className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
             value={formData.shift} 
-            onChange={(e: any) => setFormData({...formData, shift: e.target.value})}
+            onChange={(e) => setFormData({...formData, shift: e.target.value})}
           >
             {shiftsList.map((s: string) => <option key={s} value={s}>{s}</option>)}
           </select>
@@ -1757,7 +1859,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
                     </button>
                   </div>
                 ) : (
-                  filteredSupervisors.map((sup: any) => (
+                  filteredSupervisors.map((sup: SupervisorSearchResult) => (
                     <button
                       key={sup.id}
                       type="button"
@@ -1800,7 +1902,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
               value={formData.uniform_status} 
-              onChange={(e: any) => setFormData({...formData, uniform_status: e.target.value})}
+              onChange={(e) => setFormData({...formData, uniform_status: e.target.value})}
             >
               {uniformStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
             </select>
@@ -1810,7 +1912,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
               value={formData.uniform_condition} 
-              onChange={(e: any) => setFormData({...formData, uniform_condition: e.target.value})}
+              onChange={(e) => setFormData({...formData, uniform_condition: e.target.value})}
             >
               {uniformConditionList.map((s: string) => <option key={s} value={s}>{s}</option>)}
             </select>
@@ -1820,7 +1922,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
               value={formData.shoes_status} 
-              onChange={(e: any) => setFormData({...formData, shoes_status: e.target.value})}
+              onChange={(e) => setFormData({...formData, shoes_status: e.target.value})}
             >
               {shoesStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
             </select>
@@ -1830,7 +1932,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
             <select 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]" 
               value={formData.licenseStatus} 
-              onChange={(e: any) => setFormData({...formData, licenseStatus: e.target.value})}
+              onChange={(e) => setFormData({...formData, licenseStatus: e.target.value})}
             >
               {licenseStatusList.map((s: string) => <option key={s} value={s}>{s}</option>)}
             </select>
@@ -1849,7 +1951,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
             <input 
               type="text"
               value={formData.emergency_contact} 
-              onChange={(e: any) => setFormData({...formData, emergency_contact: e.target.value})} 
+              onChange={(e) => setFormData({...formData, emergency_contact: e.target.value})} 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
           </div>
@@ -1858,7 +1960,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
             <input 
               type="text"
               value={formData.emergency_phone} 
-              onChange={(e: any) => setFormData({...formData, emergency_phone: e.target.value})} 
+              onChange={(e) => setFormData({...formData, emergency_phone: e.target.value})} 
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
           </div>
@@ -1867,7 +1969,7 @@ function EditGuardForm({ guard, onSave, onCancel, shiftsList, uniformStatusList,
 
       <div className="flex justify-end gap-2 pt-4 border-t">
         <Button variant="outline" onClick={onCancel}>Cancel</Button>
-        <Button variant="secondary" onClick={onSave}>
+        <Button variant="secondary" onClick={() => onSave(formData)}>
           <Save size={14} className="mr-1" /> Save Changes
         </Button>
       </div>
