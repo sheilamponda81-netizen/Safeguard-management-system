@@ -9,6 +9,7 @@ import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { calculateTerminalDues as calculateTerminalDuesPure } from '../utils/terminalDuesCalculations';
+import { UserProfile } from '../utils/currentProfile';
 
 interface Employee {
   id: string;
@@ -23,7 +24,27 @@ interface Employee {
   email: string;
   status: string;
   is_deleted?: boolean;
-  uniform_deduction?: number;
+  uniform_deduction?: number | null;
+}
+
+// Raw `employees` row shape (query below is `select('*')`) -- only the
+// columns this file actually reads. No generated Supabase types exist in
+// this project yet (see AUDIT_REPORT.md's "Supabase generated types"
+// section).
+interface EmployeeRow {
+  id: string;
+  employee_number: string | null;
+  full_name: string | null;
+  position: string | null;
+  department: string | null;
+  basic_salary: number | null;
+  hire_date: string | null;
+  region_id: string | null;
+  phone: string | null;
+  email: string | null;
+  status: string | null;
+  is_deleted: boolean | null;
+  uniform_deduction: number | null;
 }
 
 interface TerminalDue {
@@ -96,7 +117,7 @@ export function TerminalDuesPage() {
   const [showDetailModal, setShowDetailModal] = useState<TerminalDue | null>(null);
   const [showEditModal, setShowEditModal] = useState(false);
   const [editingCalculation, setEditingCalculation] = useState<TerminalDue | null>(null);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [filterStatus, setFilterStatus] = useState('all');
   
   // ===== PAGINATION STATES =====
@@ -174,14 +195,14 @@ export function TerminalDuesPage() {
       const { data, error } = await query.order('full_name');
       if (error) throw error;
       
-      const mappedEmployees = (data || []).map((emp: any) => ({
+      const mappedEmployees = (data || []).map((emp: EmployeeRow) => ({
         id: emp.id,
         employeeNumber: emp.employee_number || '',
         fullName: emp.full_name || '',
         position: emp.position || '',
         department: emp.department || '',
         basicSalary: emp.basic_salary || 0,
-        hire_date: emp.hire_date || emp.dateHired || new Date().toISOString().split('T')[0],
+        hire_date: emp.hire_date || new Date().toISOString().split('T')[0],
         region_id: emp.region_id || '',
         phone: emp.phone || '',
         email: emp.email || '',
@@ -1087,7 +1108,7 @@ export function TerminalDuesPage() {
                   id="editStatus"
                   name="editStatus"
                   value={editingCalculation.status}
-                  onChange={(e) => setEditingCalculation({ ...editingCalculation, status: e.target.value as any })}
+                  onChange={(e) => setEditingCalculation({ ...editingCalculation, status: e.target.value as TerminalDue['status'] })}
                   className="w-full px-2 py-1 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
                 >
                   <option value="pending">Pending</option>

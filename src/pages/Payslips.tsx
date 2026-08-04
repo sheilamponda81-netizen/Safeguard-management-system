@@ -18,6 +18,8 @@ import {
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { UserProfile } from '../utils/currentProfile';
+import { getErrorMessage } from '../utils/errorHandler';
 
 // ===== PERFORMANCE: Lazy load PDF libraries only when needed =====
 const loadPDFLibraries = async () => {
@@ -41,7 +43,7 @@ interface Employee {
   status: string;
   payPoint?: string;
   contractType?: string;
-  region_id?: string;
+  region_id?: string | null;
   uniform_deduction?: number;
 }
 
@@ -79,6 +81,48 @@ interface ExtendedPayrollRecord extends PayrollRecord {
   lecture_deduction?: number;
   appearance_deduction?: number;
   uniform_amount?: number;
+}
+
+// Raw Supabase row shapes -- match the exact columns each query below
+// selects (no generated Supabase types exist in this project yet; see
+// AUDIT_REPORT.md's "Supabase generated types" section).
+interface EmployeeRow {
+  id: string;
+  employee_number: string;
+  full_name: string;
+  position: string;
+  department: string | null;
+  basic_salary: number | null;
+  status: string | null;
+  pay_point: string | null;
+  contract_type: string | null;
+  region_id: string | null;
+  uniform_deduction: number | null;
+}
+
+interface PayrollRow {
+  id: string;
+  employee_id: string;
+  month: string;
+  basic_salary: number;
+  allowances: number | null;
+  overtime: number | null;
+  bonus: number | null;
+  gross_pay: number;
+  paye: number | null;
+  pension: number | null;
+  uniform_deduction: number | null;
+  net_pay: number;
+  processed_at: string;
+  approval_status: string | null;
+}
+
+interface DeductionRow {
+  employee_id: string;
+  absent_days: number | null;
+  late_days: number | null;
+  lecture_deduction: number | null;
+  appearance_deduction: number | null;
 }
 
 interface PayslipTemplate {
@@ -120,7 +164,7 @@ export function PayslipsPage() {
   const [payslips, setPayslips] = useState<PayslipData[]>([]);
   const [search, setSearch] = useState('');
   const [view, setView] = useState<PayslipData | null>(null);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [selectedMonth, setSelectedMonth] = useState('');
   const [selectedYear, setSelectedYear] = useState('');
   const [systemMonth, setSystemMonth] = useState('');
@@ -230,7 +274,7 @@ export function PayslipsPage() {
       const { data: employeesData, error: empError } = await employeesQuery;
       if (empError) throw empError;
 
-      const mappedEmployees = (employeesData || []).map((emp: any) => ({
+      const mappedEmployees = (employeesData || []).map((emp: EmployeeRow) => ({
         id: emp.id,
         employeeNumber: emp.employee_number,
         fullName: emp.full_name,
@@ -276,7 +320,7 @@ export function PayslipsPage() {
       // rework and its figures may still change, so no payslip should be
       // generated from it. Pending and approved runs both produce payslips;
       // only the badge differs (see render below).
-      const payrollData = (rawPayrollData || []).filter((r: any) => r.approval_status !== 'rejected');
+      const payrollData = (rawPayrollData || []).filter((r: PayrollRow) => r.approval_status !== 'rejected');
 
       // Fetch employee deductions for the month
       const { data: deductionsData, error: dedError } = await supabase
@@ -289,9 +333,9 @@ export function PayslipsPage() {
       const payslipData: PayslipData[] = [];
 
       if (payrollData.length > 0) {
-        payrollData.forEach((payroll: any) => {
+        payrollData.forEach((payroll: PayrollRow) => {
           const employee = employeesById.get(payroll.employee_id);
-          const deduction = deductionsData?.find((d: any) => d.employee_id === payroll.employee_id);
+          const deduction = deductionsData?.find((d: DeductionRow) => d.employee_id === payroll.employee_id);
 
           if (employee) {
             // Calculate deduction breakdown
@@ -337,7 +381,7 @@ export function PayslipsPage() {
       }
 
       setPayslips(payslipData);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error fetching payslip data:', err);
       showNotification('Failed to load payslips', 'error');
     } finally {
@@ -646,9 +690,9 @@ export function PayslipsPage() {
       pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
       
       return pdf.output('blob');
-    } catch (error: any) {
+    } catch (error) {
       console.error('PDF Generation Error:', error);
-      showNotification('Failed to generate PDF: ' + error.message, 'error');
+      showNotification('Failed to generate PDF: ' + getErrorMessage(error), 'error');
       return null;
     }
   }, [selectedMonth, selectedYear, template, payrollRates]);
@@ -685,9 +729,9 @@ export function PayslipsPage() {
 
         showNotification(`Payslip for ${employee.fullName} downloaded successfully`, 'success');
       }
-    } catch (error: any) {
+    } catch (error) {
       console.error('PDF Download Error:', error);
-      showNotification(`Failed to generate payslip: ${error.message || 'Unknown error'}`, 'error');
+      showNotification(`Failed to generate payslip: ${getErrorMessage(error)}`, 'error');
     }
   }, [selectedMonth, selectedYear, userProfile, generatePDF]);
 
@@ -748,9 +792,9 @@ export function PayslipsPage() {
       });
 
       showNotification(`Downloaded ${successCount} payslips as ZIP`, 'success');
-    } catch (error: any) {
+    } catch (error) {
       console.error('Bulk Download Error:', error);
-      showNotification('Failed to download payslips: ' + error.message, 'error');
+      showNotification('Failed to download payslips: ' + getErrorMessage(error), 'error');
     } finally {
       setDownloading(false);
     }
@@ -799,7 +843,7 @@ export function PayslipsPage() {
       printWindow.document.close();
       printWindow.focus();
       setTimeout(() => printWindow.print(), 500);
-    } catch (error: any) {
+    } catch (error) {
       console.error('Print error:', error);
       showNotification('Failed to print payslip', 'error');
     }

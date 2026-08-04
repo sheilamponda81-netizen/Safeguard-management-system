@@ -13,6 +13,8 @@ import { Pagination } from '../components/Pagination';
 import { debounce } from '../utils/debounce';
 import { getPayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { UserProfile } from '../utils/currentProfile';
+import { getErrorMessage } from '../utils/errorHandler';
 import { toCsvRow } from '../utils/csvExport';
 import { calculateAttendanceDeductions } from '../utils/attendanceDeductions';
 
@@ -79,7 +81,7 @@ interface EmployeeModalProps {
   onClose: () => void;
   selectedMonth: string;
   deductionRates: typeof DEFAULT_RATES;
-  userProfile: any;
+  userProfile: UserProfile | null;
   getDatesForMonth: (monthYear: string) => string[];
   getEmployeeStats: (employeeId: string) => EmployeeStats;
   calculateEmployeeDeductions: (employeeId: string) => EmployeeDeductionCalc;
@@ -249,9 +251,9 @@ function EmployeeModal({
       setTimeout(() => {
         onClose();
       }, 2000);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error saving deductions:', err);
-      showNotification('Failed to save deductions: ' + err.message, 'error');
+      showNotification('Failed to save deductions: ' + getErrorMessage(err), 'error');
     } finally {
       setSaving(false);
     }
@@ -486,7 +488,7 @@ export function AttendancePage() {
   const [error, setError] = useState<string | null>(null);
   const [showCopyModal, setShowCopyModal] = useState(false);
   const [hasData, setHasData] = useState(false);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [updating, setUpdating] = useState<Record<string, boolean>>({});
   // Attendance deduction rates -- shared, admin-configurable via Settings ->
   // System (see payrollSettings.ts), instead of the fixed constant these used
@@ -572,9 +574,9 @@ export function AttendancePage() {
         setAttendance([]);
         setHasData(false);
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error fetching data:', err);
-      setError(err.message);
+      setError(getErrorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -668,9 +670,9 @@ export function AttendancePage() {
 
       if (result.error) throw result.error;
 
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error processing update:', err);
-      showNotification(`Failed to save attendance: ${err.message || 'Unknown error'}`, 'error');
+      showNotification(`Failed to save attendance: ${getErrorMessage(err)}`, 'error');
     }
   }, []);
 
@@ -685,7 +687,7 @@ export function AttendancePage() {
       updateQueue.current.clear();
 
       // Group updates by employee for efficiency
-      const groupedUpdates: Record<string, any[]> = {};
+      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string }[]> = {};
       for (const entry of entries) {
         if (!groupedUpdates[entry.employeeId]) {
           groupedUpdates[entry.employeeId] = [];
