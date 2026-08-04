@@ -1,13 +1,12 @@
 // src/pages/UserManual.tsx
-import { useState } from 'react';
-import { 
-  BookOpen, LayoutDashboard, Users, UserCheck, Calendar, Wallet, 
-  FileText, CreditCard, Calculator, FileBarChart, Settings, 
-  Shield, ShieldCheck, History, User, Building2, MapPin, 
-  ChevronDown, ChevronRight, CheckCircle, AlertCircle, 
-  Smartphone, Briefcase, Award, Sparkles, Mail, Phone, 
-  Star, Heart, Zap, Crown, Lock, Server, Database, Cloud, 
-  Fingerprint, Key
+import {
+  BookOpen, LayoutDashboard, Users, UserCheck, Calendar, Wallet,
+  CreditCard, FileBarChart, Settings,
+  Shield, ShieldCheck, User, MapPin,
+  CheckCircle, AlertCircle,
+  Smartphone, Award, Sparkles, Mail,
+  Star, Heart, Zap, Crown, Lock,
+  Fingerprint
 } from '../utils/icons';
 import { Card, Button, Badge, PageHeader } from '../components/ui';
 
@@ -18,26 +17,6 @@ const SectionTitle = ({ children, icon: Icon }: { children: React.ReactNode; ico
     <h2 className="text-xl font-bold text-slate-800">{children}</h2>
   </div>
 );
-
-const FeatureCard = ({ icon: Icon, title, description, color = 'navy' }: any) => {
-  const colorMap: Record<string, string> = {
-    navy: 'bg-[#081C3A] text-white',
-    gold: 'bg-[#D4A017] text-white',
-    green: 'bg-emerald-500 text-white',
-    blue: 'bg-blue-500 text-white',
-    purple: 'bg-purple-500 text-white',
-    red: 'bg-red-500 text-white'
-  };
-  return (
-    <div className="p-5 rounded-xl border border-slate-200 hover:shadow-xl hover:scale-[1.02] transition-all duration-300 group">
-      <div className={`w-12 h-12 rounded-xl ${colorMap[color]} flex items-center justify-center mb-4 group-hover:scale-110 transition-transform duration-300`}>
-        <Icon size={22} />
-      </div>
-      <h4 className="font-semibold text-slate-800 mb-2">{title}</h4>
-      <p className="text-sm text-slate-600">{description}</p>
-    </div>
-  );
-};
 
 const RoleCard = ({ title, level, description, permissions, color = 'navy' }: any) => {
   const colorMap: Record<string, string> = {

@@ -206,9 +206,7 @@ export const getAvailableMonthsFromSystem = (systemMonth?: string): string[] => 
 // Get past months (from July 2026 to current month)
 export const getPastMonths = (systemMonth?: string): string[] => {
   const months: string[] = [];
-  
-  const startDate = getSystemStartDate();
-  
+
   let currentDate: Date;
   if (systemMonth) {
     const [year, month] = systemMonth.split('-').map(Number);

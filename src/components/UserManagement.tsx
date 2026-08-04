@@ -1,7 +1,7 @@
 ﻿import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
-import { Card, Button, Input, Modal, Badge } from './ui';
-import { Plus, Trash2, Edit2, Shield, CheckCircle, XCircle } from 'lucide-react';
+import { Button, Input, Modal, Badge } from './ui';
+import { Plus, Trash2, Edit2 } from 'lucide-react';
 
 interface Profile {
   id: string;
@@ -15,7 +15,9 @@ interface Profile {
   created_at: string;
 }
 
-const roleLevels = [
+type BadgeColor = 'navy' | 'gold' | 'green' | 'red' | 'blue' | 'gray' | 'yellow' | 'orange' | 'purple' | 'teal' | 'emerald' | 'cyan';
+
+const roleLevels: { level: number; name: string; color: BadgeColor; desc: string }[] = [
   { level: 1, name: 'Admin', color: 'purple', desc: 'Full system access' },
   { level: 2, name: 'Manager', color: 'blue', desc: 'HR, Recruitment, Reports' },
   { level: 3, name: 'Supervisor', color: 'green', desc: 'Attendance, Security' },

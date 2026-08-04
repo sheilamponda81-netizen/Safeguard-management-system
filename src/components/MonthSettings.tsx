@@ -1,16 +1,14 @@
 import { useState, useEffect } from 'react';
-import { Calendar, Save, CheckCircle, AlertCircle, RefreshCw, ChevronRight, ChevronLeft } from 'lucide-react';
-import { Card, Button, Badge, Modal } from '../components/ui';
+import { Calendar, Save, AlertCircle, RefreshCw, ChevronRight } from 'lucide-react';
+import { Button, Badge, Modal } from '../components/ui';
 import { supabase } from '../lib/supabase';
-import { 
-  getSystemCurrentMonth, 
-  setSystemCurrentMonth, 
-  getMonthLabel, 
+import {
+  getSystemCurrentMonth,
+  setSystemCurrentMonth,
+  getMonthLabel,
   getAvailableMonthsFromSystem,
   getPastMonths,
-  isPastMonth,
-  getNextMonth,
-  getPreviousMonth
+  getNextMonth
 } from '../utils/currentMonth';
 import { showNotification } from '../utils/clickHandlers';
 

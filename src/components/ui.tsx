@@ -37,8 +37,8 @@ export function StatCard({ title, value, icon: Icon, change, accent, sub }:
   );
 }
 
-export function Button({ children, onClick, variant = 'primary', size = 'md', className = '', type = 'button', disabled }:
-  { children: React.ReactNode; onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void; variant?: 'primary' | 'secondary' | 'ghost' | 'danger' | 'outline' | 'success'; size?: 'sm' | 'md'; className?: string; type?: 'button' | 'submit'; disabled?: boolean }) {
+export function Button({ children, onClick, variant = 'primary', size = 'md', className = '', type = 'button', disabled, title }:
+  { children: React.ReactNode; onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void; variant?: 'primary' | 'secondary' | 'ghost' | 'danger' | 'outline' | 'success'; size?: 'sm' | 'md'; className?: string; type?: 'button' | 'submit'; disabled?: boolean; title?: string }) {
   const variants = {
     primary: 'bg-[#081C3A] text-white hover:bg-[#1a2f5c] shadow-sm',
     secondary: 'bg-[#D4A017] text-white hover:bg-[#e8b82e] shadow-sm',
@@ -56,6 +56,7 @@ export function Button({ children, onClick, variant = 'primary', size = 'md', cl
       type={type}
       onClick={onClick}
       disabled={disabled}
+      title={title}
       className={cn('inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed', variants[variant], sizes[size], className)}
     >
       {children}
