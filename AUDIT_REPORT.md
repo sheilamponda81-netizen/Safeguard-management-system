@@ -114,7 +114,37 @@ Deliberately does **not** recompute payroll figures itself — that logic stays 
 
 **A15. `dev` script's unnecessary `--force`** — removed, verified (dev server starts in ~270ms and serves correctly without it).
 
-**A19 (new). Recruitment applicant status has no transition validation at any layer.** `Recruitment.tsx` writes `applicants.status` as a plain string field; the only constraint anywhere is a database-level `CHECK` restricting it to a fixed set of allowed values — there is no rule, client-side or server-side, preventing an invalid *sequence* (e.g. `rejected` → `hired`, or skipping an intermediate stage the workflow is meant to require). **Deliberately not fixed and not given a test**: writing either would mean inventing a transition policy this audit has no source for, which the standing instruction against changing/inventing business rules without a confirmed requirement rules out. If a specific transition policy is wanted (e.g. a fixed pipeline order, or certain roles being barred from certain transitions), that's a product decision to make first — then it can be implemented and tested for real, rather than tested into existence here.
+**A19 (new). Recruitment applicant status has no transition validation at any layer.** `applicants` has two status-like columns: `interview_status` (`Pending`/`Shortlisted`/`Interviewed`/`Accepted`/`Rejected`) and `decision` (`Pending`/`Hire`/`Reject`), each with only a value-level `CHECK` constraint (`20260727000000_reconstructed_base_schema.sql`). There is no rule anywhere — not in `Recruitment.tsx`, not in the database — preventing an invalid *sequence*: e.g. clicking "Hire" on a still-`Pending` applicant who was never shortlisted or interviewed, re-`Reject`-ing an already-`Accepted` hire, or "Shortlist"-ing an applicant back out of `Rejected`. **Deliberately not fixed and not given a test**: writing either would mean inventing a transition policy this audit has no source for, which the standing instruction against changing/inventing business rules without a confirmed requirement rules out.
+
+**Current statuses and transitions actually exposed by the UI** (`Recruitment.tsx`'s action buttons, one row per applicant):
+
+| Button | Writes `interview_status` | Writes `decision` | Enabled when |
+|---|---|---|---|
+| Shortlist | `Shortlisted` | *(unchanged)* | `interview_status !== 'Shortlisted'` — i.e. from any other status, including `Accepted`/`Rejected` |
+| Interview | `Interviewed` | *(unchanged)* | `interview_status !== 'Interviewed'` — i.e. from any other status, including `Accepted`/`Rejected` |
+| ✓ Hire | `Accepted` | `Hire` | **always enabled**, regardless of current status — a still-`Pending` applicant can be hired with one click, with no shortlist/interview step in between |
+| Reject | `Rejected` | `Reject` | **always enabled**, regardless of current status — including an already-`Accepted`/hired applicant |
+
+No button is disabled based on `decision` at all, only (partially) on `interview_status`. This is a real, exercisable gap today, not a hypothetical: an Admin/Manager can currently hire a `Pending` applicant with zero intermediate steps, or reject someone already marked `Accepted`, and the database accepts either write silently.
+
+**Recommended state machine (documented here for business approval — NOT implemented anywhere in this pass, per instruction):**
+
+```
+Pending → Shortlisted or Rejected
+Shortlisted → Interviewed or Rejected
+Interviewed → Accepted or Rejected
+Accepted → Hired
+Hired → terminal state
+Rejected → terminal state
+```
+
+This is a conservative, linear pipeline — every stage can still end in `Rejected`, but forward progress must go through each intermediate stage in order, and both `Hired` and `Rejected` are terminal (no transitions out). It does not yet reconcile the app's current two-column design (`interview_status` + a separate `decision` field) with the single-status model above — that reconciliation (e.g. folding `decision` into the same state machine as an `Accepted → Hired` step, as sketched here, versus keeping them as two independently-governed fields) is itself part of what needs business confirmation before implementing anything.
+
+**If and only if this (or an amended version of it) is approved**, enforcement should exist at both layers, with the database as the final authority regardless of what the UI allows or hides:
+- **Interface**: disable/hide buttons that don't represent a valid transition from the applicant's current status (extending the existing partial `disabled={...}` pattern to cover all four buttons and both hire/reject cases, not just the two that already check `interview_status`).
+- **Database**: a trigger (`BEFORE UPDATE ON applicants`) or a dedicated `SECURITY DEFINER` RPC (mirroring the payroll/guard-ID/employee-number pattern elsewhere in this audit) that rejects a disallowed transition outright — so a direct API call bypassing the UI (or a bug in the UI's own disabled-state logic) can never produce an invalid sequence. The UI-only check above is a UX convenience, not a substitute for this.
+
+Not implemented in this pass. If a specific transition policy is wanted, that's a product decision to make first — then it can be implemented and tested for real, rather than tested into existence here.
 
 ## What was inspected
 
