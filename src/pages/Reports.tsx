@@ -71,6 +71,13 @@ interface WorkstationStats {
   payrollTotal: number;
 }
 
+// Accumulator shape used while building company stats -- workstations are
+// keyed by name here for O(1) lookup per employee, then converted to the
+// CompanyStats[] array shape (WorkstationStats[]) once accumulation is done.
+interface CompanyStatsAccumulator extends Omit<CompanyStats, 'workstations'> {
+  workstations: Record<string, WorkstationStats>;
+}
+
 export function ReportsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [activeReport, setActiveReport] = useState<ReportType>('company');
@@ -173,7 +180,7 @@ export function ReportsPage() {
 
   // ===== COMPANY DATA - Using companies table and assignment_type =====
   const companyData = useMemo(() => {
-    const companyMap: Record<string, CompanyStats> = {};
+    const companyMap: Record<string, CompanyStatsAccumulator> = {};
     
     activeEmployees.forEach(emp => {
       // Determine the entity name based on assignment type

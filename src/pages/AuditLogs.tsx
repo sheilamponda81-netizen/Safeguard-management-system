@@ -7,7 +7,6 @@ import {
   User,
   Clock,
   Calendar,
-  Filter,
   RefreshCw,
 } from "lucide-react";
 import {
@@ -15,11 +14,6 @@ import {
   Button,
   Badge,
   PageHeader,
-  THead,
-  TBody,
-  TR,
-  TH,
-  TD,
   Modal,
 } from "../components/ui";
 import { supabase } from "../lib/supabase";

@@ -4,7 +4,6 @@ import {
   Download,
   Eye,
   Activity,
-  User,
   Clock,
   Calendar,
   Filter,
@@ -19,11 +18,6 @@ import {
   Button,
   Badge,
   PageHeader,
-  THead,
-  TBody,
-  TR,
-  TH,
-  TD,
   Modal,
 } from "../components/ui";
 import { supabase } from "../lib/supabase";

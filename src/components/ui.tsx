@@ -63,7 +63,7 @@ export function Button({ children, onClick, variant = 'primary', size = 'md', cl
   );
 }
 
-export function Badge({ children, color = 'navy', className = '' }: { children: React.ReactNode; color?: 'navy' | 'gold' | 'green' | 'red' | 'blue' | 'gray' | 'yellow' | 'orange' | 'purple'; className?: string }) {
+export function Badge({ children, color = 'navy', className = '' }: { children: React.ReactNode; color?: 'navy' | 'gold' | 'green' | 'red' | 'blue' | 'gray' | 'yellow' | 'orange' | 'purple' | 'teal' | 'emerald' | 'cyan'; className?: string }) {
   const map: Record<string, string> = {
     navy: 'bg-[#081C3A] text-white',
     gold: 'bg-[#FFF1CC] text-[#8B6F0F]',
@@ -73,7 +73,10 @@ export function Badge({ children, color = 'navy', className = '' }: { children: 
     gray: 'bg-slate-100 text-slate-700',
     yellow: 'bg-[#FEF3C7] text-[#854D0E]',
     orange: 'bg-orange-100 text-orange-800',
-    purple: 'bg-purple-100 text-purple-800'
+    purple: 'bg-purple-100 text-purple-800',
+    teal: 'bg-teal-100 text-teal-800',
+    emerald: 'bg-emerald-100 text-emerald-800',
+    cyan: 'bg-cyan-100 text-cyan-800'
   };
   return <span className={cn('inline-flex items-center px-2 py-1 text-xs font-medium rounded-md', map[color], className)}>{children}</span>;
 }
