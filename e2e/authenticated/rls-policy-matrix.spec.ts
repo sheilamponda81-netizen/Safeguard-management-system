@@ -126,6 +126,79 @@ test.describe('RLS policy matrix (role_level hardening)', () => {
   });
 
   // ------------------------------------------------------------------
+  // terminal_dues: INSERT/UPDATE should require role_level <= 2
+  // (20260803000000_role_level_rls_hardening.sql), same pattern as
+  // payment_status above -- not previously covered by this file.
+  // ------------------------------------------------------------------
+  test.describe('terminal_dues', () => {
+    const dues = (overrides: Partial<Record<string, unknown>> = {}) => ({
+      employee_id: sampleEmployeeId, date_left: '2024-01-01', termination_type: 'resignation',
+      gratuity: 0, annual_leave: 0, uniform_refund: 0, other_benefits: 0, deductions: 0,
+      subtotal: 0, total_payable: 0, status: 'pending',
+      ...overrides,
+    });
+
+    test('Admin can insert a terminal_dues row', async () => {
+      const { data, error } = await clients.admin.from('terminal_dues').insert(dues()).select('id').single();
+      expect(error).toBeNull();
+      await clients.admin.from('terminal_dues').delete().eq('id', data!.id);
+    });
+
+    test('Manager can insert a terminal_dues row', async () => {
+      const { data, error } = await clients.manager.from('terminal_dues').insert(dues()).select('id').single();
+      expect(error).toBeNull();
+      await clients.admin.from('terminal_dues').delete().eq('id', data!.id);
+    });
+
+    test('Supervisor CANNOT insert a terminal_dues row', async () => {
+      const { error } = await clients.supervisor.from('terminal_dues').insert(dues());
+      expect(error).not.toBeNull();
+    });
+
+    test('Staff CANNOT insert a terminal_dues row', async () => {
+      const { error } = await clients.staff.from('terminal_dues').insert(dues());
+      expect(error).not.toBeNull();
+    });
+
+    test('Supervisor CANNOT update an existing terminal_dues row', async () => {
+      const { data: created } = await clients.admin.from('terminal_dues').insert(dues()).select('id').single();
+      await clients.supervisor.from('terminal_dues').update({ status: 'paid' }).eq('id', created!.id);
+      // Same RLS-denied-UPDATE-is-silent-0-rows reasoning as payment_status
+      // above -- confirm via re-read as admin, not just via `error`.
+      const { data: after } = await clients.admin.from('terminal_dues').select('status').eq('id', created!.id).single();
+      expect(after?.status).toBe('pending');
+      await clients.admin.from('terminal_dues').delete().eq('id', created!.id);
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Anonymous (unauthenticated) requests should be denied entirely --
+  // reuses the signed-in clients' beforeAll setup (creds, sampleEmployeeId)
+  // but issues requests from a client that never called signInWithPassword.
+  // ------------------------------------------------------------------
+  test.describe('anonymous access', () => {
+    let anon: SupabaseClient;
+
+    test.beforeAll(() => {
+      anon = createClient(creds.supabaseUrl, creds.supabaseAnonKey);
+    });
+
+    test('an anonymous client cannot read any employees', async () => {
+      const { data } = await anon.from('employees').select('id').limit(1);
+      // RLS denies an unauthenticated SELECT by returning an empty result
+      // set rather than a query error -- assert on the absence of rows.
+      expect(data ?? []).toHaveLength(0);
+    });
+
+    test('an anonymous client cannot insert a payment_status row', async () => {
+      const { error } = await anon.from('payment_status').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-06`, status: 'pending',
+      });
+      expect(error).not.toBeNull();
+    });
+  });
+
+  // ------------------------------------------------------------------
   // employees / payroll DELETE: should require super-admin only now
   // ------------------------------------------------------------------
   test.describe('destructive operations restricted to super-admin', () => {

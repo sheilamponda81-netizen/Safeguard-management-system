@@ -19,6 +19,14 @@
 //   E2E_STAFF_EMAIL / E2E_STAFF_PASSWORD
 // Ideally two of each, in two different regions, to test the region-
 // isolation gap directly once AUDIT_REPORT.md Finding A12 is fixed.
+//
+// OPTIONAL env vars, for the tests that specifically need a second
+// region or a second tenant (see STAGING_VALIDATION_PLAN.md). Tests that
+// need these check for them individually and skip with a clear reason if
+// absent -- they are not part of REQUIRED_VARS, so their absence does not
+// block the rest of this file's tests:
+//   E2E_ADMIN2_EMAIL / E2E_ADMIN2_PASSWORD        -- Admin in a second region, same tenant
+//   E2E_TENANT_B_ADMIN_EMAIL / E2E_TENANT_B_ADMIN_PASSWORD -- Admin in a second, separate tenant
 
 export interface StagingCredentials {
   baseUrl: string;
@@ -58,4 +66,26 @@ export function getStagingCredentials(): StagingCredentials {
     supervisor: { email: process.env.E2E_SUPERVISOR_EMAIL!, password: process.env.E2E_SUPERVISOR_PASSWORD! },
     staff: { email: process.env.E2E_STAFF_EMAIL!, password: process.env.E2E_STAFF_PASSWORD! },
   };
+}
+
+// Optional: an Admin account in a second region of the SAME tenant, for
+// region-isolation tests. Returns null (rather than throwing) when not
+// configured, so callers can test.skip() with a clear reason instead of
+// crashing the whole file.
+export function getSecondRegionAdmin(): { email: string; password: string } | null {
+  const email = process.env.E2E_ADMIN2_EMAIL;
+  const password = process.env.E2E_ADMIN2_PASSWORD;
+  if (!email || !password) return null;
+  return { email, password };
+}
+
+// Optional: an Admin account in a SECOND, separate tenant, for
+// cross-tenant isolation tests (both "can Tenant B see Tenant A's data"
+// and "does a payroll batch reject an employee_id belonging to a
+// different tenant"). Returns null when not configured.
+export function getTenantBAdmin(): { email: string; password: string } | null {
+  const email = process.env.E2E_TENANT_B_ADMIN_EMAIL;
+  const password = process.env.E2E_TENANT_B_ADMIN_PASSWORD;
+  if (!email || !password) return null;
+  return { email, password };
 }

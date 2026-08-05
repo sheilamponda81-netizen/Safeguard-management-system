@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { missingStagingVars, getStagingCredentials, StagingCredentials } from '../fixtures';
+import { missingStagingVars, getStagingCredentials, getTenantBAdmin, StagingCredentials } from '../fixtures';
 
 // Integration coverage for the workflows this audit pass's instructions
 // specifically called out: employee/guard ID generation + duplicate
@@ -88,6 +88,19 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       expect(secondNum).toBe(firstNum + 1);
     });
 
+    test('2 concurrent requests for the same region produce 2 distinct, consecutive numbers', async () => {
+      const [r1, r2] = await Promise.all([
+        clients.admin.rpc('generate_employee_number', { p_region_id: sampleRegionId }),
+        clients.admin.rpc('generate_employee_number', { p_region_id: sampleRegionId }),
+      ]);
+      expect(r1.error).toBeNull();
+      expect(r2.error).toBeNull();
+      const n1 = parseInt(r1.data!.split('-').pop()!, 10);
+      const n2 = parseInt(r2.data!.split('-').pop()!, 10);
+      expect(n1).not.toBe(n2);
+      expect(Math.abs(n2 - n1)).toBe(1);
+    });
+
     test('10 simultaneous requests for the same region produce 10 distinct, consecutive numbers', async () => {
       const results = await Promise.all(
         Array.from({ length: 10 }, () => clients.admin.rpc('generate_employee_number', { p_region_id: sampleRegionId }))
@@ -131,6 +144,19 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       expect(err2).toBeNull();
       expect(second).not.toBe(first);
       expect(parseInt(second!.slice(2), 10)).toBe(parseInt(first!.slice(2), 10) + 1);
+    });
+
+    test('2 concurrent requests produce 2 distinct, consecutive numbers', async () => {
+      const [r1, r2] = await Promise.all([
+        clients.admin.rpc('generate_guard_id'),
+        clients.admin.rpc('generate_guard_id'),
+      ]);
+      expect(r1.error).toBeNull();
+      expect(r2.error).toBeNull();
+      const n1 = parseInt(r1.data!.slice(2), 10);
+      const n2 = parseInt(r2.data!.slice(2), 10);
+      expect(n1).not.toBe(n2);
+      expect(Math.abs(n2 - n1)).toBe(1);
     });
 
     test('10 simultaneous requests produce 10 distinct, consecutive numbers', async () => {
@@ -300,6 +326,48 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       expect(Number(row?.basic_salary)).toBe(100001);
     });
 
+    test('2 concurrent process_payroll_batch calls for different employees in the same month both succeed without corrupting each other', async () => {
+      // The advisory lock in process_payroll_batch is per tenant+month, so
+      // these two calls serialize against each other -- but the migration's
+      // own DELETE/INSERT are scoped to `employee_id = ANY(v_employee_ids)`
+      // from each call's own payload, so neither call should touch the
+      // other's row. This proves that in practice, not just by reading the
+      // SQL.
+      const { data: created2, error: createErr2 } = await clients.admin
+        .from('employees')
+        .insert({ employee_number: `SFG-E2E-PAY2-${Date.now()}`, full_name: 'E2E Payroll Concurrency Test', basic_salary: 50000 })
+        .select('id')
+        .single();
+      test.skip(!!createErr2, `Could not create a second disposable employee: ${createErr2?.message}`);
+      const secondEmployeeId = created2!.id;
+      createdEmployeeIds.push(secondEmployeeId);
+
+      const concurrentMonth = '9999-10';
+      const [r1, r2] = await Promise.all([
+        clients.admin.rpc('process_payroll_batch', {
+          p_month: concurrentMonth, p_records: [record()], p_user_email: creds.admin.email,
+        }),
+        clients.admin.rpc('process_payroll_batch', {
+          p_month: concurrentMonth,
+          p_records: [record({ employee_id: secondEmployeeId, basic_salary: 50000, gross_pay: 50000, paye: 0, pension: 2500, uniform_deduction: 0, net_pay: 47500 })],
+          p_user_email: creds.admin.email,
+        }),
+      ]);
+
+      expect(r1.error).toBeNull();
+      expect(r2.error).toBeNull();
+      expect(r1.data.success).toBe(true);
+      expect(r2.data.success).toBe(true);
+
+      const { data: rows } = await clients.admin.from('payroll').select('employee_id, basic_salary').eq('month', concurrentMonth);
+      expect(rows).toHaveLength(2);
+      const byEmployee = new Map(rows!.map(r => [r.employee_id, Number(r.basic_salary)]));
+      expect(byEmployee.get(payrollEmployeeId)).toBe(100000);
+      expect(byEmployee.get(secondEmployeeId)).toBe(50000);
+
+      await clients.admin.from('payroll').delete().eq('month', concurrentMonth);
+    });
+
     test('audit log records the actual prior figures on a reprocess, not just a count', async () => {
       await clients.admin.rpc('process_payroll_batch', {
         p_month: testMonth, p_records: [record({ basic_salary: 111111 })], p_user_email: creds.admin.email,
@@ -318,6 +386,42 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       const deletedRows = logs?.[0]?.old_data?.deletedRows;
       expect(Array.isArray(deletedRows)).toBe(true);
       expect(Number(deletedRows[0]?.basic_salary)).toBe(111111);
+    });
+
+    test('a payload employee_id belonging to a different tenant is rejected', async () => {
+      const tenantBAdmin = getTenantBAdmin();
+      test.skip(!tenantBAdmin, 'E2E_TENANT_B_ADMIN_EMAIL/PASSWORD not configured -- skipping cross-tenant payroll isolation check');
+
+      const tenantBClient = createClient(creds.supabaseUrl, creds.supabaseAnonKey);
+      const { error: signInErr } = await tenantBClient.auth.signInWithPassword(tenantBAdmin!);
+      test.skip(!!signInErr, `Could not sign in as the Tenant B admin: ${signInErr?.message}`);
+
+      const { data: tenantBEmployee, error: createErr } = await tenantBClient
+        .from('employees')
+        .insert({ employee_number: `SFG-E2E-TENANTB-${Date.now()}`, full_name: 'E2E Tenant B Employee', basic_salary: 50000 })
+        .select('id')
+        .single();
+      test.skip(!!createErr, `Could not create a disposable Tenant B employee: ${createErr?.message}`);
+
+      try {
+        const { data: before } = await clients.admin.from('payroll').select('id').eq('month', testMonth).eq('employee_id', payrollEmployeeId);
+        const countBefore = before?.length ?? 0;
+
+        const { error } = await clients.admin.rpc('process_payroll_batch', {
+          p_month: testMonth,
+          p_records: [record(), record({ employee_id: tenantBEmployee!.id })],
+          p_user_email: creds.admin.email,
+        });
+        expect(error).not.toBeNull();
+
+        // Confirm the whole batch was rejected, not just the bad row --
+        // the good Tenant A record must not have been inserted either.
+        const { data: after } = await clients.admin.from('payroll').select('id').eq('month', testMonth).eq('employee_id', payrollEmployeeId);
+        expect(after?.length ?? 0).toBe(countBefore);
+      } finally {
+        await tenantBClient.from('employees').delete().eq('id', tenantBEmployee!.id);
+        await tenantBClient.auth.signOut();
+      }
     });
   });
 
