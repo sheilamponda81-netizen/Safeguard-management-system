@@ -426,6 +426,73 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
   });
 
   // ------------------------------------------------------------------
+  // Applicant dashboard counts RPC (20260804000002_applicant_dashboard_counts_rpc.sql)
+  // -- counts-only replacement for Dashboard.tsx's previous direct
+  // `applicants` SELECT, now that applicants' SELECT policy is role_level
+  // <= 2 (see rls-policy-matrix.spec.ts's "applicants" describe block).
+  // Every role_level (1-4) must be able to call this RPC; it must never
+  // return applicant PII, only 3 aggregate integers.
+  // ------------------------------------------------------------------
+  test.describe('applicant dashboard counts RPC', () => {
+    test('Admin obtains applicant dashboard counts via the RPC', async () => {
+      const { data, error } = await clients.admin.rpc('get_applicant_dashboard_counts').single();
+      expect(error).toBeNull();
+      expect(typeof data?.pending_count).toBe('number');
+      expect(typeof data?.shortlisted_count).toBe('number');
+      expect(typeof data?.interviewed_count).toBe('number');
+    });
+
+    test('Supervisor can obtain applicant dashboard counts via the RPC', async () => {
+      const { data, error } = await clients.supervisor.rpc('get_applicant_dashboard_counts').single();
+      expect(error).toBeNull();
+      expect(typeof data?.pending_count).toBe('number');
+      expect(typeof data?.shortlisted_count).toBe('number');
+      expect(typeof data?.interviewed_count).toBe('number');
+    });
+
+    test('Staff can obtain applicant dashboard counts via the RPC', async () => {
+      const { data, error } = await clients.staff.rpc('get_applicant_dashboard_counts').single();
+      expect(error).toBeNull();
+      expect(typeof data?.pending_count).toBe('number');
+      expect(typeof data?.shortlisted_count).toBe('number');
+      expect(typeof data?.interviewed_count).toBe('number');
+    });
+
+    test('the RPC returns aggregate counts ONLY -- no applicant PII, no extra fields', async () => {
+      const { data, error } = await clients.staff.rpc('get_applicant_dashboard_counts').single();
+      expect(error).toBeNull();
+      // Exact key set -- fails if the function is ever changed to return
+      // a row's worth of columns (name/email/phone/etc.) instead of the
+      // 3 documented aggregate integers.
+      expect(Object.keys(data as object).sort()).toEqual(['interviewed_count', 'pending_count', 'shortlisted_count']);
+    });
+
+    test('the counts reflect real tenant data (cross-checked against an Admin direct SELECT)', async () => {
+      const { data: created, error: createErr } = await clients.admin
+        .from('applicants')
+        .insert({ name: 'E2E RPC Count Test', position: 'Security Guard', interview_status: 'Pending', decision: 'Pending' })
+        .select('id')
+        .single();
+      test.skip(!!createErr, `Could not create a disposable applicant: ${createErr?.message}`);
+
+      try {
+        const { data: before } = await clients.admin.rpc('get_applicant_dashboard_counts').single();
+        // Insert a second Pending applicant and confirm the count increments by exactly 1.
+        const { data: created2 } = await clients.admin
+          .from('applicants')
+          .insert({ name: 'E2E RPC Count Test 2', position: 'Security Guard', interview_status: 'Pending', decision: 'Pending' })
+          .select('id')
+          .single();
+        const { data: after } = await clients.admin.rpc('get_applicant_dashboard_counts').single();
+        expect(after?.pending_count).toBe((before?.pending_count ?? 0) + 1);
+        if (created2?.id) await clients.admin.from('applicants').delete().eq('id', created2.id);
+      } finally {
+        await clients.admin.from('applicants').delete().eq('id', created!.id);
+      }
+    });
+  });
+
+  // ------------------------------------------------------------------
   // Terminal dues persistence
   // ------------------------------------------------------------------
   test.describe('terminal dues', () => {

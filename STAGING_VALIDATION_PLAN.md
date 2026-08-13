@@ -190,40 +190,109 @@ already in `supabase/migrations/`:
 10. `20260803000002_payroll_atomic_process_rpc.sql`
 11. `20260804000000_guard_id_generation.sql`
 12. `20260804000001_employee_number_generation.sql`
+13. `20260804000002_applicant_dashboard_counts_rpc.sql` — **Phase 1 / EXPAND**
+14. `20260804000003_restrict_applicants_select.sql` — **Phase 2 / CONTRACT**
 
-Migrations 1–7 are inherited/pre-existing (from before this audit began);
-8–12 are the 5 written and reviewed during this audit's own passes and are
-the focus of the detail below. **Standard command for all of them**, once a
-staging project exists and its connection is confirmed:
+**Correction to this document's own prior claim:** an earlier version of
+this section stated "migrations 1–7 are inherited/pre-existing." That was
+checked directly against `main` via `git diff --name-status main...HEAD --
+supabase/migrations/` during a later investigation pass and found to be
+**wrong** — only migrations **1–3** actually exist on `main` (the PR's base
+branch); migrations **4–14** are all new, added by this PR. Corrected here
+rather than silently left stale, consistent with this whole audit's own
+standing rule against carrying forward an unverified number.
+
+**Standard command for all of them**, once a staging project exists and its
+connection is confirmed:
 ```bash
 npx supabase db push          # applies every not-yet-applied migration, in order
 # or, one at a time:
 psql "$STAGING_DATABASE_URL" -f supabase/migrations/<file>.sql
 ```
 
+**Migrations 13–14 are a deliberate 2-phase (expand/contract) rollout, not
+independent migrations** — see §8g/§8h below for why, and do not apply #14
+until its own precondition checklist (frontend deployment confirmed live)
+is satisfied. This is the one place in this migration set where "apply
+everything in order, back to back" is explicitly NOT the safe procedure —
+every other migration here is safe to apply immediately after the one
+before it.
+
 **Per-migration detail** (preflight / command / verification / rollback /
 expected output / failure conditions / locking / data-loss / reversibility)
-for the 5 migrations this audit wrote — each one's own file also carries
-this exact SQL as inline comments, extracted here rather than re-derived,
-consistent with `DATA_INTEGRITY_REVIEW.md`'s own migration-safety table:
+for the migrations written and reviewed during this audit's own passes —
+each one's own file also carries this exact SQL as inline comments,
+extracted here rather than re-derived, consistent with
+`DATA_INTEGRITY_REVIEW.md`'s own migration-safety table:
 
-### 8a. `20260803000000_role_level_rls_hardening.sql`
+### 8a. `20260730000000_company_logo_storage.sql`
 
+- **Purpose:** creates the `company-logo` public storage bucket for
+  Settings → Company's logo upload.
+- **VERIFIED deployment rule (business decision, this pass):**
+  - **SELECT (read): public**, unrestricted — unchanged. The logo is
+    shown pre-login (Login.tsx) and in the authenticated Sidebar/Payslips;
+    it is not sensitive data.
+  - **INSERT/UPDATE/DELETE (write): Admin (role_level 1) / Manager
+    (role_level 2) / Super Admin only.** The original version of this
+    migration allowed *any authenticated user* to write — that was wider
+    than the app's own UI ever permits (the upload control lives on
+    Settings → Company, role_level 1 only per `rolePages`) and let a
+    Supervisor/Staff account replace or delete the shared logo file via a
+    direct API call. Fixed using the same two helper functions every
+    other role-aware policy in this schema uses, schema-qualified since
+    storage policies don't default to the `public` search_path:
+    `public.is_super_admin() = true OR public.current_user_role_level() <= 2`.
+- **Preflight:** none needed — bucket/policy creation only, no existing
+  data touched.
+- **Command:** `psql "$STAGING_DATABASE_URL" -f supabase/migrations/20260730000000_company_logo_storage.sql`
+- **Verification:**
+  ```sql
+  SELECT policyname, cmd FROM pg_policies
+    WHERE schemaname = 'storage' AND tablename = 'objects'
+    AND policyname LIKE '%company logo%' ORDER BY cmd;
+  -- expected: SELECT = "Public read access for company logo";
+  -- INSERT/UPDATE/DELETE = "Admins and managers can ... company logo"
+  ```
+- **Dependencies:** `public.current_user_role_level()`, defined in
+  `20260727000001_security_hardening.sql` (dated/ordered before this
+  migration, so already satisfied by this repo's own migration order).
+- **Locking risk:** brief catalog lock only, no table scan.
+- **Data-loss risk:** none.
+- **Rollback fully reversible?** **Yes** — widens write access back to any
+  authenticated user; exact rollback SQL is in the migration file's own
+  comments. Does not affect the stored logo file itself.
+
+### 8b. `20260803000000_role_level_rls_hardening.sql`
+
+- **VERIFIED deployment rule:** closes role-level policy gaps on
+  `payment_status` (SELECT/DELETE now role-restricted, was tenant-wide),
+  `terminal_dues` (same), `employee_deductions` (DELETE now super-admin
+  only), `system_settings` (DELETE now super-admin only), and `applicants`
+  (INSERT/UPDATE/DELETE role_level ≤ 2 — unchanged from the original
+  version of this file). **This migration deliberately does NOT restrict
+  `applicants` SELECT** — that specific change depends on a counts-only
+  RPC existing first (Dashboard.tsx's recruitment-count tile needs it) and
+  is its own, later migration — see §8g/§8h. Bundling it here would risk
+  a real deployment-ordering hazard (Staff/Supervisor losing direct
+  `applicants` access with no working RPC substitute yet).
 - **Preflight:** none needed — adds/replaces policies and pins function
   `search_path`s; no constraint added that could fail against existing data.
 - **Command:** `psql "$STAGING_DATABASE_URL" -f supabase/migrations/20260803000000_role_level_rls_hardening.sql`
 - **Verification:**
   ```sql
-  SELECT tablename, policyname FROM pg_policies
+  SELECT tablename, policyname, cmd FROM pg_policies
     WHERE tablename IN ('payment_status','terminal_dues','system_settings','employee_deductions','applicants','payroll','employees')
-    ORDER BY tablename, policyname;
+    ORDER BY tablename, cmd;
   -- confirm every expected policy name from the file is present
   SELECT proname, proconfig FROM pg_proc
     WHERE proname IN ('get_current_tenant_id','is_super_admin','current_user_role_level','prevent_profile_privilege_escalation');
   -- expected: proconfig contains 'search_path=public, pg_temp' for all 4
   ```
 - **Expected output:** policy list matches the file's own `CREATE POLICY`
-  statements; all 4 functions show the pinned `search_path`.
+  statements; all 4 functions show the pinned `search_path`; `applicants`
+  SELECT policy is still the pre-existing tenant-wide one (unchanged by
+  this file).
 - **Failure conditions:** none expected — no data-dependent constraint.
 - **Locking risk:** brief `ACCESS EXCLUSIVE` per policy change (catalog
   update only, no table scan) — near-instantaneous, still recommend a
@@ -237,7 +306,7 @@ consistent with `DATA_INTEGRITY_REVIEW.md`'s own migration-safety table:
   only who can read/write changes — but this is the one rollback in the set
   that needs lookup work first, not a one-liner.
 
-### 8b. `20260803000001_payroll_unique_constraint.sql`
+### 8c. `20260803000001_payroll_unique_constraint.sql`
 
 - **Preflight:**
   ```sql
@@ -247,6 +316,26 @@ consistent with `DATA_INTEGRITY_REVIEW.md`'s own migration-safety table:
   -- manually resolved (keep the most recently approved/processed row) BEFORE
   -- this migration will apply successfully.
   ```
+- **VERIFIED STAGING status (reported by the person with STAGING access,
+  not independently re-run from this environment — no STAGING credentials
+  exist here):**
+  ```
+  current_payroll_rows        = 450
+  unique_employee_month_pairs = 450
+  remaining_duplicate_groups  = 0
+  safety backup rows          = 450
+  ```
+  These four numbers matching (450/450/0/450) is consistent with the
+  preflight above already returning 0 rows in STAGING today, and with a
+  450-row safety backup having been taken before whatever cleanup produced
+  this state. **This is STAGING-only evidence, reported to this session,
+  not evidence this session independently generated or verified against a
+  live database.**
+  **Do not treat this as proof for production.** Production has its own,
+  independent data history and requires its own fresh preflight run
+  immediately before this migration is ever applied there — a clean
+  STAGING result says nothing about production's current duplicate-row
+  state.
 - **Command:** `psql "$STAGING_DATABASE_URL" -f supabase/migrations/20260803000001_payroll_unique_constraint.sql`
 - **Verification:** `SELECT conname FROM pg_constraint WHERE conname = 'payroll_employee_month_unique';` — expected 1 row.
 - **Expected output:** constraint created; second/duplicate run fails loudly (not silently).
@@ -261,10 +350,10 @@ consistent with `DATA_INTEGRITY_REVIEW.md`'s own migration-safety table:
 - **Data-loss risk:** none — adds a constraint only.
 - **Rollback fully reversible?** **Yes** — `ALTER TABLE payroll DROP CONSTRAINT IF EXISTS payroll_employee_month_unique;` — safe at any time, though it re-opens the duplicate-row risk this migration exists to close.
 
-### 8c. `20260803000002_payroll_atomic_process_rpc.sql`
+### 8d. `20260803000002_payroll_atomic_process_rpc.sql`
 
 - **Preflight:** none specific to this migration itself (creates/replaces a
-  function only) — the actual data guard is 8b's own constraint; run 8b's
+  function only) — the actual data guard is 8c's own constraint; run 8c's
   preflight, not a separate one here.
 - **Command:** `psql "$STAGING_DATABASE_URL" -f supabase/migrations/20260803000002_payroll_atomic_process_rpc.sql`
 - **Verification:**
@@ -300,7 +389,7 @@ consistent with `DATA_INTEGRITY_REVIEW.md`'s own migration-safety table:
   rejection (with legitimate-negative-net_pay allowed), rounding, audit-log
   correctness.
 
-### 8d. `20260804000000_guard_id_generation.sql`
+### 8e. `20260804000000_guard_id_generation.sql`
 
 - **Preflight:**
   ```sql
@@ -348,7 +437,7 @@ consistent with `DATA_INTEGRITY_REVIEW.md`'s own migration-safety table:
   requests" test, in addition to the pre-existing 10-simultaneous test),
   10-simultaneous, and a legacy-value-non-collision check.
 
-### 8e. `20260804000001_employee_number_generation.sql`
+### 8f. `20260804000001_employee_number_generation.sql`
 
 - **Preflight:**
   ```sql
@@ -389,29 +478,101 @@ consistent with `DATA_INTEGRITY_REVIEW.md`'s own migration-safety table:
   test), 10-simultaneous, legacy-numbering-gap safety (seed from `MAX`, not
   `COUNT`).
 
-**General ordering rule across 8c–8e** (from `DATA_INTEGRITY_REVIEW.md`):
+**General ordering rule across 8d–8f** (from `DATA_INTEGRITY_REVIEW.md`):
 roll back the **frontend** commit that calls a given RPC before dropping
 that RPC's function — dropping a function a deployed frontend is still
 actively calling turns a planned rollback into an outage.
 
-## 9. Verification order (after all 5 migrations applied)
+### 8g. `20260804000002_applicant_dashboard_counts_rpc.sql` — PHASE 1 / EXPAND
+
+- **VERIFIED deployment rule:** creates `get_applicant_dashboard_counts()`,
+  a `SECURITY DEFINER` RPC returning ONLY 3 aggregate integers (pending/
+  shortlisted/interviewed applicant counts) — no applicant name, email,
+  phone, notes, interview detail, decision, or id, ever. Callable by
+  every `role_level` (1–4); tenant-scoped internally via
+  `get_current_tenant_id()`/`is_super_admin()`, never from a client
+  parameter. **Purely additive — does not touch `applicants`' existing
+  (tenant-wide) SELECT policy.**
+- **MUST be applied BEFORE the Dashboard.tsx build that calls this RPC is
+  deployed** — a frontend calling an RPC that doesn't exist yet fails
+  outright (`function get_applicant_dashboard_counts does not exist`),
+  same class of hard dependency as `process_payroll_batch` (8d) but with
+  no client-side fallback written for this one either.
+- **Preflight:** none — new function only, no existing data/constraint
+  touched.
+- **Command:** `psql "$STAGING_DATABASE_URL" -f supabase/migrations/20260804000002_applicant_dashboard_counts_rpc.sql`
+- **Verification:**
+  ```sql
+  SELECT proname, prosecdef FROM pg_proc WHERE proname = 'get_applicant_dashboard_counts';
+  -- expected: 1 row, prosecdef = true
+  SELECT has_function_privilege('authenticated', 'get_applicant_dashboard_counts()', 'EXECUTE');
+  -- expected: true
+  SELECT has_function_privilege('anon', 'get_applicant_dashboard_counts()', 'EXECUTE');
+  -- expected: false
+  ```
+- **Locking risk:** none beyond the function-definition catalog lock.
+- **Data-loss risk:** none.
+- **Rollback fully reversible?** Yes, but only safe once the frontend that
+  calls it is rolled back first — same reasoning as 8d.
+
+### 8h. `20260804000003_restrict_applicants_select.sql` — PHASE 2 / CONTRACT
+
+- **VERIFIED deployment rule:** narrows `applicants` SELECT (full row
+  access) from tenant-wide to `role_level ≤ 2 OR is_super_admin()` — final
+  state: **direct `applicants` SELECT = Admin / Manager / Super Admin
+  only.** INSERT/UPDATE/DELETE on `applicants` are unaffected (already
+  restricted by 8b).
+- **MUST NOT be applied until ALL of the following are true (this
+  migration's own file carries the same checklist):**
+  1. `20260804000002` (8g, above) has been applied to this database.
+  2. The `Dashboard.tsx` build that calls `get_applicant_dashboard_counts()`
+     is confirmed the one actually live for all traffic to this
+     environment — no stale/cached old build still doing a direct
+     `applicants` count SELECT.
+  3. A Supervisor or Staff test account has been manually confirmed to see
+     correct recruitment counts on the Dashboard, via the RPC, BEFORE this
+     migration is applied.
+  Applying this migration before all three hold silently breaks the
+  Dashboard's recruitment-count tile for every Supervisor/Staff user (an
+  empty SELECT result, not an error — nothing in the UI would indicate
+  why).
+- **Preflight:** none — policy change only.
+- **Command:** `psql "$STAGING_DATABASE_URL" -f supabase/migrations/20260804000003_restrict_applicants_select.sql`
+- **Verification:**
+  ```sql
+  SELECT policyname, cmd FROM pg_policies WHERE tablename = 'applicants' ORDER BY cmd;
+  -- expected: SELECT/INSERT/UPDATE/DELETE all = "Managers can ... applicants in their tenant"
+  -- As Supervisor/Staff: SELECT * FROM applicants LIMIT 1;              -- expect 0 rows
+  -- As Supervisor/Staff: SELECT * FROM get_applicant_dashboard_counts(); -- expect a real row (RPC bypasses RLS)
+  ```
+- **Locking risk:** brief catalog lock only.
+- **Data-loss risk:** none.
+- **Rollback fully reversible?** Yes, independently of 8g — widens
+  `applicants` SELECT back to tenant-wide without removing the RPC.
+
+## 9. Verification order (after all migrations applied)
 
 1. Re-run each migration's own verification SQL above, in the same order.
-2. Run the full E2E suite against staging with all `REQUIRED_VARS` set (see
+2. Between 8g and 8h specifically: do not proceed to 8h until 8h's own
+   3-item precondition checklist is satisfied — this is not just
+   "verify," it's a hard gate.
+3. Run the full E2E suite against staging with all `REQUIRED_VARS` set (see
    `e2e/fixtures.ts`) — `npm run test:e2e` — confirm every currently-skipped
    test in `e2e/authenticated/*.spec.ts` converts to a real pass, not a new
    skip or failure.
-3. Only once step 2 is fully green, proceed to any manual/exploratory
+4. Only once step 3 is fully green, proceed to any manual/exploratory
    click-through testing against the Preview deployment (§2).
 
 ## 10. Rollback order
 
 Reverse of the apply order in §8, migration-by-migration, stopping at
-whichever migration introduced the problem — do not blanket-rollback all 5
-if only one is at fault. For 8c/8d/8e specifically, roll back the dependent
-**frontend** commit first (per the "General ordering rule" above) before
-dropping the function it calls, to avoid turning a planned rollback into an
-outage.
+whichever migration introduced the problem — do not blanket-rollback all of
+them if only one is at fault. For 8d/8e/8f/8g specifically, roll back the
+dependent **frontend** commit first (per the "General ordering rule" above)
+before dropping the function it calls, to avoid turning a planned rollback
+into an outage. 8h can be rolled back independently of 8g (see 8h's own
+rollback note) if only the SELECT restriction, not the RPC itself, needs
+reverting.
 
 ---
 
@@ -497,9 +658,13 @@ written and applied, the corresponding allow/deny tests should be added at
 that time, following the same signed-in-as-each-role pattern already used
 throughout both spec files.
 
-All 88 E2E tests (16 static, always-run; 72 staging-gated) currently report
-**SKIPPED**, not passing, not failing — see §14 for the exact count actually
-re-run this pass.
+As of this pass, 132 E2E tests exist (16 static, always-run; 116
+staging-gated), up from 88 in the previous revision of this document — the
+new `applicants`/RPC-counts coverage (§4/§6 above) accounts for the
+increase. All 116 staging-gated tests currently report **SKIPPED**, not
+passing, not failing, re-verified by actually running `npx playwright test`
+in this environment (16 passed / 116 skipped / 0 failed) — not carried
+forward from an earlier count.
 
 ## 13. Regional isolation — schema and policy design options (NOT applied)
 
@@ -567,6 +732,31 @@ relevant access before staging/production work proceeds past it.
 Where evidence exists (the last two rows), it is stated narrowly — "no
 service-role key in frontend code" is not the same claim as "Preview is
 definitely isolated," and this table does not conflate them.
+
+## 15. PR #36 merge readiness
+
+Stated explicitly, not left implicit in the sections above:
+
+1. **Regional RLS (§13) is a PR #36 merge blocker.** No RLS policy in this
+   schema — not in this PR, not in any migration listed in §8 — restricts
+   any table by `region_id`. Manager South (or any role) can access every
+   region's data within their tenant via a direct API call today, and
+   nothing in this PR changes that. Regional RLS design is documented
+   (§13) but explicitly **not implemented**, pending the 5 business
+   decisions §13 lists. PR #36 must not merge with this gap unresolved,
+   or with it resolved only in documentation rather than in an applied,
+   verified policy.
+2. **PR #36 stays draft/unmerged until full STAGING validation is green** —
+   concretely: every migration in §8 applied to STAGING in the order and
+   with the preconditions specified (including 8h's own 3-item checklist),
+   every staging-gated E2E test in §12 converted from SKIPPED to a real
+   PASS (not a new SKIP, not a FAIL), the credential/environment gates in
+   §14 resolved with real evidence (not this document's placeholders),
+   and — independent of all of the above — the regional RLS blocker in
+   item 1 either resolved or explicitly, separately signed off as
+   acceptable to ship without. None of these conditions has been met from
+   this environment; none can be, since this environment has no STAGING
+   or Vercel access.
 
 ---
 

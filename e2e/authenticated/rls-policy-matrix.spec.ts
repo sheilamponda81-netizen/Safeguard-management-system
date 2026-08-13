@@ -108,6 +108,73 @@ test.describe('RLS policy matrix (role_level hardening)', () => {
       expect(data?.status).toBe('pending');
       await clients.admin.from('payment_status').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-05`);
     });
+
+    // ----------------------------------------------------------------
+    // SELECT restriction (added after the src/-wide RLS access-matrix
+    // review -- role_level 3/4 have no legitimate src/ caller for this
+    // table, so SELECT is now restricted the same as INSERT/UPDATE).
+    // ----------------------------------------------------------------
+    test('Admin CAN select payment_status rows (legitimate workflow, unaffected)', async () => {
+      const { error } = await clients.admin.from('payment_status').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-07`, status: 'pending',
+      });
+      test.skip(!!error, `Could not seed a payment_status row: ${error?.message}`);
+      const { data, error: selectErr } = await clients.admin.from('payment_status').select('*').eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-07`);
+      expect(selectErr).toBeNull();
+      expect(data).toHaveLength(1);
+      await clients.admin.from('payment_status').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-07`);
+    });
+
+    test('Supervisor CANNOT select payment_status rows', async () => {
+      const { error: seedErr } = await clients.admin.from('payment_status').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-08`, status: 'pending',
+      });
+      test.skip(!!seedErr, `Could not seed a payment_status row: ${seedErr?.message}`);
+      const { data } = await clients.supervisor.from('payment_status').select('*').eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-08`);
+      // RLS denies SELECT by returning an empty set, not an error.
+      expect(data ?? []).toHaveLength(0);
+      await clients.admin.from('payment_status').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-08`);
+    });
+
+    test('Staff CANNOT select payment_status rows', async () => {
+      const { error: seedErr } = await clients.admin.from('payment_status').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-09`, status: 'pending',
+      });
+      test.skip(!!seedErr, `Could not seed a payment_status row: ${seedErr?.message}`);
+      const { data } = await clients.staff.from('payment_status').select('*').eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-09`);
+      expect(data ?? []).toHaveLength(0);
+      await clients.admin.from('payment_status').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-09`);
+    });
+
+    // ----------------------------------------------------------------
+    // DELETE restriction: no `.delete()` caller exists anywhere in
+    // src/ for this table -- policy is now super-admin only, so even
+    // Admin (role_level 1, not super-admin) and Manager are denied,
+    // not just Supervisor/Staff.
+    // ----------------------------------------------------------------
+    test('Supervisor CANNOT delete a payment_status row', async () => {
+      const { error: seedErr } = await clients.admin.from('payment_status').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-10`, status: 'pending',
+      });
+      test.skip(!!seedErr, `Could not seed a payment_status row: ${seedErr?.message}`);
+      await clients.supervisor.from('payment_status').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-10`);
+      // Denied DELETE under RLS also affects 0 rows silently -- verify
+      // via re-read as admin, same reasoning as the UPDATE test above.
+      const { data } = await clients.admin.from('payment_status').select('id').eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-10`);
+      expect(data).toHaveLength(1);
+      await clients.admin.from('payment_status').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-10`);
+    });
+
+    test('Staff CANNOT delete a payment_status row', async () => {
+      const { error: seedErr } = await clients.admin.from('payment_status').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-11`, status: 'pending',
+      });
+      test.skip(!!seedErr, `Could not seed a payment_status row: ${seedErr?.message}`);
+      await clients.staff.from('payment_status').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-11`);
+      const { data } = await clients.admin.from('payment_status').select('id').eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-11`);
+      expect(data).toHaveLength(1);
+      await clients.admin.from('payment_status').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-11`);
+    });
   });
 
   // ------------------------------------------------------------------
@@ -168,6 +235,163 @@ test.describe('RLS policy matrix (role_level hardening)', () => {
       const { data: after } = await clients.admin.from('terminal_dues').select('status').eq('id', created!.id).single();
       expect(after?.status).toBe('pending');
       await clients.admin.from('terminal_dues').delete().eq('id', created!.id);
+    });
+
+    // ----------------------------------------------------------------
+    // SELECT restriction (same reasoning/timing as payment_status above).
+    // ----------------------------------------------------------------
+    test('Manager CAN select terminal_dues rows (legitimate workflow, unaffected)', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('terminal_dues').insert(dues()).select('id').single();
+      test.skip(!!seedErr, `Could not seed a terminal_dues row: ${seedErr?.message}`);
+      const { data, error: selectErr } = await clients.manager.from('terminal_dues').select('*').eq('id', created!.id);
+      expect(selectErr).toBeNull();
+      expect(data).toHaveLength(1);
+      await clients.admin.from('terminal_dues').delete().eq('id', created!.id);
+    });
+
+    test('Supervisor CANNOT select terminal_dues rows', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('terminal_dues').insert(dues()).select('id').single();
+      test.skip(!!seedErr, `Could not seed a terminal_dues row: ${seedErr?.message}`);
+      const { data } = await clients.supervisor.from('terminal_dues').select('*').eq('id', created!.id);
+      expect(data ?? []).toHaveLength(0);
+      await clients.admin.from('terminal_dues').delete().eq('id', created!.id);
+    });
+
+    test('Staff CANNOT select terminal_dues rows', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('terminal_dues').insert(dues()).select('id').single();
+      test.skip(!!seedErr, `Could not seed a terminal_dues row: ${seedErr?.message}`);
+      const { data } = await clients.staff.from('terminal_dues').select('*').eq('id', created!.id);
+      expect(data ?? []).toHaveLength(0);
+      await clients.admin.from('terminal_dues').delete().eq('id', created!.id);
+    });
+
+    // ----------------------------------------------------------------
+    // DELETE restriction: no `.delete()` caller exists anywhere in
+    // src/ for this table -- policy is now super-admin only.
+    // ----------------------------------------------------------------
+    test('Supervisor CANNOT delete a terminal_dues row', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('terminal_dues').insert(dues()).select('id').single();
+      test.skip(!!seedErr, `Could not seed a terminal_dues row: ${seedErr?.message}`);
+      await clients.supervisor.from('terminal_dues').delete().eq('id', created!.id);
+      const { data } = await clients.admin.from('terminal_dues').select('id').eq('id', created!.id);
+      expect(data).toHaveLength(1);
+      await clients.admin.from('terminal_dues').delete().eq('id', created!.id);
+    });
+
+    test('Staff CANNOT delete a terminal_dues row', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('terminal_dues').insert(dues()).select('id').single();
+      test.skip(!!seedErr, `Could not seed a terminal_dues row: ${seedErr?.message}`);
+      await clients.staff.from('terminal_dues').delete().eq('id', created!.id);
+      const { data } = await clients.admin.from('terminal_dues').select('id').eq('id', created!.id);
+      expect(data).toHaveLength(1);
+      await clients.admin.from('terminal_dues').delete().eq('id', created!.id);
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // employee_deductions: DELETE tightened to super-admin only (no
+  // `.delete()` caller anywhere in src/). SELECT is DELIBERATELY left
+  // tenant-wide -- src/pages/Payslips.tsx (role_level 4 reachable) reads
+  // this table directly to compute net pay, so this block also regression-
+  // tests that SELECT was NOT accidentally narrowed.
+  // ------------------------------------------------------------------
+  test.describe('employee_deductions', () => {
+    test('Staff CAN still select employee_deductions rows (regression check -- Payslips.tsx needs this)', async () => {
+      const { error: seedErr } = await clients.admin.from('employee_deductions').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-01`,
+      });
+      test.skip(!!seedErr, `Could not seed an employee_deductions row: ${seedErr?.message}`);
+      const { data, error: selectErr } = await clients.staff.from('employee_deductions').select('*').eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-01`);
+      expect(selectErr).toBeNull();
+      expect(data).toHaveLength(1);
+      await clients.admin.from('employee_deductions').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-01`);
+    });
+
+    test('Staff CANNOT delete an employee_deductions row', async () => {
+      const { error: seedErr } = await clients.admin.from('employee_deductions').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-02`,
+      });
+      test.skip(!!seedErr, `Could not seed an employee_deductions row: ${seedErr?.message}`);
+      await clients.staff.from('employee_deductions').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-02`);
+      const { data } = await clients.admin.from('employee_deductions').select('id').eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-02`);
+      expect(data).toHaveLength(1);
+      await clients.admin.from('employee_deductions').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-02`);
+    });
+
+    test('Admin (role_level 1, not super-admin) CANNOT delete an employee_deductions row either', async () => {
+      // The implemented policy is super-admin only, stricter than
+      // role_level <= 3 -- confirms even Admin/Manager/Supervisor, not
+      // just Staff, are denied, since nothing in src/ ever deletes this
+      // table at any role.
+      const { error: seedErr } = await clients.admin.from('employee_deductions').insert({
+        employee_id: sampleEmployeeId, month: `${testMonth}-03`,
+      });
+      test.skip(!!seedErr, `Could not seed an employee_deductions row: ${seedErr?.message}`);
+      await clients.admin.from('employee_deductions').delete().eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-03`);
+      const { data } = await clients.admin.from('employee_deductions').select('id').eq('employee_id', sampleEmployeeId).eq('month', `${testMonth}-03`);
+      expect(data).toHaveLength(1);
+      // Cleanup: only a genuine super-admin session could actually remove
+      // this row via DELETE now; downgrade to leaving it for the
+      // far-future testMonth prefix to be swept by the general cleanup
+      // convention if no super-admin credential is configured for e2e.
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // applicants: SELECT (full row access) restricted to role_level <= 2 --
+  // Supervisor/Staff must not be able to read applicant PII directly,
+  // per business decision. Dashboard counts for all roles come from
+  // get_applicant_dashboard_counts() instead (see rpc-workflow-matrix.spec.ts).
+  //
+  // This restriction is applied by a deliberately separate, LATER
+  // migration -- 20260804000003_restrict_applicants_select.sql (Phase 2 /
+  // "contract" of a 2-phase rollout) -- not by
+  // 20260803000000_role_level_rls_hardening.sql. Running this describe
+  // block against a staging project that has 20260803000000 but NOT yet
+  // 20260804000002 (the counts RPC) and 20260804000003 (this restriction)
+  // applied will fail the SELECT-denial assertions below, since
+  // `applicants` SELECT is still tenant-wide until 20260804000003 is
+  // applied -- see that migration's own header for the required apply
+  // order and precondition checklist.
+  // ------------------------------------------------------------------
+  test.describe('applicants', () => {
+    const applicant = (overrides: Partial<Record<string, unknown>> = {}) => ({
+      name: 'E2E Test Applicant', position: 'Security Guard', interview_status: 'Pending', decision: 'Pending',
+      ...overrides,
+    });
+
+    test('Admin can SELECT full applicant rows', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('applicants').insert(applicant()).select('id').single();
+      test.skip(!!seedErr, `Could not seed an applicant: ${seedErr?.message}`);
+      const { data, error: selectErr } = await clients.admin.from('applicants').select('*').eq('id', created!.id);
+      expect(selectErr).toBeNull();
+      expect(data).toHaveLength(1);
+      await clients.admin.from('applicants').delete().eq('id', created!.id);
+    });
+
+    test('Manager can SELECT full applicant rows', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('applicants').insert(applicant()).select('id').single();
+      test.skip(!!seedErr, `Could not seed an applicant: ${seedErr?.message}`);
+      const { data, error: selectErr } = await clients.manager.from('applicants').select('*').eq('id', created!.id);
+      expect(selectErr).toBeNull();
+      expect(data).toHaveLength(1);
+      await clients.admin.from('applicants').delete().eq('id', created!.id);
+    });
+
+    test('Supervisor CANNOT select full applicant rows', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('applicants').insert(applicant()).select('id').single();
+      test.skip(!!seedErr, `Could not seed an applicant: ${seedErr?.message}`);
+      const { data } = await clients.supervisor.from('applicants').select('*').eq('id', created!.id);
+      expect(data ?? []).toHaveLength(0);
+      await clients.admin.from('applicants').delete().eq('id', created!.id);
+    });
+
+    test('Staff CANNOT select full applicant rows', async () => {
+      const { data: created, error: seedErr } = await clients.admin.from('applicants').insert(applicant()).select('id').single();
+      test.skip(!!seedErr, `Could not seed an applicant: ${seedErr?.message}`);
+      const { data } = await clients.staff.from('applicants').select('*').eq('id', created!.id);
+      expect(data ?? []).toHaveLength(0);
+      await clients.admin.from('applicants').delete().eq('id', created!.id);
     });
   });
 

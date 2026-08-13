@@ -22,6 +22,15 @@ import { showNotification } from '../utils/clickHandlers';
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
 const COLORS = ['#081C3A', '#D4A017', '#3B82F6', '#10B981', '#EF4444', '#8B5CF6', '#F59E0B', '#64748B', '#06B6D4'];
 
+// Shape of get_applicant_dashboard_counts()'s single-row return (see
+// supabase/migrations/20260804000002_applicant_dashboard_counts_rpc.sql) --
+// 3 aggregate integers only, never applicant row data.
+interface ApplicantDashboardCounts {
+  pending_count: number;
+  shortlisted_count: number;
+  interviewed_count: number;
+}
+
 // ===== COMPONENT: Chart loading placeholder =====
 const ChartLoader = () => (
   <div className="h-full flex items-center justify-center min-h-[150px]">
@@ -231,12 +240,33 @@ export function Dashboard() {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
       }
       
-      const [employeesRes, applicantsRes, shortlistedRes, interviewedRes] = await Promise.all([
+      // Applicant counts come from a counts-only RPC, not a direct
+      // `applicants` SELECT -- Supervisor/Staff (role_level 3/4) are
+      // still meant to see these numbers on the Dashboard, but as of
+      // this migration are no longer permitted to SELECT full applicant
+      // rows directly (see 20260803000000_role_level_rls_hardening.sql
+      // and 20260804000002_applicant_dashboard_counts_rpc.sql). The RPC
+      // is SECURITY DEFINER and does its own tenant scoping server-side,
+      // so it works identically regardless of the caller's role_level.
+      const [employeesRes, countsRes] = await Promise.all([
         employeesQuery,
-        supabase.from('applicants').select('id', { count: 'exact', head: false }).eq('interview_status', 'Pending'),
-        supabase.from('applicants').select('id', { count: 'exact', head: false }).eq('interview_status', 'Shortlisted'),
-        supabase.from('applicants').select('id', { count: 'exact', head: false }).eq('interview_status', 'Interviewed')
+        supabase.rpc('get_applicant_dashboard_counts').single(),
       ]);
+
+      if (countsRes.error) {
+        // Fails closed to zero rather than throwing -- a missing/errored
+        // RPC (e.g. this migration not yet applied in an environment)
+        // should degrade the recruitment stat tile, not the whole
+        // Dashboard, and must never fall back to a direct `applicants`
+        // row query (that would defeat the point of this change).
+        console.error('Error fetching applicant dashboard counts:', countsRes.error);
+      }
+      // No generated Supabase types exist in this project (see
+      // AUDIT_REPORT.md), so `.rpc(...)` has nothing to infer the return
+      // shape from -- cast explicitly to the 3-integer shape
+      // get_applicant_dashboard_counts() actually returns, matching the
+      // pattern already used for process_payroll_batch()'s result.
+      const applicantCounts = countsRes.data as ApplicantDashboardCounts | null;
 
       const employeesData = employeesRes.data || [];
       const employeeIds = employeesData.map((e: any) => e.id);
@@ -321,9 +351,9 @@ export function Dashboard() {
         expiringLicenses,
         totalPayroll,
         onLeave,
-        pendingRecruitment: applicantsRes.count || 0,
-        shortlistedRecruitment: shortlistedRes.count || 0,
-        interviewedRecruitment: interviewedRes.count || 0,
+        pendingRecruitment: applicantCounts?.pending_count ?? 0,
+        shortlistedRecruitment: applicantCounts?.shortlisted_count ?? 0,
+        interviewedRecruitment: applicantCounts?.interviewed_count ?? 0,
         attendanceRate,
         notifications: 0
       });
