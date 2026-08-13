@@ -49,6 +49,7 @@ const SecurityPage = safeLazy(() => import("./pages/Security"));
 const SettingsPage = safeLazy(() => import("./pages/Misc"));
 const AuditLogsPage = safeLazy(() => import("./pages/AuditLogs"));
 const TerminalDuesPage = safeLazy(() => import("./pages/TerminalDues"));
+const SalaryAdvancesPage = safeLazy(() => import("./pages/SalaryAdvances"));
 const FeaturesPage = safeLazy(() => import("./pages/Features"));
 const UserManualPage = safeLazy(() => import("./pages/UserManual"));
 
@@ -62,6 +63,7 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
   payslips: PayslipsPage,
   payments: PaymentsPage,
   "terminal-dues": TerminalDuesPage,
+  "salary-advances": SalaryAdvancesPage,
   reports: ReportsPage,
   settings: SettingsPage,
   security: SecurityPage,
@@ -74,13 +76,13 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
 const rolePages: Record<number, NavKey[]> = {
   1: [
     "dashboard", "employees", "recruitment", "attendance",
-    "payroll", "payslips", "payments", "terminal-dues",
+    "payroll", "payslips", "payments", "terminal-dues", "salary-advances",
     "reports", "settings", "security", "features", "auditlogs",
     "user-manual",
   ],
   2: [
     "dashboard", "employees", "recruitment", "attendance",
-    "payments", "terminal-dues", "reports", "security",
+    "payments", "terminal-dues", "salary-advances", "reports", "security",
     "user-manual",
   ],
   3: ["dashboard", "attendance", "security", "user-manual"],
@@ -97,6 +99,7 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   payslips: { title: "Payslips", breadcrumb: "Payslips" },
   payments: { title: "Payment Management", breadcrumb: "Payments" },
   "terminal-dues": { title: "Terminal Dues Calculator", breadcrumb: "Terminal Dues" },
+  "salary-advances": { title: "Salary Advances", breadcrumb: "Salary Advances" },
   reports: { title: "Reports & Analytics", breadcrumb: "Reports" },
   settings: { title: "System Settings", breadcrumb: "Settings" },
   security: { title: "Security Personnel", breadcrumb: "Security" },

@@ -9,7 +9,7 @@ vi.mock('../lib/supabase', () => ({
   },
 }));
 
-const { processPayrollBatch } = await import('./payrollProcessing');
+const { processPayrollBatch, describeProcessPayrollBatchError } = await import('./payrollProcessing');
 
 const sampleRecord = {
   employee_id: 'emp-1',
@@ -121,5 +121,52 @@ describe('processPayrollBatch', () => {
     rpcMock.mockResolvedValueOnce({ data: { success: true, month: '2026-08', deletedCount: 0, insertedCount: 1 }, error: null });
     await processPayrollBatch('2026-08', [sampleRecord]);
     expect(rpcMock).toHaveBeenCalledWith('process_payroll_batch', expect.objectContaining({ p_user_email: null }));
+  });
+
+  it('classifies the global net-pay-invariant exception (advance-caused) as "validation_failed"', async () => {
+    rpcMock.mockResolvedValueOnce({
+      data: null,
+      error: { message: "Refusing to process payroll for employee 11111111-1111-1111-1111-111111111111: this would produce a negative net pay of -5000 (net pay 15000 minus a salary advance deduction of 20000). Final payroll net pay must never be negative -- resolve this before processing (e.g. reduce the combined repayment plan, move this employee's deduction to a later month, or review their other deductions) -- nothing has been applied and the transaction has been rolled back." },
+    });
+    const result = await processPayrollBatch('2026-08', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('validation_failed');
+    expect(result.error).toMatch(/negative net pay/);
+  });
+
+  it('classifies the payload-level negative-net-pay rejection (no salary advance involved) as "validation_failed"', async () => {
+    rpcMock.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'Refusing to process payroll: one or more records has a missing, non-numeric, or negative monetary value -- every amount, including net_pay, must be zero or positive. Final payroll net pay must never be negative; review the deductions for the affected employee(s) and try again.' },
+    });
+    const result = await processPayrollBatch('2026-08', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('validation_failed');
+    expect(result.error).toMatch(/net pay must never be negative/);
+  });
+});
+
+describe('describeProcessPayrollBatchError', () => {
+  const employeeId = '11111111-1111-1111-1111-111111111111';
+  const advanceError = `Refusing to process payroll for employee ${employeeId}: this would produce a negative net pay of -5000 (net pay 15000 minus a salary advance deduction of 20000). Final payroll net pay must never be negative -- resolve this before processing.`;
+
+  it('rewrites the advance-caused negative-net-pay error into a human-readable message naming the employee, when the name can be resolved', () => {
+    const result = describeProcessPayrollBatchError(advanceError, id => (id === employeeId ? 'Jane Banda' : undefined));
+    expect(result).toBe('Payroll cannot be processed because deductions would make net pay negative for Jane Banda. Review the deductions and try again.');
+  });
+
+  it('falls back to the raw RPC message when the employee cannot be resolved to a name', () => {
+    const result = describeProcessPayrollBatchError(advanceError, () => undefined);
+    expect(result).toBe(advanceError);
+  });
+
+  it('leaves every other error message untouched, e.g. the payload-level (no-UUID) negative-net-pay rejection', () => {
+    const message = 'Refusing to process payroll: one or more records has a missing, non-numeric, or negative monetary value -- every amount, including net_pay, must be zero or positive.';
+    expect(describeProcessPayrollBatchError(message, () => 'Jane Banda')).toBe(message);
+  });
+
+  it('leaves an unrelated error (e.g. duplicate employee_id) completely untouched', () => {
+    const message = 'Refusing to process: the same employee_id appears more than once in this batch';
+    expect(describeProcessPayrollBatchError(message, () => 'Jane Banda')).toBe(message);
   });
 });

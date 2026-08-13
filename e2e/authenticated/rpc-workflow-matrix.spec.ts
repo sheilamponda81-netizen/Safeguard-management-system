@@ -301,20 +301,36 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       expect(after?.length ?? 0).toBe(countBefore);
     });
 
-    test('rejects a negative basic_salary but allows a legitimately negative net_pay', async () => {
+    test('rejects a negative basic_salary AND a negative net_pay -- final payroll net pay must never be negative (confirmed business decision, supersedes the earlier "net_pay may be negative" behavior)', async () => {
       const { error: negSalaryErr } = await clients.admin.rpc('process_payroll_batch', {
         p_month: testMonth, p_records: [record({ basic_salary: -1000 })], p_user_email: creds.admin.email,
       });
       expect(negSalaryErr).not.toBeNull();
       expect(negSalaryErr?.message).toMatch(/negative monetary value/i);
 
+      // Previously accepted regardless of salary advances -- now REJECTED
+      // outright, even with no salary advance involved at all, per the
+      // GLOBAL NET-PAY INVARIANT (see 20260813000001_payroll_salary_advance_integration.sql).
       const { error: negNetPayErr } = await clients.admin.rpc('process_payroll_batch', {
         p_month: testMonth, p_records: [record({ net_pay: -5000 })], p_user_email: creds.admin.email,
       });
-      expect(negNetPayErr).toBeNull(); // net_pay may legitimately be negative -- not rejected
+      expect(negNetPayErr).not.toBeNull();
+      expect(negNetPayErr?.message).toMatch(/negative/i);
+
+      // Nothing was written for the rejected record.
+      const { data: row } = await clients.admin.from('payroll').select('id').eq('month', testMonth).eq('employee_id', payrollEmployeeId);
+      expect(row ?? []).toHaveLength(0);
+    });
+
+    test('accepts a net_pay of exactly 0 (the boundary is inclusive, not exclusive)', async () => {
+      const { data, error } = await clients.admin.rpc('process_payroll_batch', {
+        p_month: testMonth, p_records: [record({ net_pay: 0 })], p_user_email: creds.admin.email,
+      });
+      expect(error).toBeNull();
+      expect(data.success).toBe(true);
 
       const { data: row } = await clients.admin.from('payroll').select('net_pay').eq('month', testMonth).eq('employee_id', payrollEmployeeId).single();
-      expect(Number(row?.net_pay)).toBe(-5000);
+      expect(Number(row?.net_pay)).toBe(0);
     });
 
     test('rounds monetary values to 2 decimal places on insert', async () => {
@@ -432,10 +448,34 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
   // <= 2 (see rls-policy-matrix.spec.ts's "applicants" describe block).
   // Every role_level (1-4) must be able to call this RPC; it must never
   // return applicant PII, only 3 aggregate integers.
+  //
+  // Typing note: `clients.*` are plain `SupabaseClient` (no generated
+  // Database/RPC types exist in this repo -- see AUDIT_REPORT.md), so
+  // `.rpc('get_applicant_dashboard_counts')` resolves `data` to `{}` with
+  // no generics to narrow it. `getApplicantDashboardCounts()` below is a
+  // thin, explicitly-typed wrapper around that same untyped call --
+  // mirrors the RPC's actual documented shape (see the migration's own
+  // RETURN, and Dashboard.tsx's own `ApplicantDashboardCounts` interface,
+  // which this one is kept consistent with) via a single `as` cast, the
+  // same pattern Dashboard.tsx itself already uses for this exact RPC
+  // (`countsRes.data as ApplicantDashboardCounts | null`) -- not `any`,
+  // and no behavior change: still the same untyped runtime call, only the
+  // compile-time view of its result is corrected.
   // ------------------------------------------------------------------
+  interface ApplicantDashboardCounts {
+    pending_count: number;
+    shortlisted_count: number;
+    interviewed_count: number;
+  }
+
+  const getApplicantDashboardCounts = async (client: SupabaseClient) => {
+    const { data, error } = await client.rpc('get_applicant_dashboard_counts').single();
+    return { data: data as ApplicantDashboardCounts | null, error };
+  };
+
   test.describe('applicant dashboard counts RPC', () => {
     test('Admin obtains applicant dashboard counts via the RPC', async () => {
-      const { data, error } = await clients.admin.rpc('get_applicant_dashboard_counts').single();
+      const { data, error } = await getApplicantDashboardCounts(clients.admin);
       expect(error).toBeNull();
       expect(typeof data?.pending_count).toBe('number');
       expect(typeof data?.shortlisted_count).toBe('number');
@@ -443,7 +483,7 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
     });
 
     test('Supervisor can obtain applicant dashboard counts via the RPC', async () => {
-      const { data, error } = await clients.supervisor.rpc('get_applicant_dashboard_counts').single();
+      const { data, error } = await getApplicantDashboardCounts(clients.supervisor);
       expect(error).toBeNull();
       expect(typeof data?.pending_count).toBe('number');
       expect(typeof data?.shortlisted_count).toBe('number');
@@ -451,7 +491,7 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
     });
 
     test('Staff can obtain applicant dashboard counts via the RPC', async () => {
-      const { data, error } = await clients.staff.rpc('get_applicant_dashboard_counts').single();
+      const { data, error } = await getApplicantDashboardCounts(clients.staff);
       expect(error).toBeNull();
       expect(typeof data?.pending_count).toBe('number');
       expect(typeof data?.shortlisted_count).toBe('number');
@@ -459,7 +499,7 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
     });
 
     test('the RPC returns aggregate counts ONLY -- no applicant PII, no extra fields', async () => {
-      const { data, error } = await clients.staff.rpc('get_applicant_dashboard_counts').single();
+      const { data, error } = await getApplicantDashboardCounts(clients.staff);
       expect(error).toBeNull();
       // Exact key set -- fails if the function is ever changed to return
       // a row's worth of columns (name/email/phone/etc.) instead of the
@@ -476,14 +516,14 @@ test.describe('RPC workflow matrix (generation, payroll atomicity, status transi
       test.skip(!!createErr, `Could not create a disposable applicant: ${createErr?.message}`);
 
       try {
-        const { data: before } = await clients.admin.rpc('get_applicant_dashboard_counts').single();
+        const { data: before } = await getApplicantDashboardCounts(clients.admin);
         // Insert a second Pending applicant and confirm the count increments by exactly 1.
         const { data: created2 } = await clients.admin
           .from('applicants')
           .insert({ name: 'E2E RPC Count Test 2', position: 'Security Guard', interview_status: 'Pending', decision: 'Pending' })
           .select('id')
           .single();
-        const { data: after } = await clients.admin.rpc('get_applicant_dashboard_counts').single();
+        const { data: after } = await getApplicantDashboardCounts(clients.admin);
         expect(after?.pending_count).toBe((before?.pending_count ?? 0) + 1);
         if (created2?.id) await clients.admin.from('applicants').delete().eq('id', created2.id);
       } finally {

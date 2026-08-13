@@ -550,17 +550,445 @@ actively calling turns a planned rollback into an outage.
 - **Rollback fully reversible?** Yes, independently of 8g — widens
   `applicants` SELECT back to tenant-wide without removing the RPC.
 
+### 8i. `20260813000000_salary_advances_schema.sql`
+
+- **BUSINESS RULE (revised across several drafts — "1 open advance", then
+  "sum of independent rates", then this pass's own correction — a
+  `pending` APPLICATION is not active debt):** an employee may have **UP
+  TO TWO** simultaneously `pending`/`active` salary advances. A plain
+  `UNIQUE` index can express "at most one" but not "at most two," so this
+  migration does NOT use an index for the count limit — see the
+  "concurrency-safe RPCs" bullet below. `create_salary_advance()` inserts
+  a `pending` APPLICATION only — it counts toward the max-2 limit and is
+  visible in the UI, but is not yet debt: it does not touch the combined
+  plan and is never picked up by payroll. `approve_salary_advance()` is
+  the ONLY path from `pending` to `active`, and it is the SOLE moment the
+  combined plan is established or updated — **when two advances are
+  active, there is exactly ONE COMBINED monthly deduction figure for the
+  employee's total outstanding balance**, never the sum of each advance's
+  own independently-configured rate, and approving a SECOND advance onto
+  an existing plan REQUIRES the caller to explicitly supply new combined
+  terms (management action, not silent reuse of the first advance's plan).
+- **VERIFIED deployment rule:** creates FOUR new tables —
+  `salary_advances` (application terms AS ORIGINALLY APPLIED FOR +
+  lifecycle status — immutable history once inserted, see the guard
+  trigger below), `salary_advance_deductions` (the append-only repayment
+  ledger, one row per `(salary_advance_id, payroll_month)` actually
+  deducted, enforced by a `UNIQUE(salary_advance_id, payroll_month)`
+  constraint), `salary_advance_repayment_plans` (**the ONE current,
+  living combined plan per employee** — `UNIQUE(employee_id)`; a
+  dedicated table rather than fields duplicated onto both open advances,
+  specifically so "what was originally applied for" (immutable, per
+  advance) never blurs with "what's currently being deducted" (living,
+  per employee) — see the migration's own "WHY A DEDICATED PLAN TABLE"
+  header note), and `salary_advance_repayment_plan_changes` (audit
+  history for combined-plan changes, both at second-advance approval and
+  for the later "Edit / Adjust Repayment Plan" action, employee-scoped).
+  All four start empty; no existing table, column, or row is touched. RLS
+  is enabled on all four: `salary_advances` gets SELECT/UPDATE for
+  `role_level ≤ 2 OR is_super_admin()` and DELETE restricted to
+  super-admin only, and **deliberately has NO INSERT policy at all** (see
+  below); the other three each get a SELECT-only policy for the same role
+  set and **deliberately no INSERT/UPDATE/DELETE policy at all** — all
+  three are written exclusively by `SECURITY DEFINER` functions (the
+  ledger by `process_payroll_batch()`, the plan table and change-history
+  table by `approve_salary_advance()`/`adjust_combined_repayment_plan()`
+  as applicable), which bypass RLS for their own writes — the same "only
+  one function may write here" pattern already used for
+  `guard_id_counters`/`employee_number_counters`.
+  **SAFETY REVIEW CONFIRMATION (re-audited, this pass, specifically for
+  `salary_advance_repayment_plans`/`salary_advance_repayment_plan_changes`):**
+  no INSERT, UPDATE, or DELETE policy exists on either table for ANY role,
+  including Admin/Manager/super-admin — a direct `supabase-js`
+  `.insert()`/`.update()`/`.delete()` call against either table is
+  rejected by RLS outright for every role, with no bypass. Both tables are
+  writable ONLY via `approve_salary_advance()`/
+  `adjust_combined_repayment_plan()` (and, for the ledger analog,
+  `process_payroll_batch()`), which are `SECURITY DEFINER` and bypass RLS
+  for their own writes only. This is proven directly (not just asserted)
+  by two dedicated e2e tests in `e2e/authenticated/salary-advances-matrix.spec.ts`'s
+  RLS describe block, each covering INSERT + UPDATE + DELETE for BOTH
+  Admin and Manager, immediately followed by proof that the authorized RPC
+  path still succeeds.
+- **Concurrency-safe RPCs, not a UNIQUE index, enforce the max-2 rule; a
+  dedicated pair of RPCs, not a shared one, enforce the
+  single-combined-plan rule — split across APPLICATION and APPROVAL:**
+  - `create_salary_advance()` — the ONLY way to create a new advance,
+    always as a `pending` APPLICATION. An employee-scoped
+    `pg_advisory_xact_lock` + `SELECT COUNT(*) ... WHERE status IN
+    ('pending','active')` check inside one `SECURITY DEFINER` transaction
+    rejects a 3rd. **Authorization (`is_super_admin() OR
+    current_user_role_level() <= 2`) is enforced INSIDE the function body
+    itself** — since there is no INSERT RLS policy to also fall back on,
+    this in-function check is the sole gate; an authenticated
+    Supervisor/Staff session calling the RPC directly fails with an
+    explicit exception. **This function never creates or refreshes
+    `salary_advance_repayment_plans` and is never picked up by payroll —
+    a pending application is a request, not debt.**
+  - `approve_salary_advance()` — the ONLY path from `pending` to `active`,
+    same authorization gate as `create_salary_advance()`. Locks the target
+    advance row, verifies it is still `pending` and belongs to the
+    caller's tenant, takes the same employee-scoped advisory lock, then
+    computes the employee's ACTIVE outstanding balance (across every OTHER
+    `'active'` advance) plus this advance's own amount. If this is the
+    employee's FIRST active advance, it establishes the combined plan from
+    the advance's own (optionally overridden) terms. **If the employee
+    already has an active advance, the caller MUST supply explicit new
+    combined terms (method + monthly amount or period) — the RPC raises
+    an exception rather than silently reusing or leaving the old plan.**
+    Writes a `salary_advance_repayment_plan_changes` audit row whenever an
+    EXISTING plan is changed (not on first establishment — there is no
+    "previous" state to record). Sets a transaction-local flag
+    (`app.allow_salary_advance_approval`) immediately before its own
+    `status = 'active'` UPDATE — this is what the guard trigger below
+    checks to reject the same transition via any other path. Both the
+    plan upsert and the status transition happen inside this one RPC
+    invocation (one Postgres transaction), so there is no observable
+    intermediate state where the advance is active but the plan is stale.
+  - `adjust_combined_repayment_plan()` — the LATER "Edit / Adjust
+    Repayment Plan" action, EMPLOYEE-scoped (not advance-scoped), for
+    changing an already-established plan's terms independently of
+    approving a new advance. Recomputes FUTURE terms only, from the
+    employee's current TOTAL derived outstanding balance across every
+    `'active'` advance — never any single advance's own original amount.
+    Never writes to `salary_advances` or `salary_advance_deductions`.
+    Requires a plan to already exist (raises otherwise — use
+    `approve_salary_advance()` to establish the first one). Never allows
+    the new start month to move earlier than the month after the last
+    already-posted deduction for ANY of the employee's advances. Writes an
+    audit row to `salary_advance_repayment_plan_changes`.
+  - Two `BEFORE UPDATE` triggers on `salary_advances` provide defense in
+    depth beyond the RPC-only design:
+    - `guard_salary_advance_plan_terms` — an advance's original
+      application-term columns (amount, method, monthly deduction,
+      period, start/payoff month) are now **permanently immutable** after
+      insert, full stop, no bypass — nothing legitimate needs to change
+      them post-creation now that the combined plan table is what payroll
+      actually reads from.
+    - `guard_salary_advance_status_transition` — defines and enforces the
+      full lifecycle state machine at the database level (see "LIFECYCLE
+      / STATUS INTEGRITY" below): `pending -> active` ONLY when
+      `approve_salary_advance()`'s own transaction-local flag is set (a
+      direct `UPDATE`, even by Admin, is rejected); `pending ->
+      rejected|cancelled` freely; `active -> paid` ONLY if the derived
+      outstanding balance (recomputed from `salary_advance_deductions`
+      inside the trigger, never trusted from the caller) is exactly zero;
+      **`active -> cancelled` is NOT permitted — there is no
+      write-off/cancellation path once an advance is approved, since no
+      business-approved settlement process exists yet** (a future one
+      must be a separate, explicitly audited workflow — not silently
+      reintroduced here); `paid`/`rejected`/`cancelled` are terminal — no
+      further transition, by anyone, including super-admin.
+- **Independent of the 8g/8h applicant expand/contract pair above** — this
+  is a wholly new feature with no existing frontend caller to stage
+  around, so it does not need (and must not be forced into) a 2-phase
+  expand/contract sequence. It has its own, simpler ordering constraint
+  relative to 8j below.
+- **MUST be applied BEFORE 8j** (8j's `process_payroll_batch()`
+  replacement references `salary_advances`/`salary_advance_deductions`/
+  `salary_advance_repayment_plans` by name in the same transaction it
+  redefines the function in; applying 8j first would fail outright with
+  `relation "salary_advances" does not exist`).
+- **MUST be applied BEFORE the `SalaryAdvancesPage` frontend build (the one
+  that calls `create_salary_advance()`/`approve_salary_advance()`/
+  `adjust_combined_repayment_plan()` and reads these tables) is
+  deployed** — same "backend before frontend"
+  ordering already used throughout this document for every other
+  new-table/new-RPC migration.
+- **Preflight:** none — all four tables are new and start empty; only
+  pre-existing dependencies are `get_current_tenant_id()`,
+  `is_super_admin()`, `current_user_role_level()`, and the `employees`/
+  `tenants`/`profiles` tables, all already present in STAGING per this
+  plan's own §1 setup.
+- **Command:** `psql "$STAGING_DATABASE_URL" -f supabase/migrations/20260813000000_salary_advances_schema.sql`
+- **Verification:**
+  ```sql
+  SELECT tablename, rowsecurity FROM pg_tables WHERE tablename IN
+    ('salary_advances','salary_advance_deductions','salary_advance_repayment_plans','salary_advance_repayment_plan_changes');
+  -- expected: all four rowsecurity = true
+  SELECT tablename, policyname, cmd FROM pg_policies WHERE tablename IN
+    ('salary_advances','salary_advance_deductions','salary_advance_repayment_plans','salary_advance_repayment_plan_changes') ORDER BY tablename, cmd;
+  -- expected: salary_advances has SELECT/UPDATE/DELETE policies -- NO INSERT policy;
+  -- the other three tables each have ONLY a SELECT policy
+  SELECT conname FROM pg_constraint WHERE conrelid = 'salary_advance_repayment_plans'::regclass AND contype = 'u';
+  -- expected: 1 row -- UNIQUE(employee_id)
+  SELECT indexname FROM pg_indexes WHERE tablename = 'salary_advances' AND indexname = 'salary_advances_one_open_per_employee';
+  -- expected: 0 rows -- this index does NOT exist; the max-2 rule is RPC-enforced, not index-enforced
+  SELECT proname, prosecdef FROM pg_proc WHERE proname IN
+    ('create_salary_advance','approve_salary_advance','adjust_combined_repayment_plan');
+  -- expected: all three prosecdef = true
+  SELECT tgname FROM pg_trigger WHERE tgname IN
+    ('trg_guard_salary_advance_plan_terms','trg_guard_salary_advance_status_transition');
+  -- expected: 2 rows
+  ```
+  Functional checks (require a STAGING project with a test employee):
+  - **Application vs approval:** call `create_salary_advance()` for a test
+    employee as Admin/Manager — the advance is `pending` and
+    `salary_advance_repayment_plans` has NO row for that employee yet
+    (confirm with a `SELECT`). Call `approve_salary_advance()` for it —
+    status becomes `active`, `approved_by`/`approved_at` are set, and the
+    plan row NOW exists with `combined_monthly_deduction` equal to the
+    advance's own rate.
+  - **Max-2 + second approval requires new terms:** call
+    `create_salary_advance()` a second time for the same employee (now 1
+    open, 1 more allowed) — succeeds, still `pending`, plan still reflects
+    only the first advance. Call `approve_salary_advance()` for it WITHOUT
+    supplying new combined terms — expect an explicit exception, and
+    confirm the advance is still `pending` (not partially applied). Call
+    it again WITH explicit new terms — succeeds, and the plan now reflects
+    the new combined figure. Call `create_salary_advance()` a 3rd time —
+    expect the "maximum of 2 open salary advances" exception. Pay one off
+    via `process_payroll_batch()` and call `create_salary_advance()` again
+    — expect success.
+  - **Authorization:** call `create_salary_advance()` and
+    `approve_salary_advance()` each as Supervisor/Staff — expect an
+    explicit authorization exception, not a silent no-op, from both.
+  - **Lifecycle:** attempt `UPDATE salary_advances SET status = 'active'`
+    directly (bypassing `approve_salary_advance()`) on a `pending` row, as
+    Admin — expect the guard trigger's exception. Attempt `UPDATE
+    salary_advances SET status = 'paid'` on an advance with a nonzero
+    derived balance, as Admin — expect the guard trigger's exception.
+    Attempt `UPDATE salary_advances SET status = 'cancelled'` on an
+    `active` row — expect rejection (no cancellation path once approved).
+    Attempt any status UPDATE on a `paid`/`rejected`/`cancelled` row —
+    expect rejection.
+- **Locking risk:** none beyond the table/index/function/trigger-creation
+  catalog lock.
+- **Data-loss risk:** none — pure addition.
+- **Rollback fully reversible?** Yes, but only safe if 8j has not yet been
+  applied (or is rolled back first) — dropping these tables while
+  `process_payroll_batch()` still references them breaks payroll
+  processing entirely, not just the new feature.
+  ```sql
+  DROP FUNCTION IF EXISTS adjust_combined_repayment_plan(UUID, TEXT, TEXT, NUMERIC, INTEGER, TEXT);
+  DROP FUNCTION IF EXISTS approve_salary_advance(UUID, TEXT, NUMERIC, INTEGER, TEXT, TEXT);
+  DROP FUNCTION IF EXISTS create_salary_advance(UUID, DATE, NUMERIC, TEXT, NUMERIC, INTEGER, NUMERIC, TEXT, TEXT, TEXT);
+  DROP TRIGGER IF EXISTS trg_guard_salary_advance_status_transition ON salary_advances;
+  DROP FUNCTION IF EXISTS guard_salary_advance_status_transition();
+  DROP TRIGGER IF EXISTS trg_guard_salary_advance_plan_terms ON salary_advances;
+  DROP FUNCTION IF EXISTS guard_salary_advance_plan_terms();
+  DROP TABLE IF EXISTS salary_advance_repayment_plan_changes;
+  DROP TABLE IF EXISTS salary_advance_repayment_plans;
+  DROP TABLE IF EXISTS salary_advance_deductions;
+  DROP TABLE IF EXISTS salary_advances;
+  ```
+
+### 8j. `20260813000001_payroll_salary_advance_integration.sql`
+
+- **VERIFIED deployment rule:** two changes in one file: (1)
+  `ALTER TABLE payroll ADD COLUMN IF NOT EXISTS salary_advance_deduction
+  NUMERIC(14,2) NOT NULL DEFAULT 0` — a plain additive column with a
+  constant default, no rewrite lock on a modern Postgres/Supabase version,
+  and (2) `CREATE OR REPLACE FUNCTION process_payroll_batch(...)` with the
+  **same signature** as 8d's original, preserving every existing
+  validation/authorization/locking/audit-log behavior byte-for-byte and
+  adding oldest-advance-first allocation of the employee's ONE COMBINED
+  plan figure across up to 2 open advances per employee (per the
+  max-2-open-advances rule in 8i): for each employee in the batch, resolve
+  every advance "relevant" to this month — either `status = 'active' AND
+  deduction_start_month <= p_month`, OR a `salary_advance_deductions` row
+  for `(that advance, p_month)` already exists (see the CRITICAL fix below
+  for why) — ordered oldest `application_date` first. **The combined
+  monthly budget is read from the employee's ONE
+  `salary_advance_repayment_plans.combined_monthly_deduction` row — NOT a
+  sum of each advance's own independently-configured rate** (corrected
+  from an earlier draft of this migration, which wrongly summed). The
+  oldest advance is allocated `LEAST(its own remaining balance, the
+  remaining budget)` first — no per-advance rate caps it anymore — and any
+  budget it doesn't use (because it finished paying off that month)
+  carries forward to the next advance the SAME month — reproducing the
+  business rule's own worked examples exactly (a 20,000 combined figure
+  with a 10,000 final deduction on the older advance leaves exactly 10,000
+  for the younger one that same month). Per advance, this is — governed
+  entirely by the `salary_advance_deductions` table's own
+  `UNIQUE(salary_advance_id, payroll_month)` constraint — either a new
+  ledger row (first time this advance+month is processed) or a reuse of
+  the existing one's already-stored amount (idempotent reprocessing; never
+  recomputes against an already-decremented balance, which would silently
+  produce a wrong, smaller second deduction). `payroll.salary_advance_deduction`
+  stores the TOTAL across both advances; the per-advance split lives in
+  the ledger. Each advance is marked `'paid'` independently the moment ITS
+  OWN derived balance reaches zero — this RPC's own transition passes the
+  8i lifecycle guard trigger automatically (it only ever sets `'paid'`
+  when the balance IS already zero).
+- **CRITICAL FIX verified in this pass:** a naive `WHERE status =
+  'active'` eligibility lookup would make an advance INVISIBLE to a
+  reprocess of the same month once its final deduction flips it to
+  `'paid'` during that run — silently reporting that month's deduction as
+  `0` on reprocess instead of preserving the original amount. The
+  `OR EXISTS (... salary_advance_deductions ...)` clause in the eligibility
+  query fixes this: an advance already posted for this specific month
+  stays visible (and its stored amount is reused verbatim) regardless of
+  its CURRENT status. Verified for both a single advance and for 2
+  simultaneously open advances reprocessed after both flip to `'paid'` in
+  the same run — see `e2e/authenticated/salary-advances-matrix.spec.ts`
+  tests 20 and 21.
+- **GLOBAL NET-PAY INVARIANT (CONFIRMED BUSINESS DECISION — supersedes the
+  earlier, narrower "advance-only" guard from a prior pass of this
+  document):** **final payroll net pay must never be negative, for ANY
+  employee, for ANY reason** — attendance deductions, employee deductions,
+  salary advances, terminal/other deductions, or any combination. This is
+  no longer scoped to salary advances specifically. Enforced in TWO places
+  inside `process_payroll_batch()`, forming ONE rule:
+  1. **STEP 1.5 payload validation** now REJECTS a negative
+     client-supplied `net_pay` outright, for every record, whether or not
+     that employee has any salary advance. **This is a real, intentional
+     behavior change**: the earlier rule (see `20260803000002`'s own STEP
+     1.5b comment, and its own test documenting "net_pay may legitimately
+     be negative") has been explicitly REMOVED per this pass's confirmed
+     business decision — any existing caller that relied on submitting an
+     already-negative `net_pay` will now get a clear validation error
+     instead.
+  2. Immediately after allocating an employee's salary advance(s) for the
+     month, IF `net_pay - deduction < 0` (this is now unconditional, not
+     gated on `deduction > 0`, since step 1 above already guarantees the
+     pre-advance figure is `>= 0`), the function `RAISE EXCEPTION`s.
+  Since this function has no exception handler, either failure rolls back
+  the **ENTIRE batch transaction**, not just the offending employee: every
+  payroll row, `salary_advance_deductions` ledger row, `'paid'` status
+  flip, and repayment-plan retirement written so far in that call, for
+  every employee in the batch. Deliberately does **not** invent a new
+  "advance ≤ salary" cap (no silent reduction of any deduction) — failing
+  loudly and atomically is the chosen behavior, per explicit instruction
+  not to invent an unapproved business rule. `net_pay` of exactly `0` is
+  the inclusive boundary — allowed, not rejected.
+- **PLAN RETIREMENT ON FINAL PAYOFF (safety review finding, this pass):**
+  once an employee has **no remaining `'active'` advance**, their
+  `salary_advance_repayment_plans` row is deleted in the same
+  per-employee iteration — a paid-off employee must never keep showing a
+  live "Current Combined Monthly Deduction" / "Expected Payoff" for debt
+  that no longer exists. A no-op `DELETE` (0 rows) for every employee who
+  either has no plan row at all, or still has an active advance (e.g. only
+  one of their two active advances just paid off — the plan correctly
+  survives). `salary_advance_repayment_plan_changes` audit history is
+  **never** touched by this (no foreign key to the plan table) and remains
+  permanently. The next advance `approve_salary_advance()`s for this
+  employee finds no existing plan row and cleanly establishes a fresh one
+  from that advance's own terms, with no interference from the retired
+  one.
+- **BEHAVIOR CHANGE FOR EXISTING CALLERS:** an employee with no current
+  combined repayment plan AND a non-negative `net_pay` sees ZERO behavior
+  change — `salary_advance_deduction` is simply `0` on their payroll row
+  and `net_pay` is bit-for-bit identical to pre-migration behavior. Safe
+  to apply even before any salary advance has ever been created in this
+  tenant. **ONE real, intentional behavior change (confirmed business
+  decision, this pass):** a record whose client-supplied `net_pay` is
+  already negative — previously accepted regardless of salary advances —
+  is now REJECTED outright at payload validation, whether or not the
+  employee has any salary advance at all. Any existing caller relying on
+  submitting an already-negative `net_pay` must be updated before this
+  migration reaches STAGING/production, or that call will start failing
+  loudly (by design — see the GLOBAL NET-PAY INVARIANT note above).
+- **MUST be applied AFTER 8i** (references `salary_advances`/
+  `salary_advance_deductions`/`salary_advance_repayment_plans` by name)
+  **and AFTER 8d** (`20260803000002_payroll_atomic_process_rpc.sql`, whose
+  function this replaces via `CREATE OR REPLACE`, not a fresh `CREATE`).
+- **MUST be applied BEFORE the `SalaryAdvancesPage`/updated `Payroll.tsx`
+  frontend build (the one that reads `payroll.salary_advance_deduction`
+  and sends `net_pay` values that assume the RPC subtracts the advance
+  server-side) is deployed** — deploying the frontend first would show a
+  UI-computed advance deduction that the (not-yet-updated) RPC never
+  actually applies, silently producing payroll rows whose real `net_pay`
+  doesn't match what the screen showed before processing.
+- **Only ever reads `'active'` advances (plus the same-month-ledger-row
+  idempotency clause below) — a merely `pending`, not-yet-approved
+  application is invisible to payroll entirely**, whether or not it has
+  its own configured terms; those terms only take effect the moment
+  `approve_salary_advance()` (8i) transitions it to `active` and
+  establishes/updates the combined plan this RPC reads from.
+- **Preflight:** confirm 8i has already been applied and verified (its own
+  §8i verification SQL above passes) before running this one.
+- **Command:** `psql "$STAGING_DATABASE_URL" -f supabase/migrations/20260813000001_payroll_salary_advance_integration.sql`
+- **Verification:**
+  ```sql
+  SELECT column_name, column_default, is_nullable FROM information_schema.columns
+    WHERE table_name = 'payroll' AND column_name = 'salary_advance_deduction';
+  -- expected: 1 row, column_default = '0', is_nullable = 'NO'
+  SELECT proname, prosecdef FROM pg_proc WHERE proname = 'process_payroll_batch';
+  -- expected: 1 row, prosecdef = true (unchanged from before)
+  ```
+  Functional check (requires a STAGING project with a test employee):
+  create a salary advance via the UI (it starts `pending`), process
+  payroll for it — confirm `salary_advance_deduction` is `0`, since a
+  pending application must never be deducted. Then approve it via the UI
+  (or `approve_salary_advance()` directly) and process payroll again for
+  its `deduction_start_month`; confirm the resulting payroll row's
+  `salary_advance_deduction` matches the employee's
+  `salary_advance_repayment_plans.combined_monthly_deduction` (capped by
+  the advance's remaining balance) and `net_pay` reflects it exactly once;
+  reprocess the SAME month and confirm the ledger still has exactly one
+  row for that `(salary_advance_id, payroll_month)` pair, not two. Then,
+  with a SECOND advance created and approved for the same employee (the
+  max-2 rule, second approval given explicit new combined terms), confirm
+  the payroll row's `salary_advance_deduction` equals exactly that
+  combined figure (or less, if both balances together are smaller), the
+  older advance is funded first, and — the critical regression check —
+  process the month that flips an advance to `'paid'` and reprocess that
+  SAME month again, confirming the deduction is preserved (not reset to
+  `0`). The full automated version of all of this is
+  `e2e/authenticated/salary-advances-matrix.spec.ts`, the "approve_salary_advance()
+  workflow" and "payroll integration" describe blocks specifically for the
+  application-vs-approval, 2-advance, and reprocessing-after-paid cases.
+  Additionally, for the GLOBAL NET-PAY INVARIANT (confirmed business
+  decision — see §8j's own note above): (a) submit a record with an
+  already-negative client-supplied `net_pay` and NO salary advance —
+  confirm the call is now REJECTED at payload validation, before any table
+  write (this is the REVERSED behavior — it used to succeed); (b) approve
+  an advance whose combined monthly deduction (e.g. 20,000) exceeds the
+  employee's net pay before the advance (e.g. 15,000) and process payroll
+  — confirm the call raises an exception and NOTHING is written (no
+  payroll row, no ledger row, advance status unchanged); (c) confirm a
+  COMBINATION — modest ordinary deductions plus a salary advance that
+  together go negative — is also rejected; (d) confirm `net_pay` of
+  EXACTLY `0` is accepted, and a normal positive `net_pay` is unaffected;
+  (e) submit a multi-employee batch where only ONE employee's payroll
+  would go negative — confirm the ENTIRE batch rolls back, including the
+  employees who would otherwise have succeeded; (f) design a case where
+  the failing deduction would ALSO have fully paid off the advance and
+  retired its plan in the same call — confirm BOTH the `'paid'` status
+  flip AND the plan retirement are rolled back along with everything else.
+  Then, separately, pay an advance off completely under normal (non-failing)
+  conditions — confirm `salary_advance_repayment_plans` has no row for
+  that employee afterward, `salary_advance_repayment_plan_changes` history
+  for them is still present, the next month deducts `0`, and a brand-new
+  advance approved afterward establishes a fresh plan cleanly. See the
+  "plan retirement after final payoff" and the "GLOBAL NET-PAY INVARIANT"
+  tests in the "payroll integration" describe block, and
+  `src/utils/payrollProcessing.test.ts`'s `describeProcessPayrollBatchError`
+  describe block for the frontend's human-readable error translation.
+- **Locking risk:** `ADD COLUMN ... DEFAULT 0` — brief metadata-only lock,
+  no full table rewrite. `CREATE OR REPLACE FUNCTION` — catalog-only
+  change. Neither should be noticeable in production traffic, though a
+  low-traffic window remains the more conservative choice given this
+  changes payroll-processing behavior.
+- **Data-loss risk:** none — additive column with a safe default;
+  existing payroll rows unaffected until reprocessed.
+- **Rollback fully reversible?** The function can be reverted to 8d's
+  original definition (re-run 8d's own file) independently of the column.
+  The column itself is safe to leave in place (unused, always 0) or drop:
+  ```sql
+  ALTER TABLE payroll DROP COLUMN IF EXISTS salary_advance_deduction;
+  ```
+  Only safe once the frontend reading that column has been rolled back
+  first — same "frontend before backend" rollback ordering used
+  throughout this document.
+
 ## 9. Verification order (after all migrations applied)
 
 1. Re-run each migration's own verification SQL above, in the same order.
 2. Between 8g and 8h specifically: do not proceed to 8h until 8h's own
    3-item precondition checklist is satisfied — this is not just
    "verify," it's a hard gate.
-3. Run the full E2E suite against staging with all `REQUIRED_VARS` set (see
+3. Between 8i and 8j specifically: do not proceed to 8j until 8i's own
+   verification SQL passes — 8j's `CREATE OR REPLACE FUNCTION` references
+   both new tables by name and fails outright if they don't exist yet.
+4. Run the full E2E suite against staging with all `REQUIRED_VARS` set (see
    `e2e/fixtures.ts`) — `npm run test:e2e` — confirm every currently-skipped
    test in `e2e/authenticated/*.spec.ts` converts to a real pass, not a new
-   skip or failure.
-4. Only once step 3 is fully green, proceed to any manual/exploratory
+   skip or failure. This includes the new `salary-advances-matrix.spec.ts`
+   (RLS + payroll-integration coverage) and
+   `recruitment-hooks-regression.spec.ts` (React error #310 regression).
+5. Only once step 4 is fully green, proceed to any manual/exploratory
    click-through testing against the Preview deployment (§2).
 
 ## 10. Rollback order
@@ -572,7 +1000,10 @@ dependent **frontend** commit first (per the "General ordering rule" above)
 before dropping the function it calls, to avoid turning a planned rollback
 into an outage. 8h can be rolled back independently of 8g (see 8h's own
 rollback note) if only the SELECT restriction, not the RPC itself, needs
-reverting.
+reverting. 8j can be rolled back independently of 8i (reverting the
+function to 8d's original definition without dropping the new tables); 8i
+must not be rolled back while 8j (or the frontend that depends on it) is
+still live, for the same reason described in 8i's own rollback note.
 
 ---
 
@@ -711,6 +1142,29 @@ API directly, bypassing the UI entirely, is not stopped by any of it. This
 plan does not propose relying on those filters as a substitute for RLS at
 any point, temporarily or otherwise.
 
+**`salary_advances`/`salary_advance_deductions`/`salary_advance_repayment_plans`/
+`salary_advance_repayment_plan_changes` (8i/8j, §8) inherit this exact
+same gap — stated explicitly here rather than left implicit.** Their RLS
+policies (§8i above) restrict by `tenant_id` and `role_level` only,
+identically to every other financial table in this schema
+(`payment_status`, `terminal_dues`, `employee_deductions`). None of the
+four tables has, or is claimed to have, any `region_id` column or
+region-scoped policy — this also applies to `create_salary_advance()`,
+`approve_salary_advance()`, and `adjust_combined_repayment_plan()`
+themselves, all three of which authorize by `role_level`/tenant only, with
+no region check. Concretely: an Admin or
+Manager account can create, view, or adjust salary advances for **any
+employee in the tenant**, regardless of which region that employee
+belongs to or which region the caller's own `profiles.region_id` is
+scoped to in the UI — the same "Manager South can reach North's data via
+a direct API call" gap Finding A12 already describes for every other
+table, now also true here. This is not a new,
+separate regional bypass introduced by this feature; it is the
+pre-existing, already-documented gap extending to four more tables (and
+two more RPCs), and it is resolved (or not) by the same single §13
+regional RLS design decision as everything else — no separate fix is
+proposed or needed specifically for salary advances.
+
 ## 14. Credential and environment gates (explicit, unresolved)
 
 Recorded as open gates — **none of the following is claimed complete, and
@@ -745,7 +1199,16 @@ Stated explicitly, not left implicit in the sections above:
    (§13) but explicitly **not implemented**, pending the 5 business
    decisions §13 lists. PR #36 must not merge with this gap unresolved,
    or with it resolved only in documentation rather than in an applied,
-   verified policy.
+   verified policy. **This blocker now explicitly includes the new
+   `salary_advances`/`salary_advance_deductions`/`salary_advance_repayment_plans`/
+   `salary_advance_repayment_plan_changes` tables and the
+   `create_salary_advance()`/`approve_salary_advance()`/
+   `adjust_combined_repayment_plan()` RPCs
+   (8i/8j, §8)** — see §13's own note — since they were built with
+   tenant-only authorization, consistent with every other table/RPC in
+   this schema, and it would be inaccurate for this document to claim
+   otherwise for the newest additions while leaving the rest of the
+   schema's gap unresolved.
 2. **PR #36 stays draft/unmerged until full STAGING validation is green** —
    concretely: every migration in §8 applied to STAGING in the order and
    with the preconditions specified (including 8h's own 3-item checklist),

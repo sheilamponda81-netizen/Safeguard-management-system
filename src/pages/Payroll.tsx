@@ -12,7 +12,8 @@ import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll } from '../utils/payrollCalculations';
-import { processPayrollBatch } from '../utils/payrollProcessing';
+import { calculatePooledAllocation } from '../utils/salaryAdvanceCalculations';
+import { processPayrollBatch, describeProcessPayrollBatchError } from '../utils/payrollProcessing';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { UserProfile } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
@@ -53,12 +54,28 @@ interface PayrollRecord {
   paye: number;
   pension: number;
   uniform_deduction: number;
+  // Populated authoritatively by process_payroll_batch() at processing
+  // time (see supabase/migrations/20260813000001_payroll_salary_advance_integration.sql)
+  // -- for an already-processed record this is simply read back from the
+  // stored row. For a not-yet-processed preview, calculatePayroll below
+  // computes the SAME projected figure client-side (using the identical
+  // LEAST(configured, remaining) formula the RPC applies) purely for
+  // display -- the RPC remains the sole authority for what actually gets
+  // written.
+  salary_advance_deduction: number;
   net_pay: number;
   processed_at: string;
   approval_status?: string;
   approved_by?: string | null;
   approved_at?: string | null;
   approval_notes?: string | null;
+}
+
+interface ActiveSalaryAdvance {
+  id: string;
+  remainingBalance: number;
+  applicationDate: string;
+  createdAt: string;
 }
 
 interface EmployeeDeduction {
@@ -110,6 +127,22 @@ export function PayrollPage() {
   // Position name -> whether that position's employees should get the uniform
   // deduction at all (Settings -> Positions -> "Requires Uniform").
   const [positionsRequiringUniform, setPositionsRequiringUniform] = useState<Map<string, boolean>>(new Map());
+  // Employee id -> their OPEN (up to 2, per the max-2-open-advances
+  // business rule) active salary advances' remaining balances BEFORE this
+  // month's own deduction -- used only to PREVIEW the projected combined,
+  // oldest-advance-first pooled deduction for a not-yet-processed employee
+  // (see PayrollRecord's own doc comment and calculatePooledAllocation()).
+  // Never written back; the actual applied amounts are always computed
+  // and stored server-side by process_payroll_batch(), which applies the
+  // identical pooled formula.
+  const [salaryAdvanceByEmployee, setSalaryAdvanceByEmployee] = useState<Map<string, ActiveSalaryAdvance[]>>(new Map());
+  // Employee id -> their ONE current combined_monthly_deduction from
+  // salary_advance_repayment_plans -- the single pool figure
+  // calculatePooledAllocation() allocates across the advances above.
+  // Corrected from an earlier draft that summed each advance's own
+  // independently-configured rate -- see 20260813000000's "COMBINED PLAN"
+  // design. Absent (0) for an employee with no current plan.
+  const [combinedPlanByEmployee, setCombinedPlanByEmployee] = useState<Map<string, number>>(new Map());
   const [payrollRates, setPayrollRatesState] = useState<PayrollRates>(DEFAULT_RATES);
 
   // ===== PAGINATION STATES =====
@@ -322,6 +355,66 @@ export function PayrollPage() {
         new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
       );
 
+      // ===== Active salary advances + each employee's ONE combined
+      // repayment plan (for the payroll preview only -- the actual
+      // deduction is always computed/applied server-side by
+      // process_payroll_batch(), see PayrollRecord's own doc comment).
+      // An employee may have up to 2 simultaneously open advances (the
+      // max-2-open-advances business rule), so this collects a LIST per
+      // employee, not a single value; the combined monthly figure they
+      // share comes from salary_advance_repayment_plans, NOT from summing
+      // each advance's own originally-applied-for rate (corrected from an
+      // earlier draft -- see 20260813000000's "COMBINED PLAN" design). =====
+      const advanceMap = new Map<string, ActiveSalaryAdvance[]>();
+      const planMap = new Map<string, number>();
+      if (employeeIds.length > 0) {
+        const { data: activeAdvances, error: advancesError } = await supabase
+          .from('salary_advances')
+          .select('id, employee_id, advance_amount, application_date, created_at')
+          .eq('status', 'active')
+          .lte('deduction_start_month', selectedMonth)
+          .in('employee_id', employeeIds);
+        if (advancesError) throw advancesError;
+
+        if (activeAdvances && activeAdvances.length > 0) {
+          const advanceIds = activeAdvances.map(a => a.id);
+          const { data: ledgerRows, error: ledgerError } = await supabase
+            .from('salary_advance_deductions')
+            .select('salary_advance_id, deduction_amount')
+            .in('salary_advance_id', advanceIds);
+          if (ledgerError) throw ledgerError;
+
+          const repaidByAdvance = new Map<string, number>();
+          (ledgerRows || []).forEach(row => {
+            repaidByAdvance.set(row.salary_advance_id, (repaidByAdvance.get(row.salary_advance_id) || 0) + row.deduction_amount);
+          });
+
+          activeAdvances.forEach(advance => {
+            const repaid = repaidByAdvance.get(advance.id) || 0;
+            const entry: ActiveSalaryAdvance = {
+              id: advance.id,
+              remainingBalance: Math.max(0, advance.advance_amount - repaid),
+              applicationDate: advance.application_date,
+              createdAt: advance.created_at,
+            };
+            const existing = advanceMap.get(advance.employee_id) || [];
+            existing.push(entry);
+            advanceMap.set(advance.employee_id, existing);
+          });
+
+          const { data: plans, error: plansError } = await supabase
+            .from('salary_advance_repayment_plans')
+            .select('employee_id, combined_monthly_deduction')
+            .in('employee_id', Array.from(advanceMap.keys()));
+          if (plansError) throw plansError;
+          (plans || []).forEach(plan => {
+            planMap.set(plan.employee_id, plan.combined_monthly_deduction);
+          });
+        }
+      }
+      setSalaryAdvanceByEmployee(advanceMap);
+      setCombinedPlanByEmployee(planMap);
+
       setHasData((payrollData?.length || 0) > 0);
 
     } catch (err) {
@@ -396,7 +489,28 @@ export function PayrollPage() {
 
     const paye = customValues?.paye ?? live.paye;
     const pension = customValues?.pension ?? live.pension;
-    const netPay = live.grossPay - paye - pension - live.uniformDeduction;
+    const netPayBeforeAdvance = live.grossPay - paye - pension - live.uniformDeduction;
+
+    // Preview only -- identical oldest-advance-first pooled allocation the
+    // process_payroll_batch() RPC itself applies (see
+    // 20260813000001_payroll_salary_advance_integration.sql and
+    // calculatePooledAllocation()'s own header), computed here purely so
+    // this page's own display matches what processing will actually do
+    // for an employee with up to 2 simultaneously open advances. The RPC
+    // recomputes this independently at processing time and is the only
+    // thing that actually writes it.
+    const openAdvances = salaryAdvanceByEmployee.get(employee.id) || [];
+    const combinedMonthlyDeduction = combinedPlanByEmployee.get(employee.id) || 0;
+    const salaryAdvanceDeduction = customValues?.salary_advance_deduction ?? calculatePooledAllocation(
+      combinedMonthlyDeduction,
+      openAdvances.map(a => ({
+        id: a.id,
+        remainingBalance: a.remainingBalance,
+        applicationDate: a.applicationDate,
+        createdAt: a.createdAt,
+      }))
+    ).total;
+    const netPay = netPayBeforeAdvance - salaryAdvanceDeduction;
 
     return {
       id: '',
@@ -410,6 +524,7 @@ export function PayrollPage() {
       paye,
       pension,
       uniform_deduction: live.uniformDeduction,
+      salary_advance_deduction: salaryAdvanceDeduction,
       net_pay: netPay,
       processed_at: new Date().toISOString(),
       approval_status: 'pending',
@@ -417,7 +532,7 @@ export function PayrollPage() {
       approved_at: null,
       approval_notes: null
     };
-  }, [selectedMonth, getEmployeeDeduction, attendanceCounts, positionsRequiringUniform, payrollRates]);
+  }, [selectedMonth, getEmployeeDeduction, attendanceCounts, positionsRequiringUniform, payrollRates, salaryAdvanceByEmployee, combinedPlanByEmployee]);
 
   const getDisplayPayroll = useCallback((employee: Employee): PayrollRecord => {
     const existing = getPayrollForEmployee(employee.id);
@@ -428,7 +543,7 @@ export function PayrollPage() {
 
   // ===== GET TOTALS =====
   const totals = useMemo(() => {
-    let gross = 0, net = 0, paye = 0, pension = 0, uniformDeductions = 0;
+    let gross = 0, net = 0, paye = 0, pension = 0, uniformDeductions = 0, salaryAdvanceDeductions = 0;
     employees.forEach(emp => {
       const p = getDisplayPayroll(emp);
       gross += p.gross_pay;
@@ -436,8 +551,9 @@ export function PayrollPage() {
       paye += p.paye;
       pension += p.pension;
       uniformDeductions += p.uniform_deduction || 0;
+      salaryAdvanceDeductions += p.salary_advance_deduction || 0;
     });
-    return { gross, net, paye, pension, uniformDeductions };
+    return { gross, net, paye, pension, uniformDeductions, salaryAdvanceDeductions };
   }, [employees, getDisplayPayroll]);
 
   const employeesWithDeductions = useMemo(() => {
@@ -599,7 +715,13 @@ export function PayrollPage() {
             paye: payroll.paye,
             pension: payroll.pension,
             uniform_deduction: payroll.uniform_deduction,
-            net_pay: payroll.net_pay,
+            // payroll.net_pay is the FINAL (post-advance) figure used for
+            // display/totals throughout this page -- process_payroll_batch()
+            // subtracts its OWN server-computed salary advance deduction
+            // from whatever net_pay it receives, so the value sent here
+            // must be added back to the PRE-advance figure or the RPC
+            // would subtract the same deduction a second time.
+            net_pay: payroll.net_pay + payroll.salary_advance_deduction,
             processed_at: new Date().toISOString(),
             approval_status: 'pending',
             approved_by: null,
@@ -621,7 +743,8 @@ export function PayrollPage() {
 
       if (!result.success) {
         console.error('Error copying data:', result.error);
-        showNotification('Failed to copy data: ' + result.error, 'error');
+        const message = result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error;
+        showNotification('Failed to copy data: ' + message, 'error');
         return;
       }
 
@@ -637,7 +760,7 @@ export function PayrollPage() {
     } finally {
       setProcessingStatus('');
     }
-  }, [canProcessPayroll, selectedMonth, employees, calculatePayroll, fetchData, fetchProcessedMonths]);
+  }, [canProcessPayroll, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths]);
 
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
@@ -754,8 +877,8 @@ export function PayrollPage() {
 
         totalGross += payroll.gross_pay;
         totalNet += payroll.net_pay;
-        totalDeductions += (payroll.paye + payroll.pension + payroll.uniform_deduction);
-        
+        totalDeductions += (payroll.paye + payroll.pension + payroll.uniform_deduction + payroll.salary_advance_deduction);
+
         payrollToSave.push({
           employee_id: employee.id,
           month: selectedMonth,
@@ -767,7 +890,11 @@ export function PayrollPage() {
           paye: payroll.paye,
           pension: payroll.pension,
           uniform_deduction: payroll.uniform_deduction,
-          net_pay: payroll.net_pay,
+          // See the identical comment in copyFromPreviousMonth() above --
+          // payroll.net_pay here is already post-advance; add the
+          // deduction back so process_payroll_batch() (which subtracts
+          // its own server-computed copy) doesn't subtract it twice.
+          net_pay: payroll.net_pay + payroll.salary_advance_deduction,
           processed_at: new Date().toISOString(),
           approval_status: 'pending',
           approved_by: null,
@@ -793,7 +920,8 @@ export function PayrollPage() {
 
       if (!result.success) {
         console.error('❌ Error processing payroll:', result.error);
-        showNotification('Failed to save payroll: ' + result.error, 'error');
+        const message = result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error;
+        showNotification('Failed to save payroll: ' + message, 'error');
         setProcessing(false);
         setProcessingStatus('');
         return;
@@ -818,7 +946,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -1111,10 +1239,13 @@ export function PayrollPage() {
           <div className="flex items-start justify-between">
             <div>
               <p className="text-xs text-slate-500">Total Deductions</p>
-              <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(totals.paye + totals.pension + totals.uniformDeductions)}</p>
+              <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(totals.paye + totals.pension + totals.uniformDeductions + totals.salaryAdvanceDeductions)}</p>
               <p className="text-xs text-slate-500 mt-1">PAYE: {formatKwacha(totals.paye)}</p>
               <p className="text-xs text-slate-500 mt-1">Pension: {formatKwacha(totals.pension)}</p>
               <p className="text-xs text-red-500 mt-1">Uniform/Attendance: {formatKwacha(totals.uniformDeductions)}</p>
+              {totals.salaryAdvanceDeductions > 0 && (
+                <p className="text-xs text-purple-600 mt-1">Salary Advances: {formatKwacha(totals.salaryAdvanceDeductions)}</p>
+              )}
             </div>
             <div className="w-10 h-10 rounded-lg bg-red-100 text-red-600 flex items-center justify-center">
               <Calculator size={18} />
@@ -1162,7 +1293,7 @@ export function PayrollPage() {
               a stale "PAYE (30%)" label here would contradict whatever an
               admin has actually configured. */}
           <p className="text-sm text-slate-600">
-            = Gross Pay - PAYE ({(payrollRates.payeRate * 100).toFixed(0)}% above {formatKwacha(payrollRates.payeThreshold)}) - Pension ({(payrollRates.pensionEmployeeRate * 100).toFixed(0)}%) - Uniform Deduction - Attendance Deductions
+            = Gross Pay - PAYE ({(payrollRates.payeRate * 100).toFixed(0)}% above {formatKwacha(payrollRates.payeThreshold)}) - Pension ({(payrollRates.pensionEmployeeRate * 100).toFixed(0)}%) - Uniform Deduction - Attendance Deductions - Salary Advance Deduction (if any)
           </p>
           <p className="text-xs text-slate-500 mt-2">Attendance Deductions: Absent (MK4,200/day) + Late (MK4,200/day) + Lecture + Appearance</p>
         </Card>

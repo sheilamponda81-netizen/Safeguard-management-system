@@ -4,7 +4,8 @@ import {
   Shield, History, LogOut, Menu, X,
   Wallet,
   Calculator, ClipboardList,
-  CalendarCheck, BarChart3, BookOpen
+  CalendarCheck, BarChart3, BookOpen,
+  Banknote
 } from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
@@ -22,6 +23,7 @@ export type NavKey =
   | "payslips"
   | "payments"
   | "terminal-dues"
+  | "salary-advances"
   | "reports"
   | "settings"
   | "security"
@@ -34,6 +36,7 @@ const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "employees", label: "Employees", icon: Users },
   { id: "terminal-dues", label: "Terminal Dues", icon: Calculator },
+  { id: "salary-advances", label: "Salary Advances", icon: Banknote },
   { id: "recruitment", label: "Recruitment", icon: ClipboardList },
   { id: "attendance", label: "Attendance", icon: CalendarCheck },
   { id: "payroll", label: "Payroll", icon: Wallet },
@@ -56,6 +59,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "payslips",
     "payments",
     "terminal-dues",
+    "salary-advances",
     "reports",
     "settings",
     "security",
@@ -70,6 +74,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "attendance",
     "payments",
     "terminal-dues",
+    "salary-advances",
     "reports",
     "security",
     "user-manual",

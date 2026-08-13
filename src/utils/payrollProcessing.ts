@@ -45,6 +45,11 @@ export interface ProcessPayrollBatchResult {
   month?: string;
   deletedCount?: number;
   insertedCount?: number;
+  /** How many employees in this batch had a salary advance deduction
+   *  applied -- see supabase/migrations/20260813000001_payroll_salary_advance_integration.sql.
+   *  Optional: undefined when process_payroll_batch() predates that
+   *  migration, not a failure. */
+  advanceDeductionsApplied?: number;
 }
 
 // PostgREST's own code for "the RPC function you called does not exist in
@@ -74,6 +79,40 @@ function classifyPayrollError(message: string): Extract<ProcessPayrollBatchOutco
   return 'validation_failed';
 }
 
+// The per-employee GLOBAL NET-PAY INVARIANT exception (see
+// 20260813000001_payroll_salary_advance_integration.sql's own RAISE
+// EXCEPTION text) identifies the affected employee by UUID, since that's
+// all the database function itself has -- it never resolves a human name.
+// This regex pulls that UUID back out so the UI can show an actual name
+// instead. Deliberately narrow (matches only THIS function's own
+// self-authored wording), so it only ever fires for the exact case it's
+// meant to translate.
+const NEGATIVE_NET_PAY_ERROR_RE = /for employee ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}):.*negative net pay/i;
+
+/**
+ * Rewrites process_payroll_batch()'s own negative-net-pay exception (plain
+ * English already, but keyed by employee UUID since the database has no
+ * concept of a display name) into a message naming the actual employee,
+ * when the caller can resolve that UUID to a name. Falls back to the raw
+ * RPC message untouched for every other error, and for this one too if the
+ * employee can't be resolved -- never worse than showing the original
+ * message, never a raw SQL/Postgres internal either way (the RPC's own
+ * exception text is already plain English, this only improves it further).
+ */
+export function describeProcessPayrollBatchError(
+  error: string,
+  getEmployeeName: (employeeId: string) => string | undefined
+): string {
+  const match = error.match(NEGATIVE_NET_PAY_ERROR_RE);
+  if (match) {
+    const name = getEmployeeName(match[1]);
+    if (name) {
+      return `Payroll cannot be processed because deductions would make net pay negative for ${name}. Review the deductions and try again.`;
+    }
+  }
+  return error;
+}
+
 // Raw shape of the RPC's own successful JSONB return value (see the
 // migration's final `RETURN jsonb_build_object(...)`).
 interface ProcessPayrollBatchRpcSuccess {
@@ -81,6 +120,7 @@ interface ProcessPayrollBatchRpcSuccess {
   month: string;
   deletedCount: number;
   insertedCount: number;
+  advanceDeductionsApplied?: number;
 }
 
 function isProcessPayrollBatchRpcSuccess(data: unknown): data is ProcessPayrollBatchRpcSuccess {
@@ -153,6 +193,7 @@ export async function processPayrollBatch(
       month: data.month,
       deletedCount: data.deletedCount,
       insertedCount: data.insertedCount,
+      advanceDeductionsApplied: data.advanceDeductionsApplied,
     };
   } catch (err) {
     return {
