@@ -107,7 +107,20 @@ SET search_path = public, pg_temp;
 -- process_payroll_batch() in this schema) so an anonymous/unauthenticated
 -- caller cannot reach this function at all, before it even gets a chance
 -- to evaluate auth.uid().
+--
+-- SECURITY CORRECTION (found during real STAGING validation): `REVOKE ALL
+-- ... FROM PUBLIC` alone was NOT sufficient -- the `anon` role had its own
+-- EXPLICIT EXECUTE grant on this function, independent of PUBLIC. Revoking
+-- from PUBLIC only removes the privilege every role inherits implicitly
+-- through PUBLIC; it does NOT remove a grant made directly to a specific
+-- role such as `anon`. STAGING was corrected manually with the explicit
+-- `REVOKE EXECUTE ... FROM anon` below, now folded back into this
+-- migration so a fresh apply is correct from the start, without relying on
+-- a manual follow-up step.
 REVOKE ALL ON FUNCTION get_applicant_dashboard_counts() FROM PUBLIC;
+REVOKE EXECUTE
+ON FUNCTION public.get_applicant_dashboard_counts()
+FROM anon;
 GRANT EXECUTE ON FUNCTION get_applicant_dashboard_counts() TO authenticated;
 
 -- ============================================================
@@ -131,9 +144,15 @@ GRANT EXECUTE ON FUNCTION get_applicant_dashboard_counts() TO authenticated;
 --   SELECT proname, prosecdef FROM pg_proc WHERE proname = 'get_applicant_dashboard_counts';
 --   -- Expected: 1 row, prosecdef = true.
 --   SELECT has_function_privilege('authenticated', 'get_applicant_dashboard_counts()', 'EXECUTE');
---   -- Expected: true.
+--   -- Expected permissions: authenticated = true.
 --   SELECT has_function_privilege('anon', 'get_applicant_dashboard_counts()', 'EXECUTE');
---   -- Expected: false.
+--   -- Expected permissions: anon = false. Re-verify this specifically after
+--   -- applying -- this is the exact check that caught the missing explicit
+--   -- `anon` revoke in STAGING; `REVOKE ALL ... FROM PUBLIC` passing this
+--   -- check is NOT sufficient on its own if `anon` was ever granted EXECUTE
+--   -- directly (e.g. by a prior migration, a manual grant, or a default
+--   -- privilege) -- only the explicit `REVOKE EXECUTE ... FROM anon` above
+--   -- guarantees it.
 --
 -- ROLLBACK SQL (safe at any time -- reverting means Dashboard.tsx's RPC
 -- call starts failing; see Dashboard.tsx's own fallback-to-zero handling
