@@ -311,13 +311,26 @@ export function PayrollPage() {
       setAttendanceCounts(counts);
 
       // ===== Positions (for the "Requires Uniform" gate) =====
-      const { data: positionsData, error: positionsError } = await supabase
-        .from('positions')
-        .select('name, requires_uniform');
-      if (positionsError) throw positionsError;
-      setPositionsRequiringUniform(
-        new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
-      );
+      // Isolated from the rest of this fetch: `requires_uniform` was added by
+      // supabase/migrations/20260728000000_position_uniform_flag.sql, which may
+      // not yet be applied to every environment this code runs against. If that
+      // migration isn't present, PostgREST rejects the whole query (unknown
+      // column) -- letting that throw here would take down the entire Payroll
+      // page over one optional gate. On failure, fall back to "every position
+      // requires a uniform" (the migration's own DEFAULT true), matching pre-
+      // migration behavior exactly instead of losing the rest of the page.
+      try {
+        const { data: positionsData, error: positionsError } = await supabase
+          .from('positions')
+          .select('name, requires_uniform');
+        if (positionsError) throw positionsError;
+        setPositionsRequiringUniform(
+          new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
+        );
+      } catch (positionsErr) {
+        console.error('Error fetching position uniform flags (falling back to "all positions require uniform"):', positionsErr);
+        setPositionsRequiringUniform(new Map());
+      }
 
       setHasData((payrollData?.length || 0) > 0);
 

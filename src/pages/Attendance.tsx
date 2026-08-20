@@ -51,6 +51,87 @@ interface AttendanceRecord {
   status: string;
 }
 
+// ===== PRODUCTION HOTFIX: batched attendance fetch =====
+// A single `.in('employee_id', employeeIds)` request with the entire loaded
+// employee population produces an extremely large PostgREST request URL as
+// the employee count grows -- production has grown past the point where
+// that URL is reliably accepted, returning 400 Bad Request. Splitting into
+// small employee-id batches keeps each request URL small; each batch is
+// still paginated with .range() (rather than trusting a single response to
+// contain every row) since one employee can have up to ~31 attendance rows
+// for the month, so a batch of ATTENDANCE_EMPLOYEE_BATCH_SIZE employees can
+// still exceed a single page. `{ count: 'exact' }` gives the true total
+// matching row count for the batch up front, so pagination stops based on
+// the real total rather than assuming "fewer rows than requested" means
+// "no more data" (which is not a safe assumption if the server enforces its
+// own max-rows cap below what we asked for).
+const ATTENDANCE_EMPLOYEE_BATCH_SIZE = 25;
+const ATTENDANCE_PAGE_SIZE = 500;
+
+async function fetchAttendancePage(
+  employeeIds: string[],
+  dateFrom: string,
+  dateTo: string,
+  offset: number
+) {
+  return supabase
+    .from('attendance')
+    .select('*', { count: 'exact' })
+    .gte('date', dateFrom)
+    .lte('date', dateTo)
+    .in('employee_id', employeeIds)
+    .range(offset, offset + ATTENDANCE_PAGE_SIZE - 1);
+}
+
+async function fetchAttendanceForEmployeeBatch(
+  employeeIds: string[],
+  dateFrom: string,
+  dateTo: string
+): Promise<AttendanceRecord[]> {
+  const records: AttendanceRecord[] = [];
+  let offset = 0;
+
+  while (true) {
+    const { data, error, count } = await fetchAttendancePage(employeeIds, dateFrom, dateTo, offset);
+    if (error) throw error;
+
+    records.push(...(data || []));
+    offset += ATTENDANCE_PAGE_SIZE;
+
+    const total = count ?? records.length;
+    if (offset >= total || (data || []).length === 0) break;
+  }
+
+  return records;
+}
+
+// Splits `employeeIds` into small batches (keeping each request's IN-list
+// short), fetches each batch's full attendance rows for the date range
+// (paginated internally), and merges everything into one deduplicated
+// result set keyed by the attendance record's own primary id -- so an
+// overlapping page/batch boundary can never produce a duplicate row.
+// Batches are fetched sequentially (not all at once) to avoid firing dozens
+// of simultaneous requests at once; for a hotfix, reliability matters more
+// than shaving milliseconds off the load.
+async function fetchAttendanceInBatches(
+  employeeIds: string[],
+  dateFrom: string,
+  dateTo: string
+): Promise<AttendanceRecord[]> {
+  if (employeeIds.length === 0) return [];
+
+  const byId = new Map<string, AttendanceRecord>();
+  for (let i = 0; i < employeeIds.length; i += ATTENDANCE_EMPLOYEE_BATCH_SIZE) {
+    const batch = employeeIds.slice(i, i + ATTENDANCE_EMPLOYEE_BATCH_SIZE);
+    const batchRecords = await fetchAttendanceForEmployeeBatch(batch, dateFrom, dateTo);
+    for (const record of batchRecords) {
+      byId.set(record.id, record);
+    }
+  }
+
+  return Array.from(byId.values());
+}
+
 export function AttendancePage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -135,17 +216,13 @@ export function AttendancePage() {
       if (datesArr.length > 0 && employeesData && employeesData.length > 0) {
         const employeeIds = employeesData.map(e => e.id);
 
-        let attendanceQuery = supabase
-          .from('attendance')
-          .select('*')
-          .gte('date', datesArr[0])
-          .lte('date', datesArr[datesArr.length - 1])
-          .in('employee_id', employeeIds);
-
-        const { data: attendanceData, error: attError } = await attendanceQuery;
-        if (attError) throw attError;
-        setAttendance(attendanceData || []);
-        setHasData((attendanceData || []).length > 0);
+        const attendanceData = await fetchAttendanceInBatches(
+          employeeIds,
+          datesArr[0],
+          datesArr[datesArr.length - 1]
+        );
+        setAttendance(attendanceData);
+        setHasData(attendanceData.length > 0);
       } else {
         setAttendance([]);
         setHasData(false);
@@ -572,31 +649,39 @@ export function AttendancePage() {
     const sourceDates = getDatesForMonth(sourceMonth);
     const targetDates = getDatesForMonth(selectedMonth);
 
-    let sourceQuery = supabase
-      .from('attendance')
-      .select('*')
-      .gte('date', sourceDates[0])
-      .lte('date', sourceDates[sourceDates.length - 1]);
-    
-    if (!userProfile?.is_super_admin && userProfile?.region_id) {
-      const { data: regionEmployees } = await supabase
-        .from('employees')
-        .select('id')
-        .eq('region_id', userProfile.region_id)
-        .eq('is_deleted', false);
-      const employeeIds = regionEmployees?.map(e => e.id) || [];
-      if (employeeIds.length > 0) {
-        sourceQuery = sourceQuery.in('employee_id', employeeIds);
+    let sourceData: AttendanceRecord[];
+    try {
+      if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        // Region-scoped caller -- same oversized employee_id IN-list risk as
+        // the main fetchData load, so it goes through the same batched helper.
+        const { data: regionEmployees } = await supabase
+          .from('employees')
+          .select('id')
+          .eq('region_id', userProfile.region_id)
+          .eq('is_deleted', false);
+        const employeeIds = regionEmployees?.map(e => e.id) || [];
+        sourceData = await fetchAttendanceInBatches(
+          employeeIds,
+          sourceDates[0],
+          sourceDates[sourceDates.length - 1]
+        );
+      } else {
+        // Super admin / no region -- unfiltered by employee_id (unchanged from
+        // prior behavior), so no giant IN-list is ever built here.
+        const { data, error: sourceError } = await supabase
+          .from('attendance')
+          .select('*')
+          .gte('date', sourceDates[0])
+          .lte('date', sourceDates[sourceDates.length - 1]);
+        if (sourceError) throw sourceError;
+        sourceData = data || [];
       }
-    }
-    
-    const { data: sourceData, error: sourceError } = await sourceQuery;
-    
-    if (sourceError) {
+    } catch (sourceError) {
       console.error('Error fetching source data:', sourceError);
+      showNotification('Failed to fetch attendance data for the source month.', 'error');
       return;
     }
-    
+
     if (sourceData && sourceData.length > 0) {
       // tenant_id is omitted -- it defaults to the current user's own tenant
       // via the DB column default, same convention as processSingleUpdate.
