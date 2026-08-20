@@ -18,6 +18,7 @@ import {
   normalizeMonthKey
 } from '../utils/currentMonth';
 import { showNotification } from '../utils/clickHandlers';
+import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
 const COLORS = ['#081C3A', '#D4A017', '#3B82F6', '#10B981', '#EF4444', '#8B5CF6', '#F59E0B', '#64748B', '#06B6D4'];
@@ -307,18 +308,25 @@ export function Dashboard() {
         const lastDay = new Date(parseInt(selectedMonth.split('-')[0]), parseInt(selectedMonth.split('-')[1]), 0).getDate();
         const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
         
-        let attendanceQuery = supabase
-          .from('attendance')
-          .select('status')
-          .gte('date', monthStart)
-          .lte('date', monthEnd);
-        
-        if (employeeIds.length > 0) {
-          attendanceQuery = attendanceQuery.in('employee_id', employeeIds);
-        }
-        
-        const { data: attendanceRecords } = await attendanceQuery;
-        
+        // Batched: `employeeIds` is the full loaded employee population, which
+        // produced an oversized employee_id IN-list request URL in production
+        // (confirmed 400 Bad Request on this exact query shape -- select
+        // 'status', date range, employee_id IN). Only aggregate stats are
+        // needed here, so batching + client-side aggregation (already done
+        // below) is the minimal fix -- no row `id` is selected, so no dedup
+        // step applies (see src/utils/employeeBatchFetch.ts).
+        const attendanceRecords = await fetchInEmployeeIdBatches<{ status: string }>(
+          employeeIds,
+          (batch, from, to) =>
+            supabase
+              .from('attendance')
+              .select('status', { count: 'exact' })
+              .gte('date', monthStart)
+              .lte('date', monthEnd)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+
         if (attendanceRecords && attendanceRecords.length > 0) {
           let presentCount = 0;
           let totalRecords = 0;
@@ -380,11 +388,24 @@ export function Dashboard() {
       // ===== PAYROLL HISTORY — real net pay totals per month from the
       // `payroll` table. A month with no processed payroll run shows 0,
       // never a fabricated estimate. =====
-      let payrollQuery = supabase.from('payroll').select('month, net_pay, employee_id, approval_status');
-      if (employeeIds.length > 0) {
-        payrollQuery = payrollQuery.in('employee_id', employeeIds);
-      }
-      const { data: allPayrollRecords } = await payrollQuery;
+      // Batched: same oversized employee_id IN-list problem, confirmed 400
+      // Bad Request on this exact query shape (select month/net_pay/
+      // employee_id/approval_status, employee_id IN). No row `id` is
+      // selected, so no dedup step applies.
+      const allPayrollRecords = await fetchInEmployeeIdBatches<{
+        month: string;
+        net_pay: number;
+        employee_id: string;
+        approval_status: string;
+      }>(
+        employeeIds,
+        (batch, from, to) =>
+          supabase
+            .from('payroll')
+            .select('month, net_pay, employee_id, approval_status', { count: 'exact' })
+            .in('employee_id', batch)
+            .range(from, to)
+      );
 
       const payrollTotalsByMonthKey = new Map<string, number>();
       (allPayrollRecords || []).forEach((r: any) => {
@@ -430,15 +451,25 @@ export function Dashboard() {
         };
       });
 
+      // Batched: same oversized employee_id IN-list problem, confirmed 400
+      // Bad Request on this exact query shape (select date/status over a
+      // 6-month range, employee_id IN). This range is the widest of the
+      // three Dashboard queries (up to ~183 days), so pagination is expected
+      // to kick in even within a single 25-employee batch. No row `id` is
+      // selected, so no dedup step applies.
       let allAttendanceRecords: { date: string; status: string }[] = [];
       if (monthRanges.length > 0 && employeeIds.length > 0) {
-        const { data: records } = await supabase
-          .from('attendance')
-          .select('date, status')
-          .gte('date', monthRanges[0].startDate)
-          .lte('date', monthRanges[monthRanges.length - 1].endDate)
-          .in('employee_id', employeeIds);
-        allAttendanceRecords = records || [];
+        allAttendanceRecords = await fetchInEmployeeIdBatches<{ date: string; status: string }>(
+          employeeIds,
+          (batch, from, to) =>
+            supabase
+              .from('attendance')
+              .select('date, status', { count: 'exact' })
+              .gte('date', monthRanges[0].startDate)
+              .lte('date', monthRanges[monthRanges.length - 1].endDate)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
       }
 
       const attendanceDataTemp = monthRanges.map(({ label, startDate, endDate }) => {

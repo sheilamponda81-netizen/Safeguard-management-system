@@ -13,6 +13,7 @@ import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll } from '../utils/payrollCalculations';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 
 interface Employee {
   id: string;
@@ -211,15 +212,30 @@ export function PayrollPage() {
         }
       }
 
-      let query = supabase.from('payroll').select('month').order('month', { ascending: false });
+      // `employeeIds` (region-scoped) can be as large as `employees` (all-
+      // tenant) elsewhere in this file -- same oversized-IN-list risk, so it
+      // goes through the same batched helper. A super admin (employeeIds ===
+      // null, no region scoping needed) keeps the original single, unfiltered
+      // query.
+      let months: string[];
       if (employeeIds) {
-        query = query.in('employee_id', employeeIds);
+        const rows = await fetchInEmployeeIdBatches<{ month: string }>(
+          employeeIds,
+          (batch, from, to) =>
+            supabase
+              .from('payroll')
+              .select('month', { count: 'exact' })
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        months = rows.map(r => r.month);
+      } else {
+        const { data, error } = await supabase.from('payroll').select('month');
+        if (error) throw error;
+        months = (data || []).map(r => r.month);
       }
 
-      const { data, error } = await query;
-      if (error) throw error;
-
-      const uniqueMonths = [...new Set(data?.map(r => r.month) || [])];
+      const uniqueMonths = [...new Set(months)].sort().reverse();
       setProcessedMonths(uniqueMonths);
     } catch (err) {
       console.error('Error fetching processed months:', err);
@@ -251,16 +267,22 @@ export function PayrollPage() {
       // payroll too.
       const employeeIds = (employeesData || []).map(e => e.id);
 
-      let payrollData: PayrollRecord[] = [];
-      if (employeeIds.length > 0) {
-        const { data, error: payError } = await supabase
-          .from('payroll')
-          .select('*')
-          .eq('month', selectedMonth)
-          .in('employee_id', employeeIds);
-        if (payError) throw payError;
-        payrollData = data || [];
-      }
+      // Batched: `employeeIds` can be the entire region/tenant population,
+      // which produced an oversized employee_id IN-list request URL in
+      // production (confirmed 400 Bad Request on this exact query shape --
+      // select('*'), month filter, employee_id IN). See
+      // src/utils/employeeBatchFetch.ts.
+      const payrollDataRaw = await fetchInEmployeeIdBatches<PayrollRecord>(
+        employeeIds,
+        (batch, from, to) =>
+          supabase
+            .from('payroll')
+            .select('*', { count: 'exact' })
+            .eq('month', selectedMonth)
+            .in('employee_id', batch)
+            .range(from, to)
+      );
+      const payrollData = dedupeById(payrollDataRaw);
       setPayrollRecords(payrollData);
 
       if (payrollData.length > 0) {
@@ -270,16 +292,18 @@ export function PayrollPage() {
         setIsApproved(false);
       }
 
-      let deductionsData: EmployeeDeduction[] = [];
-      if (employeeIds.length > 0) {
-        const { data, error: dedError } = await supabase
-          .from('employee_deductions')
-          .select('*')
-          .eq('month', selectedMonth)
-          .in('employee_id', employeeIds);
-        if (dedError) throw dedError;
-        deductionsData = data || [];
-      }
+      // Batched for the same reason as the payroll records fetch above.
+      const deductionsDataRaw = await fetchInEmployeeIdBatches<EmployeeDeduction>(
+        employeeIds,
+        (batch, from, to) =>
+          supabase
+            .from('employee_deductions')
+            .select('*', { count: 'exact' })
+            .eq('month', selectedMonth)
+            .in('employee_id', batch)
+            .range(from, to)
+      );
+      const deductionsData = dedupeById(deductionsDataRaw);
       setEmployeeDeductions(deductionsData);
 
       // ===== Live attendance-derived absent/late counts for this month =====
@@ -290,34 +314,52 @@ export function PayrollPage() {
       const lastDay = new Date(year, monthNum, 0).getDate();
       const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
 
+      // Batched for the same reason as above. This query selects only
+      // `employee_id, status` (no row `id`), and employee batches/pages never
+      // overlap, so no dedup step is needed -- the rows are simply
+      // aggregated client-side exactly as before.
       const counts = new Map<string, AttendanceCount>();
-      if (employeeIds.length > 0) {
-        const { data: attendanceData, error: attendanceError } = await supabase
-          .from('attendance')
-          .select('employee_id, status')
-          .gte('date', monthStart)
-          .lte('date', monthEnd)
-          .in('employee_id', employeeIds);
+      const attendanceData = await fetchInEmployeeIdBatches<{ employee_id: string; status: string }>(
+        employeeIds,
+        (batch, from, to) =>
+          supabase
+            .from('attendance')
+            .select('employee_id, status', { count: 'exact' })
+            .gte('date', monthStart)
+            .lte('date', monthEnd)
+            .in('employee_id', batch)
+            .range(from, to)
+      );
 
-        if (attendanceError) throw attendanceError;
-
-        (attendanceData || []).forEach(record => {
-          const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
-          if (record.status === 'A') existing.absentDays += 1;
-          if (record.status === 'L') existing.lateDays += 1;
-          counts.set(record.employee_id, existing);
-        });
-      }
+      attendanceData.forEach(record => {
+        const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
+        if (record.status === 'A') existing.absentDays += 1;
+        if (record.status === 'L') existing.lateDays += 1;
+        counts.set(record.employee_id, existing);
+      });
       setAttendanceCounts(counts);
 
       // ===== Positions (for the "Requires Uniform" gate) =====
-      const { data: positionsData, error: positionsError } = await supabase
-        .from('positions')
-        .select('name, requires_uniform');
-      if (positionsError) throw positionsError;
-      setPositionsRequiringUniform(
-        new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
-      );
+      // Isolated from the rest of this fetch: `requires_uniform` was added by
+      // supabase/migrations/20260728000000_position_uniform_flag.sql, which may
+      // not yet be applied to every environment this code runs against. If that
+      // migration isn't present, PostgREST rejects the whole query (unknown
+      // column) -- letting that throw here would take down the entire Payroll
+      // page over one optional gate. On failure, fall back to "every position
+      // requires a uniform" (the migration's own DEFAULT true), matching pre-
+      // migration behavior exactly instead of losing the rest of the page.
+      try {
+        const { data: positionsData, error: positionsError } = await supabase
+          .from('positions')
+          .select('name, requires_uniform');
+        if (positionsError) throw positionsError;
+        setPositionsRequiringUniform(
+          new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
+        );
+      } catch (positionsErr) {
+        console.error('Error fetching position uniform flags (falling back to "all positions require uniform"):', positionsErr);
+        setPositionsRequiringUniform(new Map());
+      }
 
       setHasData((payrollData?.length || 0) > 0);
 
@@ -557,13 +599,21 @@ export function PayrollPage() {
         console.error('Error deleting existing data:', deleteError);
       }
 
-      const { data: sourceData, error: sourceError } = await supabase
-        .from('payroll')
-        .select('*')
-        .eq('month', sourceMonth)
-        .in('employee_id', employeeIds);
-
-      if (sourceError) {
+      // Same oversized-IN-list risk/fix as the main fetchData payroll query.
+      let sourceData: PayrollRecord[];
+      try {
+        const sourceDataRaw = await fetchInEmployeeIdBatches<PayrollRecord>(
+          employeeIds,
+          (batch, from, to) =>
+            supabase
+              .from('payroll')
+              .select('*', { count: 'exact' })
+              .eq('month', sourceMonth)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        sourceData = dedupeById(sourceDataRaw);
+      } catch (sourceError: any) {
         console.error('Error fetching source data:', sourceError);
         showNotification('Failed to fetch source data: ' + sourceError.message, 'error');
         return;
