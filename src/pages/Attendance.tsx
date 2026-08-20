@@ -13,6 +13,7 @@ import { Pagination } from '../components/Pagination';
 import { debounce } from '../utils/debounce';
 import { getPayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -52,84 +53,27 @@ interface AttendanceRecord {
 }
 
 // ===== PRODUCTION HOTFIX: batched attendance fetch =====
-// A single `.in('employee_id', employeeIds)` request with the entire loaded
-// employee population produces an extremely large PostgREST request URL as
-// the employee count grows -- production has grown past the point where
-// that URL is reliably accepted, returning 400 Bad Request. Splitting into
-// small employee-id batches keeps each request URL small; each batch is
-// still paginated with .range() (rather than trusting a single response to
-// contain every row) since one employee can have up to ~31 attendance rows
-// for the month, so a batch of ATTENDANCE_EMPLOYEE_BATCH_SIZE employees can
-// still exceed a single page. `{ count: 'exact' }` gives the true total
-// matching row count for the batch up front, so pagination stops based on
-// the real total rather than assuming "fewer rows than requested" means
-// "no more data" (which is not a safe assumption if the server enforces its
-// own max-rows cap below what we asked for).
-const ATTENDANCE_EMPLOYEE_BATCH_SIZE = 25;
-const ATTENDANCE_PAGE_SIZE = 500;
-
-async function fetchAttendancePage(
-  employeeIds: string[],
-  dateFrom: string,
-  dateTo: string,
-  offset: number
-) {
-  return supabase
-    .from('attendance')
-    .select('*', { count: 'exact' })
-    .gte('date', dateFrom)
-    .lte('date', dateTo)
-    .in('employee_id', employeeIds)
-    .range(offset, offset + ATTENDANCE_PAGE_SIZE - 1);
-}
-
-async function fetchAttendanceForEmployeeBatch(
-  employeeIds: string[],
-  dateFrom: string,
-  dateTo: string
-): Promise<AttendanceRecord[]> {
-  const records: AttendanceRecord[] = [];
-  let offset = 0;
-
-  while (true) {
-    const { data, error, count } = await fetchAttendancePage(employeeIds, dateFrom, dateTo, offset);
-    if (error) throw error;
-
-    records.push(...(data || []));
-    offset += ATTENDANCE_PAGE_SIZE;
-
-    const total = count ?? records.length;
-    if (offset >= total || (data || []).length === 0) break;
-  }
-
-  return records;
-}
-
-// Splits `employeeIds` into small batches (keeping each request's IN-list
-// short), fetches each batch's full attendance rows for the date range
-// (paginated internally), and merges everything into one deduplicated
-// result set keyed by the attendance record's own primary id -- so an
-// overlapping page/batch boundary can never produce a duplicate row.
-// Batches are fetched sequentially (not all at once) to avoid firing dozens
-// of simultaneous requests at once; for a hotfix, reliability matters more
-// than shaving milliseconds off the load.
+// See src/utils/employeeBatchFetch.ts for why this exists (oversized
+// employee_id IN-list requests returning 400 in production) and how batching
+// + pagination + bounded concurrency work. Uses dedupeById defensively since
+// `select('*')` includes each row's own `id`.
 async function fetchAttendanceInBatches(
   employeeIds: string[],
   dateFrom: string,
   dateTo: string
 ): Promise<AttendanceRecord[]> {
-  if (employeeIds.length === 0) return [];
-
-  const byId = new Map<string, AttendanceRecord>();
-  for (let i = 0; i < employeeIds.length; i += ATTENDANCE_EMPLOYEE_BATCH_SIZE) {
-    const batch = employeeIds.slice(i, i + ATTENDANCE_EMPLOYEE_BATCH_SIZE);
-    const batchRecords = await fetchAttendanceForEmployeeBatch(batch, dateFrom, dateTo);
-    for (const record of batchRecords) {
-      byId.set(record.id, record);
-    }
-  }
-
-  return Array.from(byId.values());
+  const records = await fetchInEmployeeIdBatches<AttendanceRecord>(
+    employeeIds,
+    (batch, from, to) =>
+      supabase
+        .from('attendance')
+        .select('*', { count: 'exact' })
+        .gte('date', dateFrom)
+        .lte('date', dateTo)
+        .in('employee_id', batch)
+        .range(from, to)
+  );
+  return dedupeById(records);
 }
 
 export function AttendancePage() {
