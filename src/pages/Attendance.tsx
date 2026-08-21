@@ -126,6 +126,11 @@ function EmployeeModal({
   });
   const [saving, setSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
+  // No functional role has attendance.create/attendance.edit in the seeded
+  // matrix -- only a legacy account (role_level <= 3, enforced server-side)
+  // may edit these additional deductions, matching AttendancePage's own
+  // isEditable gate for the main grid.
+  const canEditDeductions = (userProfile?.role_level ?? null) !== null;
 
   useEffect(() => {
     if (!selectedEmployee) return;
@@ -350,6 +355,7 @@ function EmployeeModal({
               >
                 <RefreshCw size={14} className="mr-1" /> Reload
               </Button>
+              {canEditDeductions && (
               <Button
                 variant="secondary"
                 onClick={saveDeductions}
@@ -366,6 +372,7 @@ function EmployeeModal({
                   'Save Deductions'
                 )}
               </Button>
+              )}
             </div>
           </div>
 
@@ -427,7 +434,8 @@ function EmployeeModal({
                     type="number"
                     value={editableDeductions.lectureMissed}
                     onChange={(e) => handleDeductionChange('lectureMissed', parseInt(e.target.value) || 0)}
-                    className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                    disabled={!canEditDeductions}
+                    className="w-20 px-2 py-1 text-sm border border-slate-200 rounded text-right disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
                     min="0"
                   />
                   <span className="text-xs text-slate-400">(Wed/Thu)</span>
@@ -438,7 +446,8 @@ function EmployeeModal({
                     type="number"
                     value={editableDeductions.lectureDeduction}
                     onChange={(e) => handleDeductionChange('lectureDeduction', parseInt(e.target.value) || 0)}
-                    className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                    disabled={!canEditDeductions}
+                    className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
                     min="0"
                   />
                 </div>
@@ -448,7 +457,8 @@ function EmployeeModal({
                     type="number"
                     value={editableDeductions.appearanceDeduction}
                     onChange={(e) => handleDeductionChange('appearanceDeduction', parseInt(e.target.value) || 0)}
-                    className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right"
+                    disabled={!canEditDeductions}
+                    className="w-28 px-2 py-1 text-sm border border-slate-200 rounded text-right disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
                     min="0"
                   />
                 </div>
@@ -490,6 +500,15 @@ export function AttendancePage() {
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [updating, setUpdating] = useState<Record<string, boolean>>({});
+  // Permission-driven action gating (correction round 2, item 6) -- every
+  // legacy account that could ever reach this page (role_level 1/2/3 --
+  // role_level 4/Staff never had "attendance" in its nav map, see
+  // App.tsx's rolePages) keeps exactly its existing write access,
+  // unchanged. The new operations_manager role has attendance.view ONLY
+  // (no attendance.create/edit), matching "Operations on Attendance: no
+  // marking/edit/save controls" -- read-only. HR Manager/Accountant never
+  // reach this page at all (no attendance.view permission).
+  const [canEditAttendance, setCanEditAttendance] = useState(true);
   // Attendance deduction rates -- shared, admin-configurable via Settings ->
   // System (see payrollSettings.ts), instead of the fixed constant these used
   // to be. Payroll.tsx/Payslips.tsx read the same source for the figures they
@@ -534,6 +553,13 @@ export function AttendancePage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
+    // No functional role has attendance.create/attendance.edit in the
+    // seeded matrix -- only a legacy account (role_level <= 3, enforced
+    // server-side by the RLS on `attendance`/`employee_deductions`) may
+    // write here. operations_manager (attendance.view only) is
+    // structurally excluded by role_level being NULL, matching the
+    // backend exactly -- there is no permission key to OR in here.
+    setCanEditAttendance((profile?.role_level ?? null) !== null);
   }, []);
 
   // ===== FETCH DATA =====
@@ -1174,7 +1200,7 @@ export function AttendancePage() {
             <TBody>
               {paginatedEmployees.map(emp => {
                 const stats = getEmployeeStats(emp.id);
-                const isEditable = isCurrentMonth;
+                const isEditable = isCurrentMonth && canEditAttendance;
                 return (
                   <TR key={emp.id} onClick={() => setSelectedEmployee(emp)} className="cursor-pointer">
                     <TD className="sticky left-0 bg-white z-10">

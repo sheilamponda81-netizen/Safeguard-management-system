@@ -1,9 +1,10 @@
 import { useState, useEffect, lazy, Suspense, useCallback, useMemo } from "react";
 import { Toaster } from "sonner";
 import { LoginPage } from "./pages/Login";
-import { Sidebar, TopBar, BottomNav, NavKey } from "./components/Sidebar";
+import { Sidebar, TopBar, BottomNav, NavKey, resolveAllowedPages } from "./components/Sidebar";
 import { supabase } from "./lib/supabase";
-import { getCurrentProfile } from "./utils/currentProfile";
+import { getCurrentProfile, UserProfile } from "./utils/currentProfile";
+import { isBusinessAdmin, getMyPermissions } from "./utils/permissions";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { startMonitoring } from "./utils/alerts";
 import { logger } from "./utils/logger";
@@ -113,7 +114,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [nav, setNav] = useState<NavKey>("dashboard");
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
+  const [allowedPages, setAllowedPages] = useState<NavKey[]>(rolePages[4]);
   const [preloaded, setPreloaded] = useState<Set<NavKey>>(new Set());
 
   // ===== OPTIMIZED: Use useCallback for navigation =====
@@ -131,11 +132,6 @@ export default function App() {
     if (preloaded.has(key)) return;
     setPreloaded(prev => new Set(prev).add(key));
   }, [preloaded]);
-
-  // ===== OPTIMIZED: Use useMemo for allowed pages =====
-  const allowedPages = useMemo(() => {
-    return rolePages[userRoleLevel] || rolePages[4];
-  }, [userRoleLevel]);
 
   // ===== OPTIMIZED: Use useMemo for titles =====
   const currentTitle = useMemo(() => {
@@ -189,13 +185,20 @@ export default function App() {
         // introduce a real bug: re-running this whole effect -- including
         // re-subscribing to onAuthStateChange -- every time sessionChecked
         // flips, which happens multiple times within this same call).
+        // The cached-session fast path only short-circuits for a LEGACY
+        // account (a real cached role_level number) -- its allowedPages
+        // are a pure function of that number, so rolePages[roleLevel] is
+        // safe to use instantly without a network round trip. A
+        // functional-role account (role_level null/absent from the cache)
+        // needs a permissions fetch to know its allowedPages, so it always
+        // falls through to the full check below instead.
         const cachedSession = sessionStorage.getItem('sb-session-cache');
         if (cachedSession) {
           try {
             const parsed = JSON.parse(cachedSession);
-            if (parsed && parsed.user) {
+            if (parsed && parsed.user && typeof parsed.role_level === 'number') {
               setLoggedIn(true);
-              setUserRoleLevel(parsed.role_level || 4);
+              setAllowedPages(rolePages[parsed.role_level] || rolePages[4]);
               setLoading(false);
               return;
             }
@@ -217,15 +220,25 @@ export default function App() {
           if (session) {
             setLoggedIn(true);
             localStorage.setItem('sb-session', JSON.stringify(session));
-            
-            const profile = await getCurrentProfile();
 
-            const roleLevel = profile?.role_level || 4;
-            setUserRoleLevel(roleLevel);
-            
+            const profile = await getCurrentProfile();
+            const roleLevel = profile?.role_level ?? null;
+
+            const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
+            let permissions = new Set<string>();
+            if (roleLevel === null && !businessAdmin) {
+              permissions = await getMyPermissions();
+            }
+            const pages = resolveAllowedPages(profile as UserProfile | null, permissions, rolePages);
+            if (isMounted) setAllowedPages(pages);
+
+            // Only cache a real (legacy) role_level number for the fast
+            // path above -- caching `null` would need the permissions set
+            // cached alongside it to be useful, which this deliberately
+            // does not do (see the fast-path comment above).
             sessionStorage.setItem('sb-session-cache', JSON.stringify({
               user: session.user,
-              role_level: roleLevel
+              ...(roleLevel !== null ? { role_level: roleLevel } : {})
             }));
           } else {
             setLoggedIn(false);
@@ -249,19 +262,27 @@ export default function App() {
       if (event === 'SIGNED_IN' && session) {
         setLoggedIn(true);
         localStorage.setItem('sb-session', JSON.stringify(session));
-        
-        const profile = await getCurrentProfile();
 
-        const roleLevel = profile?.role_level || 4;
-        setUserRoleLevel(roleLevel);
+        const profile = await getCurrentProfile();
+        const roleLevel = profile?.role_level ?? null;
+
+        const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
+        let permissions = new Set<string>();
+        if (roleLevel === null && !businessAdmin) {
+          permissions = await getMyPermissions();
+        }
+        if (isMounted) {
+          setAllowedPages(resolveAllowedPages(profile as UserProfile | null, permissions, rolePages));
+        }
+
         sessionStorage.setItem('sb-session-cache', JSON.stringify({
           user: session.user,
-          role_level: roleLevel
+          ...(roleLevel !== null ? { role_level: roleLevel } : {})
         }));
         setLoading(false);
       } else if (event === 'SIGNED_OUT') {
         setLoggedIn(false);
-        setUserRoleLevel(4);
+        setAllowedPages(rolePages[4]);
         localStorage.removeItem('sb-session');
         sessionStorage.removeItem('sb-session-cache');
         setLoading(false);
@@ -285,9 +306,9 @@ export default function App() {
         if (cachedSession) {
           try {
             const parsed = JSON.parse(cachedSession);
-            if (parsed && parsed.user) {
+            if (parsed && parsed.user && typeof parsed.role_level === 'number') {
               setLoggedIn(true);
-              setUserRoleLevel(parsed.role_level || 4);
+              setAllowedPages(rolePages[parsed.role_level] || rolePages[4]);
               return;
             }
           } catch (e) {

@@ -18,7 +18,14 @@ export interface UserProfile {
   email: string | null;
   full_name: string | null;
   role: string | null;
-  role_level: number;
+  // NULL for every new functional-role account (admin / hr_manager /
+  // accountant / operations_manager) -- deliberate, structural, see
+  // supabase/migrations/20260817000000_functional_role_permissions_foundation.sql's
+  // header. Every legacy numeric-comparison call site MUST treat null as
+  // "no legacy access" (e.g. `role_level || 4`, never a raw `<=` compare
+  // against a possibly-null value) and layer a has_permission()-based check
+  // on top for the new roles -- see src/utils/permissions.ts.
+  role_level: number | null;
   department: string | null;
   is_super_admin: boolean;
   is_active: boolean;

@@ -4,6 +4,7 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile, UserProfile } from '../utils/currentProfile';
+import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
@@ -143,6 +144,12 @@ export function SalaryAdvancesPage() {
   // Rules of Hooks fix documented in Recruitment.tsx for the exact class
   // of bug this must never reintroduce). =====
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  // Functional-role fallback for canManage below -- hr_manager and
+  // accountant both hold salary_advances.create/approve/adjust (see the
+  // seeded matrix in 20260817000000), but their role_level is NULL by
+  // design, so the legacy `roleLevel <= 2` check alone would wrongly wall
+  // them out of this entire page.
+  const [hasFunctionalManagePermission, setHasFunctionalManagePermission] = useState(false);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [advances, setAdvances] = useState<SalaryAdvanceRow[]>([]);
   const [deductionLedger, setDeductionLedger] = useState<DeductionLedgerRow[]>([]);
@@ -193,7 +200,10 @@ export function SalaryAdvancesPage() {
   // ===== MEMOIZED VALUES =====
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin ?? false, [userProfile]);
   const roleLevel = useMemo(() => userProfile?.role_level ?? 4, [userProfile]);
-  const canManage = useMemo(() => isSuperAdmin || roleLevel <= 2, [isSuperAdmin, roleLevel]);
+  const canManage = useMemo(
+    () => isSuperAdmin || roleLevel <= 2 || hasFunctionalManagePermission,
+    [isSuperAdmin, roleLevel, hasFunctionalManagePermission],
+  );
   const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
 
   const employeesById = useMemo(() => {
@@ -354,6 +364,7 @@ export function SalaryAdvancesPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
+    setHasFunctionalManagePermission(await hasPermission(PERMISSIONS.SALARY_ADVANCES_CREATE));
   }, []);
 
   const fetchEmployees = useCallback(async () => {

@@ -9,8 +9,12 @@ import {
 } from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
-import { getCurrentProfile } from "../utils/currentProfile";
+import { getCurrentProfile, UserProfile } from "../utils/currentProfile";
 import { getCompanySettings } from "../utils/companySettings";
+import {
+  PERMISSIONS, PermissionKey, isBusinessAdmin, getMyPermissions,
+  ROLE_DISPLAY_NAMES, FunctionalRole,
+} from "../utils/permissions";
 import { useState, useEffect, useCallback } from "react";
 import { ChevronRight } from 'lucide-react';
 
@@ -83,6 +87,60 @@ const roleMenuItems: Record<number, NavKey[]> = {
   4: ["dashboard", "payslips", "user-manual"],
 };
 
+const ALL_NAV_KEYS: NavKey[] = allNavItems.map((item) => item.id);
+
+// Governing permission(s) for each nav item, for a NEW functional-role
+// account (role_level = NULL). A page is reachable if the account holds
+// ANY ONE of the listed permissions -- e.g. "reports" is reachable with
+// EITHER the financial OR the operational view permission (the deeper
+// financial-vs-operational content split happens inside Reports.tsx
+// itself). "settings" and "auditlogs" are deliberately absent -- both stay
+// Admin-only (is_business_admin()), not permission-table-backed (see
+// 20260817000004's PART 2 header and 20260817000001's PART 4
+// respectively) -- a business admin reaches them via the ALL_NAV_KEYS
+// branch in resolveAllowedPages() below, not through this map.
+export const NAV_PERMISSIONS: Partial<Record<NavKey, PermissionKey[]>> = {
+  dashboard: [PERMISSIONS.DASHBOARD_VIEW],
+  employees: [PERMISSIONS.EMPLOYEES_VIEW],
+  recruitment: [PERMISSIONS.RECRUITMENT_VIEW],
+  attendance: [PERMISSIONS.ATTENDANCE_VIEW],
+  payroll: [PERMISSIONS.PAYROLL_VIEW],
+  payslips: [PERMISSIONS.PAYSLIPS_VIEW],
+  payments: [PERMISSIONS.PAYMENTS_VIEW],
+  "terminal-dues": [PERMISSIONS.TERMINAL_DUES_VIEW],
+  "salary-advances": [PERMISSIONS.SALARY_ADVANCES_VIEW],
+  reports: [PERMISSIONS.REPORTS_FINANCIAL_VIEW, PERMISSIONS.REPORTS_OPERATIONAL_VIEW],
+  security: [PERMISSIONS.SECURITY_PERSONNEL_VIEW],
+  features: [PERMISSIONS.FUTURE_FEATURES_VIEW],
+  "user-manual": [PERMISSIONS.USER_MANUAL_VIEW],
+};
+
+// Shared derivation used by BOTH Sidebar (nav rendering) and App.tsx
+// (routing guard) so the two can never drift apart. A LEGACY account
+// (role_level IS NOT NULL) uses the EXACT SAME role_level -> page-list map
+// it always has -- zero behavior change for any existing account. A
+// functional-role account (role_level === null, by design -- see
+// 20260817000000's header) is resolved from its permission set instead; a
+// business admin (legacy role_level = 1 OR the new role = 'admin') always
+// gets every page, matching Admin's existing full access.
+export function resolveAllowedPages(
+  profile: UserProfile | null,
+  permissions: Set<string>,
+  legacyMap: Record<number, NavKey[]>,
+): NavKey[] {
+  const roleLevel = profile?.role_level ?? null;
+  if (roleLevel !== null) {
+    return legacyMap[roleLevel] || legacyMap[4];
+  }
+  if (isBusinessAdmin(profile)) {
+    return ALL_NAV_KEYS;
+  }
+  const pages = (Object.keys(NAV_PERMISSIONS) as NavKey[]).filter((key) =>
+    NAV_PERMISSIONS[key]!.some((perm) => permissions.has(perm)),
+  );
+  return pages.length > 0 ? pages : (["dashboard", "user-manual"] as NavKey[]);
+}
+
 export function Sidebar({
   active,
   onNavigate,
@@ -96,7 +154,10 @@ export function Sidebar({
   onClose: () => void;
   onPreload?: (key: NavKey) => void;
 }) {
-  const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
+  const [userRoleLevel, setUserRoleLevel] = useState<number | null>(4);
+  const [userRole, setUserRole] = useState<string | null>(null);
+  const [userIsBusinessAdmin, setUserIsBusinessAdmin] = useState(false);
+  const [allowedMenuIds, setAllowedMenuIds] = useState<NavKey[]>(roleMenuItems[4]);
   const [loading, setLoading] = useState(true);
   const [userName, setUserName] = useState<string>("User");
   const [isMobile, setIsMobile] = useState(false);
@@ -171,11 +232,24 @@ export function Sidebar({
             console.error("Error fetching profile:", error);
             setUserName(user.email?.split("@")[0] || "User");
             setUserRoleLevel(4);
+            setAllowedMenuIds(roleMenuItems[4]);
           } else {
             setUserName(
               profile?.full_name || user.email?.split("@")[0] || "User",
             );
-            setUserRoleLevel(profile?.role_level || 4);
+            const roleLevel = profile?.role_level ?? null;
+            setUserRoleLevel(roleLevel);
+            setUserRole(profile?.role ?? null);
+            const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
+            setUserIsBusinessAdmin(businessAdmin);
+
+            let permissions = new Set<string>();
+            if (roleLevel === null && !businessAdmin) {
+              permissions = await getMyPermissions();
+            }
+            setAllowedMenuIds(
+              resolveAllowedPages(profile as UserProfile | null, permissions, roleMenuItems),
+            );
           }
         }
       } catch (err) {
@@ -187,7 +261,6 @@ export function Sidebar({
     getUserInfo();
   }, []);
 
-  const allowedMenuIds = roleMenuItems[userRoleLevel] || roleMenuItems[4];
   const visibleNavItems = allNavItems.filter((item) =>
     allowedMenuIds.includes(item.id),
   );
@@ -201,7 +274,15 @@ export function Sidebar({
     if (userRoleLevel === 1) return "Administrator";
     if (userRoleLevel === 2) return "Manager";
     if (userRoleLevel === 3) return "Supervisor";
-    return "Staff";
+    if (userRoleLevel === 4) return "Staff";
+    // Functional-role account (role_level === null) -- display its real
+    // role name instead of falling through to "Staff", which would
+    // misrepresent a new hr_manager/accountant/operations_manager/admin
+    // account as the legacy lowest-privilege role.
+    if (userRole && userRole in ROLE_DISPLAY_NAMES) {
+      return ROLE_DISPLAY_NAMES[userRole as FunctionalRole];
+    }
+    return "User";
   };
 
   // ===== PERFORMANCE: Memoize NavLink component =====
@@ -282,7 +363,7 @@ export function Sidebar({
           <div className="px-3 py-2 text-sm text-slate-500">Loading...</div>
         )}
 
-        {!loading && userRoleLevel === 1 && (
+        {!loading && (userRoleLevel === 1 || userIsBusinessAdmin) && (
           <>
             <p className="px-3 py-2 mt-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
               Special
@@ -410,8 +491,15 @@ export function BottomNav({
   active: NavKey;
   onNavigate: (k: NavKey) => void;
 }) {
-  const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
+  const [allowedBottomMenus, setAllowedBottomMenus] = useState<NavKey[]>(["dashboard", "employees", "payments", "payslips", "reports", "user-manual"]);
   const [loading, setLoading] = useState(true);
+
+  const roleBottomItems: Record<number, NavKey[]> = {
+    1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings", "auditlogs", "user-manual"],
+    2: ["dashboard", "employees", "terminal-dues", "attendance", "reports", "user-manual"],
+    3: ["dashboard", "employees", "attendance","terminal-dues", "reports", "user-manual"],
+    4: ["dashboard", "employees", "payments", "payslips", "reports", "user-manual"],
+  };
 
   useEffect(() => {
     const getUserRole = async () => {
@@ -421,7 +509,20 @@ export function BottomNav({
         } = await supabase.auth.getUser();
         if (user) {
           const profile = await getCurrentProfile();
-          setUserRoleLevel(profile?.role_level || 4);
+          const roleLevel = profile?.role_level ?? null;
+          const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
+          let permissions = new Set<string>();
+          if (roleLevel === null && !businessAdmin) {
+            permissions = await getMyPermissions();
+          }
+          // resolveAllowedPages() returns the FULL page set for the
+          // caller; `allItems` below (a hand-curated subset for the
+          // limited mobile bottom bar) is what actually narrows it --
+          // same intersection pattern this bar already used for legacy
+          // accounts via `roleBottomItems`.
+          setAllowedBottomMenus(
+            resolveAllowedPages(profile as UserProfile | null, permissions, roleBottomItems),
+          );
         }
       } catch (err) {
         console.error("Failed to get role:", err);
@@ -431,16 +532,6 @@ export function BottomNav({
     };
     getUserRole();
   }, []);
-
-  const roleBottomItems: Record<number, NavKey[]> = {
-    1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings", "auditlogs", "user-manual"],
-    2: ["dashboard", "employees", "terminal-dues", "attendance", "reports", "user-manual"],
-    3: ["dashboard", "employees", "attendance","terminal-dues", "reports", "user-manual"],
-    4: ["dashboard", "employees", "payments", "payslips", "reports", "user-manual"],
-  };
-
-  const allowedBottomMenus =
-    roleBottomItems[userRoleLevel] || roleBottomItems[4];
 
   const allItems = [
     { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },

@@ -8,6 +8,7 @@ import {
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader } from '../components/ui';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
@@ -125,6 +126,15 @@ export function SecurityPage() {
   const [viewingItem, setViewingItem] = useState<SecurityPersonnel | null>(null);
   const [loading, setLoading] = useState(true);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  // Permission-driven action gating (correction round 2, item 6) -- legacy
+  // accounts keep unrestricted access, unchanged. HR Manager gets all
+  // three (security_personnel.create/edit/delete); Operations Manager
+  // (security_personnel.view only) gets none -- read-only, matching
+  // "Operations on Security: no Create/Edit/Delete". Accountant never
+  // reaches this page at all (no security_personnel.* permission at all).
+  const [canCreateGuard, setCanCreateGuard] = useState(true);
+  const [canEditGuard, setCanEditGuard] = useState(true);
+  const [canDeleteGuard, setCanDeleteGuard] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [filterShift, setFilterShift] = useState('all');
   const [filterStatus, setFilterStatus] = useState('all');
@@ -231,18 +241,26 @@ export function SecurityPage() {
         profile = await fetchUserProfile();
         if (profile) {
           setUserProfile(profile);
+          const isLegacy = (profile?.role_level ?? null) !== null;
+          setCanCreateGuard(await canAccess(isLegacy, PERMISSIONS.SECURITY_PERSONNEL_CREATE));
+          setCanEditGuard(await canAccess(isLegacy, PERMISSIONS.SECURITY_PERSONNEL_EDIT));
+          setCanDeleteGuard(await canAccess(isLegacy, PERMISSIONS.SECURITY_PERSONNEL_DELETE));
         } else {
           setFetchError('Unable to load user profile');
           setLoading(false);
           return;
         }
       }
-      
+
       console.log('Fetching security data for region:', profile?.region_id);
 
       // Build the query - exclude deleted employees
+      // employees_security: narrow guard-data read surface (Design B2) --
+      // this view already limits columns to what this page needs plus the
+      // guard-only fields, gated by its own security_personnel.view
+      // authorization predicate.
       let query = supabase
-        .from('employees')
+        .from('employees_security')
         .select('*')
         .eq('is_deleted', false);
 
@@ -373,9 +391,9 @@ export function SecurityPage() {
 
         if (error) throw error;
 
-        // Fetch the updated employee data
+        // Fetch the updated employee data via employees_security (Design B2)
         const { data: updatedEmployee, error: fetchError } = await supabase
-          .from('employees')
+          .from('employees_security')
           .select('*')
           .eq('id', newGuard.employee_id)
           .maybeSingle();
@@ -411,7 +429,10 @@ export function SecurityPage() {
         }
       } else {
         // Create new employee as guard
-        const { data, error } = await supabase
+        // Do not return guard columns directly from the raw employees
+        // mutation -- narrow RETURNING to id only, then fetch the full
+        // security row through employees_security (Design B2).
+        const { data: insertData, error } = await supabase
           .from('employees')
           .insert([{
             full_name: newGuard.full_name,
@@ -436,12 +457,22 @@ export function SecurityPage() {
             department: 'Operations',
             is_deleted: false
           }])
-          .select();
+          .select('id')
+          .single();
 
         if (error) throw error;
 
-        if (data && data[0]) {
-          const newEmployee = data[0];
+        const { data: newEmployee, error: fetchNewError } = insertData
+          ? await supabase
+              .from('employees_security')
+              .select('*')
+              .eq('id', insertData.id)
+              .maybeSingle()
+          : { data: null, error: null };
+
+        if (fetchNewError) throw fetchNewError;
+
+        if (newEmployee) {
           const guard: SecurityPersonnel = {
             id: newEmployee.id,
             full_name: newEmployee.full_name,
@@ -699,7 +730,9 @@ export function SecurityPage() {
         actions={
           <>
             <Button variant="outline" onClick={handleExport}><Download size={16} /> Export</Button>
-            <Button variant="secondary" onClick={() => setShowAddModal(true)}><UserPlus size={16} /> Add Guard</Button>
+            {canCreateGuard && (
+              <Button variant="secondary" onClick={() => setShowAddModal(true)}><UserPlus size={16} /> Add Guard</Button>
+            )}
             <Button variant="outline" onClick={refreshData}><RefreshCw size={16} className="mr-1" /> Refresh</Button>
           </>
         }
@@ -818,11 +851,15 @@ export function SecurityPage() {
           <Shield size={48} className="mx-auto text-slate-300 mb-4" />
           <h3 className="text-lg font-semibold text-slate-800 mb-2">No Security Personnel Found</h3>
           <p className="text-sm text-slate-500 max-w-md mx-auto">
-            There are no security personnel records available. Click "Add Guard" to create your first record.
+            {canCreateGuard
+              ? 'There are no security personnel records available. Click "Add Guard" to create your first record.'
+              : 'There are no security personnel records available.'}
           </p>
-          <Button variant="secondary" className="mt-4" onClick={() => setShowAddModal(true)}>
-            <UserPlus size={16} className="mr-1" /> Add Guard
-          </Button>
+          {canCreateGuard && (
+            <Button variant="secondary" className="mt-4" onClick={() => setShowAddModal(true)}>
+              <UserPlus size={16} className="mr-1" /> Add Guard
+            </Button>
+          )}
         </Card>
       ) : (
         <>
@@ -895,22 +932,26 @@ export function SecurityPage() {
                           >
                             <Eye size={14} />
                           </button>
-                          <button 
-                            type="button"
-                            onClick={() => handleEdit(emp)} 
-                            className="w-7 h-7 rounded-lg hover:bg-slate-100 text-amber-600 flex items-center justify-center"
-                            title="Edit"
-                          >
-                            <Edit2 size={14} />
-                          </button>
-                          <button 
-                            type="button"
-                            onClick={() => handleDelete(emp)} 
-                            className="w-7 h-7 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"
-                            title="Delete"
-                          >
-                            <Trash2 size={14} />
-                          </button>
+                          {canEditGuard && (
+                            <button
+                              type="button"
+                              onClick={() => handleEdit(emp)}
+                              className="w-7 h-7 rounded-lg hover:bg-slate-100 text-amber-600 flex items-center justify-center"
+                              title="Edit"
+                            >
+                              <Edit2 size={14} />
+                            </button>
+                          )}
+                          {canDeleteGuard && (
+                            <button
+                              type="button"
+                              onClick={() => handleDelete(emp)}
+                              className="w-7 h-7 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"
+                              title="Delete"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          )}
                         </div>
                       </td>
                     </TR>

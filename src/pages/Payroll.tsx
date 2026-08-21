@@ -24,6 +24,7 @@ import {
   canApprovePayroll as canApprovePayrollFor,
   isPendingApproval as computeIsPendingApproval,
 } from '../utils/payrollPermissions';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
 
 interface Employee {
   id: string;
@@ -218,10 +219,15 @@ export function PayrollPage() {
       const roleLevel = profile?.role_level || 4;
       const roleContext = { isSuperAdmin, roleLevel };
 
-      setCanProcessPayroll(canProcessPayrollFor(roleContext));
-      setCanEditPayroll(canEditPayrollFor(roleContext));
-      setCanViewPayroll(canViewPayrollFor(roleContext));
-      setCanApprovePayroll(canApprovePayrollFor(roleContext));
+      // OR'd with has_permission() for the new functional roles -- a
+      // legacy-only check would wall out an accountant (payroll.view/
+      // process/approve, role_level = NULL by design) entirely. canEdit
+      // maps to payroll.process (there is no separate "edit" permission in
+      // the seeded matrix -- editing draft entries is part of processing).
+      setCanProcessPayroll(await canAccess(canProcessPayrollFor(roleContext), PERMISSIONS.PAYROLL_PROCESS));
+      setCanEditPayroll(await canAccess(canEditPayrollFor(roleContext), PERMISSIONS.PAYROLL_PROCESS));
+      setCanViewPayroll(await canAccess(canViewPayrollFor(roleContext), PERMISSIONS.PAYROLL_VIEW));
+      setCanApprovePayroll(await canAccess(canApprovePayrollFor(roleContext), PERMISSIONS.PAYROLL_APPROVE));
     }
   }, []);
 

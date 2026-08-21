@@ -4,6 +4,7 @@ import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs 
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
@@ -380,6 +381,16 @@ export function EmployeesPage() {
   const debouncedFilterWorkstation = useDebouncedValue(filterWorkstation, 300);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [userLoading, setUserLoading] = useState(true);
+  // Permission-driven action gating (correction round 2, item 6) --
+  // legacy accounts (role_level set) keep unrestricted create/edit/delete,
+  // exactly as before this rollout (no legacy account was ever gated
+  // here). A new functional-role account is gated: HR Manager gets all
+  // three (employees.create/edit/delete); Accountant/Operations Manager
+  // (employees.view only) get none -- Employees becomes read-only for
+  // them, matching "Accountant on Employees: no Add, no Edit, no Delete".
+  const [canCreateEmployee, setCanCreateEmployee] = useState(true);
+  const [canEditEmployee, setCanEditEmployee] = useState(true);
+  const [canDeleteEmployee, setCanDeleteEmployee] = useState(true);
   const [showDeletedModal, setShowDeletedModal] = useState(false);
   const [selectedDeletedEmployee, setSelectedDeletedEmployee] = useState<Employee | null>(null);
   
@@ -441,13 +452,20 @@ export function EmployeesPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
+    const isLegacy = (profile?.role_level ?? null) !== null;
+    setCanCreateEmployee(await canAccess(isLegacy, PERMISSIONS.EMPLOYEES_CREATE));
+    setCanEditEmployee(await canAccess(isLegacy, PERMISSIONS.EMPLOYEES_EDIT));
+    setCanDeleteEmployee(await canAccess(isLegacy, PERMISSIONS.EMPLOYEES_DELETE));
     setUserLoading(false);
   }, []);
 
   const fetchEmployees = useCallback(async () => {
     setLoading(true);
     try {
-      let query = supabase.from('employees').select('*');
+      // employees_general: non-sensitive employee read surface (Design B2) --
+      // confirmed the Employees module never references any guard/security-
+      // only column.
+      let query = supabase.from('employees_general').select('*');
       
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         query = query.eq('region_id', userProfile.region_id);
@@ -656,7 +674,10 @@ export function EmployeesPage() {
     // adding several employees in a row makes a transient blip more likely
     // to land mid-request.
     let employeeNumberToUse = safeEmp.employeeNumber;
-    let data: EmployeeRow[] | null = null;
+    // Narrowed RETURNING -- just `id`, not the full row (no `RETURNING *`
+    // against the base table). The complete row the UI needs is fetched
+    // separately from `employees_general` once the insert succeeds.
+    let insertedId: string | null = null;
     let error: { message: string; code?: string; isNetworkError?: boolean } | null = null;
     const MAX_INSERT_ATTEMPTS = 5;
 
@@ -666,8 +687,9 @@ export function EmployeesPage() {
         const result = await supabase
           .from('employees')
           .insert([buildInsertRow(employeeNumberToUse)])
-          .select();
-        data = result.data;
+          .select('id')
+          .single();
+        insertedId = result.data?.id ?? null;
         error = result.error;
       } catch (networkErr) {
         error = { message: getErrorMessage(networkErr), isNetworkError: true };
@@ -701,47 +723,60 @@ export function EmployeesPage() {
         : 'Error adding employee: ' + getErrorMessage(error);
       showNotification(message, 'error');
       return;
-    } else if (data && data[0]) {
+    } else if (insertedId) {
+      // Fetch the complete non-sensitive row through employees_general --
+      // the base-table insert above only returned `id` (no `RETURNING *`).
+      const { data: fullRow, error: fetchError } = await supabase
+        .from('employees_general')
+        .select('*')
+        .eq('id', insertedId)
+        .single();
+
+      if (fetchError || !fullRow) {
+        showNotification('Employee added, but failed to load the new record: ' + getErrorMessage(fetchError), 'error');
+        return;
+      }
+
       const newEmployee = {
-        id: data[0].id,
-        employeeNumber: data[0].employee_number,
-        fullName: data[0].full_name,
-        gender: data[0].gender || '',
-        age: data[0].age || 0,
-        phone: data[0].phone || '',
-        position: data[0].position,
-        department: data[0].department || 'Operations',
-        basicSalary: data[0].basic_salary,
-        status: data[0].status || 'Active',
-        email: data[0].email || '',
-        dateHired: data[0].hire_date || new Date().toISOString().split('T')[0],
-        dob: data[0].dob,
-        nationalId: data[0].national_id,
-        address: data[0].address,
-        qualification: data[0].qualification,
-        contractType: data[0].contract_type,
-        region_id: data[0].region_id,
-        company: data[0].company,
-        workstation: data[0].workstation,
-        pay_point: data[0].pay_point,
-        account_number: data[0].account_number,
-        uniform_deduction: data[0].uniform_deduction || 0,
-        next_of_kin_name: data[0].next_of_kin_name || '',
-        next_of_kin_relationship: data[0].next_of_kin_relationship || '',
-        next_of_kin_phone: data[0].next_of_kin_phone || '',
-        next_of_kin_address: data[0].next_of_kin_address || '',
-        is_deleted: data[0].is_deleted || false,
-        deleted_at: data[0].deleted_at || null,
-        deleted_reason: data[0].deleted_reason || null,
-        deleted_by: data[0].deleted_by || null,
-        created_at: data[0].created_at || null,
-        assignment_type: data[0].assignment_type || 'company',
-        resident_name: data[0].resident_name || '',
-        resident_contact: data[0].resident_contact || '',
-        company_id: data[0].company_id || null,
+        id: fullRow.id,
+        employeeNumber: fullRow.employee_number,
+        fullName: fullRow.full_name,
+        gender: fullRow.gender || '',
+        age: fullRow.age || 0,
+        phone: fullRow.phone || '',
+        position: fullRow.position,
+        department: fullRow.department || 'Operations',
+        basicSalary: fullRow.basic_salary,
+        status: fullRow.status || 'Active',
+        email: fullRow.email || '',
+        dateHired: fullRow.hire_date || new Date().toISOString().split('T')[0],
+        dob: fullRow.dob,
+        nationalId: fullRow.national_id,
+        address: fullRow.address,
+        qualification: fullRow.qualification,
+        contractType: fullRow.contract_type,
+        region_id: fullRow.region_id,
+        company: fullRow.company,
+        workstation: fullRow.workstation,
+        pay_point: fullRow.pay_point,
+        account_number: fullRow.account_number,
+        uniform_deduction: fullRow.uniform_deduction || 0,
+        next_of_kin_name: fullRow.next_of_kin_name || '',
+        next_of_kin_relationship: fullRow.next_of_kin_relationship || '',
+        next_of_kin_phone: fullRow.next_of_kin_phone || '',
+        next_of_kin_address: fullRow.next_of_kin_address || '',
+        is_deleted: fullRow.is_deleted || false,
+        deleted_at: fullRow.deleted_at || null,
+        deleted_reason: fullRow.deleted_reason || null,
+        deleted_by: fullRow.deleted_by || null,
+        created_at: fullRow.created_at || null,
+        assignment_type: fullRow.assignment_type || 'company',
+        resident_name: fullRow.resident_name || '',
+        resident_contact: fullRow.resident_contact || '',
+        company_id: fullRow.company_id || null,
       };
       setEmployees([newEmployee, ...employees]);
-      
+
       await logAudit({
         action: 'CREATE',
         entity_type: 'employee',
@@ -805,7 +840,10 @@ export function EmployeesPage() {
     const uniformDeduction = safeEmp.uniform_deduction || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
 
-    const { data, error } = await supabase
+    // Narrowed RETURNING -- just `id`, not the full row (no `RETURNING *`
+    // against the base table). The complete row the UI needs is fetched
+    // separately from `employees_general` once the update succeeds.
+    const { data: updateResult, error } = await supabase
       .from('employees')
       .update({
         employee_number: safeEmp.employeeNumber,
@@ -839,44 +877,57 @@ export function EmployeesPage() {
         // company_id will be updated by trigger
       })
       .eq('id', editingEmployee.id)
-      .select();
-    
+      .select('id');
+
     if (error) {
       // Leave the modal open on failure so the admin's edits aren't discarded.
       showNotification('Error updating employee: ' + getErrorMessage(error), 'error');
       return;
-    } else if (data && data[0]) {
+    } else if (updateResult && updateResult[0]) {
+      // Fetch the complete non-sensitive row through employees_general --
+      // the base-table update above only returned `id` (no `RETURNING *`).
+      const { data: fullRow, error: fetchError } = await supabase
+        .from('employees_general')
+        .select('*')
+        .eq('id', updateResult[0].id)
+        .single();
+
+      if (fetchError || !fullRow) {
+        showNotification('Employee updated, but failed to reload the record: ' + getErrorMessage(fetchError), 'error');
+        return;
+      }
+
       const updatedEmployee = {
         ...editingEmployee,
-        employeeNumber: data[0].employee_number,
-        fullName: data[0].full_name,
-        gender: data[0].gender || '',
-        age: data[0].age || 0,
-        phone: data[0].phone || '',
-        position: data[0].position,
-        department: data[0].department || 'Operations',
-        basicSalary: data[0].basic_salary,
-        status: data[0].status || 'Active',
-        email: data[0].email || '',
-        dateHired: data[0].hire_date || new Date().toISOString().split('T')[0],
-        dob: data[0].dob,
-        nationalId: data[0].national_id,
-        address: data[0].address,
-        qualification: data[0].qualification,
-        contractType: data[0].contract_type,
-        company: data[0].company,
-        workstation: data[0].workstation,
-        pay_point: data[0].pay_point,
-        account_number: data[0].account_number,
-        uniform_deduction: data[0].uniform_deduction || 0,
-        next_of_kin_name: data[0].next_of_kin_name || '',
-        next_of_kin_relationship: data[0].next_of_kin_relationship || '',
-        next_of_kin_phone: data[0].next_of_kin_phone || '',
-        next_of_kin_address: data[0].next_of_kin_address || '',
-        assignment_type: data[0].assignment_type || 'company',
-        resident_name: data[0].resident_name || '',
-        resident_contact: data[0].resident_contact || '',
-        company_id: data[0].company_id || null,
+        employeeNumber: fullRow.employee_number,
+        fullName: fullRow.full_name,
+        gender: fullRow.gender || '',
+        age: fullRow.age || 0,
+        phone: fullRow.phone || '',
+        position: fullRow.position,
+        department: fullRow.department || 'Operations',
+        basicSalary: fullRow.basic_salary,
+        status: fullRow.status || 'Active',
+        email: fullRow.email || '',
+        dateHired: fullRow.hire_date || new Date().toISOString().split('T')[0],
+        dob: fullRow.dob,
+        nationalId: fullRow.national_id,
+        address: fullRow.address,
+        qualification: fullRow.qualification,
+        contractType: fullRow.contract_type,
+        company: fullRow.company,
+        workstation: fullRow.workstation,
+        pay_point: fullRow.pay_point,
+        account_number: fullRow.account_number,
+        uniform_deduction: fullRow.uniform_deduction || 0,
+        next_of_kin_name: fullRow.next_of_kin_name || '',
+        next_of_kin_relationship: fullRow.next_of_kin_relationship || '',
+        next_of_kin_phone: fullRow.next_of_kin_phone || '',
+        next_of_kin_address: fullRow.next_of_kin_address || '',
+        assignment_type: fullRow.assignment_type || 'company',
+        resident_name: fullRow.resident_name || '',
+        resident_contact: fullRow.resident_contact || '',
+        company_id: fullRow.company_id || null,
       };
       setEmployees(employees.map(e => e.id === updatedEmployee.id ? updatedEmployee : e));
       
@@ -1116,7 +1167,9 @@ export function EmployeesPage() {
           <>
             <Button variant="outline" className="hidden md:inline-flex"><Filter size={16} /> Filter</Button>
             <Button variant="outline" className="hidden md:inline-flex" onClick={handleExport}><Download size={16} /> Export</Button>
-            <Button variant="secondary" onClick={() => setShowAdd(true)}><Plus size={16} /> Add Employee</Button>
+            {canCreateEmployee && (
+              <Button variant="secondary" onClick={() => setShowAdd(true)}><Plus size={16} /> Add Employee</Button>
+            )}
           </>
         }
       />
@@ -1328,19 +1381,25 @@ export function EmployeesPage() {
                           >
                             <Eye size={14} />
                           </button>
-                          <button 
-                            onClick={() => restoreEmployee(emp)} 
-                            className="w-8 h-8 rounded-lg hover:bg-emerald-50 text-emerald-600 flex items-center justify-center"
-                            title="Restore Employee"
-                          >
-                            <RotateCcw size={14} />
-                          </button>
+                          {canEditEmployee && (
+                            <button
+                              onClick={() => restoreEmployee(emp)}
+                              className="w-8 h-8 rounded-lg hover:bg-emerald-50 text-emerald-600 flex items-center justify-center"
+                              title="Restore Employee"
+                            >
+                              <RotateCcw size={14} />
+                            </button>
+                          )}
                         </>
                       ) : (
                         <>
                           <button onClick={() => setSelected(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Eye size={14} /></button>
-                          <button onClick={() => handleEdit(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-amber-600 flex items-center justify-center"><Edit2 size={14} /></button>
-                          <button onClick={() => handleDelete(emp)} className="w-8 h-8 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"><Trash2 size={14} /></button>
+                          {canEditEmployee && (
+                            <button onClick={() => handleEdit(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-amber-600 flex items-center justify-center"><Edit2 size={14} /></button>
+                          )}
+                          {canDeleteEmployee && (
+                            <button onClick={() => handleDelete(emp)} className="w-8 h-8 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"><Trash2 size={14} /></button>
+                          )}
                         </>
                       )}
                     </div>

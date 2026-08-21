@@ -4,6 +4,7 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
@@ -119,6 +120,14 @@ export function TerminalDuesPage() {
   const [editingCalculation, setEditingCalculation] = useState<TerminalDue | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [filterStatus, setFilterStatus] = useState('all');
+  // Permission-driven action gating (correction round 2, item 6) --
+  // legacy accounts keep unrestricted access, unchanged. HR Manager gets
+  // all three (terminal_dues.create/edit/process); Accountant
+  // (terminal_dues.view only) gets none -- read-only, matching "Accountant
+  // on Terminal Dues: no Create, no Edit, no Process/status change".
+  const [canCreateTerminalDue, setCanCreateTerminalDue] = useState(true);
+  const [canEditTerminalDue, setCanEditTerminalDue] = useState(true);
+  const [canProcessTerminalDue, setCanProcessTerminalDue] = useState(true);
   
   // ===== PAGINATION STATES =====
   const [duesPage, setDuesPage] = useState(1);
@@ -177,13 +186,19 @@ export function TerminalDuesPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
+    const isLegacy = (profile?.role_level ?? null) !== null;
+    setCanCreateTerminalDue(await canAccess(isLegacy, PERMISSIONS.TERMINAL_DUES_CREATE));
+    setCanEditTerminalDue(await canAccess(isLegacy, PERMISSIONS.TERMINAL_DUES_EDIT));
+    setCanProcessTerminalDue(await canAccess(isLegacy, PERMISSIONS.TERMINAL_DUES_PROCESS));
   }, []);
 
   const fetchEmployees = useCallback(async () => {
     try {
       // CRITICAL: Exclude deleted employees
+      // employees_general: non-sensitive employee read surface (Design B2) --
+      // confirmed no Terminal Dues calculation references any guard column.
       let query = supabase
-        .from('employees')
+        .from('employees_general')
         .select('*')
         .eq('status', 'Active')
         .eq('is_deleted', false);
@@ -576,9 +591,11 @@ export function TerminalDuesPage() {
         title="Terminal Dues Calculator"
         subtitle="Calculate and manage employee termination benefits"
         actions={
-          <Button variant="secondary" onClick={() => setShowCalculateModal(true)}>
-            <Calculator size={16} className="mr-1" /> New Calculation
-          </Button>
+          canCreateTerminalDue ? (
+            <Button variant="secondary" onClick={() => setShowCalculateModal(true)}>
+              <Calculator size={16} className="mr-1" /> New Calculation
+            </Button>
+          ) : undefined
         }
       />
 
@@ -715,17 +732,19 @@ export function TerminalDuesPage() {
                         >
                           <Eye size={14} />
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setEditingCalculation(calc);
-                            setShowEditModal(true);
-                          }}
-                          className="w-7 h-7 rounded-lg hover:bg-slate-100 text-amber-600"
-                        >
-                          <Edit2 size={14} />
-                        </button>
-                        {calc.status === 'pending' && (
+                        {canEditTerminalDue && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingCalculation(calc);
+                              setShowEditModal(true);
+                            }}
+                            className="w-7 h-7 rounded-lg hover:bg-slate-100 text-amber-600"
+                          >
+                            <Edit2 size={14} />
+                          </button>
+                        )}
+                        {canProcessTerminalDue && calc.status === 'pending' && (
                           <>
                             <button
                               type="button"
@@ -743,7 +762,7 @@ export function TerminalDuesPage() {
                             </button>
                           </>
                         )}
-                        {calc.status === 'approved' && (
+                        {canProcessTerminalDue && calc.status === 'approved' && (
                           <button
                             type="button"
                             onClick={() => updateStatus(calc.id, 'paid')}

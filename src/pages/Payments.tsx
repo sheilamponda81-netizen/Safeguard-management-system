@@ -134,8 +134,12 @@ export function PaymentsPage() {
   const fetchPaymentData = useCallback(async () => {
     setLoading(true);
     try {
+      // employees_general: non-sensitive employee read surface (Design B2) --
+      // Payments never needs guard/security-only fields, and this keeps
+      // those columns out of reach even if the base employees table's own
+      // grants are ever tightened (Phase C).
       let employeesQuery = supabase
-        .from('employees')
+        .from('employees_general')
         .select('*')
         .eq('is_deleted', false); // <-- CRITICAL: Exclude deleted employees
       

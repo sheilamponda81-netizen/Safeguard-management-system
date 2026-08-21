@@ -18,6 +18,7 @@ import {
   normalizeMonthKey
 } from '../utils/currentMonth';
 import { showNotification } from '../utils/clickHandlers';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
 const COLORS = ['#081C3A', '#D4A017', '#3B82F6', '#10B981', '#EF4444', '#8B5CF6', '#F59E0B', '#64748B', '#06B6D4'];
@@ -61,6 +62,21 @@ export function Dashboard() {
   const [systemMonth, setSystemMonth] = useState('');
   const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [refreshing, setRefreshing] = useState(false);
+
+  // ===== PERMISSION-AWARE DASHBOARD SECTIONS =====
+  // Legacy accounts (role_level set) see EXACTLY what they always have --
+  // payroll/attendance SELECT has been "legacy-open" (any role_level) on
+  // these two tables since before this rollout, so canAccess(true, ...)
+  // short-circuits true for every legacy role, unchanged. A NEW
+  // functional-role account is gated: Payroll data needs payroll.view
+  // (Admin/Accountant only); Attendance needs attendance.view (Admin/
+  // Operations Manager only); Recruitment counts are already fully
+  // permission-aware server-side via get_applicant_dashboard_counts()
+  // (20260817000003) -- this flag only controls whether the STAT CARD
+  // itself is shown, not the data's own authorization.
+  const [canViewPayroll, setCanViewPayroll] = useState(true);
+  const [canViewAttendance, setCanViewAttendance] = useState(true);
+  const [canViewRecruitment, setCanViewRecruitment] = useState(true);
   
   // ===== PERFORMANCE: Track chart loading state =====
   const [chartModules, setChartModules] = useState<any>(null);
@@ -169,6 +185,11 @@ export function Dashboard() {
         setUserProfile(profile);
         const name = profile?.full_name || user.email?.split('@')[0] || 'User';
         setUserName(name);
+
+        const isLegacy = (profile?.role_level ?? null) !== null;
+        setCanViewPayroll(await canAccess(isLegacy, PERMISSIONS.PAYROLL_VIEW));
+        setCanViewAttendance(await canAccess(isLegacy, PERMISSIONS.ATTENDANCE_VIEW));
+        setCanViewRecruitment(await canAccess(isLegacy, PERMISSIONS.RECRUITMENT_VIEW));
       }
     };
     getUserInfo();
@@ -231,8 +252,14 @@ export function Dashboard() {
     
     try {
       // ===== CRITICAL: Exclude deleted employees =====
+      // Reads from `employees_general` (20260817000005), not `employees`
+      // directly -- same row-level tenant/region access, but guard-
+      // specific columns (license_status, etc.) are NULLed for a caller
+      // without security_personnel.view, so an Accountant session never
+      // receives raw guard data in this fetch even though it isn't
+      // rendered today.
       let employeesQuery = supabase
-        .from('employees')
+        .from('employees_general')
         .select('*')
         .eq('is_deleted', false);
       
@@ -310,24 +337,28 @@ export function Dashboard() {
       const onLeave = employeesData.filter((e: any) => e.status === 'On Leave').length;
       
       // ===== ACCURATE ATTENDANCE RATE =====
+      // Only fetched for a caller who can actually see Attendance
+      // (Admin/Operations Manager, or any legacy account -- attendance
+      // SELECT has been legacy-open since before this rollout) -- an
+      // Accountant/HR Manager session never issues this request at all.
       let attendanceRate = 0;
-      if (employeesData.length > 0) {
+      if (employeesData.length > 0 && canViewAttendance) {
         const monthStart = `${selectedMonth}-01`;
         const lastDay = new Date(parseInt(selectedMonth.split('-')[0]), parseInt(selectedMonth.split('-')[1]), 0).getDate();
         const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
-        
+
         let attendanceQuery = supabase
           .from('attendance')
           .select('status')
           .gte('date', monthStart)
           .lte('date', monthEnd);
-        
+
         if (employeeIds.length > 0) {
           attendanceQuery = attendanceQuery.in('employee_id', employeeIds);
         }
-        
+
         const { data: attendanceRecords } = await attendanceQuery;
-        
+
         if (attendanceRecords && attendanceRecords.length > 0) {
           let presentCount = 0;
           let totalRecords = 0;
@@ -388,42 +419,48 @@ export function Dashboard() {
 
       // ===== PAYROLL HISTORY — real net pay totals per month from the
       // `payroll` table. A month with no processed payroll run shows 0,
-      // never a fabricated estimate. =====
-      let payrollQuery = supabase.from('payroll').select('month, net_pay, employee_id, approval_status');
-      if (employeeIds.length > 0) {
-        payrollQuery = payrollQuery.in('employee_id', employeeIds);
+      // never a fabricated estimate. Only fetched for a caller who can
+      // actually see Payroll (Admin/Accountant, or any legacy account --
+      // payroll SELECT has been legacy-open since before this rollout) --
+      // an HR Manager/Operations Manager session never issues this
+      // request at all. =====
+      if (canViewPayroll) {
+        let payrollQuery = supabase.from('payroll').select('month, net_pay, employee_id, approval_status');
+        if (employeeIds.length > 0) {
+          payrollQuery = payrollQuery.in('employee_id', employeeIds);
+        }
+        const { data: allPayrollRecords } = await payrollQuery;
+
+        const payrollTotalsByMonthKey = new Map<string, number>();
+        (allPayrollRecords || []).forEach((r: any) => {
+          const key = normalizeMonthKey(r.month);
+          if (!key) return;
+          payrollTotalsByMonthKey.set(key, (payrollTotalsByMonthKey.get(key) || 0) + (r.net_pay || 0));
+        });
+
+        // Real payroll status for the selected month, not a hardcoded "Ready".
+        const selectedMonthKey = normalizeMonthKey(selectedMonth);
+        const selectedMonthPayrollRecords = (allPayrollRecords || []).filter(
+          (r: any) => normalizeMonthKey(r.month) === selectedMonthKey
+        );
+        setPayrollStatusLabel(
+          selectedMonthPayrollRecords.length === 0
+            ? 'Not Processed'
+            : selectedMonthPayrollRecords.every((r: any) => r.approval_status === 'approved')
+              ? 'Approved'
+              : 'Pending Approval'
+        );
+
+        const historyData = chartMonths.map(month => {
+          const [year, monthNum] = month.split('-').map(Number);
+          const monthName = monthNames[monthNum - 1];
+          return {
+            month: `${monthName} ${year}`,
+            amount: payrollTotalsByMonthKey.get(month) || 0
+          };
+        });
+        setPayrollHistory(historyData);
       }
-      const { data: allPayrollRecords } = await payrollQuery;
-
-      const payrollTotalsByMonthKey = new Map<string, number>();
-      (allPayrollRecords || []).forEach((r: any) => {
-        const key = normalizeMonthKey(r.month);
-        if (!key) return;
-        payrollTotalsByMonthKey.set(key, (payrollTotalsByMonthKey.get(key) || 0) + (r.net_pay || 0));
-      });
-
-      // Real payroll status for the selected month, not a hardcoded "Ready".
-      const selectedMonthKey = normalizeMonthKey(selectedMonth);
-      const selectedMonthPayrollRecords = (allPayrollRecords || []).filter(
-        (r: any) => normalizeMonthKey(r.month) === selectedMonthKey
-      );
-      setPayrollStatusLabel(
-        selectedMonthPayrollRecords.length === 0
-          ? 'Not Processed'
-          : selectedMonthPayrollRecords.every((r: any) => r.approval_status === 'approved')
-            ? 'Approved'
-            : 'Pending Approval'
-      );
-
-      const historyData = chartMonths.map(month => {
-        const [year, monthNum] = month.split('-').map(Number);
-        const monthName = monthNames[monthNum - 1];
-        return {
-          month: `${monthName} ${year}`,
-          amount: payrollTotalsByMonthKey.get(month) || 0
-        };
-      });
-      setPayrollHistory(historyData);
 
       // ===== ATTENDANCE DATA - Starting from June 2026 =====
       // Single query spanning the whole 6-month window, grouped by month
@@ -440,7 +477,7 @@ export function Dashboard() {
       });
 
       let allAttendanceRecords: { date: string; status: string }[] = [];
-      if (monthRanges.length > 0 && employeeIds.length > 0) {
+      if (monthRanges.length > 0 && employeeIds.length > 0 && canViewAttendance) {
         const { data: records } = await supabase
           .from('attendance')
           .select('date, status')
@@ -473,7 +510,7 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  }, [selectedMonth, userProfile]);
+  }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance]);
 
   useEffect(() => {
     if (userProfile && selectedMonth) {
@@ -716,9 +753,13 @@ export function Dashboard() {
       {/* Stats Cards - Load immediately, no chart dependencies */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard title="Total Employees" value={String(stats.total)} icon={Users} accent="navy" sub={`${stats.activeGuards} Active Guards`} />
-        <StatCard title="Monthly Payroll" value={stats.totalPayroll > 0 ? formatKwacha(stats.totalPayroll) : 'MK 0'} icon={Wallet} accent="gold" sub={`Period: ${monthLabel}`} />
+        {canViewPayroll && (
+          <StatCard title="Monthly Payroll" value={stats.totalPayroll > 0 ? formatKwacha(stats.totalPayroll) : 'MK 0'} icon={Wallet} accent="gold" sub={`Period: ${monthLabel}`} />
+        )}
         <StatCard title="On Leave" value={String(stats.onLeave)} icon={UserMinus} accent="red" sub="Currently on leave" />
-        <StatCard title="Pending Recruitment" value={String(stats.pendingRecruitment)} icon={ClipboardList} accent="blue" sub={`${stats.shortlistedRecruitment} shortlisted, ${stats.interviewedRecruitment} interviewed`} />
+        {canViewRecruitment && (
+          <StatCard title="Pending Recruitment" value={String(stats.pendingRecruitment)} icon={ClipboardList} accent="blue" sub={`${stats.shortlistedRecruitment} shortlisted, ${stats.interviewedRecruitment} interviewed`} />
+        )}
       </div>
 
       {/* Security Personnel Dashboard */}
@@ -726,7 +767,9 @@ export function Dashboard() {
         <StatCard title="Active Guards" value={String(stats.activeGuards)} icon={Shield} accent="green" sub="On duty now" />
         <StatCard title="Sites Covered" value={String(stats.sitesCount)} icon={MapPin} accent="navy" sub={`${stats.sitesCount} locations`} />
         <StatCard title="Supervisors on Duty" value={String(stats.supervisorsOnDuty)} icon={ShieldCheck} accent="blue" sub="Active monitoring" />
-        <StatCard title="Attendance Rate" value={`${stats.attendanceRate}%`} icon={CheckCircle2} accent="gold" sub={`${monthLabel}`} />
+        {canViewAttendance && (
+          <StatCard title="Attendance Rate" value={`${stats.attendanceRate}%`} icon={CheckCircle2} accent="gold" sub={`${monthLabel}`} />
+        )}
       </div>
 
       {/* Company & Resident Stats */}
@@ -737,14 +780,18 @@ export function Dashboard() {
 
       {/* Quick status */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <Card className="p-4 flex items-center gap-3">
-          <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${payrollStatusLabel === 'Approved' ? 'bg-emerald-100 text-emerald-600' : payrollStatusLabel === 'Pending Approval' ? 'bg-[#FFF1CC] text-[#D4A017]' : 'bg-slate-100 text-slate-500'}`}><CheckCircle2 size={20} /></div>
-          <div><p className="text-xs text-slate-500">Payroll Status</p><p className="font-semibold text-slate-800 text-sm">{payrollStatusLabel}</p></div>
-        </Card>
-        <Card className="p-4 flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-blue-100 flex items-center justify-center text-blue-600"><TrendingUp size={20} /></div>
-          <div><p className="text-xs text-slate-500">Attendance Rate</p><p className="font-semibold text-slate-800 text-sm">{stats.attendanceRate}%</p></div>
-        </Card>
+        {canViewPayroll && (
+          <Card className="p-4 flex items-center gap-3">
+            <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${payrollStatusLabel === 'Approved' ? 'bg-emerald-100 text-emerald-600' : payrollStatusLabel === 'Pending Approval' ? 'bg-[#FFF1CC] text-[#D4A017]' : 'bg-slate-100 text-slate-500'}`}><CheckCircle2 size={20} /></div>
+            <div><p className="text-xs text-slate-500">Payroll Status</p><p className="font-semibold text-slate-800 text-sm">{payrollStatusLabel}</p></div>
+          </Card>
+        )}
+        {canViewAttendance && (
+          <Card className="p-4 flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-blue-100 flex items-center justify-center text-blue-600"><TrendingUp size={20} /></div>
+            <div><p className="text-xs text-slate-500">Attendance Rate</p><p className="font-semibold text-slate-800 text-sm">{stats.attendanceRate}%</p></div>
+          </Card>
+        )}
         <Card className="p-4 flex items-center gap-3">
           <div className="w-10 h-10 rounded-lg bg-[#FFF1CC] flex items-center justify-center text-[#D4A017]"><ShieldCheck size={20} /></div>
           <div><p className="text-xs text-slate-500">On Duty Guards</p><p className="font-semibold text-slate-800 text-sm">{stats.activeGuards}</p></div>
@@ -757,15 +804,17 @@ export function Dashboard() {
 
       {/* Charts row 1 - Lazy loaded */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Card className="p-5 lg:col-span-2">
-          <div className="flex items-center justify-between mb-4">
-            <div><h3 className="font-semibold text-slate-800">Monthly Payroll Trend</h3><p className="text-xs text-slate-500">Last 6 months payroll expenditure</p></div>
-            <Badge color="gold">{monthLabel}</Badge>
-          </div>
-          <div className="h-64">
-            {renderPayrollChart}
-          </div>
-        </Card>
+        {canViewPayroll && (
+          <Card className="p-5 lg:col-span-2">
+            <div className="flex items-center justify-between mb-4">
+              <div><h3 className="font-semibold text-slate-800">Monthly Payroll Trend</h3><p className="text-xs text-slate-500">Last 6 months payroll expenditure</p></div>
+              <Badge color="gold">{monthLabel}</Badge>
+            </div>
+            <div className="h-64">
+              {renderPayrollChart}
+            </div>
+          </Card>
+        )}
 
         <Card className="p-5">
           <div className="flex items-center justify-between mb-4">
@@ -787,15 +836,17 @@ export function Dashboard() {
 
       {/* Charts row 2 - Lazy loaded */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card className="p-5">
-          <div className="flex items-center justify-between mb-4">
-            <div><h3 className="font-semibold text-slate-800">Attendance Trend</h3><p className="text-xs text-slate-500">Workforce attendance percentage</p></div>
-            <Badge color="green">{stats.attendanceRate}% ({monthLabel})</Badge>
-          </div>
-          <div className="h-56">
-            {renderAttendanceChart}
-          </div>
-        </Card>
+        {canViewAttendance && (
+          <Card className="p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div><h3 className="font-semibold text-slate-800">Attendance Trend</h3><p className="text-xs text-slate-500">Workforce attendance percentage</p></div>
+              <Badge color="green">{stats.attendanceRate}% ({monthLabel})</Badge>
+            </div>
+            <div className="h-56">
+              {renderAttendanceChart}
+            </div>
+          </Card>
+        )}
 
         <Card className="p-5">
           <div className="flex items-center justify-between mb-4">
