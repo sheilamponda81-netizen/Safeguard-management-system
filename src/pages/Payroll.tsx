@@ -25,6 +25,7 @@ import {
   isPendingApproval as computeIsPendingApproval,
 } from '../utils/payrollPermissions';
 import { canAccess, PERMISSIONS } from '../utils/permissions';
+import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 
 interface Employee {
   id: string;
@@ -253,15 +254,30 @@ export function PayrollPage() {
         }
       }
 
-      let query = supabase.from('payroll').select('month').order('month', { ascending: false });
+      // `employeeIds` (region-scoped) can be as large as `employees` (all-
+      // tenant) elsewhere in this file -- same oversized-IN-list risk, so it
+      // goes through the same batched helper. A super admin (employeeIds ===
+      // null, no region scoping needed) keeps the original single, unfiltered
+      // query.
+      let months: string[];
       if (employeeIds) {
-        query = query.in('employee_id', employeeIds);
+        const rows = await fetchInEmployeeIdBatches<{ month: string }>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('payroll')
+              .select('month', withCount ? { count: 'exact' } : undefined)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        months = rows.map(r => r.month);
+      } else {
+        const { data, error } = await supabase.from('payroll').select('month');
+        if (error) throw error;
+        months = (data || []).map(r => r.month);
       }
 
-      const { data, error } = await query;
-      if (error) throw error;
-
-      const uniqueMonths = [...new Set(data?.map(r => r.month) || [])];
+      const uniqueMonths = [...new Set(months)].sort().reverse();
       setProcessedMonths(uniqueMonths);
     } catch (err) {
       console.error('Error fetching processed months:', err);
@@ -293,16 +309,86 @@ export function PayrollPage() {
       // payroll too.
       const employeeIds = (employeesData || []).map(e => e.id);
 
-      let payrollData: PayrollRecord[] = [];
-      if (employeeIds.length > 0) {
-        const { data, error: payError } = await supabase
-          .from('payroll')
-          .select('*')
-          .eq('month', selectedMonth)
-          .in('employee_id', employeeIds);
-        if (payError) throw payError;
-        payrollData = data || [];
-      }
+      // ===== Live attendance-derived absent/late counts for this month =====
+      const [yearStr, monthStr] = selectedMonth.split('-');
+      const year = parseInt(yearStr, 10);
+      const monthNum = parseInt(monthStr, 10);
+      const monthStart = `${selectedMonth}-01`;
+      const lastDay = new Date(year, monthNum, 0).getDate();
+      const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
+
+      // PERFORMANCE CORRECTION: these four reads (payroll records, employee
+      // deductions, attendance counts, positions) don't depend on each
+      // other's results -- only on `employeeIds`/`selectedMonth`, already
+      // known at this point -- so they're fetched concurrently via
+      // Promise.all instead of one after another, roughly halving Payroll's
+      // load-time critical path. Each one is still internally batched (see
+      // src/utils/employeeBatchFetch.ts) for the same oversized employee_id
+      // IN-list reason as before; only the sequencing between them changed.
+      // The positions fetch keeps its own internal try/catch (see below) so
+      // it resolves rather than rejects on failure, exactly as before --
+      // safe to run inside the same Promise.all. If any of the other three
+      // genuinely fails, Promise.all rejects before any state is set, so no
+      // partial/stale data is ever displayed -- same fail-fast guarantee as
+      // the previous sequential version, just evaluated together instead of
+      // one at a time.
+      const [payrollDataRaw, deductionsDataRaw, attendanceCountRows, positionsRequiringUniformMap] = await Promise.all([
+        fetchInEmployeeIdBatches<PayrollRecord>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('payroll')
+              .select('*', withCount ? { count: 'exact' } : undefined)
+              .eq('month', selectedMonth)
+              .in('employee_id', batch)
+              .range(from, to)
+        ),
+        fetchInEmployeeIdBatches<EmployeeDeduction>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('employee_deductions')
+              .select('*', withCount ? { count: 'exact' } : undefined)
+              .eq('month', selectedMonth)
+              .in('employee_id', batch)
+              .range(from, to)
+        ),
+        fetchInEmployeeIdBatches<{ employee_id: string; status: string }>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('attendance')
+              .select('employee_id, status', withCount ? { count: 'exact' } : undefined)
+              .gte('date', monthStart)
+              .lte('date', monthEnd)
+              .in('employee_id', batch)
+              .range(from, to)
+        ),
+        // ===== Positions (for the "Requires Uniform" gate) =====
+        // Isolated from the rest of this fetch: `requires_uniform` was added
+        // by supabase/migrations/20260728000000_position_uniform_flag.sql,
+        // which may not yet be applied to every environment this code runs
+        // against. If that migration isn't present, PostgREST rejects the
+        // whole query (unknown column) -- letting that throw here would take
+        // down the entire Payroll page over one optional gate. On failure,
+        // fall back to "every position requires a uniform" (the migration's
+        // own DEFAULT true), matching pre-migration behavior exactly instead
+        // of losing the rest of the page.
+        (async () => {
+          try {
+            const { data: positionsData, error: positionsError } = await supabase
+              .from('positions')
+              .select('name, requires_uniform');
+            if (positionsError) throw positionsError;
+            return new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]));
+          } catch (positionsErr) {
+            console.error('Error fetching position uniform flags (falling back to "all positions require uniform"):', positionsErr);
+            return new Map<string, boolean>();
+          }
+        })(),
+      ]);
+
+      const payrollData = dedupeById(payrollDataRaw);
       setPayrollRecords(payrollData);
 
       if (payrollData.length > 0) {
@@ -312,54 +398,19 @@ export function PayrollPage() {
         setIsApproved(false);
       }
 
-      let deductionsData: EmployeeDeduction[] = [];
-      if (employeeIds.length > 0) {
-        const { data, error: dedError } = await supabase
-          .from('employee_deductions')
-          .select('*')
-          .eq('month', selectedMonth)
-          .in('employee_id', employeeIds);
-        if (dedError) throw dedError;
-        deductionsData = data || [];
-      }
+      const deductionsData = dedupeById(deductionsDataRaw);
       setEmployeeDeductions(deductionsData);
 
-      // ===== Live attendance-derived absent/late counts for this month =====
-      const [yearStr, monthStr] = selectedMonth.split('-');
-      const year = parseInt(yearStr, 10);
-      const monthNum = parseInt(monthStr, 10);
-      const monthStart = `${selectedMonth}-01`;
-      const lastDay = new Date(year, monthNum, 0).getDate();
-      const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
-
       const counts = new Map<string, AttendanceCount>();
-      if (employeeIds.length > 0) {
-        const { data: attendanceData, error: attendanceError } = await supabase
-          .from('attendance')
-          .select('employee_id, status')
-          .gte('date', monthStart)
-          .lte('date', monthEnd)
-          .in('employee_id', employeeIds);
-
-        if (attendanceError) throw attendanceError;
-
-        (attendanceData || []).forEach(record => {
-          const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
-          if (record.status === 'A') existing.absentDays += 1;
-          if (record.status === 'L') existing.lateDays += 1;
-          counts.set(record.employee_id, existing);
-        });
-      }
+      attendanceCountRows.forEach(record => {
+        const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
+        if (record.status === 'A') existing.absentDays += 1;
+        if (record.status === 'L') existing.lateDays += 1;
+        counts.set(record.employee_id, existing);
+      });
       setAttendanceCounts(counts);
 
-      // ===== Positions (for the "Requires Uniform" gate) =====
-      const { data: positionsData, error: positionsError } = await supabase
-        .from('positions')
-        .select('name, requires_uniform');
-      if (positionsError) throw positionsError;
-      setPositionsRequiringUniform(
-        new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
-      );
+      setPositionsRequiringUniform(positionsRequiringUniformMap);
 
       // ===== Active salary advances + each employee's ONE combined
       // repayment plan (for the payroll preview only -- the actual
@@ -671,14 +722,26 @@ export function PayrollPage() {
       // The target month's existing rows are no longer deleted here up
       // front -- process_payroll_batch() (called below, once newRecords is
       // built) does the delete and insert atomically in one transaction,
-      // scoped to exactly `employeeIds` as before.
-      const { data: sourceData, error: sourceError } = await supabase
-        .from('payroll')
-        .select('*')
-        .eq('month', sourceMonth)
-        .in('employee_id', employeeIds);
-
-      if (sourceError) {
+      // scoped to exactly `employeeIds` as before. (A separate manual
+      // pre-delete would race with that atomic RPC step and isn't needed.)
+      //
+      // Same oversized-IN-list risk/fix as the main fetchData payroll query
+      // -- batched via employeeBatchFetch instead of one request built from
+      // the entire employee population.
+      let sourceData: PayrollRecord[];
+      try {
+        const sourceDataRaw = await fetchInEmployeeIdBatches<PayrollRecord>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('payroll')
+              .select('*', withCount ? { count: 'exact' } : undefined)
+              .eq('month', sourceMonth)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        sourceData = dedupeById(sourceDataRaw);
+      } catch (sourceError: any) {
         console.error('Error fetching source data:', sourceError);
         showNotification('Failed to fetch source data: ' + sourceError.message, 'error');
         return;

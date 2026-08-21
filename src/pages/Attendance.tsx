@@ -17,6 +17,7 @@ import { UserProfile } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
 import { toCsvRow } from '../utils/csvExport';
 import { calculateAttendanceDeductions } from '../utils/attendanceDeductions';
+import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -485,6 +486,31 @@ function EmployeeModal({
   );
 }
 
+// ===== PRODUCTION HOTFIX: batched attendance fetch =====
+// See src/utils/employeeBatchFetch.ts for why this exists (oversized
+// employee_id IN-list requests returning 400 in production) and how batching
+// + pagination + bounded concurrency work. Uses dedupeById defensively since
+// `select('*')` includes each row's own `id`.
+async function fetchAttendanceInBatches(
+  employeeIds: string[],
+  dateFrom: string,
+  dateTo: string
+): Promise<AttendanceRecord[]> {
+  if (employeeIds.length === 0) return [];
+  const records = await fetchInEmployeeIdBatches<AttendanceRecord>(
+    employeeIds,
+    (batch, from, to, withCount) =>
+      supabase
+        .from('attendance')
+        .select('*', withCount ? { count: 'exact' } : undefined)
+        .gte('date', dateFrom)
+        .lte('date', dateTo)
+        .in('employee_id', batch)
+        .range(from, to)
+  );
+  return dedupeById(records);
+}
+
 export function AttendancePage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -585,17 +611,13 @@ export function AttendancePage() {
       if (datesArr.length > 0 && employeesData && employeesData.length > 0) {
         const employeeIds = employeesData.map(e => e.id);
 
-        const attendanceQuery = supabase
-          .from('attendance')
-          .select('*')
-          .gte('date', datesArr[0])
-          .lte('date', datesArr[datesArr.length - 1])
-          .in('employee_id', employeeIds);
-
-        const { data: attendanceData, error: attError } = await attendanceQuery;
-        if (attError) throw attError;
-        setAttendance(attendanceData || []);
-        setHasData((attendanceData || []).length > 0);
+        const attendanceData = await fetchAttendanceInBatches(
+          employeeIds,
+          datesArr[0],
+          datesArr[datesArr.length - 1]
+        );
+        setAttendance(attendanceData);
+        setHasData(attendanceData.length > 0);
       } else {
         setAttendance([]);
         setHasData(false);
@@ -973,31 +995,39 @@ export function AttendancePage() {
     const sourceDates = getDatesForMonth(sourceMonth);
     const targetDates = getDatesForMonth(selectedMonth);
 
-    let sourceQuery = supabase
-      .from('attendance')
-      .select('*')
-      .gte('date', sourceDates[0])
-      .lte('date', sourceDates[sourceDates.length - 1]);
-    
-    if (!userProfile?.is_super_admin && userProfile?.region_id) {
-      const { data: regionEmployees } = await supabase
-        .from('employees')
-        .select('id')
-        .eq('region_id', userProfile.region_id)
-        .eq('is_deleted', false);
-      const employeeIds = regionEmployees?.map(e => e.id) || [];
-      if (employeeIds.length > 0) {
-        sourceQuery = sourceQuery.in('employee_id', employeeIds);
+    let sourceData: AttendanceRecord[];
+    try {
+      if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        // Region-scoped caller -- same oversized employee_id IN-list risk as
+        // the main fetchData load, so it goes through the same batched helper.
+        const { data: regionEmployees } = await supabase
+          .from('employees')
+          .select('id')
+          .eq('region_id', userProfile.region_id)
+          .eq('is_deleted', false);
+        const employeeIds = regionEmployees?.map(e => e.id) || [];
+        sourceData = await fetchAttendanceInBatches(
+          employeeIds,
+          sourceDates[0],
+          sourceDates[sourceDates.length - 1]
+        );
+      } else {
+        // Super admin / no region -- unfiltered by employee_id (unchanged from
+        // prior behavior), so no giant IN-list is ever built here.
+        const { data, error: sourceError } = await supabase
+          .from('attendance')
+          .select('*')
+          .gte('date', sourceDates[0])
+          .lte('date', sourceDates[sourceDates.length - 1]);
+        if (sourceError) throw sourceError;
+        sourceData = data || [];
       }
-    }
-    
-    const { data: sourceData, error: sourceError } = await sourceQuery;
-    
-    if (sourceError) {
+    } catch (sourceError) {
       console.error('Error fetching source data:', sourceError);
+      showNotification('Failed to fetch attendance data for the source month.', 'error');
       return;
     }
-    
+
     if (sourceData && sourceData.length > 0) {
       // tenant_id is omitted -- it defaults to the current user's own tenant
       // via the DB column default, same convention as processSingleUpdate.
