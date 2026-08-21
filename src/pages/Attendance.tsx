@@ -64,10 +64,10 @@ async function fetchAttendanceInBatches(
 ): Promise<AttendanceRecord[]> {
   const records = await fetchInEmployeeIdBatches<AttendanceRecord>(
     employeeIds,
-    (batch, from, to) =>
+    (batch, from, to, withCount) =>
       supabase
         .from('attendance')
-        .select('*', { count: 'exact' })
+        .select('*', withCount ? { count: 'exact' } : undefined)
         .gte('date', dateFrom)
         .lte('date', dateTo)
         .in('employee_id', batch)
