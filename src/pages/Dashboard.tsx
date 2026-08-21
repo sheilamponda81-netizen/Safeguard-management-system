@@ -301,45 +301,75 @@ export function Dashboard() {
       
       const onLeave = employeesData.filter((e: any) => e.status === 'On Leave').length;
       
-      // ===== ACCURATE ATTENDANCE RATE =====
-      let attendanceRate = 0;
-      if (employeesData.length > 0) {
-        const monthStart = `${selectedMonth}-01`;
-        const lastDay = new Date(parseInt(selectedMonth.split('-')[0]), parseInt(selectedMonth.split('-')[1]), 0).getDate();
-        const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
-        
-        // Batched: `employeeIds` is the full loaded employee population, which
-        // produced an oversized employee_id IN-list request URL in production
-        // (confirmed 400 Bad Request on this exact query shape -- select
-        // 'status', date range, employee_id IN). Only aggregate stats are
-        // needed here, so batching + client-side aggregation (already done
-        // below) is the minimal fix -- no row `id` is selected, so no dedup
-        // step applies (see src/utils/employeeBatchFetch.ts).
-        const attendanceRecords = await fetchInEmployeeIdBatches<{ status: string }>(
+      // ===== ATTENDANCE — fetched ONCE for the full 6-month chart window,
+      // then BOTH the current-month attendance rate AND the 6-month chart
+      // are derived from that single dataset client-side. =====
+      // PERFORMANCE CORRECTION: the previous version fetched this same
+      // `attendance` table twice per Dashboard load -- once scoped to just
+      // the selected month (for `attendanceRate` below), and again for the
+      // full 6-month chart window a few lines further down. `chartMonths`'s
+      // own last entry IS the selected month (getChartMonths ends at
+      // whatever month is passed in), so the 6-month fetch's result already
+      // contains every row the 1-month fetch would have returned -- the
+      // second fetch was pure duplicated network/DB work. Moved the
+      // `chartMonths`/`monthRanges` computation up here (it doesn't depend
+      // on anything computed below) so the single merged fetch can use the
+      // full 6-month range up front.
+      const chartMonths = getChartMonths(selectedMonth);
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const monthRanges = chartMonths.map(month => {
+        const [year, monthNum] = month.split('-').map(Number);
+        const monthName = monthNames[monthNum - 1];
+        const lastDay = new Date(year, monthNum, 0).getDate();
+        return {
+          label: `${monthName} ${year}`,
+          startDate: `${year}-${String(monthNum).padStart(2, '0')}-01`,
+          endDate: `${year}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`,
+        };
+      });
+      const monthStart = `${selectedMonth}-01`;
+      const monthEndLastDay = new Date(parseInt(selectedMonth.split('-')[0]), parseInt(selectedMonth.split('-')[1]), 0).getDate();
+      const monthEnd = `${selectedMonth}-${String(monthEndLastDay).padStart(2, '0')}`;
+
+      // Batched: `employeeIds` is the full loaded employee population, which
+      // produced an oversized employee_id IN-list request URL in production
+      // (confirmed 400 Bad Request on this exact query shape -- select
+      // date/status over a date range, employee_id IN). Only aggregate
+      // stats/chart data are needed from this, so batching + client-side
+      // aggregation is the minimal fix -- no row `id` is selected, so no
+      // dedup step applies (see src/utils/employeeBatchFetch.ts).
+      let allAttendanceRecords: { date: string; status: string }[] = [];
+      if (monthRanges.length > 0 && employeeIds.length > 0) {
+        allAttendanceRecords = await fetchInEmployeeIdBatches<{ date: string; status: string }>(
           employeeIds,
-          (batch, from, to) =>
+          (batch, from, to, withCount) =>
             supabase
               .from('attendance')
-              .select('status', { count: 'exact' })
-              .gte('date', monthStart)
-              .lte('date', monthEnd)
+              .select('date, status', withCount ? { count: 'exact' } : undefined)
+              .gte('date', monthRanges[0].startDate)
+              .lte('date', monthRanges[monthRanges.length - 1].endDate)
               .in('employee_id', batch)
               .range(from, to)
         );
-
-        if (attendanceRecords && attendanceRecords.length > 0) {
-          let presentCount = 0;
-          let totalRecords = 0;
-          attendanceRecords.forEach(record => {
-            if (record.status !== '-') {
-              totalRecords++;
-              if (record.status === 'P') presentCount++;
-            }
-          });
-          attendanceRate = totalRecords > 0 ? Math.round((presentCount / totalRecords) * 100) : 0;
-        }
       }
-      
+
+      // ===== ACCURATE ATTENDANCE RATE ===== derived from the merged fetch
+      // above by filtering to just the selected month's own date bounds
+      // (identical to what the old dedicated 1-month query would have
+      // returned, since it's a strict subset of the 6-month range fetched).
+      let attendanceRate = 0;
+      if (allAttendanceRecords.length > 0) {
+        let presentCount = 0;
+        let totalRecords = 0;
+        allAttendanceRecords.forEach(record => {
+          if (record.date >= monthStart && record.date <= monthEnd && record.status !== '-') {
+            totalRecords++;
+            if (record.status === 'P') presentCount++;
+          }
+        });
+        attendanceRate = totalRecords > 0 ? Math.round((presentCount / totalRecords) * 100) : 0;
+      }
+
       setStats({
         total: employeesData.length,
         activeGuards,
@@ -372,9 +402,8 @@ export function Dashboard() {
       // ===== GROWTH DATA — real cumulative headcount per month, starting from
       // the system's actual start month (June 2026), not a fabricated
       // multi-year history the system never existed for. =====
-      const chartMonths = getChartMonths(selectedMonth);
-      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
+      // (`chartMonths`/`monthNames`/`monthRanges` were computed earlier,
+      // alongside the merged attendance fetch, and are reused here.)
       const growth = chartMonths.map(month => {
         const [year, monthNum] = month.split('-').map(Number);
         const monthName = monthNames[monthNum - 1];
@@ -399,10 +428,10 @@ export function Dashboard() {
         approval_status: string;
       }>(
         employeeIds,
-        (batch, from, to) =>
+        (batch, from, to, withCount) =>
           supabase
             .from('payroll')
-            .select('month, net_pay, employee_id, approval_status', { count: 'exact' })
+            .select('month, net_pay, employee_id, approval_status', withCount ? { count: 'exact' } : undefined)
             .in('employee_id', batch)
             .range(from, to)
       );
@@ -438,40 +467,9 @@ export function Dashboard() {
       setPayrollHistory(historyData);
 
       // ===== ATTENDANCE DATA - Starting from June 2026 =====
-      // Single query spanning the whole 6-month window, grouped by month
-      // client-side, instead of one sequential await per month.
-      const monthRanges = chartMonths.map(month => {
-        const [year, monthNum] = month.split('-').map(Number);
-        const monthName = monthNames[monthNum - 1];
-        const lastDay = new Date(year, monthNum, 0).getDate();
-        return {
-          label: `${monthName} ${year}`,
-          startDate: `${year}-${String(monthNum).padStart(2, '0')}-01`,
-          endDate: `${year}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`,
-        };
-      });
-
-      // Batched: same oversized employee_id IN-list problem, confirmed 400
-      // Bad Request on this exact query shape (select date/status over a
-      // 6-month range, employee_id IN). This range is the widest of the
-      // three Dashboard queries (up to ~183 days), so pagination is expected
-      // to kick in even within a single 25-employee batch. No row `id` is
-      // selected, so no dedup step applies.
-      let allAttendanceRecords: { date: string; status: string }[] = [];
-      if (monthRanges.length > 0 && employeeIds.length > 0) {
-        allAttendanceRecords = await fetchInEmployeeIdBatches<{ date: string; status: string }>(
-          employeeIds,
-          (batch, from, to) =>
-            supabase
-              .from('attendance')
-              .select('date, status', { count: 'exact' })
-              .gte('date', monthRanges[0].startDate)
-              .lte('date', monthRanges[monthRanges.length - 1].endDate)
-              .in('employee_id', batch)
-              .range(from, to)
-        );
-      }
-
+      // Reuses `allAttendanceRecords`, already fetched once (in full, for
+      // this same 6-month window) alongside the attendance-rate calculation
+      // above -- no second attendance fetch here.
       const attendanceDataTemp = monthRanges.map(({ label, startDate, endDate }) => {
         let present = 0;
         let total = 0;
