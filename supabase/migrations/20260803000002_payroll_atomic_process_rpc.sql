@@ -299,7 +299,20 @@ $$;
 -- function enforces that itself in STEP 1, but revoking broad EXECUTE
 -- and granting only to `authenticated` is defense in depth -- anonymous
 -- callers can't reach it at all).
+--
+-- SECURITY CORRECTION (found while applying this migration to STAGING):
+-- `REVOKE ALL ... FROM PUBLIC` alone was NOT sufficient -- STAGING's
+-- pg_proc.proacl showed `anon` still had a direct, explicit EXECUTE grant
+-- on this function, independent of PUBLIC (Supabase grants EXECUTE on
+-- every newly created function directly to `anon`/`authenticated` via a
+-- database-level default-privilege rule, separate from the PUBLIC
+-- pseudo-role). STAGING was corrected manually with an explicit
+-- `REVOKE EXECUTE ... FROM anon` immediately after this discovery; that
+-- same explicit revoke is folded back into this migration below so a
+-- fresh apply (a new environment, a rebuilt STAGING project) is correct
+-- from the start, without relying on a manual follow-up step.
 REVOKE ALL ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) FROM anon;
 GRANT EXECUTE ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) TO authenticated;
 
 -- ============================================================

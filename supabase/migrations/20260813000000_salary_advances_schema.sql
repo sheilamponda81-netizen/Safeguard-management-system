@@ -569,7 +569,13 @@ BEGIN
 END;
 $$;
 
+-- `REVOKE ALL ... FROM PUBLIC` alone does not remove `anon`'s own direct
+-- EXECUTE grant on a newly created function -- Supabase grants EXECUTE to
+-- `anon`/`authenticated` directly via a database-level default-privilege
+-- rule, separate from PUBLIC (confirmed against STAGING's pg_proc.proacl
+-- while applying 20260803000002_payroll_atomic_process_rpc.sql).
 REVOKE ALL ON FUNCTION create_salary_advance(UUID, DATE, NUMERIC, TEXT, NUMERIC, INTEGER, NUMERIC, TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION create_salary_advance(UUID, DATE, NUMERIC, TEXT, NUMERIC, INTEGER, NUMERIC, TEXT, TEXT, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION create_salary_advance(UUID, DATE, NUMERIC, TEXT, NUMERIC, INTEGER, NUMERIC, TEXT, TEXT, TEXT) TO authenticated;
 
 -- ============================================================
@@ -841,7 +847,10 @@ BEGIN
 END;
 $$;
 
+-- See create_salary_advance() above for why `anon` is revoked explicitly,
+-- not just PUBLIC.
 REVOKE ALL ON FUNCTION approve_salary_advance(UUID, TEXT, NUMERIC, INTEGER, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION approve_salary_advance(UUID, TEXT, NUMERIC, INTEGER, TEXT, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION approve_salary_advance(UUID, TEXT, NUMERIC, INTEGER, TEXT, TEXT) TO authenticated;
 
 -- ============================================================
@@ -1009,7 +1018,10 @@ BEGIN
 END;
 $$;
 
+-- See create_salary_advance() above for why `anon` is revoked explicitly,
+-- not just PUBLIC.
 REVOKE ALL ON FUNCTION adjust_combined_repayment_plan(UUID, TEXT, TEXT, NUMERIC, INTEGER, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION adjust_combined_repayment_plan(UUID, TEXT, TEXT, NUMERIC, INTEGER, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION adjust_combined_repayment_plan(UUID, TEXT, TEXT, NUMERIC, INTEGER, TEXT) TO authenticated;
 
 -- ============================================================

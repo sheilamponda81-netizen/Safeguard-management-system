@@ -463,7 +463,12 @@ BEGIN
 END;
 $$;
 
+-- Re-stated here (redundant with 20260803000002, which already revokes
+-- both PUBLIC and `anon` at this function's true creation, and whose ACL
+-- survives this CREATE OR REPLACE unchanged) for this file's own
+-- self-sufficiency, matching the pattern used elsewhere in this schema.
 REVOKE ALL ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) FROM anon;
 GRANT EXECUTE ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) TO authenticated;
 
 -- ============================================================

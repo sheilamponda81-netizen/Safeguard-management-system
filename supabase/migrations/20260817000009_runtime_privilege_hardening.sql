@@ -45,27 +45,36 @@
 -- ============================================================
 
 -- ============================================================
--- PART 1: SECURITY DEFINER function EXECUTE hardening
+-- PART 1: SECURITY DEFINER function EXECUTE hardening (now closed at
+-- source everywhere in the chain; this PART is defense-in-depth
+-- reinforcement, not the first or only place these are secured)
 -- ============================================================
 --
+-- HISTORY / CORRECTION: this PART originally contained the FIRST fix for
 -- `get_current_tenant_id()`, `is_super_admin()`, and
--- `current_user_role_level()` have never had PostgreSQL's default
--- PUBLIC-EXECUTE grant revoked, in any migration from their original
--- definition (20260727000000 / 20260727000001) through their most recent
--- redefinition (20260817000000) -- confirmed by grepping every
--- migration file in this repo for `GRANT`/`REVOKE` referencing these
--- three function names: zero matches. Every OTHER helper defined
--- alongside them in 20260817000000 (current_user_role,
--- current_user_region_id, is_current_user_active, is_business_admin,
--- region_allowed, has_permission, get_my_permissions) already has an
--- explicit `REVOKE ALL ... FROM PUBLIC` + `GRANT EXECUTE ... TO
--- authenticated` in that same migration -- these three were simply
--- missed. All three are used INSIDE RLS policy USING/WITH CHECK clauses
--- throughout this schema, evaluated as the querying `authenticated` role,
--- so `authenticated` EXECUTE must be (re-)granted in the same statement
--- that revokes PUBLIC, or every policy referencing them would start
--- failing with "permission denied for function" the moment PUBLIC is
--- revoked.
+-- `current_user_role_level()` -- which had never had PostgreSQL's/
+-- Supabase's default PUBLIC- and anon-EXECUTE grants revoked in any prior
+-- migration. That left a real anonymous-execution window open for every
+-- migration between their original definition and this one -- exactly
+-- the kind of temporary exposure a staged production rollout must not
+-- have. Per a later audit (triggered by discovering the same class of gap
+-- on `process_payroll_batch()` while applying 20260803000002 to STAGING),
+-- the authoritative fix for these 4 functions was moved to
+-- 20260803000000_role_level_rls_hardening.sql -- the earliest migration in
+-- the controlled apply chain that already touches all 4 by name (for
+-- search_path pinning) -- so a fresh apply is correct from the very first
+-- migration that mentions them, not just by the time this file runs.
+-- `prevent_profile_privilege_escalation()`'s trigger-only treatment
+-- (revoke PUBLIC + anon, no authenticated grant) is likewise established
+-- there. `guard_employee_region_reassignment()` and
+-- `guard_applicant_region_assignment()` are hardened at their own true
+-- creation point, 20260817000001_functional_roles_direct_region_tables.sql,
+-- for the same reason. CREATE OR REPLACE FUNCTION preserves an existing
+-- function's privileges unchanged (same OID, only the body/other
+-- attributes change), so none of the redefinitions between those earlier
+-- migrations and this one re-opened the window. The statements below are
+-- kept as idempotent, redundant reinforcement rather than removed,
+-- matching this schema's established self-sufficiency pattern.
 REVOKE ALL ON FUNCTION get_current_tenant_id() FROM PUBLIC;
 REVOKE ALL ON FUNCTION is_super_admin() FROM PUBLIC;
 REVOKE ALL ON FUNCTION current_user_role_level() FROM PUBLIC;
@@ -85,18 +94,86 @@ GRANT EXECUTE ON FUNCTION current_user_role_level() TO authenticated;
 -- check applies to a direct `SELECT function_name()`-style call, not to
 -- automatic trigger invocation, which runs under the trigger's own
 -- definer/invoker semantics regardless of the caller's function-level
--- grants). None of the three has ever had an explicit GRANT/REVOKE
--- either -- confirmed by the same repo-wide grep -- so they still carry
--- PostgreSQL's default PUBLIC-EXECUTE grant despite never needing it.
--- Revoking it removes a direct-RPC-call surface (e.g. a client could
--- otherwise call `SELECT guard_employee_region_reassignment()` directly,
--- pointlessly, but still an unnecessary SECURITY DEFINER entry point)
--- with zero effect on the triggers themselves, which keep firing exactly
--- as before. No GRANT TO authenticated is added for any of the three --
--- none is required.
+-- grants). Revoking PUBLIC and anon removes a direct-RPC-call surface
+-- (e.g. a client could otherwise call
+-- `SELECT guard_employee_region_reassignment()` directly, pointlessly,
+-- but still an unnecessary SECURITY DEFINER entry point) with zero effect
+-- on the triggers themselves, which keep firing exactly as before. No
+-- GRANT TO authenticated is added for any of the three -- none is
+-- required.
 REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM PUBLIC;
 REVOKE ALL ON FUNCTION guard_employee_region_reassignment() FROM PUBLIC;
 REVOKE ALL ON FUNCTION guard_applicant_region_assignment() FROM PUBLIC;
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM anon;
+REVOKE ALL ON FUNCTION guard_employee_region_reassignment() FROM anon;
+REVOKE ALL ON FUNCTION guard_applicant_region_assignment() FROM anon;
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM authenticated;
+REVOKE ALL ON FUNCTION guard_employee_region_reassignment() FROM authenticated;
+REVOKE ALL ON FUNCTION guard_applicant_region_assignment() FROM authenticated;
+
+-- ============================================================
+-- PART 1b: previously-unaudited dead functions -- found during the
+-- broader "audit every other SECURITY DEFINER function / client-callable
+-- RPC in the chain" pass triggered by the process_payroll_batch anon-
+-- execute discovery. `analyze_query_performance()`, `set_tenant_context()`,
+-- and `get_tenant_context()` (20240619000000) and `set_user_tenant()`
+-- (20240619000001) are NOT SECURITY DEFINER, but Supabase exposes every
+-- function in the `public` schema as a `/rpc/<name>` endpoint regardless
+-- of SECURITY DEFINER status, and grants EXECUTE on each directly to
+-- `anon`/`authenticated` at creation -- so all 4 have been client-callable
+-- since the very first migration, with no revoke of any kind, ever.
+-- Confirmed via a repo-wide grep of every `.rpc(` call site in `src/` --
+-- none of the 4 is called by this application anywhere.
+--
+-- `analyze_query_performance(query_text TEXT)` is the most serious of the
+-- 4: it runs `EXECUTE 'EXPLAIN ANALYZE ' || query_text`, i.e. dynamic SQL
+-- built by directly concatenating caller-supplied text -- a live,
+-- reachable-via-API SQL-injection primitive for ANY authenticated (and,
+-- absent this fix, anon) caller, entirely independent of RLS, since the
+-- injected text is never parameterized. `set_tenant_context()`/
+-- `get_tenant_context()` only read/write a session-local GUC (no table
+-- access) and `set_user_tenant()` is a trigger function (AFTER INSERT ON
+-- auth.users) with no legitimate direct-call use -- lower severity than
+-- analyze_query_performance, but still unused dead surface with no
+-- legitimate caller. All 4 are locked down completely (PUBLIC, anon, AND
+-- authenticated -- unlike the RLS-helper functions above, nothing
+-- legitimate in this app calls any of these 4, so no role needs EXECUTE).
+--
+-- GUARDED, not a bare REVOKE: all 4 were only ever defined in
+-- 20240619000000_tenant_isolation.sql, a pre-"reconstructed-base-schema"
+-- historical migration that a real, already-bootstrapped STAGING/
+-- production project carries (confirmed present there) but that a fresh
+-- environment built from 20260727000000_reconstructed_base_schema.sql
+-- onward does NOT re-create (confirmed by local replay of this exact
+-- migration chain against a disposable Postgres cluster: a bare
+-- `REVOKE ... ON FUNCTION analyze_query_performance(TEXT)` fails outright
+-- with "function does not exist" on such an environment). `to_regprocedure`
+-- returns NULL instead of raising when a signature doesn't exist, so this
+-- block is safe to run on either kind of environment.
+DO $$
+BEGIN
+  IF to_regprocedure('public.analyze_query_performance(text)') IS NOT NULL THEN
+    REVOKE ALL ON FUNCTION analyze_query_performance(TEXT) FROM PUBLIC;
+    REVOKE ALL ON FUNCTION analyze_query_performance(TEXT) FROM anon;
+    REVOKE ALL ON FUNCTION analyze_query_performance(TEXT) FROM authenticated;
+  END IF;
+  IF to_regprocedure('public.set_tenant_context(uuid)') IS NOT NULL THEN
+    REVOKE ALL ON FUNCTION set_tenant_context(UUID) FROM PUBLIC;
+    REVOKE ALL ON FUNCTION set_tenant_context(UUID) FROM anon;
+    REVOKE ALL ON FUNCTION set_tenant_context(UUID) FROM authenticated;
+  END IF;
+  IF to_regprocedure('public.get_tenant_context()') IS NOT NULL THEN
+    REVOKE ALL ON FUNCTION get_tenant_context() FROM PUBLIC;
+    REVOKE ALL ON FUNCTION get_tenant_context() FROM anon;
+    REVOKE ALL ON FUNCTION get_tenant_context() FROM authenticated;
+  END IF;
+  IF to_regprocedure('public.set_user_tenant()') IS NOT NULL THEN
+    REVOKE ALL ON FUNCTION set_user_tenant() FROM PUBLIC;
+    REVOKE ALL ON FUNCTION set_user_tenant() FROM anon;
+    REVOKE ALL ON FUNCTION set_user_tenant() FROM authenticated;
+  END IF;
+END;
+$$;
 
 -- ============================================================
 -- PART 2: table-level privilege hardening
@@ -287,6 +364,22 @@ REVOKE SELECT, INSERT, UPDATE, DELETE ON employee_number_counters FROM authentic
 --   SELECT has_function_privilege('authenticated', 'is_super_admin()', 'EXECUTE');
 --   SELECT has_function_privilege('anon', 'is_super_admin()', 'EXECUTE');
 --   -- expected: true, false
+--   SELECT has_function_privilege('authenticated', 'prevent_profile_privilege_escalation()', 'EXECUTE');
+--   SELECT has_function_privilege('authenticated', 'guard_employee_region_reassignment()', 'EXECUTE');
+--   SELECT has_function_privilege('authenticated', 'guard_applicant_region_assignment()', 'EXECUTE');
+--   -- expected: false, false, false (trigger-only -- no direct client
+--   -- EXECUTE for ANY role, including authenticated; triggers keep firing
+--   -- regardless, per the note where these are defined)
+--   SELECT has_function_privilege('authenticated', 'analyze_query_performance(text)', 'EXECUTE');
+--   SELECT has_function_privilege('anon', 'analyze_query_performance(text)', 'EXECUTE');
+--   SELECT has_function_privilege('authenticated', 'set_tenant_context(uuid)', 'EXECUTE');
+--   SELECT has_function_privilege('authenticated', 'get_tenant_context()', 'EXECUTE');
+--   SELECT has_function_privilege('authenticated', 'set_user_tenant()', 'EXECUTE');
+--   -- expected: false for all 5 (PART 1b -- fully dead, unused surface).
+--   -- Only meaningful on an environment where 20240619000000 was actually
+--   -- applied (e.g. real STAGING/production) -- on a fresh environment
+--   -- built from 20260727000000 onward, these 4 functions never exist at
+--   -- all, and PART 1b's guarded DO block is a no-op for them.
 --
 -- ROLLBACK SQL (safe at any time -- restores the exact grants this
 -- migration removed; does not touch any row of data):
@@ -304,6 +397,10 @@ REVOKE SELECT, INSERT, UPDATE, DELETE ON employee_number_counters FROM authentic
 --   GRANT EXECUTE ON FUNCTION prevent_profile_privilege_escalation() TO PUBLIC;
 --   GRANT EXECUTE ON FUNCTION guard_employee_region_reassignment() TO PUBLIC;
 --   GRANT EXECUTE ON FUNCTION guard_applicant_region_assignment() TO PUBLIC;
+--   GRANT EXECUTE ON FUNCTION analyze_query_performance(TEXT) TO PUBLIC;
+--   GRANT EXECUTE ON FUNCTION set_tenant_context(UUID) TO PUBLIC;
+--   GRANT EXECUTE ON FUNCTION get_tenant_context() TO PUBLIC;
+--   GRANT EXECUTE ON FUNCTION set_user_tenant() TO PUBLIC;
 --   -- (not recommended -- this restores the exact broad-grant state this
 --   -- migration exists to close; use only to unblock an unexpected break.)
 -- ============================================================

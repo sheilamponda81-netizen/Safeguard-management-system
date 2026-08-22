@@ -208,23 +208,31 @@ FOR SELECT USING (tenant_id = get_current_tenant_id() OR is_super_admin() = true
 -- 20260817000004 are UNCHANGED -- not touched by this migration.
 
 -- ============================================================
--- PART 4: FIX generate_employee_number() ANON-EXECUTE GAP
+-- PART 4: generate_employee_number() ANON-EXECUTE GAP (now closed at
+-- source; this block is defense-in-depth reinforcement)
 -- ============================================================
--- Found during the SECURITY DEFINER function audit: unlike every other
--- SECURITY DEFINER function in this schema (including its own sibling
--- generate_guard_id()), 20260804000001_employee_number_generation.sql
--- never REVOKEd the PUBLIC default EXECUTE grant Postgres applies to every
--- newly CREATEd function -- so `anon` has had EXECUTE on
--- generate_employee_number(UUID) since that migration was first applied.
--- Impact is limited (the function immediately raises 'no tenant resolved
--- for the calling user' for an anon caller, since get_current_tenant_id()
--- returns NULL with no auth.uid()) but this still needlessly exposes the
--- function surface -- including its internal row-locking/counter-mutation
--- logic -- to unauthenticated callers, violating minimum-necessary-
--- privilege. Fixed to match generate_guard_id()'s existing pattern.
+-- Originally found during the SECURITY DEFINER function audit: unlike
+-- every other SECURITY DEFINER function in this schema (including its own
+-- sibling generate_guard_id()), 20260804000001_employee_number_generation.sql
+-- shipped with no REVOKE at all -- neither PUBLIC nor `anon` -- so both
+-- had EXECUTE on generate_employee_number(UUID) since that migration was
+-- first applied. Impact was limited (the function immediately raises 'no
+-- tenant resolved for the calling user' for an anon caller, since
+-- get_current_tenant_id() returns NULL with no auth.uid()) but this still
+-- needlessly exposed the function surface -- including its internal
+-- row-locking/counter-mutation logic -- to unauthenticated callers,
+-- violating minimum-necessary-privilege.
+--
+-- CORRECTED AT SOURCE: 20260804000001_employee_number_generation.sql now
+-- REVOKEs both PUBLIC and `anon` immediately at creation, so a fresh apply
+-- never has an exposure window. The statements below are kept as
+-- idempotent, redundant reinforcement (harmless to re-run) rather than
+-- removed, matching this schema's existing self-sufficiency pattern for
+-- migrations that touch an object another migration already secured.
 -- ============================================================
 
 REVOKE ALL ON FUNCTION generate_employee_number(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION generate_employee_number(UUID) FROM anon;
 GRANT EXECUTE ON FUNCTION generate_employee_number(UUID) TO authenticated;
 
 -- ============================================================

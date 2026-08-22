@@ -160,6 +160,17 @@ $$;
 -- Trigger attachment itself (trigger_prevent_profile_privilege_escalation
 -- BEFORE UPDATE ON profiles) is unchanged from 20260727000001 -- only the
 -- function body above changed via CREATE OR REPLACE, same trigger.
+--
+-- EXECUTE ACL is already hardened at this function's original definition
+-- (20260803000000_role_level_rls_hardening.sql: REVOKE ALL FROM PUBLIC,
+-- anon, AND authenticated -- trigger-only, no legitimate direct client
+-- caller at all) and CREATE OR REPLACE FUNCTION preserves an existing
+-- function's privileges unchanged, so no new grant statement is needed
+-- here. Restated as idempotent reinforcement anyway, for this file's own
+-- self-sufficiency:
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM PUBLIC;
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM anon;
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM authenticated;
 
 -- ============================================================
 -- PART 2: employees
@@ -257,6 +268,20 @@ DROP TRIGGER IF EXISTS trg_guard_employee_region_reassignment ON employees;
 CREATE TRIGGER trg_guard_employee_region_reassignment
 BEFORE UPDATE ON employees
 FOR EACH ROW EXECUTE FUNCTION guard_employee_region_reassignment();
+
+-- Trigger-only: no legitimate direct client EXECUTE. `REVOKE ALL FROM
+-- PUBLIC` alone would still leave direct `anon` AND `authenticated`
+-- EXECUTE grants in place on Supabase (its default-privilege rule grants
+-- both directly at creation, independent of PUBLIC -- see the note on
+-- prevent_profile_privilege_escalation() above), so all three are revoked
+-- explicitly, immediately at this function's creation. A trigger fires
+-- regardless of the DML-issuing role's own EXECUTE privilege on the
+-- trigger function (verified empirically -- that check applies only to a
+-- direct `SELECT function_name()`-style call), so employees UPDATE still
+-- enforces this guard for authenticated callers with zero grant here.
+REVOKE ALL ON FUNCTION guard_employee_region_reassignment() FROM PUBLIC;
+REVOKE ALL ON FUNCTION guard_employee_region_reassignment() FROM anon;
+REVOKE ALL ON FUNCTION guard_employee_region_reassignment() FROM authenticated;
 
 -- ============================================================
 -- PART 3: applicants (Recruitment)
@@ -380,6 +405,13 @@ DROP TRIGGER IF EXISTS trg_guard_applicant_region_assignment ON applicants;
 CREATE TRIGGER trg_guard_applicant_region_assignment
 BEFORE INSERT OR UPDATE ON applicants
 FOR EACH ROW EXECUTE FUNCTION guard_applicant_region_assignment();
+
+-- Trigger-only, same reasoning as guard_employee_region_reassignment()
+-- above: no legitimate direct client EXECUTE, and PUBLIC alone is not
+-- sufficient to remove anon's/authenticated's own direct grants.
+REVOKE ALL ON FUNCTION guard_applicant_region_assignment() FROM PUBLIC;
+REVOKE ALL ON FUNCTION guard_applicant_region_assignment() FROM anon;
+REVOKE ALL ON FUNCTION guard_applicant_region_assignment() FROM authenticated;
 
 -- ============================================================
 -- PART 4: audit_logs -- Admin-only view, NOT generic regional data

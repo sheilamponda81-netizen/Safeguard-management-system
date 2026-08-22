@@ -152,6 +152,15 @@ BEGIN
 END;
 $$;
 
+-- SECURITY CORRECTION (closed at source, see
+-- 20260817000005_functional_roles_corrections_lockdown.sql's own header
+-- for how this gap was originally found downstream): unlike every other
+-- SECURITY DEFINER function in this schema, this one shipped with no
+-- REVOKE at all, leaving it fully PUBLIC- and anon-executable. Both are
+-- closed here now, at the function's own creation, rather than left open
+-- until a later migration finds and fixes it.
+REVOKE ALL ON FUNCTION generate_employee_number(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION generate_employee_number(UUID) FROM anon;
 GRANT EXECUTE ON FUNCTION generate_employee_number(UUID) TO authenticated;
 
 -- ============================================================

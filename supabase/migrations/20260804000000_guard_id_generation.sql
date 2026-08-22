@@ -190,7 +190,15 @@ BEGIN
 END;
 $$;
 
+-- `REVOKE ALL ... FROM PUBLIC` alone does not remove `anon`'s own direct
+-- EXECUTE grant on a newly created function -- Supabase grants EXECUTE to
+-- `anon`/`authenticated` directly via a database-level default-privilege
+-- rule, separate from PUBLIC (confirmed against STAGING's pg_proc.proacl
+-- while applying 20260803000002_payroll_atomic_process_rpc.sql). The
+-- explicit `anon` revoke below closes that from the moment this function
+-- is first created, rather than relying on a later, catch-all migration.
 REVOKE ALL ON FUNCTION generate_guard_id() FROM PUBLIC;
+REVOKE ALL ON FUNCTION generate_guard_id() FROM anon;
 GRANT EXECUTE ON FUNCTION generate_guard_id() TO authenticated;
 
 -- ============================================================

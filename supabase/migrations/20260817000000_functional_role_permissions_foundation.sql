@@ -400,6 +400,14 @@ BEGIN
 END;
 $$;
 
+-- `REVOKE ALL ... FROM PUBLIC` alone does not remove `anon`'s own direct
+-- EXECUTE grant on a newly created function -- Supabase grants EXECUTE to
+-- `anon`/`authenticated` directly via a database-level default-privilege
+-- rule, separate from PUBLIC (confirmed against STAGING's pg_proc.proacl
+-- while applying 20260803000002_payroll_atomic_process_rpc.sql). Every
+-- one of these 7 functions is an RLS-policy helper resolving the CALLER's
+-- own identity via auth.uid()/current_setting -- none has any legitimate
+-- reason to be reachable by an unauthenticated caller.
 REVOKE ALL ON FUNCTION current_user_role() FROM PUBLIC;
 REVOKE ALL ON FUNCTION current_user_region_id() FROM PUBLIC;
 REVOKE ALL ON FUNCTION is_current_user_active() FROM PUBLIC;
@@ -407,6 +415,13 @@ REVOKE ALL ON FUNCTION is_business_admin() FROM PUBLIC;
 REVOKE ALL ON FUNCTION region_allowed(UUID) FROM PUBLIC;
 REVOKE ALL ON FUNCTION has_permission(TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION get_my_permissions() FROM PUBLIC;
+REVOKE ALL ON FUNCTION current_user_role() FROM anon;
+REVOKE ALL ON FUNCTION current_user_region_id() FROM anon;
+REVOKE ALL ON FUNCTION is_current_user_active() FROM anon;
+REVOKE ALL ON FUNCTION is_business_admin() FROM anon;
+REVOKE ALL ON FUNCTION region_allowed(UUID) FROM anon;
+REVOKE ALL ON FUNCTION has_permission(TEXT) FROM anon;
+REVOKE ALL ON FUNCTION get_my_permissions() FROM anon;
 GRANT EXECUTE ON FUNCTION current_user_role() TO authenticated;
 GRANT EXECUTE ON FUNCTION current_user_region_id() TO authenticated;
 GRANT EXECUTE ON FUNCTION is_current_user_active() TO authenticated;

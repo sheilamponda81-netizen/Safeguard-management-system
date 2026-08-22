@@ -310,6 +310,54 @@ ALTER FUNCTION current_user_role_level() SET search_path = public, pg_temp;
 ALTER FUNCTION prevent_profile_privilege_escalation() SET search_path = public, pg_temp;
 
 -- ============================================================
+-- EXECUTE privilege hardening for these same 4 functions, added at this
+-- migration -- the earliest point in the controlled apply chain that
+-- already touches all 4 by name (for the search_path pin above) -- rather
+-- than waiting until 20260817000009_runtime_privilege_hardening.sql at
+-- the very end of the chain. Confirmed against a real Supabase project
+-- (STAGING): `REVOKE ALL ... FROM PUBLIC` alone is NOT sufficient --
+-- Supabase grants EXECUTE on every newly created function DIRECTLY to
+-- `anon` and `authenticated` via a database-level default-privilege rule
+-- that is separate from the PUBLIC pseudo-role; `pg_proc.proacl` shows an
+-- explicit `anon=X/postgres` entry that a PUBLIC-only revoke never
+-- touches. Applying the explicit `anon` revoke here, immediately, closes
+-- the anonymous-execution window from the moment these functions are
+-- first altered by this migration, instead of leaving it open for every
+-- migration between here and 20260817000009.
+-- ============================================================
+REVOKE ALL ON FUNCTION get_current_tenant_id() FROM PUBLIC;
+REVOKE ALL ON FUNCTION is_super_admin() FROM PUBLIC;
+REVOKE ALL ON FUNCTION current_user_role_level() FROM PUBLIC;
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM PUBLIC;
+REVOKE ALL ON FUNCTION get_current_tenant_id() FROM anon;
+REVOKE ALL ON FUNCTION is_super_admin() FROM anon;
+REVOKE ALL ON FUNCTION current_user_role_level() FROM anon;
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM anon;
+GRANT EXECUTE ON FUNCTION get_current_tenant_id() TO authenticated;
+GRANT EXECUTE ON FUNCTION is_super_admin() TO authenticated;
+GRANT EXECUTE ON FUNCTION current_user_role_level() TO authenticated;
+-- prevent_profile_privilege_escalation is trigger-only (BEFORE UPDATE ON
+-- profiles, attached in 20260727000001) -- deliberately NOT granted to
+-- authenticated here, and explicitly REVOKEd from authenticated too, not
+-- just PUBLIC/anon: the same default-privilege rule that grants EXECUTE
+-- to anon at creation also grants it directly to `authenticated`, so
+-- leaving that unrevoked would have quietly kept a direct-RPC-call
+-- surface open for any authenticated caller. Verified empirically against
+-- a local disposable Postgres cluster (both that this default-grant gap
+-- was real, and that revoking it changes nothing about the trigger's own
+-- behavior): a trigger function fires regardless of whether the
+-- DML-issuing role holds direct EXECUTE on the trigger function itself --
+-- that privilege check applies only to a direct `SELECT function_name()`-
+-- style call, not to trigger invocation -- so authenticated callers can
+-- still UPDATE profiles (subject to RLS) with this trigger enforced, even
+-- with zero EXECUTE grant on the function. (PostgreSQL also independently
+-- forbids calling a RETURNS TRIGGER function outside of trigger context
+-- at all, regardless of grants -- this revoke closes the ACL gap for
+-- completeness/defense-in-depth, not because the prior state was actually
+-- exploitable.)
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM authenticated;
+
+-- ============================================================
 -- MIGRATION SAFETY NOTES (added after this audit's migration-safety review)
 -- ============================================================
 --
@@ -354,6 +402,16 @@ ALTER FUNCTION prevent_profile_privilege_escalation() SET search_path = public, 
 --   SELECT proname, proconfig FROM pg_proc
 --     WHERE proname IN ('get_current_tenant_id','is_super_admin','current_user_role_level','prevent_profile_privilege_escalation');
 --   -- Expected: proconfig contains 'search_path=public, pg_temp' for all 4.
+--   SELECT has_function_privilege('anon', 'get_current_tenant_id()', 'EXECUTE') AS gcti_anon,
+--          has_function_privilege('anon', 'is_super_admin()', 'EXECUTE') AS isa_anon,
+--          has_function_privilege('anon', 'current_user_role_level()', 'EXECUTE') AS curl_anon,
+--          has_function_privilege('anon', 'prevent_profile_privilege_escalation()', 'EXECUTE') AS ppe_anon,
+--          has_function_privilege('authenticated', 'get_current_tenant_id()', 'EXECUTE') AS gcti_auth,
+--          has_function_privilege('authenticated', 'is_super_admin()', 'EXECUTE') AS isa_auth,
+--          has_function_privilege('authenticated', 'current_user_role_level()', 'EXECUTE') AS curl_auth,
+--          has_function_privilege('authenticated', 'prevent_profile_privilege_escalation()', 'EXECUTE') AS ppe_auth;
+--   -- Expected: all 4 *_anon columns = false; gcti_auth/isa_auth/curl_auth = true;
+--   -- ppe_auth = false (trigger-only, no direct client EXECUTE needed or granted).
 --
 -- ADDITIONAL VERIFICATION -- role_level SELECT enforcement (added this
 -- revision, best run as each real role rather than by inspecting SQL

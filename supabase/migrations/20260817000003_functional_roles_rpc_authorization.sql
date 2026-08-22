@@ -344,7 +344,11 @@ BEGIN
 END;
 $$;
 
+-- Re-stated (redundant with 20260803000002, this function's original
+-- definition, whose ACL survives every later CREATE OR REPLACE unchanged)
+-- for this file's own self-sufficiency.
 REVOKE ALL ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) FROM anon;
 GRANT EXECUTE ON FUNCTION process_payroll_batch(TEXT, JSONB, TEXT, JSONB) TO authenticated;
 
 -- ============================================================
@@ -455,7 +459,10 @@ BEGIN
 END;
 $$;
 
+-- Re-stated (redundant with 20260813000000, this function's original
+-- definition) for this file's own self-sufficiency.
 REVOKE ALL ON FUNCTION create_salary_advance(UUID, DATE, NUMERIC, TEXT, NUMERIC, INTEGER, NUMERIC, TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION create_salary_advance(UUID, DATE, NUMERIC, TEXT, NUMERIC, INTEGER, NUMERIC, TEXT, TEXT, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION create_salary_advance(UUID, DATE, NUMERIC, TEXT, NUMERIC, INTEGER, NUMERIC, TEXT, TEXT, TEXT) TO authenticated;
 
 -- ============================================================
@@ -663,7 +670,10 @@ BEGIN
 END;
 $$;
 
+-- Re-stated (redundant with 20260813000000, this function's original
+-- definition) for this file's own self-sufficiency.
 REVOKE ALL ON FUNCTION approve_salary_advance(UUID, TEXT, NUMERIC, INTEGER, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION approve_salary_advance(UUID, TEXT, NUMERIC, INTEGER, TEXT, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION approve_salary_advance(UUID, TEXT, NUMERIC, INTEGER, TEXT, TEXT) TO authenticated;
 
 -- ============================================================
@@ -816,7 +826,10 @@ BEGIN
 END;
 $$;
 
+-- Re-stated (redundant with 20260813000000, this function's original
+-- definition) for this file's own self-sufficiency.
 REVOKE ALL ON FUNCTION adjust_combined_repayment_plan(UUID, TEXT, TEXT, NUMERIC, INTEGER, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION adjust_combined_repayment_plan(UUID, TEXT, TEXT, NUMERIC, INTEGER, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION adjust_combined_repayment_plan(UUID, TEXT, TEXT, NUMERIC, INTEGER, TEXT) TO authenticated;
 
 -- ============================================================
