@@ -105,7 +105,22 @@
 -- of its own -- it evaluates the real `employees` RLS as the calling user,
 -- automatically, with no duplicated tenant/region/permission logic to keep
 -- in sync with the base table's own policy.
+--
+-- DROP before CREATE (not CREATE OR REPLACE alone): 20260817000005 already
+-- created `employees_general` with 45 output columns (37 non-guard + 8
+-- guard columns, CASE-WHEN-nulled). PostgreSQL's CREATE OR REPLACE VIEW
+-- can only ADD trailing columns to an existing view, never remove or
+-- reorder them -- replacing a 45-column view with this 37-column
+-- definition via CREATE OR REPLACE alone fails with "cannot drop columns
+-- from view". DROP VIEW IF EXISTS first, then a fresh CREATE VIEW, avoids
+-- that entirely. No CASCADE: a repo-wide check (every *.sql/*.ts file
+-- under supabase/) confirms no other database object selects FROM/JOINs
+-- employees_general -- the only references are this file, 20260817000005
+-- itself, and one comment -- so a plain DROP VIEW cannot fail on a
+-- dependent object and does not need to force-drop anything.
 -- ============================================================
+
+DROP VIEW IF EXISTS public.employees_general;
 
 CREATE OR REPLACE VIEW employees_general AS
 SELECT
@@ -240,4 +255,7 @@ COMMENT ON VIEW employees_security IS
 -- ROLLBACK SQL:
 --   DROP VIEW IF EXISTS employees_security;
 --   -- Restore 20260817000005's employees_general definition verbatim
---   -- (all 45 columns, guard columns CASE-WHEN-nulled) if reverting fully.
+--   -- (all 45 columns, guard columns CASE-WHEN-nulled) if reverting fully --
+--   -- DROP VIEW IF EXISTS employees_general; first (same column-count-
+--   -- change constraint as above applies in reverse), then re-run that
+--   -- migration's CREATE OR REPLACE VIEW/ALTER VIEW/REVOKE/GRANT block.
