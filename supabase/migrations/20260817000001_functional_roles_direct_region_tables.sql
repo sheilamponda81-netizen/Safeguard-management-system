@@ -308,6 +308,24 @@ REVOKE ALL ON FUNCTION guard_employee_region_reassignment() FROM authenticated;
 -- one-time, shrinking transitional set, not a permanent gap.
 -- ============================================================
 
+-- Drops BOTH possible prior names for this policy, not just the most
+-- recent one: 20260804000003_restrict_applicants_select.sql (which
+-- renamed the original "Users can view applicants in their tenant" to
+-- "Managers can view applicants in their tenant") is a deliberately
+-- DECOUPLED, later-applied "Phase 2" migration with its own separate
+-- deploy-ordering precondition (see that file's own header) -- unlike
+-- every other applicants policy rename in this schema, which happens
+-- atomically within a single migration (20260803000000, for INSERT/
+-- UPDATE/DELETE). If 20260804000003 has not yet been applied to a given
+-- environment by the time this migration runs, dropping only "Managers
+-- can view applicants in their tenant" would leave the ORIGINAL
+-- tenant-wide "Users can view applicants in their tenant" policy live
+-- alongside the new regional one below -- both PERMISSIVE, so Postgres
+-- ORs them together and the old tenant-wide policy silently bypasses the
+-- new region restriction entirely. Confirmed as a real gap found while
+-- applying this migration to STAGING. Dropping both names is safe and
+-- idempotent regardless of which one (if either) currently exists.
+DROP POLICY IF EXISTS "Users can view applicants in their tenant" ON applicants;
 DROP POLICY IF EXISTS "Managers can view applicants in their tenant" ON applicants;
 CREATE POLICY "Applicants: view within tenant+region, action or legacy permitted" ON applicants
 FOR SELECT USING (
@@ -480,6 +498,17 @@ FOR INSERT WITH CHECK (
 --   -- expected: 2 rows
 --   SELECT policyname, cmd FROM pg_policies WHERE tablename IN
 --     ('profiles','employees','applicants','audit_logs') ORDER BY tablename, cmd;
+--   SELECT tablename, cmd, COUNT(*), array_agg(policyname) FROM pg_policies
+--     WHERE tablename IN ('profiles','employees','applicants','audit_logs')
+--     GROUP BY tablename, cmd HAVING COUNT(*) > 1 ORDER BY tablename, cmd;
+--   -- expected: 0 rows -- catches exactly the class of bug this revision
+--   -- fixes (two PERMISSIVE policies for the same table+command, which
+--   -- Postgres ORs together rather than replaces). In particular:
+--   SELECT policyname FROM pg_policies WHERE tablename = 'applicants' AND cmd = 'SELECT';
+--   -- expected: exactly 1 row, policyname =
+--   -- "Applicants: view within tenant+region, action or legacy permitted"
+--   -- -- NOT also "Users can view applicants in their tenant" or
+--   -- "Managers can view applicants in their tenant".
 --
 -- ROLLBACK: re-run each superseded migration's own CREATE POLICY blocks
 -- verbatim (20260727000000 for profiles/employees/applicants/audit_logs
