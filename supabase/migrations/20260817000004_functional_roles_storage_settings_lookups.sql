@@ -23,7 +23,19 @@
 -- after this migration -- confirmed intentional per item 38.
 -- ============================================================
 
+-- Drops BOTH the correct repo-lineage name ("Admins and managers...") AND
+-- a singular-"Admin" variant ("Admin and managers...") that repository
+-- history never created but that direct live STAGING pg_policies
+-- evidence confirmed actually exists there after this migration was
+-- first applied -- real deployed-state drift from the committed
+-- migration lineage, not something this file's own history explains.
+-- Since Production may carry the same drift, this migration is made
+-- defensive against both known naming variants rather than assuming the
+-- repo's own history is the complete picture of what's actually live.
+-- Each DROP is IF EXISTS, so this is safe/idempotent regardless of which
+-- variant (if either) is actually present in a given environment.
 DROP POLICY IF EXISTS "Admins and managers can upload company logo" ON storage.objects;
+DROP POLICY IF EXISTS "Admin and managers can upload company logo" ON storage.objects;
 CREATE POLICY "Admins can upload company logo" ON storage.objects
 FOR INSERT TO authenticated WITH CHECK (
   bucket_id = 'company-logo'
@@ -31,6 +43,7 @@ FOR INSERT TO authenticated WITH CHECK (
 );
 
 DROP POLICY IF EXISTS "Admins and managers can update company logo" ON storage.objects;
+DROP POLICY IF EXISTS "Admin and managers can update company logo" ON storage.objects;
 CREATE POLICY "Admins can update company logo" ON storage.objects
 FOR UPDATE TO authenticated USING (
   bucket_id = 'company-logo'
@@ -41,6 +54,7 @@ FOR UPDATE TO authenticated USING (
 );
 
 DROP POLICY IF EXISTS "Admins and managers can delete company logo" ON storage.objects;
+DROP POLICY IF EXISTS "Admin and managers can delete company logo" ON storage.objects;
 CREATE POLICY "Admins can delete company logo" ON storage.objects
 FOR DELETE TO authenticated USING (
   bucket_id = 'company-logo'
@@ -164,8 +178,12 @@ FOR UPDATE USING (
 -- VERIFICATION SQL (run immediately after applying):
 --   SELECT policyname, cmd FROM pg_policies WHERE schemaname = 'storage'
 --     AND tablename = 'objects' AND policyname LIKE '%company logo%' ORDER BY cmd;
---   -- expected: SELECT = "Public read access for company logo" (unchanged),
---   -- INSERT/UPDATE/DELETE = "Admins can ... company logo"
+--   -- expected: EXACTLY 4 rows total -- SELECT = "Public read access for
+--   -- company logo" (unchanged), INSERT/UPDATE/DELETE = "Admins can ...
+--   -- company logo" -- confirms neither legacy name ("Admins and
+--   -- managers..." from repo lineage, or the "Admin and managers..."
+--   -- singular-typo variant confirmed present on live STAGING via direct
+--   -- pg_policies evidence) survived alongside the new Admin-only ones.
 --   SELECT policyname, cmd FROM pg_policies WHERE tablename = 'system_settings' ORDER BY cmd;
 --   -- expected: SELECT/INSERT/UPDATE = "Admins can ...", DELETE = "Super admins can delete settings"
 --   -- Functional check: as a legacy Manager or a new hr_manager/accountant/
