@@ -157,9 +157,25 @@ WITH CHECK (
   )
 );
 -- DELETE ("Users can delete attendance in their tenant", tenant-only,
--- never role-gated) is left AS-IS deliberately -- out of scope for this
--- pass (no business rule above discusses attendance deletion, and
--- narrowing it isn't required to satisfy any instruction in this round).
+-- never role-gated) -- CORRECTED (found while applying this migration to
+-- STAGING): dropped outright, with NO replacement policy. Leaving it in
+-- place, even temporarily, opens a real tenant-wide hard-DELETE path for
+-- ANY authenticated tenant member during the rollout window between this
+-- migration and 20260817000009_runtime_privilege_hardening.sql -- that
+-- later migration only REVOKEs the table-level DELETE GRANT from
+-- `authenticated` (a privilege layer below RLS), it does not touch this
+-- RLS policy, so the policy alone remains a live, unrestricted DELETE
+-- path for as long as the table-level grant is still in place. A
+-- repository-wide search of every `.delete(` call site in `src/` confirms
+-- attendance mutations are INSERT/UPDATE only -- no legitimate `.delete()`
+-- caller exists for this table anywhere in the app -- so no replacement
+-- policy is added, for ANY role. `is_super_admin()` is only a boolean
+-- read inside a policy's USING clause, not a Postgres BYPASSRLS grant --
+-- with zero DELETE policy present, RLS denies DELETE by default for
+-- every authenticated caller, including a super-admin application user,
+-- not just legacy/functional-role ones. That is the intended outcome
+-- here (no confirmed legitimate need for it), not an oversight.
+DROP POLICY IF EXISTS "Users can delete attendance in their tenant" ON attendance;
 
 -- ============================================================
 -- PART 3: payment_status (Payments)
@@ -467,6 +483,12 @@ FOR SELECT USING (
 -- 4 never had a frontend path to reach this regardless, so this closes an
 -- unenforced gap rather than removing used access; confirm this against
 -- real STAGING accounts before relying on that claim in production.
+-- SECOND CHANGE (found while applying to STAGING): `attendance` DELETE
+-- now has NO policy at all for any non-super-admin role -- previously a
+-- tenant-wide, ungated DELETE was live for every authenticated tenant
+-- member. No legitimate caller ever used it (confirmed via repo-wide
+-- `.delete(` search), so this closes a real, unused, unrestricted
+-- hard-delete path rather than removing used access.
 --
 -- VERIFICATION SQL:
 --   SELECT tablename, policyname, cmd FROM pg_policies WHERE tablename IN
@@ -474,6 +496,19 @@ FOR SELECT USING (
 --      'terminal_dues','salary_advances','salary_advance_deductions',
 --      'salary_advance_repayment_plans','salary_advance_repayment_plan_changes')
 --   ORDER BY tablename, cmd;
+--   SELECT COUNT(*) FROM pg_policies WHERE tablename = 'attendance' AND cmd = 'DELETE';
+--   -- expected: 0 (no DELETE policy of any kind on attendance -- not
+--   -- even a super-admin-only one). NOTE this means no authenticated
+--   -- caller, INCLUDING a super-admin application user, can DELETE an
+--   -- attendance row through RLS-protected access at all any more --
+--   -- is_super_admin() is only a boolean read inside a policy's USING
+--   -- clause, not a Postgres BYPASSRLS grant, so removing the policy
+--   -- removes the capability for every role that goes through RLS,
+--   -- not just legacy/functional-role callers. This is intentional and
+--   -- matches "no legitimate .delete() caller exists anywhere in the
+--   -- app" -- if a genuine admin need for hard-deleting attendance rows
+--   -- is ever confirmed, it requires its own explicit, reviewed policy
+--   -- added later, not a byproduct of this migration.
 --
 -- ROLLBACK: re-run each superseded migration's own CREATE POLICY blocks
 -- verbatim (20260727000000 for the base tenant-only shape,
