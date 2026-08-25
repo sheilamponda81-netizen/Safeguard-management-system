@@ -87,7 +87,16 @@ const roleMenuItems: Record<number, NavKey[]> = {
   4: ["dashboard", "payslips", "user-manual"],
 };
 
-const ALL_NAV_KEYS: NavKey[] = allNavItems.map((item) => item.id);
+// "security" and "features" are rendered separately (the "Special"
+// section below, not the generic allNavItems loop), so they're not rows
+// in allNavItems -- but a business admin (the ALL_NAV_KEYS branch in
+// resolveAllowedPages() below) must still resolve as having them, so a
+// FUNCTIONAL admin (role='admin', role_level=null -- not just a legacy
+// role_level=1 account, which already gets both via roleMenuItems[1]
+// above) sees the same Special-section items a legacy Admin always has.
+// Appended explicitly here rather than added to allNavItems, so the
+// generic visibleNavItems loop never renders them a second time.
+const ALL_NAV_KEYS: NavKey[] = [...allNavItems.map((item) => item.id), "security", "features"];
 
 // Governing permission(s) for each nav item, for a NEW functional-role
 // account (role_level = NULL). A page is reachable if the account holds
@@ -156,7 +165,6 @@ export function Sidebar({
 }) {
   const [userRoleLevel, setUserRoleLevel] = useState<number | null>(4);
   const [userRole, setUserRole] = useState<string | null>(null);
-  const [userIsBusinessAdmin, setUserIsBusinessAdmin] = useState(false);
   const [allowedMenuIds, setAllowedMenuIds] = useState<NavKey[]>(roleMenuItems[4]);
   const [loading, setLoading] = useState(true);
   const [userName, setUserName] = useState<string>("User");
@@ -241,7 +249,6 @@ export function Sidebar({
             setUserRoleLevel(roleLevel);
             setUserRole(profile?.role ?? null);
             const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
-            setUserIsBusinessAdmin(businessAdmin);
 
             let permissions = new Set<string>();
             if (roleLevel === null && !businessAdmin) {
@@ -363,70 +370,86 @@ export function Sidebar({
           <div className="px-3 py-2 text-sm text-slate-500">Loading...</div>
         )}
 
-        {!loading && (userRoleLevel === 1 || userIsBusinessAdmin) && (
+        {/* Permission-aware, not role-name-gated -- each item renders iff
+            allowedMenuIds (the same resolveAllowedPages() result the route
+            guard in App.tsx uses) actually contains it, so this section can
+            never show a button the route guard would then deny, and never
+            hide one the route guard already permits (see this file's own
+            ALL_NAV_KEYS comment for how a business admin -- legacy or
+            functional -- ends up with both). Previously gated on
+            `userRoleLevel === 1 || userIsBusinessAdmin` alone, which ignored
+            allowedMenuIds entirely and hid both items from every functional
+            non-admin role (hr_manager/accountant/operations_manager) even
+            though role_permissions already granted them
+            future_features.view/security_personnel.view. */}
+        {!loading && (allowedMenuIds.includes("security") || allowedMenuIds.includes("features")) && (
           <>
             <p className="px-3 py-2 mt-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
               Special
             </p>
-            <button
-              onClick={() => {
-                onNavigate("security");
-                if (isMobile) {
-                  onClose();
-                }
-              }}
-              onMouseEnter={() => {
-                if (onPreload) {
-                  onPreload("security");
-                }
-              }}
-              onTouchStart={() => {
-                if (onPreload) {
-                  onPreload("security");
-                }
-              }}
-              className={cn(
-                "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
-                active === "security"
-                  ? "bg-[#081C3A] text-white shadow-sm"
-                  : "text-slate-600 hover:bg-slate-100",
-              )}
-            >
-              <Shield
-                size={18}
-                className={active === "security" ? "text-[#D4A017]" : ""}
-              />
-              <span>Security Personnel</span>
-            </button>
-            <button
-              onClick={() => {
-                onNavigate("features");
-                if (isMobile) {
-                  onClose();
-                }
-              }}
-              onMouseEnter={() => {
-                if (onPreload) {
-                  onPreload("features");
-                }
-              }}
-              onTouchStart={() => {
-                if (onPreload) {
-                  onPreload("features");
-                }
-              }}
-              className={cn(
-                "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
-                active === "features"
-                  ? "bg-[#081C3A] text-white shadow-sm"
-                  : "text-slate-600 hover:bg-slate-100",
-              )}
-            >
-              <span className="w-[18px] h-[18px] rounded bg-[#D4A017] text-white text-[10px] flex items-center justify-center font-bold">
-                ★
-              </span>
-              <span>Future Features</span>
-            </button>
+            {allowedMenuIds.includes("security") && (
+              <button
+                onClick={() => {
+                  onNavigate("security");
+                  if (isMobile) {
+                    onClose();
+                  }
+                }}
+                onMouseEnter={() => {
+                  if (onPreload) {
+                    onPreload("security");
+                  }
+                }}
+                onTouchStart={() => {
+                  if (onPreload) {
+                    onPreload("security");
+                  }
+                }}
+                className={cn(
+                  "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
+                  active === "security"
+                    ? "bg-[#081C3A] text-white shadow-sm"
+                    : "text-slate-600 hover:bg-slate-100",
+                )}
+              >
+                <Shield
+                  size={18}
+                  className={active === "security" ? "text-[#D4A017]" : ""}
+                />
+                <span>Security Personnel</span>
+              </button>
+            )}
+            {allowedMenuIds.includes("features") && (
+              <button
+                onClick={() => {
+                  onNavigate("features");
+                  if (isMobile) {
+                    onClose();
+                  }
+                }}
+                onMouseEnter={() => {
+                  if (onPreload) {
+                    onPreload("features");
+                  }
+                }}
+                onTouchStart={() => {
+                  if (onPreload) {
+                    onPreload("features");
+                  }
+                }}
+                className={cn(
+                  "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
+                  active === "features"
+                    ? "bg-[#081C3A] text-white shadow-sm"
+                    : "text-slate-600 hover:bg-slate-100",
+                )}
+              >
+                <span className="w-[18px] h-[18px] rounded bg-[#D4A017] text-white text-[10px] flex items-center justify-center font-bold">
+                  ★
+                </span>
+                <span>Future Features</span>
+              </button>
+            )}
           </>
         )}
       </div>
