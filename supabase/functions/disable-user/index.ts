@@ -119,9 +119,24 @@ serve(async (req) => {
     // Business-continuity guard, preserved from the prior (broken)
     // deleteUser()'s own "cannot delete the last admin" check, generalized
     // to cover both a legacy Admin (role_level = 1) and a new functional
-    // Admin (role = 'admin') account, plus super admins.
-    const targetIsAdminClass =
-      target.is_super_admin === true || target.role === 'admin' || target.role_level === 1;
+    // Admin (role = 'admin') account.
+    //
+    // ALIGNED (this pass): is_super_admin is deliberately NOT part of this
+    // definition. Business Admin and Super Admin are separate concepts
+    // throughout this schema (is_business_admin() vs is_super_admin(),
+    // never folded together) -- a profile that is ONLY is_super_admin=true
+    // (no role='admin', no role_level=1) is not this TENANT's local admin,
+    // and counting it here would be a false sense of coverage: if that
+    // Super Admin is later removed, the tenant could be left with zero
+    // real local admins with nothing having caught it. This now matches
+    // the authoritative definition enforced at the database level by
+    // prevent_profile_privilege_escalation()'s last-Admin invariant
+    // (20260822000000_functional_user_edit_rpc.sql) -- THAT trigger is
+    // what actually prevents the tenant from reaching zero admins,
+    // atomically and for every write path, including this one; the check
+    // below is only a friendly, non-authoritative pre-check for a clearer
+    // error message in the common (non-racing) case.
+    const targetIsAdminClass = target.role === 'admin' || target.role_level === 1;
 
     if (targetIsAdminClass) {
       const { count, error: countError } = await supabase
@@ -130,7 +145,7 @@ serve(async (req) => {
         .eq('tenant_id', target.tenant_id)
         .eq('is_active', true)
         .is('deleted_at', null)
-        .or('is_super_admin.eq.true,role.eq.admin,role_level.eq.1');
+        .or('role.eq.admin,role_level.eq.1');
 
       if (countError) {
         return json({ error: 'Failed to verify remaining admins: ' + countError.message }, 500);
