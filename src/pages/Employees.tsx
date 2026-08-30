@@ -16,6 +16,7 @@ import { toCsvRow } from '../utils/csvExport';
 import { generateEmployeeNumberServerSide } from '../utils/employeeNumberGeneration';
 import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
+import { checkEmployeeIdentifierConflicts, formatIdentifierConflictMessage, identifierColumnFromUniqueViolation } from '../utils/employeeConflicts';
 
 interface Employee {
   id: string;
@@ -529,37 +530,6 @@ export function EmployeesPage() {
     }
   }, [userProfile, filterRegionId, debouncedFilterCompany, debouncedFilterWorkstation, filterPayPoint]);
 
-  // ===== CHECK DUPLICATES =====
-  // National ID, phone, and bank account/mobile money number are the three
-  // "must never collide" fields across the whole employee base (soon to be
-  // ~2000 records) -- checked against active (non-deleted) employees only, so
-  // a soft-deleted record's old details never blocks reusing them.
-  const checkDuplicates = useCallback(async (nationalId: string, phone: string, accountNumber: string, employeeId?: string) => {
-    // Independent lookups -- run in parallel instead of three sequential
-    // round trips, which also cuts the window where a network blip during
-    // this step can turn into a "Failed to fetch" partway through adding an
-    // employee.
-    const buildQuery = (column: string, value: string) => {
-      let query = supabase.from('employees').select('id').eq(column, value).eq('is_deleted', false);
-      if (employeeId) {
-        query = query.neq('id', employeeId);
-      }
-      return query;
-    };
-
-    const [nationalIdResult, phoneResult, accountResult] = await Promise.all([
-      nationalId ? buildQuery('national_id', nationalId) : Promise.resolve({ data: [] as { id: string }[] }),
-      phone ? buildQuery('phone', phone) : Promise.resolve({ data: [] as { id: string }[] }),
-      accountNumber ? buildQuery('account_number', accountNumber) : Promise.resolve({ data: [] as { id: string }[] }),
-    ]);
-
-    return {
-      nationalIdExists: !!(nationalIdResult.data && nationalIdResult.data.length > 0),
-      phoneExists: !!(phoneResult.data && phoneResult.data.length > 0),
-      accountExists: !!(accountResult.data && accountResult.data.length > 0),
-    };
-  }, []);
-
   // Same region-prefix + last-number-plus-one logic AddEmployeeForm uses to
   // show a live preview after picking a region -- extracted here so
   // addEmployee can call it again, with a fresh read, whenever the number it
@@ -600,20 +570,14 @@ export function EmployeesPage() {
       return;
     }
 
-    const { nationalIdExists, phoneExists, accountExists } = await checkDuplicates(safeEmp.nationalId, safeEmp.phone, safeEmp.account_number);
+    const identifierConflicts = await checkEmployeeIdentifierConflicts({
+      nationalId: safeEmp.nationalId,
+      phone: safeEmp.phone,
+      accountNumber: safeEmp.account_number,
+    });
 
-    if (nationalIdExists) {
-      showNotification(`National ID ${safeEmp.nationalId} is already in use by another employee!`, 'error');
-      return;
-    }
-
-    if (phoneExists) {
-      showNotification(`Phone number ${safeEmp.phone} is already in use by another employee!`, 'error');
-      return;
-    }
-
-    if (accountExists) {
-      showNotification(`Account number ${safeEmp.account_number} is already in use by another employee!`, 'error');
+    if (identifierConflicts.length > 0) {
+      showNotification(formatIdentifierConflictMessage(identifierConflicts), 'error');
       return;
     }
 
@@ -718,9 +682,30 @@ export function EmployeesPage() {
       // everything the admin just typed, forcing them to redo the whole
       // form after a failure that (thanks to the retries above) is now
       // rarely their fault to begin with.
-      const message = error.isNetworkError
+      let message = error.isNetworkError
         ? 'Network error while adding employee. Please check your connection and try again.'
         : 'Error adding employee: ' + getErrorMessage(error);
+
+      // Defensive, forward-compatible handling for a genuine DB-level
+      // unique violation on national_id/phone/account_number -- see
+      // identifierColumnFromUniqueViolation()'s own comment for why this is
+      // currently unreachable in production (no such constraint exists yet,
+      // confirmed against the schema) but must not silently fall back to
+      // the raw Postgres message if a constraint is ever added.
+      if (!error.isNetworkError && error.code === '23505') {
+        const column = identifierColumnFromUniqueViolation(error);
+        if (column) {
+          const conflicts = await checkEmployeeIdentifierConflicts({
+            nationalId: column === 'national_id' ? safeEmp.nationalId : null,
+            phone: column === 'phone' ? safeEmp.phone : null,
+            accountNumber: column === 'account_number' ? safeEmp.account_number : null,
+          });
+          if (conflicts.length > 0) {
+            message = formatIdentifierConflictMessage(conflicts);
+          }
+        }
+      }
+
       showNotification(message, 'error');
       return;
     } else if (insertedId) {
@@ -788,7 +773,7 @@ export function EmployeesPage() {
       showNotification(`${safeEmp.fullName} has been added`, 'success');
     }
     setShowAdd(false);
-  }, [userProfile, employees, checkDuplicates, getNextEmployeeNumberForRegion]);
+  }, [userProfile, employees, getNextEmployeeNumberForRegion]);
 
   // ===== UPDATE EMPLOYEE =====
   const updateEmployee = useCallback(async (emp: EmployeeFormData) => {
@@ -815,20 +800,17 @@ export function EmployeesPage() {
       next_of_kin_address: sanitizeInput(emp.next_of_kin_address),
     };
     
-    const { nationalIdExists, phoneExists, accountExists } = await checkDuplicates(safeEmp.nationalId, safeEmp.phone, safeEmp.account_number, editingEmployee.id);
+    // editingEmployee.id is excluded so the employee's own unchanged
+    // National ID/Phone/Account Number is never reported as a conflict
+    // with itself.
+    const identifierConflicts = await checkEmployeeIdentifierConflicts({
+      nationalId: safeEmp.nationalId,
+      phone: safeEmp.phone,
+      accountNumber: safeEmp.account_number,
+    }, editingEmployee.id);
 
-    if (nationalIdExists) {
-      showNotification(`National ID ${safeEmp.nationalId} is already in use by another employee!`, 'error');
-      return;
-    }
-
-    if (phoneExists) {
-      showNotification(`Phone number ${safeEmp.phone} is already in use by another employee!`, 'error');
-      return;
-    }
-
-    if (accountExists) {
-      showNotification(`Account number ${safeEmp.account_number} is already in use by another employee!`, 'error');
+    if (identifierConflicts.length > 0) {
+      showNotification(formatIdentifierConflictMessage(identifierConflicts), 'error');
       return;
     }
 
@@ -881,7 +863,27 @@ export function EmployeesPage() {
 
     if (error) {
       // Leave the modal open on failure so the admin's edits aren't discarded.
-      showNotification('Error updating employee: ' + getErrorMessage(error), 'error');
+      let message = 'Error updating employee: ' + getErrorMessage(error);
+
+      // Defensive, forward-compatible handling -- see the matching comment
+      // in addEmployee() and identifierColumnFromUniqueViolation() for why
+      // this cannot fire for national_id/phone/account_number today (no
+      // DB-level unique constraint exists on them yet).
+      if (error.code === '23505') {
+        const column = identifierColumnFromUniqueViolation(error);
+        if (column) {
+          const conflicts = await checkEmployeeIdentifierConflicts({
+            nationalId: column === 'national_id' ? safeEmp.nationalId : null,
+            phone: column === 'phone' ? safeEmp.phone : null,
+            accountNumber: column === 'account_number' ? safeEmp.account_number : null,
+          }, editingEmployee.id);
+          if (conflicts.length > 0) {
+            message = formatIdentifierConflictMessage(conflicts);
+          }
+        }
+      }
+
+      showNotification(message, 'error');
       return;
     } else if (updateResult && updateResult[0]) {
       // Fetch the complete non-sensitive row through employees_general --
@@ -954,7 +956,7 @@ export function EmployeesPage() {
     }
     setShowEdit(false);
     setEditingEmployee(null);
-  }, [editingEmployee, employees, checkDuplicates]);
+  }, [editingEmployee, employees]);
 
   // ===== DELETE EMPLOYEE =====
   const handleDelete = useCallback(async (employee: Employee) => {

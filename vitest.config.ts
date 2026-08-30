@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { defineConfig, configDefaults } from 'vitest/config';
 import path from 'path';
 
 // Separate from vite.config.ts deliberately: vite.config.ts is the
@@ -14,6 +14,13 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+    // src/tests/auth.test.ts (a legacy manual smoke-test script with
+    // hardcoded live credentials, no describe/it blocks, requiring a real
+    // Supabase session) was already removed from this branch's own history
+    // -- this exclude is a defensive no-op today, kept so the file can
+    // never accidentally get picked up as a test again if it's ever
+    // reintroduced by a future merge from main.
+    exclude: [...configDefaults.exclude, 'src/tests/auth.test.ts'],
     // src/lib/supabase.ts throws at import time if these are unset, and
     // several otherwise-pure utility modules (e.g. payrollSettings.ts,
     // for its DB-backed getPayrollRates()) import it transitively even
