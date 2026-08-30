@@ -42,6 +42,8 @@ export const PERMISSIONS = {
   REPORTS_OPERATIONAL_VIEW: 'reports.operational.view',
   REPORTS_OPERATIONAL_EXPORT: 'reports.operational.export',
   ATTENDANCE_VIEW: 'attendance.view',
+  ATTENDANCE_CREATE: 'attendance.create',
+  ATTENDANCE_EDIT: 'attendance.edit',
   USER_MANUAL_VIEW: 'user_manual.view',
   FUTURE_FEATURES_VIEW: 'future_features.view',
 } as const;

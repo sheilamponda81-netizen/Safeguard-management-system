@@ -18,6 +18,7 @@ import { getErrorMessage } from '../utils/errorHandler';
 import { toCsvRow } from '../utils/csvExport';
 import { calculateAttendanceDeductions } from '../utils/attendanceDeductions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
+import { resolveAttendanceWritePermissions } from '../utils/attendancePermissions';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -526,15 +527,21 @@ export function AttendancePage() {
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [updating, setUpdating] = useState<Record<string, boolean>>({});
-  // Permission-driven action gating (correction round 2, item 6) -- every
-  // legacy account that could ever reach this page (role_level 1/2/3 --
-  // role_level 4/Staff never had "attendance" in its nav map, see
-  // App.tsx's rolePages) keeps exactly its existing write access,
-  // unchanged. The new operations_manager role has attendance.view ONLY
-  // (no attendance.create/edit), matching "Operations on Attendance: no
-  // marking/edit/save controls" -- read-only. HR Manager/Accountant never
-  // reach this page at all (no attendance.view permission).
-  const [canEditAttendance, setCanEditAttendance] = useState(true);
+  // Permission-driven action gating (revised: create/edit resolved
+  // separately, fail-closed, and functional roles ask the real permission
+  // system instead of a role_level-presence check). A single grid click
+  // can result in either an INSERT (no record yet for that day) or an
+  // UPDATE (a record already exists) -- see processSingleUpdate below --
+  // and the backend gates those independently
+  // (has_permission('attendance.create') / has_permission('attendance.edit')
+  // in supabase/migrations/20260817000002_functional_roles_indirect_region_tables.sql),
+  // so the combined `canModifyAttendance` below requires BOTH. Both
+  // default to false (fail-closed) until resolution completes.
+  const [canCreateAttendance, setCanCreateAttendance] = useState(false);
+  const [canEditAttendance, setCanEditAttendance] = useState(false);
+  // Combined gate for the click-to-cycle grid -- a cell may go either way,
+  // so both permissions are required for the interaction to be safe.
+  const canModifyAttendance = canCreateAttendance && canEditAttendance;
   // Attendance deduction rates -- shared, admin-configurable via Settings ->
   // System (see payrollSettings.ts), instead of the fixed constant these used
   // to be. Payroll.tsx/Payslips.tsx read the same source for the figures they
@@ -577,15 +584,21 @@ export function AttendancePage() {
 
   // ===== FETCH USER PROFILE =====
   const fetchUserProfile = useCallback(async () => {
+    // Fail closed at the start of every resolution pass -- never leave a
+    // stale true from a previous profile/user context visible while the
+    // current one is still being resolved.
+    setCanCreateAttendance(false);
+    setCanEditAttendance(false);
+
     const profile = await getCurrentProfile();
     setUserProfile(profile);
-    // No functional role has attendance.create/attendance.edit in the
-    // seeded matrix -- only a legacy account (role_level <= 3, enforced
-    // server-side by the RLS on `attendance`/`employee_deductions`) may
-    // write here. operations_manager (attendance.view only) is
-    // structurally excluded by role_level being NULL, matching the
-    // backend exactly -- there is no permission key to OR in here.
-    setCanEditAttendance((profile?.role_level ?? null) !== null);
+
+    // resolveAttendanceWritePermissions() already fails closed internally
+    // (an error there returns both false, never throws) -- so whatever it
+    // returns is always safe to apply directly.
+    const permissions = await resolveAttendanceWritePermissions(profile);
+    setCanCreateAttendance(permissions.canCreateAttendance);
+    setCanEditAttendance(permissions.canEditAttendance);
   }, []);
 
   // ===== FETCH DATA =====
@@ -763,12 +776,23 @@ export function AttendancePage() {
 
   // ===== OPTIMIZED: UPDATE ATTENDANCE WITH OPTIMISTIC UI =====
   const updateAttendance = useCallback(async (employeeId: string, date: string, currentStatus: string) => {
+    // Defense-in-depth: the grid's own click handler already gates on
+    // canModifyAttendance before ever calling this function, but this
+    // guard means no INSERT/UPDATE request can be issued from here even
+    // if some future call site forgets that check -- backend RLS is the
+    // real authorization boundary regardless, but a read-only viewer
+    // should never even have a request attempted.
+    if (!canModifyAttendance) {
+      showNotification('You do not have permission to edit attendance.', 'error');
+      return;
+    }
+
     const employee = employees.find(e => e.id === employeeId);
     if (!userProfile?.is_super_admin && employee?.region_id !== userProfile?.region_id) {
       showNotification('You can only edit attendance for employees in your region', 'error');
       return;
     }
-    
+
     if (selectedMonth !== systemMonth) {
       showNotification('Attendance can only be edited for the current month.', 'error');
       return;
@@ -828,7 +852,7 @@ export function AttendancePage() {
         return newState;
       });
     }
-  }, [employees, userProfile, selectedMonth, systemMonth, updating, processUpdateQueue]);
+  }, [canModifyAttendance, employees, userProfile, selectedMonth, systemMonth, updating, processUpdateQueue]);
 
   // ===== DEBOUNCED UPDATE (per cell) =====
   // A single shared debounce instance (as this used to be, memoized on
@@ -1179,7 +1203,9 @@ export function AttendancePage() {
         <div className="flex flex-wrap items-center gap-4 text-xs">
           {Object.keys(statusColors).filter(k => k !== '-').map(k => (<div key={k} className="flex items-center gap-2"><span className={`w-4 h-4 rounded ${statusColors[k]}`} /><span className="text-slate-700">{statusLabels[k]}</span></div>))}
           <div className="flex items-center gap-2"><span className="w-4 h-4 rounded bg-slate-200" /><span className="text-slate-700">Weekend / Off</span></div>
-          <div className="ml-auto text-xs text-slate-400">Click on any status to change (cycles through all options)</div>
+          {canModifyAttendance && (
+            <div className="ml-auto text-xs text-slate-400">Click on any status to change (cycles through all options)</div>
+          )}
         </div>
       </Card>
 
@@ -1230,7 +1256,7 @@ export function AttendancePage() {
             <TBody>
               {paginatedEmployees.map(emp => {
                 const stats = getEmployeeStats(emp.id);
-                const isEditable = isCurrentMonth && canEditAttendance;
+                const isEditable = isCurrentMonth && canModifyAttendance;
                 return (
                   <TR key={emp.id} onClick={() => setSelectedEmployee(emp)} className="cursor-pointer">
                     <TD className="sticky left-0 bg-white z-10">
@@ -1260,7 +1286,17 @@ export function AttendancePage() {
                           if (isEditable && !isUpdating) {
                             getDebouncedUpdate(updateKey)(emp.id, date, status);
                           } else if (!isEditable) {
-                            showNotification('Attendance can only be edited for the current month.', 'info');
+                            // Preserve the month-specific message only when
+                            // the month is actually the reason -- otherwise
+                            // a permission-denied viewer (e.g. Operations
+                            // Manager) needs an accurate message, not one
+                            // that blames the selected month regardless.
+                            showNotification(
+                              !canModifyAttendance
+                                ? 'You do not have permission to edit attendance.'
+                                : 'Attendance can only be edited for the current month.',
+                              'info'
+                            );
                           }
                         }}>
                           <div className={`w-6 h-6 mx-auto rounded text-[10px] font-semibold text-white flex items-center justify-center ${!isEditable ? 'cursor-not-allowed opacity-70' : isUpdating ? 'opacity-50' : 'cursor-pointer hover:opacity-80'} transition-opacity ${statusColors[status]}`}>

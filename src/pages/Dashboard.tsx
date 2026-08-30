@@ -18,7 +18,7 @@ import {
   normalizeMonthKey
 } from '../utils/currentMonth';
 import { showNotification } from '../utils/clickHandlers';
-import { canAccess, PERMISSIONS } from '../utils/permissions';
+import { resolveDashboardPermissions } from '../utils/dashboardPermissions';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
@@ -65,19 +65,25 @@ export function Dashboard() {
   const [refreshing, setRefreshing] = useState(false);
 
   // ===== PERMISSION-AWARE DASHBOARD SECTIONS =====
+  // Fail-closed by design: every flag starts false, and stays false unless
+  // permission resolution actually succeeds and grants it. `permissionsResolved`
+  // gates the FIRST dashboard fetch entirely (see the effect below) so no
+  // module's data is ever requested before its own flag is known -- not
+  // "requested but safely returns empty," genuinely never requested.
   // Legacy accounts (role_level set) see EXACTLY what they always have --
   // payroll/attendance SELECT has been "legacy-open" (any role_level) on
   // these two tables since before this rollout, so canAccess(true, ...)
   // short-circuits true for every legacy role, unchanged. A NEW
   // functional-role account is gated: Payroll data needs payroll.view
   // (Admin/Accountant only); Attendance needs attendance.view (Admin/
-  // Operations Manager only); Recruitment counts are already fully
-  // permission-aware server-side via get_applicant_dashboard_counts()
-  // (20260817000003) -- this flag only controls whether the STAT CARD
-  // itself is shown, not the data's own authorization.
-  const [canViewPayroll, setCanViewPayroll] = useState(true);
-  const [canViewAttendance, setCanViewAttendance] = useState(true);
-  const [canViewRecruitment, setCanViewRecruitment] = useState(true);
+  // Operations Manager only); Recruitment counts need recruitment.view
+  // (Admin/HR Manager only) -- these flags now control BOTH whether the
+  // stat card is shown AND whether the underlying fetch/RPC call is made
+  // at all.
+  const [canViewPayroll, setCanViewPayroll] = useState(false);
+  const [canViewAttendance, setCanViewAttendance] = useState(false);
+  const [canViewRecruitment, setCanViewRecruitment] = useState(false);
+  const [permissionsResolved, setPermissionsResolved] = useState(false);
   
   // ===== PERFORMANCE: Track chart loading state =====
   const [chartModules, setChartModules] = useState<any>(null);
@@ -180,17 +186,33 @@ export function Dashboard() {
 
   useEffect(() => {
     const getUserInfo = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const profile = await getCurrentProfile();
-        setUserProfile(profile);
-        const name = profile?.full_name || user.email?.split('@')[0] || 'User';
-        setUserName(name);
+      // Reset to the fail-closed state at the start of every resolution
+      // pass (not just on first mount) -- if this effect is ever re-run
+      // for a new user/profile context, stale flags from a PREVIOUS
+      // caller must never remain visible while the new caller's real
+      // permissions are still being resolved.
+      setPermissionsResolved(false);
+      setCanViewPayroll(false);
+      setCanViewAttendance(false);
+      setCanViewRecruitment(false);
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user) {
+          const profile = await getCurrentProfile();
+          setUserProfile(profile);
+          const name = profile?.full_name || user.email?.split('@')[0] || 'User';
+          setUserName(name);
 
-        const isLegacy = (profile?.role_level ?? null) !== null;
-        setCanViewPayroll(await canAccess(isLegacy, PERMISSIONS.PAYROLL_VIEW));
-        setCanViewAttendance(await canAccess(isLegacy, PERMISSIONS.ATTENDANCE_VIEW));
-        setCanViewRecruitment(await canAccess(isLegacy, PERMISSIONS.RECRUITMENT_VIEW));
+          // resolveDashboardPermissions() already fails closed internally
+          // (an error there returns all-false, never throws) -- so
+          // whatever it returns is always safe to apply directly.
+          const permissions = await resolveDashboardPermissions(profile);
+          setCanViewPayroll(permissions.canViewPayroll);
+          setCanViewAttendance(permissions.canViewAttendance);
+          setCanViewRecruitment(permissions.canViewRecruitment);
+        }
+      } finally {
+        setPermissionsResolved(true);
       }
     };
     getUserInfo();
@@ -268,6 +290,8 @@ export function Dashboard() {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
       }
       
+      const employeesRes = await employeesQuery;
+
       // Applicant counts come from a counts-only RPC, not a direct
       // `applicants` SELECT -- Supervisor/Staff (role_level 3/4) are
       // still meant to see these numbers on the Dashboard, but as of
@@ -275,26 +299,30 @@ export function Dashboard() {
       // rows directly (see 20260803000000_role_level_rls_hardening.sql
       // and 20260804000002_applicant_dashboard_counts_rpc.sql). The RPC
       // is SECURITY DEFINER and does its own tenant scoping server-side,
-      // so it works identically regardless of the caller's role_level.
-      const [employeesRes, countsRes] = await Promise.all([
-        employeesQuery,
-        supabase.rpc('get_applicant_dashboard_counts').single(),
-      ]);
-
-      if (countsRes.error) {
-        // Fails closed to zero rather than throwing -- a missing/errored
-        // RPC (e.g. this migration not yet applied in an environment)
-        // should degrade the recruitment stat tile, not the whole
-        // Dashboard, and must never fall back to a direct `applicants`
-        // row query (that would defeat the point of this change).
-        console.error('Error fetching applicant dashboard counts:', countsRes.error);
+      // so it works identically regardless of the caller's role_level --
+      // but it is only ever CALLED when canViewRecruitment is already
+      // known true. A caller without recruitment.view must not merely
+      // receive a safe zero response; the request itself must never be
+      // made (permission-aware fetching, not just permission-aware data).
+      let applicantCounts: ApplicantDashboardCounts | null = null;
+      if (canViewRecruitment) {
+        const { data, error } = await supabase.rpc('get_applicant_dashboard_counts').single();
+        if (error) {
+          // Fails closed to zero rather than throwing -- an errored RPC
+          // call (e.g. a transient network issue) should degrade the
+          // recruitment stat tile, not the whole Dashboard, and must
+          // never fall back to a direct `applicants` row query (that
+          // would defeat the point of this change).
+          console.error('Error fetching applicant dashboard counts:', error);
+        } else {
+          // No generated Supabase types exist in this project (see
+          // AUDIT_REPORT.md), so `.rpc(...)` has nothing to infer the
+          // return shape from -- cast explicitly to the 3-integer shape
+          // get_applicant_dashboard_counts() actually returns, matching
+          // the pattern already used for process_payroll_batch()'s result.
+          applicantCounts = data as ApplicantDashboardCounts | null;
+        }
       }
-      // No generated Supabase types exist in this project (see
-      // AUDIT_REPORT.md), so `.rpc(...)` has nothing to infer the return
-      // shape from -- cast explicitly to the 3-integer shape
-      // get_applicant_dashboard_counts() actually returns, matching the
-      // pattern already used for process_payroll_batch()'s result.
-      const applicantCounts = countsRes.data as ApplicantDashboardCounts | null;
 
       const employeesData = employeesRes.data || [];
       const employeeIds = employeesData.map((e: any) => e.id);
@@ -542,13 +570,18 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance]);
+  }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance, canViewRecruitment]);
 
   useEffect(() => {
-    if (userProfile && selectedMonth) {
+    // permissionsResolved is required here, not just userProfile/selectedMonth
+    // -- otherwise the first fetch could run while canViewPayroll/
+    // canViewAttendance/canViewRecruitment still hold their fail-closed
+    // defaults, which happen to be false-negative-safe but would still
+    // mean the fetch ran before permissions were actually known.
+    if (userProfile && selectedMonth && permissionsResolved) {
       fetchDashboardData();
     }
-  }, [userProfile, selectedMonth, fetchDashboardData]);
+  }, [userProfile, selectedMonth, permissionsResolved, fetchDashboardData]);
 
   const refreshData = useCallback(async () => {
     setRefreshing(true);
