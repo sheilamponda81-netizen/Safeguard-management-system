@@ -14,7 +14,7 @@ import { debounce } from '../utils/debounce';
 import { getPayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
-import { deriveCompanyOptions, deriveSiteOptions, filterAttendanceEmployees } from '../utils/attendanceFilters';
+import { filterAttendanceEmployees } from '../utils/attendanceFilters';
 
 const statusColors: Record<string, string> = {
   P: 'bg-emerald-500', 
@@ -85,10 +85,11 @@ export function AttendancePage() {
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  // Company/Site filters -- UI/read-only: they narrow which already-fetched
-  // `employees` rows are displayed via filteredEmployees below, and never
-  // change what's fetched or written. Site is cleared whenever Company
-  // changes so a stale site pick from a different company can't linger.
+  // Company/Resident and Site/Workstation free-text filters -- UI/read-only:
+  // they narrow which already-fetched `employees` rows are displayed via
+  // filteredEmployees below, and never change what's fetched or written.
+  // Independent text filters (not a dependent select pair), so neither one
+  // resets the other.
   const [filterCompany, setFilterCompany] = useState('');
   const [filterSite, setFilterSite] = useState('');
   const [selectedMonth, setSelectedMonth] = useState('');
@@ -518,16 +519,12 @@ export function AttendancePage() {
     };
   }, [attendanceByEmployee, selectedMonth, getDatesForMonth, getAttendanceStatus, deductionRates]);
 
-  // ===== COMPANY / SITE FILTER OPTIONS =====
-  // Derived client-side from the already-fetched `employees` list -- no
-  // extra query. See src/utils/attendanceFilters.ts for the (unit-tested)
-  // pure logic.
-  const companyOptions = useMemo(() => deriveCompanyOptions(employees), [employees]);
-  const siteOptions = useMemo(() => deriveSiteOptions(employees, filterCompany), [employees, filterCompany]);
-
   // ===== FILTER EMPLOYEES =====
+  // Company/Site are free-text partial, case-insensitive matches against
+  // the already-fetched `employees` list -- no extra query. See
+  // src/utils/attendanceFilters.ts for the (unit-tested) pure logic.
   const filteredEmployees = useMemo(
-    () => filterAttendanceEmployees(employees, { search: sanitizeInput(search), company: filterCompany, site: filterSite }),
+    () => filterAttendanceEmployees(employees, { search: sanitizeInput(search), company: sanitizeInput(filterCompany), site: sanitizeInput(filterSite) }),
     [employees, search, filterCompany, filterSite]
   );
 
@@ -1184,26 +1181,30 @@ export function AttendancePage() {
             className="w-full pl-10 pr-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
           />
         </div>
-        <select
-          id="filterCompanyAttendance"
-          name="filterCompanyAttendance"
-          value={filterCompany}
-          onChange={e => { setFilterCompany(e.target.value); setFilterSite(''); }}
-          className="px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
-        >
-          <option value="">All Companies</option>
-          {companyOptions.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
-        <select
-          id="filterSiteAttendance"
-          name="filterSiteAttendance"
-          value={filterSite}
-          onChange={e => setFilterSite(e.target.value)}
-          className="px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
-        >
-          <option value="">All Sites</option>
-          {siteOptions.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <div className="relative flex-1">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            id="filterCompanyAttendance"
+            name="filterCompanyAttendance"
+            type="text"
+            value={filterCompany}
+            onChange={e => setFilterCompany(sanitizeInput(e.target.value))}
+            placeholder="Search company/resident..."
+            className="w-full pl-10 pr-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
+        <div className="relative flex-1">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            id="filterSiteAttendance"
+            name="filterSiteAttendance"
+            type="text"
+            value={filterSite}
+            onChange={e => setFilterSite(sanitizeInput(e.target.value))}
+            placeholder="Search site/workstation..."
+            className="w-full pl-10 pr-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+          />
+        </div>
         <div className="text-sm text-slate-500">{filteredEmployees.length} employees</div>
         {!isCurrentMonth && (
           <Badge color={isFutureMonthSelected ? 'blue' : 'amber'} className="text-xs">

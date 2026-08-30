@@ -1,75 +1,116 @@
 import { describe, it, expect } from 'vitest';
-import { deriveCompanyOptions, deriveSiteOptions, filterAttendanceEmployees } from './attendanceFilters';
+import { filterAttendanceEmployees } from './attendanceFilters';
 
 const employees = [
-  { full_name: 'John Banda', employee_number: 'SFG-S-001', company: 'ACME LTD', workstation: 'Site X' },
+  { full_name: 'John Banda', employee_number: 'SFG-S-001', company: 'ACME LTD', workstation: 'Site X - Chichiri' },
   { full_name: 'Mary Phiri', employee_number: 'SFG-S-002', company: 'ACME LTD', workstation: 'Site Y' },
-  { full_name: 'Grace Tembo', employee_number: 'SFG-S-003', company: 'BETA CO', workstation: 'Site Z' },
+  { full_name: 'Grace Tembo', employee_number: 'SFG-S-003', company: 'BATA SHOE COMPANY', workstation: 'Site Z' },
   { full_name: 'Peter Zulu', employee_number: 'SFG-S-004', company: null, workstation: '' },
+  { full_name: 'Ruth Mvula', employee_number: 'SFG-S-005', company: undefined as string | null | undefined, workstation: undefined as string | null | undefined },
 ];
 
-describe('deriveCompanyOptions', () => {
-  it('returns distinct, sorted, non-blank company names', () => {
-    expect(deriveCompanyOptions(employees)).toEqual(['ACME LTD', 'BETA CO']);
-  });
-
-  it('returns an empty list when no employee has a company on record', () => {
-    expect(deriveCompanyOptions([{ full_name: 'X', employee_number: '1', company: null, workstation: null }])).toEqual([]);
-  });
-});
-
-describe('deriveSiteOptions', () => {
-  it('lists every distinct site when no company is selected', () => {
-    expect(deriveSiteOptions(employees, '')).toEqual(['Site X', 'Site Y', 'Site Z']);
-  });
-
-  it('narrows sites to the selected company', () => {
-    expect(deriveSiteOptions(employees, 'ACME LTD')).toEqual(['Site X', 'Site Y']);
-    expect(deriveSiteOptions(employees, 'BETA CO')).toEqual(['Site Z']);
-  });
-
-  it('returns an empty list for a company with no recorded workstations', () => {
-    expect(deriveSiteOptions([{ full_name: 'X', employee_number: '1', company: 'EMPTY CO', workstation: null }], 'EMPTY CO')).toEqual([]);
-  });
-});
-
 describe('filterAttendanceEmployees', () => {
-  it('matches by name, case-insensitively', () => {
-    const result = filterAttendanceEmployees(employees, { search: 'mary', company: '', site: '' });
-    expect(result.map(e => e.full_name)).toEqual(['Mary Phiri']);
+  describe('existing employee search behavior (name/employee number)', () => {
+    it('matches by name, case-insensitively', () => {
+      const result = filterAttendanceEmployees(employees, { search: 'mary', company: '', site: '' });
+      expect(result.map(e => e.full_name)).toEqual(['Mary Phiri']);
+    });
+
+    it('matches by employee number', () => {
+      const result = filterAttendanceEmployees(employees, { search: 'SFG-S-003', company: '', site: '' });
+      expect(result.map(e => e.full_name)).toEqual(['Grace Tembo']);
+    });
+
+    it('returns everyone when all filters are empty', () => {
+      expect(filterAttendanceEmployees(employees, { search: '', company: '', site: '' })).toHaveLength(5);
+    });
+
+    it('never mutates the input array', () => {
+      const copy = [...employees];
+      filterAttendanceEmployees(employees, { search: 'mary', company: 'ACME', site: 'Site Y' });
+      expect(employees).toEqual(copy);
+    });
   });
 
-  it('matches by employee number', () => {
-    const result = filterAttendanceEmployees(employees, { search: 'SFG-S-003', company: '', site: '' });
-    expect(result.map(e => e.full_name)).toEqual(['Grace Tembo']);
+  describe('company/resident search', () => {
+    it('matches a partial company substring', () => {
+      const result = filterAttendanceEmployees(employees, { search: '', company: 'Bata', site: '' });
+      expect(result.map(e => e.full_name)).toEqual(['Grace Tembo']);
+    });
+
+    it('is case-insensitive', () => {
+      const lower = filterAttendanceEmployees(employees, { search: '', company: 'acme', site: '' });
+      const upper = filterAttendanceEmployees(employees, { search: '', company: 'ACME', site: '' });
+      const mixed = filterAttendanceEmployees(employees, { search: '', company: 'AcMe', site: '' });
+      expect(lower.map(e => e.full_name)).toEqual(['John Banda', 'Mary Phiri']);
+      expect(upper).toEqual(lower);
+      expect(mixed).toEqual(lower);
+    });
+
+    it('blank company search means all companies/residents', () => {
+      expect(filterAttendanceEmployees(employees, { search: '', company: '', site: '' })).toHaveLength(5);
+      expect(filterAttendanceEmployees(employees, { search: '', company: '   ', site: '' })).toHaveLength(5);
+    });
+
+    it('does not crash and simply excludes employees with a null/blank company when a company filter is active', () => {
+      expect(() => filterAttendanceEmployees(employees, { search: '', company: 'acme', site: '' })).not.toThrow();
+      const result = filterAttendanceEmployees(employees, { search: '', company: 'acme', site: '' });
+      expect(result.map(e => e.full_name)).not.toContain('Peter Zulu');
+      expect(result.map(e => e.full_name)).not.toContain('Ruth Mvula');
+    });
   });
 
-  it('filters by company alone', () => {
-    const result = filterAttendanceEmployees(employees, { search: '', company: 'ACME LTD', site: '' });
-    expect(result.map(e => e.full_name)).toEqual(['John Banda', 'Mary Phiri']);
+  describe('site/workstation search', () => {
+    it('matches a partial site substring', () => {
+      const result = filterAttendanceEmployees(employees, { search: '', company: '', site: 'Chichiri' });
+      expect(result.map(e => e.full_name)).toEqual(['John Banda']);
+    });
+
+    it('is case-insensitive', () => {
+      const lower = filterAttendanceEmployees(employees, { search: '', company: '', site: 'chichiri' });
+      const upper = filterAttendanceEmployees(employees, { search: '', company: '', site: 'CHICHIRI' });
+      expect(lower.map(e => e.full_name)).toEqual(['John Banda']);
+      expect(upper).toEqual(lower);
+    });
+
+    it('blank site search means all sites', () => {
+      expect(filterAttendanceEmployees(employees, { search: '', company: '', site: '' })).toHaveLength(5);
+      expect(filterAttendanceEmployees(employees, { search: '', company: '', site: '   ' })).toHaveLength(5);
+    });
+
+    it('does not crash and simply excludes employees with a null/blank workstation when a site filter is active', () => {
+      expect(() => filterAttendanceEmployees(employees, { search: '', company: '', site: 'site' })).not.toThrow();
+      const result = filterAttendanceEmployees(employees, { search: '', company: '', site: 'site' });
+      expect(result.map(e => e.full_name)).not.toContain('Peter Zulu');
+      expect(result.map(e => e.full_name)).not.toContain('Ruth Mvula');
+    });
   });
 
-  it('filters by site alone', () => {
-    const result = filterAttendanceEmployees(employees, { search: '', company: '', site: 'Site Z' });
-    expect(result.map(e => e.full_name)).toEqual(['Grace Tembo']);
+  describe('combined filtering (AND, not OR)', () => {
+    it('combines employee search with company search', () => {
+      const result = filterAttendanceEmployees(employees, { search: 'john', company: 'acme', site: '' });
+      expect(result.map(e => e.full_name)).toEqual(['John Banda']);
+
+      const excluded = filterAttendanceEmployees(employees, { search: 'grace', company: 'acme', site: '' });
+      expect(excluded).toEqual([]);
+    });
+
+    it('combines employee search, company search, and site search', () => {
+      const result = filterAttendanceEmployees(employees, { search: 'john', company: 'acme', site: 'chichiri' });
+      expect(result.map(e => e.full_name)).toEqual(['John Banda']);
+
+      // Same search + same company, but a site substring that doesn't match -- must exclude.
+      const excluded = filterAttendanceEmployees(employees, { search: 'john', company: 'acme', site: 'site z' });
+      expect(excluded).toEqual([]);
+    });
   });
 
-  it('combines search, company, and site filters (AND, not OR)', () => {
-    const result = filterAttendanceEmployees(employees, { search: 'john', company: 'ACME LTD', site: 'Site X' });
-    expect(result.map(e => e.full_name)).toEqual(['John Banda']);
-
-    // Same search + same company, but the wrong site -- must exclude.
-    const excluded = filterAttendanceEmployees(employees, { search: 'john', company: 'ACME LTD', site: 'Site Y' });
-    expect(excluded).toEqual([]);
-  });
-
-  it('returns everyone when all filters are empty', () => {
-    expect(filterAttendanceEmployees(employees, { search: '', company: '', site: '' })).toHaveLength(4);
-  });
-
-  it('never mutates the input array', () => {
-    const copy = [...employees];
-    filterAttendanceEmployees(employees, { search: 'mary', company: 'ACME LTD', site: 'Site Y' });
-    expect(employees).toEqual(copy);
+  it('handles a fully blank/null/undefined company and workstation without throwing, for any filter combination', () => {
+    const edgeCase = [{ full_name: 'Edge Case', employee_number: 'SFG-S-999', company: null, workstation: undefined as string | null | undefined }];
+    expect(() => filterAttendanceEmployees(edgeCase, { search: '', company: '', site: '' })).not.toThrow();
+    expect(() => filterAttendanceEmployees(edgeCase, { search: '', company: 'anything', site: '' })).not.toThrow();
+    expect(() => filterAttendanceEmployees(edgeCase, { search: '', company: '', site: 'anything' })).not.toThrow();
+    expect(filterAttendanceEmployees(edgeCase, { search: '', company: '', site: '' })).toHaveLength(1);
+    expect(filterAttendanceEmployees(edgeCase, { search: '', company: 'anything', site: '' })).toHaveLength(0);
   });
 });
