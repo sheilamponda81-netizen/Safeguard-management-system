@@ -99,6 +99,23 @@
 --     region's (or tenant's) payroll id -- and thanks to the atomicity
 --     fix above, cannot get a "partial" approval of just the ids that DO
 --     belong to them either; the whole call fails.
+--   * Tenant consistency check on the payroll row itself: for a regular
+--     Admin, the WHERE clause below requires BOTH p.tenant_id =
+--     v_tenant_id directly AND (through the joined employees row)
+--     e.tenant_id = v_tenant_id. This is deliberate belt-and-braces, not
+--     redundant -- confirmed by direct schema inspection
+--     (20260727000000_reconstructed_base_schema.sql) and an exhaustive
+--     grep across every migration for a trigger/CHECK/composite FK tying
+--     the two together: payroll.tenant_id and employees.tenant_id are
+--     each independent FKs to tenants(id), both DEFAULT
+--     get_current_tenant_id() at insert time, but with no database-
+--     enforced constraint requiring them to ever match for a given
+--     employee_id. Since this function is SECURITY DEFINER and bypasses
+--     payroll's RLS entirely, that gap cannot be treated as "effectively
+--     enforced by application behavior" -- it must be re-checked
+--     explicitly here. A super admin is unaffected: their branch below is
+--     unchanged and still trusts the supplied snapshot ids directly (after
+--     month + role checks), with no per-row tenant/region filter.
 --   * approval_status: NOT filtered on either the read or the write
 --     today -- clicking Approve/Reject unconditionally sets EVERY
 --     supplied-and-authorized payroll row to the clicked status,
@@ -212,11 +229,15 @@ BEGIN
   -- month via the row itself, but this also protects against a stale id
   -- from a different month somehow ending up in the array). A super
   -- admin's ids are trusted directly once role/month match; a regular
-  -- Admin's ids are additionally re-authorized through the linked
-  -- employee's own tenant_id/region_id. Rows that fail either check are
-  -- simply not matched by this WHERE clause -- they do not raise an
-  -- error on their own, which is exactly why the count comparison below
-  -- is required for all-or-nothing correctness.
+  -- Admin's ids are additionally re-authorized both directly against the
+  -- payroll row's own tenant_id and through the linked employee's
+  -- tenant_id/region_id -- see the "Tenant consistency check on the
+  -- payroll row itself" note above for why p.tenant_id = v_tenant_id is
+  -- required explicitly rather than assumed from the employees join
+  -- alone. Rows that fail any of these checks are simply not matched by
+  -- this WHERE clause -- they do not raise an error on their own, which
+  -- is exactly why the count comparison below is required for
+  -- all-or-nothing correctness.
   UPDATE public.payroll p
   SET approval_status = p_status,
       approved_by = v_caller_id,
@@ -227,12 +248,16 @@ BEGIN
     AND p.month = p_month
     AND (
       v_is_super
-      OR EXISTS (
-        SELECT 1
-        FROM public.employees e
-        WHERE e.id = p.employee_id
-          AND e.tenant_id = v_tenant_id
-          AND e.region_id = v_region_id
+      OR (
+        p.tenant_id = v_tenant_id
+        AND EXISTS (
+          SELECT 1
+          FROM public.employees e
+          WHERE e.id = p.employee_id
+            AND e.tenant_id = p.tenant_id
+            AND e.tenant_id = v_tenant_id
+            AND e.region_id = v_region_id
+        )
       )
     );
 
