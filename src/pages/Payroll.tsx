@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, Wallet, Calculator, Check, CheckCircle2, ChevronRight, Save, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon, UserCheck, Clock, XCircle } from 'lucide-react';
+import { Search, Wallet, Calculator, Check, CheckCircle2, ChevronRight, Save, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon, UserCheck, Clock, XCircle, FileText } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -27,6 +27,7 @@ import {
 import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { approvePayrollRun } from '../utils/payrollApproval';
+import { buildPayrollReportCsv } from '../utils/payrollExport';
 
 interface Employee {
   id: string;
@@ -38,6 +39,14 @@ interface Employee {
   status: string;
   is_deleted?: boolean;
   uniform_deduction?: number;
+  region_id?: string | null;
+  company?: string | null;
+  workstation?: string | null;
+}
+
+interface PayrollRegion {
+  id: string;
+  name: string;
 }
 
 interface AttendanceCount {
@@ -114,6 +123,11 @@ export function PayrollPage() {
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [copySourceMonths, setCopySourceMonths] = useState<string[]>([]);
+  // Region id -> name, for the Export Report's "Region" column and for
+  // scoping a historical (already-processed) month's payroll rows to a
+  // regular Admin's own region -- fetched once, same pattern as
+  // Payments.tsx's own `regions` state.
+  const [regions, setRegions] = useState<PayrollRegion[]>([]);
   const [processedMonths, setProcessedMonths] = useState<string[]>([]);
   const [processingStatus, setProcessingStatus] = useState('');
   const [canProcessPayroll, setCanProcessPayroll] = useState(false);
@@ -289,26 +303,107 @@ export function PayrollPage() {
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      let employeesQuery = supabase
-        .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id')
-        .eq('is_deleted', false)
-        .eq('status', 'Active');
+      // BROWSING an existing processed historical payroll run is a
+      // fundamentally different operation from PREPARING/PREVIEWING a
+      // current or future one, and must not share the same "start from
+      // today's roster" semantics -- see the two branches below.
+      const isHistoricalMonth = selectedMonth < systemMonth;
 
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+      let employeesData: Employee[];
+      // Set only for a historical month, where the payroll rows
+      // themselves (fetched below) are what determine `employeeIds` --
+      // resolved into the same Promise.all as the current/future branch's
+      // fresh payroll fetch, so both branches share one code path from
+      // here on.
+      let historicalPayrollPromise: Promise<PayrollRecord[]> | null = null;
+
+      if (isHistoricalMonth) {
+        // ===== A: BROWSING AN EXISTING PROCESSED HISTORICAL PAYROLL RUN =====
+        // Must show exactly what was STORED for that payroll period --
+        // never reconstructed from today's employee roster. If this
+        // branch instead started from "today's Active, region-scoped
+        // employees" (as branch B below correctly does for PREPARING a
+        // new run), a legitimate stored payroll record for someone since
+        // deactivated, soft-deleted, or moved to another region would
+        // silently disappear from view the moment their CURRENT employee
+        // record changed, even though the record itself is untouched in
+        // the database. This entire branch is read-only -- no UPDATE/
+        // INSERT/DELETE happens anywhere on this path -- so viewing a past
+        // month can never reprocess, recalculate, or mutate it.
+        const { data: rawHistoricalPayroll, error: payrollError } = await supabase
+          .from('payroll')
+          .select('*')
+          .eq('month', selectedMonth);
+        if (payrollError) throw payrollError;
+
+        const allHistoricalPayroll = dedupeById(rawHistoricalPayroll || []);
+        const historicalEmployeeIds = [...new Set(allHistoricalPayroll.map(r => r.employee_id))];
+
+        // Employee DISPLAY fields (name, number, position, region, company,
+        // workstation) as they exist TODAY -- fetched by id, with NO
+        // Active/is_deleted/region filter, so a since-changed employee
+        // record still has details to show next to their historical
+        // payroll row. This never gates which payroll rows are shown; the
+        // fetch above already determined that.
+        const historicalEmployees = historicalEmployeeIds.length > 0
+          ? await fetchInEmployeeIdBatches<Employee>(
+              historicalEmployeeIds,
+              (batch, from, to, withCount) =>
+                supabase
+                  .from('employees')
+                  .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id, company, workstation', withCount ? { count: 'exact' } : undefined)
+                  .in('id', batch)
+                  .range(from, to)
+            )
+          : [];
+        const historicalEmployeesById = new Map(historicalEmployees.map(e => [e.id, e]));
+
+        // Region scoping for a non-super-admin: payroll has no region_id
+        // column of its own, so -- same as branch B below -- this is
+        // enforced through each employee's region_id. Necessarily their
+        // CURRENT region, since this schema doesn't separately track an
+        // employee's region at the time a past payroll run happened; a
+        // regional Admin viewing history therefore sees "is this employee
+        // in my region today", the same limitation branch B already has
+        // for the current month.
+        const authorizedPayroll = (!userProfile?.is_super_admin && userProfile?.region_id)
+          ? allHistoricalPayroll.filter(r => historicalEmployeesById.get(r.employee_id)?.region_id === userProfile.region_id)
+          : allHistoricalPayroll;
+
+        const authorizedIds = new Set(authorizedPayroll.map(r => r.employee_id));
+        employeesData = historicalEmployees.filter(e => authorizedIds.has(e.id));
+        historicalPayrollPromise = Promise.resolve(authorizedPayroll);
+      } else {
+        // ===== B: PREPARING / PREVIEWING A CURRENT OR FUTURE PAYROLL RUN =====
+        // Unchanged from before: driven by today's live, Active, region-
+        // scoped roster, since this is the population payroll can actually
+        // be prepared/processed against -- there is no "stored snapshot"
+        // to browse yet for a month that hasn't been (fully) processed.
+        let employeesQuery = supabase
+          .from('employees')
+          .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id, company, workstation')
+          .eq('is_deleted', false)
+          .eq('status', 'Active');
+
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+        }
+
+        const { data: rosterData, error: empError } = await employeesQuery;
+        if (empError) throw empError;
+        employeesData = rosterData || [];
       }
 
-      const { data: employeesData, error: empError } = await employeesQuery;
-      if (empError) throw empError;
-      setEmployees(employeesData || []);
+      setEmployees(employeesData);
 
       // payroll/employee_deductions/attendance have no region_id column of
       // their own, so region scoping for a non-super-admin has to go through
       // this (already region-scoped) employee id list -- otherwise a regional
       // payroll manager would see, and could overwrite, every other region's
-      // payroll too.
-      const employeeIds = (employeesData || []).map(e => e.id);
+      // payroll too. For a historical month this is the set of employees who
+      // actually have a stored payroll row for that month (branch A above),
+      // not today's roster.
+      const employeeIds = employeesData.map(e => e.id);
 
       // ===== Live attendance-derived absent/late counts for this month =====
       const [yearStr, monthStr] = selectedMonth.split('-');
@@ -332,9 +427,13 @@ export function PayrollPage() {
       // genuinely fails, Promise.all rejects before any state is set, so no
       // partial/stale data is ever displayed -- same fail-fast guarantee as
       // the previous sequential version, just evaluated together instead of
-      // one at a time.
+      // one at a time. For a historical month the "payroll records" leg is
+      // already resolved (`historicalPayrollPromise`, from branch A above --
+      // it's what determined `employeeIds` in the first place); for a
+      // current/future month it's fetched fresh here, batched exactly as
+      // before.
       const [payrollDataRaw, deductionsDataRaw, attendanceCountRows, positionsRequiringUniformMap] = await Promise.all([
-        fetchInEmployeeIdBatches<PayrollRecord>(
+        historicalPayrollPromise ?? fetchInEmployeeIdBatches<PayrollRecord>(
           employeeIds,
           (batch, from, to, withCount) =>
             supabase
@@ -481,7 +580,7 @@ export function PayrollPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedMonth, userProfile]);
+  }, [selectedMonth, systemMonth, userProfile]);
 
   // ===== Shared payroll rates (PAYE rate/threshold, pension rate) from Settings =====
   useEffect(() => {
@@ -660,6 +759,9 @@ export function PayrollPage() {
 
       const pastMonths = months.filter(m => m < month);
       setCopySourceMonths(pastMonths);
+
+      const { data: regionsData } = await supabase.from('regions').select('id, name');
+      setRegions(regionsData || []);
 
       await fetchUserProfile();
     };
@@ -923,6 +1025,41 @@ export function PayrollPage() {
     }
   }, [canApprovePayroll, payrollRecords, selectedMonth, userProfile, approvalNotes, fetchData, fetchProcessedMonths]);
 
+  // ===== EXPORT PAYROLL REPORT =====
+  // Always exports whatever is CURRENTLY LOADED for `selectedMonth` --
+  // the month actually being viewed, never silently the live current
+  // month -- and only what fetchData() already fetched for this caller's
+  // authorized tenant/region scope (see fetchData's branch A/B above), so
+  // this can never leak another tenant's or another region's payroll.
+  // Uses the stored `payrollRecords` directly (not a live/unprocessed
+  // preview via getDisplayPayroll), since this is a report for the
+  // Accountant/Managing Director -- only figures that were actually
+  // processed and stored belong in it.
+  const exportPayrollReport = useCallback(() => {
+    const regionsById = new Map(regions.map(r => [r.id, r]));
+    const csv = buildPayrollReportCsv(selectedMonth, payrollRecords, employeesById, regionsById, deductionsByEmployee);
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `payroll_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    logAudit({
+      action: 'EXPORT',
+      entity_type: 'payroll',
+      new_data: {
+        month: selectedMonth,
+        employeeCount: payrollRecords.length,
+      },
+      region_id: userProfile?.region_id,
+    });
+
+    showNotification('Payroll report exported!', 'success');
+  }, [payrollRecords, employeesById, regions, deductionsByEmployee, selectedMonth, userProfile]);
+
   // ===== PROCESS PAYROLL =====
   const processPayroll = useCallback(async () => {
     if (!isCurrentMonth) {
@@ -1099,6 +1236,14 @@ export function PayrollPage() {
                 Jump to Current
               </button>
             )}
+
+            <Button
+              variant="secondary"
+              onClick={exportPayrollReport}
+              disabled={payrollRecords.length === 0}
+            >
+              <FileText size={16} /> Export Report
+            </Button>
 
             {canApprovePayroll && isMonthProcessed && !isApproved && isCurrentMonth && (
               <Button 
