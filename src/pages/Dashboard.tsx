@@ -83,6 +83,7 @@ export function Dashboard() {
   const [canViewPayroll, setCanViewPayroll] = useState(false);
   const [canViewAttendance, setCanViewAttendance] = useState(false);
   const [canViewRecruitment, setCanViewRecruitment] = useState(false);
+  const [canViewSecurity, setCanViewSecurity] = useState(false);
   const [permissionsResolved, setPermissionsResolved] = useState(false);
   
   // ===== PERFORMANCE: Track chart loading state =====
@@ -118,12 +119,23 @@ export function Dashboard() {
   const [initialLoad, setInitialLoad] = useState(true);
 
   // ===== MEMOIZED PENDING TASKS =====
+  // Each item is gated on the same resolveDashboardPermissions() flags
+  // already used to gate this page's own data fetches/cards, not a
+  // hardcoded role check -- a functional-role account with no access to
+  // the underlying feature (e.g. an Accountant, who has no
+  // recruitment.view or security_personnel.view) should not be shown a
+  // task pointing at a page they can't open. "Process Leave Requests" is
+  // intentionally left ungated: no leave-management feature or
+  // permission exists anywhere in this app to gate it against (confirmed
+  // by inspecting permissions.ts's full PERMISSIONS list and every page
+  // in src/pages) -- inventing one here would be a business rule this
+  // audit has no source for.
   const pendingTasks = useMemo(() => [
-    { title: 'Approve Payroll', due: 'Today', priority: 'high', icon: Wallet },
-    { title: 'Review Job Applications', due: 'Tomorrow', priority: 'medium', icon: ClipboardList },
-    { title: 'Process Leave Requests', due: '2 days', priority: 'medium', icon: Calendar },
-    { title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high', icon: Shield }
-  ], []);
+    { title: 'Approve Payroll', due: 'Today', priority: 'high', icon: Wallet, visible: canViewPayroll },
+    { title: 'Review Job Applications', due: 'Tomorrow', priority: 'medium', icon: ClipboardList, visible: canViewRecruitment },
+    { title: 'Process Leave Requests', due: '2 days', priority: 'medium', icon: Calendar, visible: true },
+    { title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high', icon: Shield, visible: canViewSecurity }
+  ].filter(task => task.visible), [canViewPayroll, canViewRecruitment, canViewSecurity]);
 
   // ===== PERFORMANCE: Lazy load charts after data is ready =====
   const loadCharts = useCallback(async () => {
@@ -210,6 +222,7 @@ export function Dashboard() {
           setCanViewPayroll(permissions.canViewPayroll);
           setCanViewAttendance(permissions.canViewAttendance);
           setCanViewRecruitment(permissions.canViewRecruitment);
+          setCanViewSecurity(permissions.canViewSecurity);
         }
       } finally {
         setPermissionsResolved(true);
@@ -980,7 +993,7 @@ export function Dashboard() {
 
         <Card className="overflow-hidden">
           <div className="flex items-center justify-between p-5 border-b border-slate-100">
-            <h3 className="font-semibold text-slate-800">Pending Tasks</h3><span className="text-xs text-slate-500">4 items</span>
+            <h3 className="font-semibold text-slate-800">Pending Tasks</h3><span className="text-xs text-slate-500">{pendingTasks.length} items</span>
           </div>
           <div className="p-3 space-y-2">
             {pendingTasks.map((t, i) => {

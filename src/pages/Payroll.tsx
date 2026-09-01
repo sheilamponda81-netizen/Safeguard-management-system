@@ -432,6 +432,42 @@ export function PayrollPage() {
       // it's what determined `employeeIds` in the first place); for a
       // current/future month it's fetched fresh here, batched exactly as
       // before.
+      //
+      // The raw `attendance` table is deliberately NOT read at all for a
+      // historical month (see the skipped leg below) -- a processed
+      // month's absent/late DAY COUNTS are already available from
+      // `employee_deductions.absent_days`/`late_days` (fetched
+      // unconditionally just below, for both branches), which is the
+      // authoritative figure `process_payroll_batch()` actually used when
+      // that payroll ran, not "whatever attendance looks like today."
+      // This isn't just a cosmetic simplification: the active `attendance`
+      // SELECT RLS policy (20260817000002_functional_roles_indirect_
+      // region_tables.sql:107-119) requires
+      // `current_user_role_level() IS NOT NULL OR has_permission('attendance.view')`
+      // -- a functional-role Accountant (role_level = NULL, no
+      // attendance.view grant in the seeded matrix) would be denied this
+      // read entirely, even though Accountant legitimately has
+      // payroll.view/payroll.process and is explicitly allowed to browse
+      // historical payroll. `employee_deductions` has no such gap for
+      // Accountant -- its own SELECT policy also accepts
+      // `has_permission('payslips.view')`, which Accountant does have.
+      // The live current/future branch below is intentionally left
+      // reading raw `attendance` unchanged: that read exists specifically
+      // so an in-progress payroll run's preview always reflects today's
+      // actual attendance without depending on Attendance.tsx's own
+      // manual per-employee "Save Deductions" step (see that file's
+      // saveDeductions()) -- switching it to employee_deductions would
+      // reintroduce exactly the staleness this design already avoids, for
+      // every role, not just Accountant. That narrower gap (a
+      // functional-role Accountant previewing the CURRENT month's payroll
+      // may see understated attendance deductions if RLS denies this read
+      // in production) is a real, pre-existing limitation, tracked as
+      // Finding A23 in AUDIT_REPORT.md rather than fixed here -- the safe
+      // fix is a narrowly-scoped SECURITY DEFINER RPC returning only
+      // payroll-relevant absent/late totals (re-authorized the same way
+      // approve_payroll_run() is), not a broadened attendance.view grant
+      // and not a second live-attendance code path; that needs its own
+      // migration and review, not a byproduct of this fix.
       const [payrollDataRaw, deductionsDataRaw, attendanceCountRows, positionsRequiringUniformMap] = await Promise.all([
         historicalPayrollPromise ?? fetchInEmployeeIdBatches<PayrollRecord>(
           employeeIds,
@@ -453,17 +489,19 @@ export function PayrollPage() {
               .in('employee_id', batch)
               .range(from, to)
         ),
-        fetchInEmployeeIdBatches<{ employee_id: string; status: string }>(
-          employeeIds,
-          (batch, from, to, withCount) =>
-            supabase
-              .from('attendance')
-              .select('employee_id, status', withCount ? { count: 'exact' } : undefined)
-              .gte('date', monthStart)
-              .lte('date', monthEnd)
-              .in('employee_id', batch)
-              .range(from, to)
-        ),
+        isHistoricalMonth
+          ? Promise.resolve([] as { employee_id: string; status: string }[])
+          : fetchInEmployeeIdBatches<{ employee_id: string; status: string }>(
+              employeeIds,
+              (batch, from, to, withCount) =>
+                supabase
+                  .from('attendance')
+                  .select('employee_id, status', withCount ? { count: 'exact' } : undefined)
+                  .gte('date', monthStart)
+                  .lte('date', monthEnd)
+                  .in('employee_id', batch)
+                  .range(from, to)
+            ),
         // ===== Positions (for the "Requires Uniform" gate) =====
         // Isolated from the rest of this fetch: `requires_uniform` was added
         // by supabase/migrations/20260728000000_position_uniform_flag.sql,
@@ -502,12 +540,25 @@ export function PayrollPage() {
       setEmployeeDeductions(deductionsData);
 
       const counts = new Map<string, AttendanceCount>();
-      attendanceCountRows.forEach(record => {
-        const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
-        if (record.status === 'A') existing.absentDays += 1;
-        if (record.status === 'L') existing.lateDays += 1;
-        counts.set(record.employee_id, existing);
-      });
+      if (isHistoricalMonth) {
+        // No raw attendance rows were fetched (see the skipped Promise.all
+        // leg above) -- derive the same {absentDays, lateDays} shape from
+        // employee_deductions instead, which already has it for a
+        // processed month and needs no attendance.view-gated read.
+        deductionsData.forEach(deduction => {
+          counts.set(deduction.employee_id, {
+            absentDays: deduction.absent_days || 0,
+            lateDays: deduction.late_days || 0,
+          });
+        });
+      } else {
+        attendanceCountRows.forEach(record => {
+          const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
+          if (record.status === 'A') existing.absentDays += 1;
+          if (record.status === 'L') existing.lateDays += 1;
+          counts.set(record.employee_id, existing);
+        });
+      }
       setAttendanceCounts(counts);
 
       setPositionsRequiringUniform(positionsRequiringUniformMap);

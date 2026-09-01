@@ -11,6 +11,7 @@ vi.mock('./permissions', () => ({
     PAYROLL_VIEW: 'payroll.view',
     ATTENDANCE_VIEW: 'attendance.view',
     RECRUITMENT_VIEW: 'recruitment.view',
+    SECURITY_PERSONNEL_VIEW: 'security_personnel.view',
   },
 }));
 
@@ -43,11 +44,12 @@ describe('resolveDashboardPermissions', () => {
     mockedCanAccess.mockReset();
   });
 
-  it('Operations Manager (functional, no payroll.view/recruitment.view): payroll and recruitment denied, attendance allowed', async () => {
-    // operations_manager: attendance.view seeded, payroll.view and
-    // recruitment.view NOT seeded (see role_permissions in
+  it('Operations Manager (functional, no payroll.view/recruitment.view): payroll and recruitment denied, attendance and security allowed', async () => {
+    // operations_manager: attendance.view and security_personnel.view
+    // seeded, payroll.view and recruitment.view NOT seeded (see
+    // role_permissions in
     // 20260817000000_functional_role_permissions_foundation.sql).
-    mockedCanAccess.mockImplementation(async (_legacy, permission) => permission === 'attendance.view');
+    mockedCanAccess.mockImplementation(async (_legacy, permission) => permission === 'attendance.view' || permission === 'security_personnel.view');
 
     const result = await resolveDashboardPermissions(makeProfile({ role: 'operations_manager', role_level: null }));
 
@@ -55,6 +57,7 @@ describe('resolveDashboardPermissions', () => {
       canViewPayroll: false,
       canViewAttendance: true,
       canViewRecruitment: false,
+      canViewSecurity: true,
     });
   });
 
@@ -67,6 +70,26 @@ describe('resolveDashboardPermissions', () => {
     expect(result.canViewPayroll).toBe(false);
   });
 
+  it('Accountant (functional, no attendance.view/recruitment.view/security_personnel.view): payroll allowed, everything else denied', async () => {
+    // accountant: payroll.view seeded; attendance.view, recruitment.view,
+    // and security_personnel.view NOT seeded (see role_permissions in
+    // 20260817000000_functional_role_permissions_foundation.sql -- the
+    // Accountant row list has no attendance.*/recruitment.*/
+    // security_personnel.* entries at all). This is the exact profile
+    // the "Renew Expiring Licenses" and "Review Job Applications"
+    // pending-task gating exists for (Dashboard.tsx).
+    mockedCanAccess.mockImplementation(async (_legacy, permission) => permission === 'payroll.view');
+
+    const result = await resolveDashboardPermissions(makeProfile({ role: 'accountant', role_level: null }));
+
+    expect(result).toEqual({
+      canViewPayroll: true,
+      canViewAttendance: false,
+      canViewRecruitment: false,
+      canViewSecurity: false,
+    });
+  });
+
   it('legacy account: canAccess(true, ...) short-circuits every flag true, unchanged from before this rollout', async () => {
     mockedCanAccess.mockImplementation(async (legacyAllowed) => legacyAllowed);
 
@@ -76,6 +99,7 @@ describe('resolveDashboardPermissions', () => {
       canViewPayroll: true,
       canViewAttendance: true,
       canViewRecruitment: true,
+      canViewSecurity: true,
     });
   });
 
@@ -88,6 +112,7 @@ describe('resolveDashboardPermissions', () => {
       canViewPayroll: false,
       canViewAttendance: false,
       canViewRecruitment: false,
+      canViewSecurity: false,
     });
   });
 
@@ -103,6 +128,7 @@ describe('resolveDashboardPermissions', () => {
       canViewPayroll: true,
       canViewAttendance: true,
       canViewRecruitment: true,
+      canViewSecurity: true,
     });
   });
 });
