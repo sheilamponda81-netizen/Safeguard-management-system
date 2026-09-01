@@ -26,6 +26,8 @@ import {
 } from '../utils/payrollPermissions';
 import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
+import { handleError } from '../utils/errorHandler';
+import { approvePayrollRun } from '../utils/payrollApproval';
 
 interface Employee {
   id: string;
@@ -852,27 +854,41 @@ export function PayrollPage() {
     setProcessingStatus(status === 'approved' ? 'Approving payroll...' : 'Rejecting payroll...');
 
     try {
-      const updateData = {
-        approval_status: status,
-        approved_by: userProfile?.id || null,
-        approved_at: new Date().toISOString(),
-        approval_notes: approvalNotes || null,
-        updated_at: new Date().toISOString()
-      };
+      // Sends exactly the payroll row ids already loaded into
+      // payrollRecords (the on-screen snapshot) as an RPC body parameter,
+      // instead of building `.in('employee_id', payrollRecords.map(...))`
+      // as a URL filter -- that filter used to carry the full in-scope
+      // employee id list into the request URL, which for a full month's
+      // payroll run (hundreds of employees) produced a PostgREST request
+      // large enough to be rejected outright with a bare 400 Bad Request.
+      // See src/utils/payrollApproval.ts and
+      // supabase/migrations/20260831000000_payroll_approval_rpc.sql for
+      // the exact scope/authorization this RPC applies and why.
+      const result = await approvePayrollRun({
+        month: selectedMonth,
+        status,
+        notes: approvalNotes || null,
+        payrollIds: payrollRecords.map(r => r.id),
+      });
 
-      // Update only the payroll records this admin can actually see (their
-      // own region, or the whole company for a super admin) -- payrollRecords
-      // is already scoped that way by fetchData. An unscoped update-by-month
-      // here would also approve/reject every OTHER region's payroll for this
-      // month, since the payroll table has no region_id column of its own.
-      const { error } = await supabase
-        .from('payroll')
-        .update(updateData)
-        .eq('month', selectedMonth)
-        .in('employee_id', payrollRecords.map(r => r.employee_id));
+      if (!result.success) {
+        const message = result.reason === 'rpc_error' ? 'Failed to approve payroll: ' + result.error : result.error!;
+        showNotification(message, 'error');
+        // 'scope_changed' means the RPC's own all-or-nothing check aborted
+        // the whole update server-side (nothing was approved) because the
+        // on-screen snapshot no longer matches reality -- refresh so the
+        // UI reflects current data instead of silently showing stale
+        // records the admin might retry against again.
+        if (result.reason === 'scope_changed') {
+          await fetchData();
+          await fetchProcessedMonths();
+        }
+        return;
+      }
 
-      if (error) throw error;
-
+      // logAudit() never throws (see src/utils/auditLogger.ts) -- a
+      // failure to write the audit row is logged to the console but can
+      // never be mistaken here for the payroll approval itself failing.
       await logAudit({
         action: status === 'approved' ? 'APPROVE' : 'REJECT',
         entity_type: 'payroll',
@@ -880,7 +896,7 @@ export function PayrollPage() {
           month: selectedMonth,
           status: status,
           notes: approvalNotes,
-          recordsCount: payrollRecords.length,
+          recordsCount: result.updatedCount,
           approved_by: userProfile?.full_name || userProfile?.email
         },
         region_id: userProfile?.region_id
@@ -901,7 +917,7 @@ export function PayrollPage() {
 
     } catch (err) {
       console.error('Error approving payroll:', err);
-      showNotification('Failed to approve payroll: ' + getErrorMessage(err), 'error');
+      showNotification('Failed to approve payroll: ' + handleError(err), 'error');
     } finally {
       setProcessing(false);
       setProcessingStatus('');
