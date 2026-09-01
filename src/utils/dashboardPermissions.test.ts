@@ -16,7 +16,7 @@ vi.mock('./permissions', () => ({
 }));
 
 import { canAccess } from './permissions';
-import { resolveDashboardPermissions } from './dashboardPermissions';
+import { resolveDashboardPermissions, buildPendingTasks, DashboardPermissions } from './dashboardPermissions';
 
 const mockedCanAccess = vi.mocked(canAccess);
 
@@ -130,5 +130,65 @@ describe('resolveDashboardPermissions', () => {
       canViewRecruitment: true,
       canViewSecurity: true,
     });
+  });
+});
+
+describe('buildPendingTasks', () => {
+  function makePermissions(overrides: Partial<DashboardPermissions>): DashboardPermissions {
+    return {
+      canViewPayroll: false,
+      canViewAttendance: false,
+      canViewRecruitment: false,
+      canViewSecurity: false,
+      ...overrides,
+    };
+  }
+
+  it('Accountant-shaped permissions (payroll only): does not see Review Job Applications or Renew Expiring Licenses', () => {
+    const tasks = buildPendingTasks(makePermissions({ canViewPayroll: true }));
+    const titles = tasks.map(t => t.title);
+    expect(titles).toContain('Approve Payroll');
+    expect(titles).toContain('Process Leave Requests');
+    expect(titles).not.toContain('Review Job Applications');
+    expect(titles).not.toContain('Renew Expiring Licenses');
+    expect(tasks).toHaveLength(2);
+  });
+
+  it('a user WITH recruitment.view (e.g. HR Manager) does see Review Job Applications', () => {
+    const tasks = buildPendingTasks(makePermissions({ canViewRecruitment: true }));
+    expect(tasks.map(t => t.title)).toContain('Review Job Applications');
+  });
+
+  it('a user WITH security_personnel.view sees Renew Expiring Licenses', () => {
+    const tasks = buildPendingTasks(makePermissions({ canViewSecurity: true }));
+    expect(tasks.map(t => t.title)).toContain('Renew Expiring Licenses');
+  });
+
+  it('Approve Payroll follows canViewPayroll specifically, not any other flag', () => {
+    const withPayroll = buildPendingTasks(makePermissions({ canViewPayroll: true }));
+    const withoutPayroll = buildPendingTasks(makePermissions({ canViewRecruitment: true, canViewSecurity: true }));
+    expect(withPayroll.map(t => t.title)).toContain('Approve Payroll');
+    expect(withoutPayroll.map(t => t.title)).not.toContain('Approve Payroll');
+  });
+
+  it('Process Leave Requests is always visible -- no permission gates it, since no leave-management feature exists', () => {
+    expect(buildPendingTasks(makePermissions({})).map(t => t.title)).toEqual(['Process Leave Requests']);
+  });
+
+  it('a business admin (every flag true) sees all four tasks, and the count is the actual list length', () => {
+    const tasks = buildPendingTasks(makePermissions({ canViewPayroll: true, canViewAttendance: true, canViewRecruitment: true, canViewSecurity: true }));
+    expect(tasks).toHaveLength(4);
+    expect(tasks.map(t => t.title)).toEqual([
+      'Approve Payroll',
+      'Review Job Applications',
+      'Process Leave Requests',
+      'Renew Expiring Licenses',
+    ]);
+  });
+
+  it('a role with nothing granted sees only the ungated task -- proves the filter fails closed, not open', () => {
+    const tasks = buildPendingTasks(makePermissions({}));
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].title).toBe('Process Leave Requests');
   });
 });

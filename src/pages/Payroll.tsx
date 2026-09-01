@@ -28,6 +28,7 @@ import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { approvePayrollRun } from '../utils/payrollApproval';
 import { buildPayrollReportCsv } from '../utils/payrollExport';
+import { AttendanceCount, countsFromRawAttendance, countsFromDeductions } from '../utils/payrollAttendanceCounts';
 
 interface Employee {
   id: string;
@@ -49,10 +50,11 @@ interface PayrollRegion {
   name: string;
 }
 
-interface AttendanceCount {
-  absentDays: number;
-  lateDays: number;
-}
+// AttendanceCount, and the two functions that build it (from raw
+// `attendance` rows vs. from stored `employee_deductions` rows), live in
+// src/utils/payrollAttendanceCounts.ts -- extracted so they're
+// independently unit-testable; see that file's own header for why two
+// sources exist.
 
 interface PayrollRecord {
   id: string;
@@ -539,26 +541,12 @@ export function PayrollPage() {
       const deductionsData = dedupeById(deductionsDataRaw);
       setEmployeeDeductions(deductionsData);
 
-      const counts = new Map<string, AttendanceCount>();
-      if (isHistoricalMonth) {
-        // No raw attendance rows were fetched (see the skipped Promise.all
-        // leg above) -- derive the same {absentDays, lateDays} shape from
-        // employee_deductions instead, which already has it for a
-        // processed month and needs no attendance.view-gated read.
-        deductionsData.forEach(deduction => {
-          counts.set(deduction.employee_id, {
-            absentDays: deduction.absent_days || 0,
-            lateDays: deduction.late_days || 0,
-          });
-        });
-      } else {
-        attendanceCountRows.forEach(record => {
-          const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
-          if (record.status === 'A') existing.absentDays += 1;
-          if (record.status === 'L') existing.lateDays += 1;
-          counts.set(record.employee_id, existing);
-        });
-      }
+      // No raw attendance rows were fetched for a historical month (see
+      // the skipped Promise.all leg above) -- derive the same
+      // {absentDays, lateDays} shape from employee_deductions instead.
+      const counts: Map<string, AttendanceCount> = isHistoricalMonth
+        ? countsFromDeductions(deductionsData)
+        : countsFromRawAttendance(attendanceCountRows);
       setAttendanceCounts(counts);
 
       setPositionsRequiringUniform(positionsRequiringUniformMap);

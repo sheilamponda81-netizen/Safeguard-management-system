@@ -18,7 +18,7 @@ import {
   normalizeMonthKey
 } from '../utils/currentMonth';
 import { showNotification } from '../utils/clickHandlers';
-import { resolveDashboardPermissions } from '../utils/dashboardPermissions';
+import { resolveDashboardPermissions, buildPendingTasks, PendingTask } from '../utils/dashboardPermissions';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
@@ -119,23 +119,21 @@ export function Dashboard() {
   const [initialLoad, setInitialLoad] = useState(true);
 
   // ===== MEMOIZED PENDING TASKS =====
-  // Each item is gated on the same resolveDashboardPermissions() flags
-  // already used to gate this page's own data fetches/cards, not a
-  // hardcoded role check -- a functional-role account with no access to
-  // the underlying feature (e.g. an Accountant, who has no
-  // recruitment.view or security_personnel.view) should not be shown a
-  // task pointing at a page they can't open. "Process Leave Requests" is
-  // intentionally left ungated: no leave-management feature or
-  // permission exists anywhere in this app to gate it against (confirmed
-  // by inspecting permissions.ts's full PERMISSIONS list and every page
-  // in src/pages) -- inventing one here would be a business rule this
-  // audit has no source for.
-  const pendingTasks = useMemo(() => [
-    { title: 'Approve Payroll', due: 'Today', priority: 'high', icon: Wallet, visible: canViewPayroll },
-    { title: 'Review Job Applications', due: 'Tomorrow', priority: 'medium', icon: ClipboardList, visible: canViewRecruitment },
-    { title: 'Process Leave Requests', due: '2 days', priority: 'medium', icon: Calendar, visible: true },
-    { title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high', icon: Shield, visible: canViewSecurity }
-  ].filter(task => task.visible), [canViewPayroll, canViewRecruitment, canViewSecurity]);
+  // Filtering itself lives in buildPendingTasks() (dashboardPermissions.ts),
+  // gated on the same permission flags already used to gate this page's
+  // own data fetches/cards, not a hardcoded role check -- extracted so
+  // it's independently unit-testable. Icons stay here (React components
+  // don't belong in a permissions-utility module).
+  const pendingTasks = useMemo(
+    () => buildPendingTasks({ canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity }),
+    [canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity]
+  );
+  const pendingTaskIcons: Record<PendingTask['key'], typeof Wallet> = {
+    'approve-payroll': Wallet,
+    'review-applications': ClipboardList,
+    'process-leave': Calendar,
+    'renew-licenses': Shield,
+  };
 
   // ===== PERFORMANCE: Lazy load charts after data is ready =====
   const loadCharts = useCallback(async () => {
@@ -997,7 +995,7 @@ export function Dashboard() {
           </div>
           <div className="p-3 space-y-2">
             {pendingTasks.map((t, i) => {
-              const Icon = t.icon;
+              const Icon = pendingTaskIcons[t.key];
               const priorityClass = t.priority === 'high' ? 'bg-red-100 text-red-600' : t.priority === 'medium' ? 'bg-[#FFF1CC] text-[#D4A017]' : 'bg-slate-100 text-slate-600';
               return (
                 <div key={i} className="p-3 rounded-lg hover:bg-slate-50 cursor-pointer">

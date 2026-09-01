@@ -34,3 +34,29 @@ export async function resolveDashboardPermissions(profile: UserProfile | null): 
     return { canViewPayroll: false, canViewAttendance: false, canViewRecruitment: false, canViewSecurity: false };
   }
 }
+
+export interface PendingTask {
+  key: 'approve-payroll' | 'review-applications' | 'process-leave' | 'renew-licenses';
+  title: string;
+  due: string;
+  priority: 'high' | 'medium';
+}
+
+// Dashboard.tsx's static "Pending Tasks" widget, gated by the same
+// DashboardPermissions flags it already uses to gate its own data
+// fetches -- extracted so the filtering logic is independently
+// unit-testable without rendering the page. "Process Leave Requests" is
+// deliberately left ungated: no leave-management feature or permission
+// exists anywhere in this app to gate it against (confirmed by
+// inspecting permissions.ts's full PERMISSIONS list and every page in
+// src/pages) -- inventing one here would be a business rule this audit
+// has no source for.
+export function buildPendingTasks(permissions: DashboardPermissions): PendingTask[] {
+  const allTasks: (PendingTask & { visible: boolean })[] = [
+    { key: 'approve-payroll', title: 'Approve Payroll', due: 'Today', priority: 'high', visible: permissions.canViewPayroll },
+    { key: 'review-applications', title: 'Review Job Applications', due: 'Tomorrow', priority: 'medium', visible: permissions.canViewRecruitment },
+    { key: 'process-leave', title: 'Process Leave Requests', due: '2 days', priority: 'medium', visible: true },
+    { key: 'renew-licenses', title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high', visible: permissions.canViewSecurity },
+  ];
+  return allTasks.filter(task => task.visible).map(({ visible: _visible, ...task }) => task);
+}
