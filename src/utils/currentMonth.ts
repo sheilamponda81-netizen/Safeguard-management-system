@@ -172,13 +172,32 @@ export const getMonthLabel = (month: string): string => {
   return date.toLocaleString('default', { month: 'long', year: 'numeric' });
 };
 
-// Get available months (starting from July 2026, going forward)
+// Get available months: every historical month from the system's fixed
+// start date (July 2026) up to the current/system month, PLUS 48 months
+// (4 years) forward from the current/system month -- exactly as before.
+//
+// Before this change, this function only ever generated the forward-
+// looking window, so every page whose month selector/arrows are gated by
+// `availableMonths.includes(...)` (Payroll, Attendance, Payments,
+// Payslips) could never navigate to a past month or year at all: the
+// left/previous arrow was permanently disabled the moment you reached
+// the current month, and the dropdown never listed anything earlier.
+// Adding the historical range is purely additive -- every month a caller
+// could already reach is still reachable, in the same order, and the
+// forward-looking window is untouched -- so this cannot regress any
+// existing behavior for the other pages/features that call this
+// function for a different purpose (e.g. future-dated planning).
+//
+// This does not become an "enormous hard-coded list": it is bounded by
+// the system's own fixed start date (getSystemStartDate()), so it grows
+// by exactly one entry per real month that passes -- the same bounded,
+// computed shape as the forward window's fixed 48 entries.
 export const getAvailableMonthsFromSystem = (systemMonth?: string): string[] => {
   const months: string[] = [];
-  
+
   // Start from July 2026
   const startDate = getSystemStartDate();
-  
+
   // Use the system month if provided, otherwise use start date
   let currentDate: Date;
   if (systemMonth) {
@@ -191,7 +210,19 @@ export const getAvailableMonthsFromSystem = (systemMonth?: string): string[] => 
   } else {
     currentDate = new Date(startDate);
   }
-  
+
+  // Historical months: system start (inclusive) through the month before
+  // `currentDate` (exclusive) -- ascending order, so the combined list
+  // stays chronological (oldest to newest) end to end.
+  const historicalMonths: string[] = [];
+  let cursor = new Date(startDate);
+  while (cursor < currentDate) {
+    const year = cursor.getFullYear();
+    const month = String(cursor.getMonth() + 1).padStart(2, '0');
+    historicalMonths.push(`${year}-${month}`);
+    cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+  }
+
   // Generate 48 months (4 years) starting from the current month
   for (let i = 0; i < 48; i++) {
     const date = new Date(currentDate.getFullYear(), currentDate.getMonth() + i, 1);
@@ -199,8 +230,8 @@ export const getAvailableMonthsFromSystem = (systemMonth?: string): string[] => 
     const month = String(date.getMonth() + 1).padStart(2, '0');
     months.push(`${year}-${month}`);
   }
-  
-  return months;
+
+  return [...historicalMonths, ...months];
 };
 
 // Get past months (from July 2026 to current month)
