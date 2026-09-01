@@ -26,7 +26,6 @@ import {
 } from '../utils/payrollPermissions';
 import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
-import { handleError } from '../utils/errorHandler';
 import { approvePayrollRun } from '../utils/payrollApproval';
 
 interface Employee {
@@ -917,7 +916,7 @@ export function PayrollPage() {
 
     } catch (err) {
       console.error('Error approving payroll:', err);
-      showNotification('Failed to approve payroll: ' + handleError(err), 'error');
+      showNotification('Failed to approve payroll: ' + getErrorMessage(err), 'error');
     } finally {
       setProcessing(false);
       setProcessingStatus('');

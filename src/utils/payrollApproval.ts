@@ -1,5 +1,5 @@
 import { supabase } from '../lib/supabase';
-import { handleError } from './errorHandler';
+import { getErrorMessage } from './errorHandler';
 
 export interface ApprovePayrollRunParams {
   month: string;
@@ -92,12 +92,12 @@ export async function approvePayrollRun(params: ApprovePayrollRunParams): Promis
           reason: 'scope_changed',
         };
       }
-      return { success: false, updatedCount: 0, error: handleError(error), reason: 'rpc_error' };
+      return { success: false, updatedCount: 0, error: getErrorMessage(error), reason: 'rpc_error' };
     }
 
     const updatedCount = typeof data === 'number' ? data : 0;
     return { success: true, updatedCount };
   } catch (err) {
-    return { success: false, updatedCount: 0, error: handleError(err), reason: 'rpc_error' };
+    return { success: false, updatedCount: 0, error: getErrorMessage(err), reason: 'rpc_error' };
   }
 }
