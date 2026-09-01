@@ -259,22 +259,45 @@ export function PayslipsPage() {
     setLoading(true);
     try {
       const monthYear = `${selectedYear}-${String(months.indexOf(selectedMonth) + 1).padStart(2, '0')}`;
-      
-      // CRITICAL: Exclude deleted employees and include uniform_deduction
-      let employeesQuery = supabase
-        .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id, uniform_deduction')
-        .eq('status', 'Active')
-        .eq('is_deleted', false);
 
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+      // Fetch payroll records for the selected month FIRST, directly --
+      // NOT gated by today's Active/is_deleted/region employee roster. A
+      // payslip must reflect exactly what was STORED for that payroll
+      // period: gating this query (or the employee join below) by today's
+      // roster would silently drop a legitimate historical payslip for
+      // anyone since deactivated, soft-deleted, or moved to another
+      // region, even though their processed payroll row is untouched.
+      // RLS already scopes this read to the caller's own tenant.
+      const { data: rawPayrollData, error: payError } = await supabase
+        .from('payroll')
+        .select('*')
+        .eq('month', monthYear);
+      if (payError) throw payError;
+
+      // A rejected payroll run isn't valid pay data -- it's flagged for
+      // rework and its figures may still change, so no payslip should be
+      // generated from it. Pending and approved runs both produce payslips;
+      // only the badge differs (see render below).
+      const payrollData = (rawPayrollData || []).filter((r: PayrollRow) => r.approval_status !== 'rejected');
+      const payrollEmployeeIds = [...new Set(payrollData.map((r: PayrollRow) => r.employee_id))];
+
+      // Employee DISPLAY fields (name, number, position, pay point,
+      // contract type, region, uniform deduction) as they exist TODAY --
+      // fetched by id, with no Active/is_deleted/region filter, so a
+      // since-changed employee record still has details to show on their
+      // historical payslip. This never gates which payslips are produced;
+      // `payrollData` above already determined that.
+      let employeesData: EmployeeRow[] = [];
+      if (payrollEmployeeIds.length > 0) {
+        const { data, error: empError } = await supabase
+          .from('employees')
+          .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id, uniform_deduction')
+          .in('id', payrollEmployeeIds);
+        if (empError) throw empError;
+        employeesData = data || [];
       }
 
-      const { data: employeesData, error: empError } = await employeesQuery;
-      if (empError) throw empError;
-
-      const mappedEmployees = (employeesData || []).map((emp: EmployeeRow) => ({
+      const mappedEmployees = employeesData.map((emp: EmployeeRow) => ({
         id: emp.id,
         employeeNumber: emp.employee_number,
         fullName: emp.full_name,
@@ -290,6 +313,18 @@ export function PayslipsPage() {
 
       const employeesById = new Map(mappedEmployees.map(e => [e.id, e]));
 
+      // Region scoping for a non-super-admin: applied here against the
+      // payroll rows (using each employee's CURRENT region_id), rather
+      // than as a pre-filter on the employees query, for the same
+      // historical-snapshot reason as above -- an employee's region at
+      // the time a past payroll run happened isn't separately tracked by
+      // this schema, so this is necessarily "is this employee in my
+      // region today," the same limitation the rest of this app's region
+      // scoping already has.
+      const authorizedPayrollData = (!userProfile?.is_super_admin && userProfile?.region_id)
+        ? payrollData.filter((r: PayrollRow) => employeesById.get(r.employee_id)?.region_id === userProfile.region_id)
+        : payrollData;
+
       // Positions eligible for a uniform deduction -- same flag Payroll.tsx
       // gates on, so a senior/office position never shows a fabricated
       // "Uniform Deduction" line here just because their employee record
@@ -299,28 +334,6 @@ export function PayslipsPage() {
         .select('name, requires_uniform');
       if (posError) throw posError;
       const positionMap = new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]));
-
-      // Fetch payroll records
-      let payrollQuery = supabase
-        .from('payroll')
-        .select('*')
-        .eq('month', monthYear);
-
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        const employeeIds = mappedEmployees.map(e => e.id);
-        if (employeeIds.length > 0) {
-          payrollQuery = payrollQuery.in('employee_id', employeeIds);
-        }
-      }
-
-      const { data: rawPayrollData, error: payError } = await payrollQuery;
-      if (payError) throw payError;
-
-      // A rejected payroll run isn't valid pay data -- it's flagged for
-      // rework and its figures may still change, so no payslip should be
-      // generated from it. Pending and approved runs both produce payslips;
-      // only the badge differs (see render below).
-      const payrollData = (rawPayrollData || []).filter((r: PayrollRow) => r.approval_status !== 'rejected');
 
       // Fetch employee deductions for the month
       const { data: deductionsData, error: dedError } = await supabase
@@ -332,8 +345,8 @@ export function PayslipsPage() {
 
       const payslipData: PayslipData[] = [];
 
-      if (payrollData.length > 0) {
-        payrollData.forEach((payroll: PayrollRow) => {
+      if (authorizedPayrollData.length > 0) {
+        authorizedPayrollData.forEach((payroll: PayrollRow) => {
           const employee = employeesById.get(payroll.employee_id);
           const deduction = deductionsData?.find((d: DeductionRow) => d.employee_id === payroll.employee_id);
 
