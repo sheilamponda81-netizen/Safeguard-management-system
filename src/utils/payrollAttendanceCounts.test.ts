@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { countsFromDeductions, deriveAttendanceCountsState } from './payrollAttendanceCounts';
+import { countsFromDeductions, deriveAttendanceCountsState, isPreviewBlocked, hasAnyBlockedPreview } from './payrollAttendanceCounts';
 
 describe('countsFromDeductions', () => {
   it('maps employee_id/absent_days/late_days directly, one row per employee -- the shape shared by employee_deductions and get_payroll_attendance_counts()', () => {
@@ -57,5 +57,38 @@ describe('deriveAttendanceCountsState (fail-closed decision Payroll.tsx renders/
     const rpcResult = { rows: [{ employee_id: 'e1', absent_days: 1, late_days: 1 }], failed: false };
     const state = deriveAttendanceCountsState(false, staleDeductions, rpcResult);
     expect(state.counts.get('e1')).toEqual({ absentDays: 1, lateDays: 1 });
+  });
+});
+
+describe('isPreviewBlocked (per-employee row gate)', () => {
+  it('blocked: attendance unavailable AND this employee has no stored payroll row yet', () => {
+    expect(isPreviewBlocked(true, false)).toBe(true);
+  });
+
+  it('not blocked: attendance unavailable but this employee already has a stored payroll row -- their figures come from that row, not calculatePayroll()', () => {
+    expect(isPreviewBlocked(true, true)).toBe(false);
+  });
+
+  it('not blocked: attendance available, regardless of whether a stored row exists', () => {
+    expect(isPreviewBlocked(false, false)).toBe(false);
+    expect(isPreviewBlocked(false, true)).toBe(false);
+  });
+});
+
+describe('hasAnyBlockedPreview (page-level totals/summary gate)', () => {
+  it('blocked: attendance unavailable AND at least one requested employee has no stored row', () => {
+    expect(hasAnyBlockedPreview(true, ['e1', 'e2'], new Set(['e1']))).toBe(true);
+  });
+
+  it('not blocked: attendance unavailable but EVERY employee already has a stored row (month fully processed) -- totals stay real', () => {
+    expect(hasAnyBlockedPreview(true, ['e1', 'e2'], new Set(['e1', 'e2']))).toBe(false);
+  });
+
+  it('not blocked: attendance available, even with unprocessed employees present', () => {
+    expect(hasAnyBlockedPreview(false, ['e1', 'e2'], new Set())).toBe(false);
+  });
+
+  it('not blocked: no employees at all', () => {
+    expect(hasAnyBlockedPreview(true, [], new Set())).toBe(false);
   });
 });

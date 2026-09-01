@@ -77,3 +77,29 @@ export function deriveAttendanceCountsState(
     unavailable: attendanceRpcResult.failed,
   };
 }
+
+// Extracted from Payroll.tsx's per-row render logic -- whether THIS
+// employee's currently-displayed payroll figures are a live calculation
+// built on attendanceCounts (getDisplayPayroll() falls through to
+// calculatePayroll() whenever there is no stored payroll row for them
+// yet), while the fetch that populates attendanceCounts is known to have
+// failed. Deliberately false whenever hasExistingRecord is true -- an
+// already-processed employee's figures come from the stored, unaffected
+// payroll row, never from calculatePayroll(), regardless of
+// attendanceCountsUnavailable. This is the exact condition Payroll.tsx
+// uses to decide whether to render a real monetary value or a safe "—"
+// placeholder for the Uniform/Attendance and Net Pay cells.
+export function isPreviewBlocked(attendanceCountsUnavailable: boolean, hasExistingRecord: boolean): boolean {
+  return attendanceCountsUnavailable && !hasExistingRecord;
+}
+
+// Extracted from Payroll.tsx's totals/summary-card render logic --
+// page-level version of isPreviewBlocked(): true only when at least one
+// employee currently in view actually has a blocked (live-calculated,
+// unreliable) preview. Deliberately NOT simply `attendanceCountsUnavailable`
+// on its own: a month that is already fully processed (every employee has
+// a stored payroll row) must keep showing its real, stored totals even if
+// this fetch happens to fail, since nothing displayed there depends on it.
+export function hasAnyBlockedPreview(attendanceCountsUnavailable: boolean, employeeIds: string[], employeeIdsWithExistingRecord: Set<string>): boolean {
+  return attendanceCountsUnavailable && employeeIds.some(id => !employeeIdsWithExistingRecord.has(id));
+}

@@ -28,7 +28,7 @@ import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { approvePayrollRun } from '../utils/payrollApproval';
 import { buildPayrollReportCsv } from '../utils/payrollExport';
-import { AttendanceCount, deriveAttendanceCountsState } from '../utils/payrollAttendanceCounts';
+import { AttendanceCount, deriveAttendanceCountsState, isPreviewBlocked, hasAnyBlockedPreview } from '../utils/payrollAttendanceCounts';
 
 interface Employee {
   id: string;
@@ -761,6 +761,26 @@ export function PayrollPage() {
     // re-deriving it separately here and risking the two disagreeing.
     return employees.filter(emp => getDisplayPayroll(emp).uniform_deduction > 0);
   }, [employees, getDisplayPayroll]);
+
+  // True only when at least one CURRENTLY DISPLAYED figure is actually a
+  // live calculation built on a failed/unavailable attendance-count fetch
+  // -- i.e. attendanceCountsUnavailable AND at least one employee has no
+  // stored payroll row yet (getDisplayPayroll falls through to
+  // calculatePayroll() for them, which silently treats a missing
+  // attendanceCounts entry as zero). Deliberately false for an
+  // already-fully-processed month even if attendanceCountsUnavailable
+  // happens to be true (every displayed figure there comes from the
+  // stored, already-authoritative payroll row, untouched by this fetch) --
+  // and always false for a historical month, which never sets
+  // attendanceCountsUnavailable at all. Gates the deduction/net-pay
+  // DISPLAY only (see the render section below) -- it does not change
+  // what getDisplayPayroll/calculatePayroll compute, so Process Payroll
+  // (already disabled via attendanceCountsUnavailable directly) is
+  // unaffected.
+  const hasBlockedPreview = useMemo(
+    () => hasAnyBlockedPreview(attendanceCountsUnavailable, employees.map(e => e.id), new Set(payrollByEmployee.keys())),
+    [attendanceCountsUnavailable, employees, payrollByEmployee]
+  );
 
   // ===== UPDATE FIELD =====
   const updateField = useCallback((employeeId: string, field: keyof PayrollRecord, value: number) => {
@@ -1509,7 +1529,10 @@ export function PayrollPage() {
         </Card>
       )}
 
-      {employeesWithDeductions.length > 0 && (
+      {/* Suppressed while hasBlockedPreview -- this list is itself built
+          from the same live calculation that's currently unreliable, and
+          the blocking banner above already explains why. */}
+      {!hasBlockedPreview && employeesWithDeductions.length > 0 && (
         <Card className="p-4 bg-red-50 border-red-200 border">
           <div className="flex items-start gap-3">
             <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />
@@ -1518,7 +1541,7 @@ export function PayrollPage() {
                 Attendance & Uniform Deductions Applied
               </p>
               <p className="text-sm text-red-700">
-                {employeesWithDeductions.length} employee(s) have uniform and/or attendance deductions for this month. 
+                {employeesWithDeductions.length} employee(s) have uniform and/or attendance deductions for this month.
                 These will be automatically included in the payroll calculation.
               </p>
               <div className="mt-2 text-xs text-red-600 space-y-1">
@@ -1552,12 +1575,21 @@ export function PayrollPage() {
           <div className="flex items-start justify-between">
             <div>
               <p className="text-xs text-slate-500">Total Deductions</p>
-              <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(totals.paye + totals.pension + totals.uniformDeductions + totals.salaryAdvanceDeductions)}</p>
-              <p className="text-xs text-slate-500 mt-1">PAYE: {formatKwacha(totals.paye)}</p>
-              <p className="text-xs text-slate-500 mt-1">Pension: {formatKwacha(totals.pension)}</p>
-              <p className="text-xs text-red-500 mt-1">Uniform/Attendance: {formatKwacha(totals.uniformDeductions)}</p>
-              {totals.salaryAdvanceDeductions > 0 && (
-                <p className="text-xs text-purple-600 mt-1">Salary Advances: {formatKwacha(totals.salaryAdvanceDeductions)}</p>
+              {hasBlockedPreview ? (
+                <>
+                  <p className="text-xl font-bold text-slate-400 mt-1">—</p>
+                  <p className="text-xs text-red-500 mt-1">Attendance totals unavailable</p>
+                </>
+              ) : (
+                <>
+                  <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(totals.paye + totals.pension + totals.uniformDeductions + totals.salaryAdvanceDeductions)}</p>
+                  <p className="text-xs text-slate-500 mt-1">PAYE: {formatKwacha(totals.paye)}</p>
+                  <p className="text-xs text-slate-500 mt-1">Pension: {formatKwacha(totals.pension)}</p>
+                  <p className="text-xs text-red-500 mt-1">Uniform/Attendance: {formatKwacha(totals.uniformDeductions)}</p>
+                  {totals.salaryAdvanceDeductions > 0 && (
+                    <p className="text-xs text-purple-600 mt-1">Salary Advances: {formatKwacha(totals.salaryAdvanceDeductions)}</p>
+                  )}
+                </>
               )}
             </div>
             <div className="w-10 h-10 rounded-lg bg-red-100 text-red-600 flex items-center justify-center">
@@ -1569,8 +1601,17 @@ export function PayrollPage() {
           <div className="flex items-start justify-between">
             <div>
               <p className="text-xs text-[#8B6F0F]">Net Pay</p>
-              <p className="text-2xl font-bold text-[#081C3A] mt-1">{formatKwacha(totals.net)}</p>
-              <p className="text-xs text-[#8B6F0F] mt-1">Total Disbursement</p>
+              {hasBlockedPreview ? (
+                <>
+                  <p className="text-2xl font-bold text-slate-400 mt-1">—</p>
+                  <p className="text-xs text-red-500 mt-1">Attendance totals unavailable</p>
+                </>
+              ) : (
+                <>
+                  <p className="text-2xl font-bold text-[#081C3A] mt-1">{formatKwacha(totals.net)}</p>
+                  <p className="text-xs text-[#8B6F0F] mt-1">Total Disbursement</p>
+                </>
+              )}
             </div>
             <div className="w-10 h-10 rounded-lg bg-[#081C3A] text-[#D4A017] flex items-center justify-center">
               <ChevronRight size={18} />
@@ -1581,8 +1622,17 @@ export function PayrollPage() {
           <div className="flex items-start justify-between">
             <div>
               <p className="text-xs text-red-600">Uniform/Attendance</p>
-              <p className="text-xl font-bold text-red-600 mt-1">{formatKwacha(totals.uniformDeductions)}</p>
-              <p className="text-xs text-red-500 mt-1">{employeesWithDeductions.length} employees</p>
+              {hasBlockedPreview ? (
+                <>
+                  <p className="text-xl font-bold text-slate-400 mt-1">—</p>
+                  <p className="text-xs text-red-500 mt-1">Attendance totals unavailable</p>
+                </>
+              ) : (
+                <>
+                  <p className="text-xl font-bold text-red-600 mt-1">{formatKwacha(totals.uniformDeductions)}</p>
+                  <p className="text-xs text-red-500 mt-1">{employeesWithDeductions.length} employees</p>
+                </>
+              )}
             </div>
             <div className="w-10 h-10 rounded-lg bg-red-200 text-red-700 flex items-center justify-center">
               <AlertCircle size={18} />
@@ -1685,8 +1735,15 @@ export function PayrollPage() {
                 const positionRequiresUniform = positionsRequiringUniform.get(emp.position) ?? true;
                 const uniformAmount = positionRequiresUniform ? (emp.uniform_deduction ?? payrollRates.uniformDeduction) : 0;
                 const hasUniform = uniformAmount > 0;
-                const hasAnyDeduction = p.uniform_deduction > 0;
                 const existingRecord = payrollByEmployee.get(emp.id);
+                // This employee's own uniform/attendance and net-pay figures
+                // are a live calculation built on attendanceCounts, and that
+                // fetch failed -- never render them as if valid (see
+                // hasBlockedPreview's own comment above). Never true for an
+                // already-processed employee (existingRecord), whose figures
+                // come from the stored, unaffected payroll row instead.
+                const previewBlocked = isPreviewBlocked(attendanceCountsUnavailable, !!existingRecord);
+                const hasAnyDeduction = !previewBlocked && p.uniform_deduction > 0;
                 const isEditable = canEditPayroll && !existingRecord && isCurrentMonth && !isMonthProcessed && !isApproved;
 
                 return (
@@ -1772,19 +1829,27 @@ export function PayrollPage() {
                       {formatKwacha(p.gross_pay)}
                     </TD>
                     <TD className={`text-right font-mono font-semibold ${hasAnyDeduction ? 'text-red-600' : 'text-slate-500'} bg-red-50/50`}>
-                      {formatKwacha(p.uniform_deduction || 0)}
-                      {hasAnyDeduction && (
-                        <div className="text-[10px] text-red-400 space-y-0.5">
-                          {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
-                          {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × MK4,200</div>}
-                          {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × MK4,200</div>}
-                          {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
-                          {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
-                        </div>
+                      {previewBlocked ? (
+                        <span className="text-slate-400" title="Unable to load attendance totals for this employee">—</span>
+                      ) : (
+                        <>
+                          {formatKwacha(p.uniform_deduction || 0)}
+                          {hasAnyDeduction && (
+                            <div className="text-[10px] text-red-400 space-y-0.5">
+                              {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
+                              {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × MK4,200</div>}
+                              {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × MK4,200</div>}
+                              {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
+                              {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
+                            </div>
+                          )}
+                        </>
                       )}
                     </TD>
                     <TD className="text-right font-mono font-bold text-[#081C3A] bg-slate-100">
-                      {formatKwacha(p.net_pay)}
+                      {previewBlocked
+                        ? <span className="text-slate-400" title="Unable to load attendance totals for this employee">—</span>
+                        : formatKwacha(p.net_pay)}
                     </TD>
                   </TR>
                 );
