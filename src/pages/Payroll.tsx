@@ -28,7 +28,7 @@ import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { approvePayrollRun } from '../utils/payrollApproval';
 import { buildPayrollReportCsv } from '../utils/payrollExport';
-import { AttendanceCount, countsFromRawAttendance, countsFromDeductions } from '../utils/payrollAttendanceCounts';
+import { AttendanceCount, deriveAttendanceCountsState } from '../utils/payrollAttendanceCounts';
 
 interface Employee {
   id: string;
@@ -50,11 +50,12 @@ interface PayrollRegion {
   name: string;
 }
 
-// AttendanceCount, and the two functions that build it (from raw
-// `attendance` rows vs. from stored `employee_deductions` rows), live in
+// AttendanceCount and deriveAttendanceCountsState (which decides the
+// counts map + fail-closed attendanceCountsUnavailable flag from either
+// the historical employee_deductions rows or the current/future
+// get_payroll_attendance_counts() RPC result) live in
 // src/utils/payrollAttendanceCounts.ts -- extracted so they're
-// independently unit-testable; see that file's own header for why two
-// sources exist.
+// independently unit-testable; see that file's own header for details.
 
 interface PayrollRecord {
   id: string;
@@ -143,6 +144,14 @@ export function PayrollPage() {
   // employee_id -- payroll deductions now always reflect real attendance directly,
   // with no separate manual "save deductions" step required.
   const [attendanceCounts, setAttendanceCounts] = useState<Map<string, AttendanceCount>>(new Map());
+  // Set true whenever the CURRENT/FUTURE-month live attendance-count RPC
+  // (get_payroll_attendance_counts) fails for any reason -- fail-closed
+  // guard: attendanceCounts is never trusted as "zero deductions" while
+  // this is true. See the blocking banner in the render below and the
+  // guard clauses in processPayroll()/copyFromPreviousMonth(). Always
+  // false for a historical month, which never calls this RPC (its counts
+  // come from the stored employee_deductions rows instead).
+  const [attendanceCountsUnavailable, setAttendanceCountsUnavailable] = useState(false);
   // Position name -> whether that position's employees should get the uniform
   // deduction at all (Settings -> Positions -> "Requires Uniform").
   const [positionsRequiringUniform, setPositionsRequiringUniform] = useState<Map<string, boolean>>(new Map());
@@ -407,14 +416,6 @@ export function PayrollPage() {
       // not today's roster.
       const employeeIds = employeesData.map(e => e.id);
 
-      // ===== Live attendance-derived absent/late counts for this month =====
-      const [yearStr, monthStr] = selectedMonth.split('-');
-      const year = parseInt(yearStr, 10);
-      const monthNum = parseInt(monthStr, 10);
-      const monthStart = `${selectedMonth}-01`;
-      const lastDay = new Date(year, monthNum, 0).getDate();
-      const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
-
       // PERFORMANCE CORRECTION: these four reads (payroll records, employee
       // deductions, attendance counts, positions) don't depend on each
       // other's results -- only on `employeeIds`/`selectedMonth`, already
@@ -435,42 +436,34 @@ export function PayrollPage() {
       // current/future month it's fetched fresh here, batched exactly as
       // before.
       //
-      // The raw `attendance` table is deliberately NOT read at all for a
-      // historical month (see the skipped leg below) -- a processed
-      // month's absent/late DAY COUNTS are already available from
-      // `employee_deductions.absent_days`/`late_days` (fetched
-      // unconditionally just below, for both branches), which is the
-      // authoritative figure `process_payroll_batch()` actually used when
-      // that payroll ran, not "whatever attendance looks like today."
-      // This isn't just a cosmetic simplification: the active `attendance`
-      // SELECT RLS policy (20260817000002_functional_roles_indirect_
-      // region_tables.sql:107-119) requires
-      // `current_user_role_level() IS NOT NULL OR has_permission('attendance.view')`
-      // -- a functional-role Accountant (role_level = NULL, no
-      // attendance.view grant in the seeded matrix) would be denied this
-      // read entirely, even though Accountant legitimately has
-      // payroll.view/payroll.process and is explicitly allowed to browse
-      // historical payroll. `employee_deductions` has no such gap for
-      // Accountant -- its own SELECT policy also accepts
-      // `has_permission('payslips.view')`, which Accountant does have.
-      // The live current/future branch below is intentionally left
-      // reading raw `attendance` unchanged: that read exists specifically
-      // so an in-progress payroll run's preview always reflects today's
-      // actual attendance without depending on Attendance.tsx's own
-      // manual per-employee "Save Deductions" step (see that file's
-      // saveDeductions()) -- switching it to employee_deductions would
-      // reintroduce exactly the staleness this design already avoids, for
-      // every role, not just Accountant. That narrower gap (a
-      // functional-role Accountant previewing the CURRENT month's payroll
-      // may see understated attendance deductions if RLS denies this read
-      // in production) is a real, pre-existing limitation, tracked as
-      // Finding A23 in AUDIT_REPORT.md rather than fixed here -- the safe
-      // fix is a narrowly-scoped SECURITY DEFINER RPC returning only
-      // payroll-relevant absent/late totals (re-authorized the same way
-      // approve_payroll_run() is), not a broadened attendance.view grant
-      // and not a second live-attendance code path; that needs its own
-      // migration and review, not a byproduct of this fix.
-      const [payrollDataRaw, deductionsDataRaw, attendanceCountRows, positionsRequiringUniformMap] = await Promise.all([
+      // The raw `attendance` table is NEVER read client-side, for either
+      // branch (Finding A23/A24 -- see AUDIT_REPORT.md). For a historical
+      // month, absent/late DAY COUNTS come from the stored
+      // `employee_deductions.absent_days`/`late_days` rows (fetched
+      // unconditionally just below, for both branches) -- the figure
+      // `process_payroll_batch()` actually used when that payroll ran, not
+      // "whatever attendance looks like today." For a current/future
+      // month, they come from `get_payroll_attendance_counts()` (see
+      // supabase/migrations/20260901000000_payroll_attendance_aggregate_rpc.sql),
+      // a narrow SECURITY DEFINER RPC that returns only
+      // {employee_id, absent_days, late_days} -- never a raw attendance
+      // row -- gated by the same payroll.view/legacy-role_level rule as
+      // the `payroll` table's own RLS, not by attendance.view. This is
+      // what closes the gap the two approaches above both had: `attendance`
+      // itself is RLS-gated on `current_user_role_level() IS NOT NULL OR
+      // has_permission('attendance.view')`, which a functional-role
+      // Accountant (role_level = NULL, no attendance.view grant in the
+      // seeded matrix) fails -- previously RLS would silently return ZERO
+      // rows (no error), so the live preview silently understated
+      // attendance-derived deductions with nothing in the UI indicating
+      // anything was wrong. The RPC leg below fails LOUD instead: any
+      // error is captured (not swallowed) and surfaces as
+      // `attendanceCountsUnavailable`, which blocks Process Payroll /
+      // Copy From Previous Month and shows a blocking banner -- see the
+      // guard clauses in processPayroll()/copyFromPreviousMonth() and the
+      // render section below. A historical month never calls this RPC at
+      // all (employeeIds there come from what's already stored).
+      const [payrollDataRaw, deductionsDataRaw, attendanceRpcResult, positionsRequiringUniformMap] = await Promise.all([
         historicalPayrollPromise ?? fetchInEmployeeIdBatches<PayrollRecord>(
           employeeIds,
           (batch, from, to, withCount) =>
@@ -491,19 +484,29 @@ export function PayrollPage() {
               .in('employee_id', batch)
               .range(from, to)
         ),
-        isHistoricalMonth
-          ? Promise.resolve([] as { employee_id: string; status: string }[])
-          : fetchInEmployeeIdBatches<{ employee_id: string; status: string }>(
-              employeeIds,
-              (batch, from, to, withCount) =>
-                supabase
-                  .from('attendance')
-                  .select('employee_id, status', withCount ? { count: 'exact' } : undefined)
-                  .gte('date', monthStart)
-                  .lte('date', monthEnd)
-                  .in('employee_id', batch)
-                  .range(from, to)
-            ),
+        // Isolated in its own try/catch, same pattern as the positions leg
+        // below: a failure here must never reject the whole Promise.all
+        // and take down payroll/deductions/positions loading too -- it's
+        // captured as `failed: true` instead, so fetchData can render its
+        // OWN dedicated fail-closed state (banner + disabled processing)
+        // rather than a generic "failed to load payroll data" toast that
+        // doesn't actually stop an Accountant from clicking Process
+        // Payroll against silently-zeroed attendance data.
+        (isHistoricalMonth || employeeIds.length === 0)
+          ? Promise.resolve({ rows: [] as { employee_id: string; absent_days: number; late_days: number }[], failed: false })
+          : (async () => {
+              try {
+                const { data, error } = await supabase.rpc('get_payroll_attendance_counts', {
+                  p_employee_ids: employeeIds,
+                  p_month: selectedMonth,
+                });
+                if (error) throw error;
+                return { rows: (data || []) as { employee_id: string; absent_days: number; late_days: number }[], failed: false };
+              } catch (attendanceRpcErr) {
+                console.error('Error fetching payroll attendance totals:', attendanceRpcErr);
+                return { rows: [] as { employee_id: string; absent_days: number; late_days: number }[], failed: true };
+              }
+            })(),
         // ===== Positions (for the "Requires Uniform" gate) =====
         // Isolated from the rest of this fetch: `requires_uniform` was added
         // by supabase/migrations/20260728000000_position_uniform_flag.sql,
@@ -541,13 +544,13 @@ export function PayrollPage() {
       const deductionsData = dedupeById(deductionsDataRaw);
       setEmployeeDeductions(deductionsData);
 
-      // No raw attendance rows were fetched for a historical month (see
-      // the skipped Promise.all leg above) -- derive the same
-      // {absentDays, lateDays} shape from employee_deductions instead.
-      const counts: Map<string, AttendanceCount> = isHistoricalMonth
-        ? countsFromDeductions(deductionsData)
-        : countsFromRawAttendance(attendanceCountRows);
-      setAttendanceCounts(counts);
+      // See deriveAttendanceCountsState's own header comment
+      // (src/utils/payrollAttendanceCounts.ts) for the exact fail-closed
+      // decision this makes -- extracted so it's independently
+      // unit-testable without rendering this page.
+      const attendanceState = deriveAttendanceCountsState(isHistoricalMonth, deductionsData, attendanceRpcResult);
+      setAttendanceCounts(attendanceState.counts);
+      setAttendanceCountsUnavailable(attendanceState.unavailable);
 
       setPositionsRequiringUniform(positionsRequiringUniformMap);
 
@@ -851,7 +854,16 @@ export function PayrollPage() {
       showNotification('You do not have permission to copy payroll data.', 'error');
       return;
     }
-    
+
+    // Same fail-closed guard as processPayroll() -- calculatePayroll()
+    // below is called per employee to compute the target month's uniform/
+    // attendance deductions, which must never proceed on a known-missing
+    // attendance-count fetch.
+    if (attendanceCountsUnavailable) {
+      showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
+      return;
+    }
+
     setProcessingStatus('Copying data from ' + getMonthLabel(sourceMonth) + '...');
 
     try {
@@ -971,7 +983,7 @@ export function PayrollPage() {
     } finally {
       setProcessingStatus('');
     }
-  }, [canProcessPayroll, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths]);
+  }, [canProcessPayroll, attendanceCountsUnavailable, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths]);
 
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
@@ -1114,7 +1126,17 @@ export function PayrollPage() {
       showNotification('You do not have permission to process payroll. Only Super Admins can process payroll.', 'error');
       return;
     }
-    
+
+    // Fail-closed, defense in depth: the Process Payroll button is already
+    // disabled while this is true (see the render section), but this
+    // function must never proceed on its own even if somehow invoked
+    // anyway -- calculatePayroll() below would otherwise silently treat
+    // every employee's attendance as zero absent/late days.
+    if (attendanceCountsUnavailable) {
+      showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
+      return;
+    }
+
     setProcessing(true);
     setProcessingStatus('Preparing payroll data...');
     
@@ -1206,7 +1228,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -1311,10 +1333,10 @@ export function PayrollPage() {
             )}
 
             {canProcessPayroll && isCurrentMonth && (
-              <Button 
-                variant={isMonthProcessed ? "outline" : "secondary"} 
+              <Button
+                variant={isMonthProcessed ? "outline" : "secondary"}
                 onClick={() => setShowConfirmModal(true)}
-                disabled={processing || isApproved}
+                disabled={processing || isApproved || attendanceCountsUnavailable}
               >
                 {processing ? (
                   <span className="flex items-center gap-2">
@@ -1427,6 +1449,29 @@ export function PayrollPage() {
                   </button>
                 )}
               </p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {attendanceCountsUnavailable && (
+        <Card className="p-4 bg-red-50 border-red-300 border">
+          <div className="flex items-start gap-3">
+            <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-semibold text-red-800">
+                Unable to load attendance totals required for payroll. Please refresh and try again.
+              </p>
+              <p className="text-sm text-red-700 mt-1">
+                Processing and copy-forward are disabled until this loads successfully, so payroll is
+                never calculated or saved with missing attendance data.
+              </p>
+              <button
+                onClick={() => fetchData()}
+                className="mt-2 text-sm font-medium text-red-800 hover:underline"
+              >
+                Retry
+              </button>
             </div>
           </div>
         </Card>
@@ -1605,6 +1650,10 @@ export function PayrollPage() {
           onAction={() => {
             if (copySourceMonths.length === 0) {
               showNotification('No previous months available to copy from.', 'error');
+              return;
+            }
+            if (attendanceCountsUnavailable) {
+              showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
               return;
             }
             setShowCopyModal(true);

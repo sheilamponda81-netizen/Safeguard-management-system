@@ -1,51 +1,36 @@
-// Extracted from Payroll.tsx's fetchData() so the two sources of
-// {absentDays, lateDays} per employee -- live raw `attendance` rows for
-// the current/future branch, and stored `employee_deductions` rows for
-// the historical branch -- are independently unit-testable without
-// rendering the page (this repo has no component-test infrastructure).
+// Extracted from Payroll.tsx's fetchData() so the {absentDays, lateDays}
+// per-employee shape the live payroll calculation consumes
+// (calculateLivePayroll in payrollCalculations.ts) is independently
+// unit-testable without rendering the page (this repo has no
+// component-test infrastructure).
 //
-// Why two sources exist at all: a historical/processed month's payroll
-// figures are already frozen in the `payroll` row itself; this shape is
-// used only for the decorative "Absent: N x MK4,200" breakdown tooltip
-// next to that already-correct figure, never to recompute it. For that
-// tooltip, employee_deductions.absent_days/late_days is available to a
-// functional-role Accountant (via has_permission('payslips.view'), see
-// 20260817000002_functional_roles_indirect_region_tables.sql:252-264),
-// while raw `attendance` is not (Accountant has no attendance.view grant
-// in the seeded matrix, 20260817000000:315-333). For the current/future
-// (unprocessed) branch, this shape instead DRIVES the live-preview
-// deduction calculation itself (see calculateLivePayroll in
-// payrollCalculations.ts), so it still reads raw `attendance` there --
-// switching that branch to employee_deductions would trade correctness
-// for authorization convenience, see this repo's AUDIT_REPORT.md Finding
-// A23 for why that tradeoff is deliberately NOT made here.
+// Both Payroll branches now feed this from an already pre-aggregated
+// {employee_id, absent_days, late_days} source -- never from raw
+// `attendance` rows client-side:
+//   - Historical (processed) months: the stored `employee_deductions` row
+//     for that employee+month (has_permission('payslips.view') already
+//     authorizes a functional-role Accountant to read this table -- see
+//     20260817000002_functional_roles_indirect_region_tables.sql:252-264).
+//   - Current/future (unprocessed) months: `get_payroll_attendance_counts()`
+//     (supabase/migrations/20260901000000_payroll_attendance_aggregate_rpc.sql),
+//     a narrow SECURITY DEFINER RPC returning the SAME
+//     {employee_id, absent_days, late_days} shape, gated by payroll.view/
+//     legacy role_level -- not attendance.view. This replaced a direct
+//     `.from('attendance')` read that a functional-role Accountant (no
+//     attendance.view grant in the seeded matrix) was silently denied by
+//     RLS with zero rows and no error, understating deductions with
+//     nothing in the UI indicating anything was wrong -- see
+//     AUDIT_REPORT.md Findings A23/A24.
 
 export interface AttendanceCount {
   absentDays: number;
   lateDays: number;
 }
 
-// Current/future branch: one row per attendance-marked day, `status`
-// 'A' (absent) or 'L' (late) among others -- summed into a day count per
-// employee. An RLS-denied read (Accountant, current month) resolves to
-// an empty array here, not an error -- see this function's caller in
-// Payroll.tsx and AUDIT_REPORT.md Finding A23 for the resulting
-// silently-zeroed-deduction risk this does NOT protect against on its
-// own; this function only shapes whatever rows it's given.
-export function countsFromRawAttendance(rows: { employee_id: string; status: string }[]): Map<string, AttendanceCount> {
-  const counts = new Map<string, AttendanceCount>();
-  rows.forEach(record => {
-    const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
-    if (record.status === 'A') existing.absentDays += 1;
-    if (record.status === 'L') existing.lateDays += 1;
-    counts.set(record.employee_id, existing);
-  });
-  return counts;
-}
-
-// Historical branch: one row per employee+month, already carrying the
-// day counts directly (employee_deductions.absent_days/late_days) --
-// no per-day rows to sum, just a direct mapping.
+// Maps a pre-aggregated {employee_id, absent_days, late_days}[] source --
+// either stored `employee_deductions` rows or
+// `get_payroll_attendance_counts()` RPC rows, both share this exact shape
+// -- into the Map<employeeId, AttendanceCount> the live calculation reads.
 export function countsFromDeductions(deductions: { employee_id: string; absent_days: number; late_days: number }[]): Map<string, AttendanceCount> {
   const counts = new Map<string, AttendanceCount>();
   deductions.forEach(deduction => {
@@ -55,4 +40,40 @@ export function countsFromDeductions(deductions: { employee_id: string; absent_d
     });
   });
   return counts;
+}
+
+export interface AttendanceRpcResult {
+  rows: { employee_id: string; absent_days: number; late_days: number }[];
+  failed: boolean;
+}
+
+export interface AttendanceCountsState {
+  counts: Map<string, AttendanceCount>;
+  unavailable: boolean;
+}
+
+// Extracted from Payroll.tsx's fetchData() -- the exact decision of what
+// to set attendanceCounts/attendanceCountsUnavailable to, given which
+// branch this is and what the get_payroll_attendance_counts() RPC call
+// returned. A historical month is ALWAYS unavailable: false, regardless
+// of attendanceRpcResult -- it never depends on the live RPC (the RPC is
+// not even called for a historical month; see Payroll.tsx). This is the
+// fail-closed decision point: a failed RPC call for a current/future
+// month must never be silently treated as "zero attendance" -- unavailable
+// becomes true, which Payroll.tsx uses to block Process Payroll/Copy From
+// Previous Month and show a blocking banner, rather than letting
+// calculatePayroll() proceed against an empty counts map as if that were
+// a legitimate zero.
+export function deriveAttendanceCountsState(
+  isHistoricalMonth: boolean,
+  deductions: { employee_id: string; absent_days: number; late_days: number }[],
+  attendanceRpcResult: AttendanceRpcResult
+): AttendanceCountsState {
+  if (isHistoricalMonth) {
+    return { counts: countsFromDeductions(deductions), unavailable: false };
+  }
+  return {
+    counts: countsFromDeductions(attendanceRpcResult.rows),
+    unavailable: attendanceRpcResult.failed,
+  };
 }
