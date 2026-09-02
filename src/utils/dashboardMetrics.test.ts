@@ -1,53 +1,64 @@
 import { describe, it, expect } from 'vitest';
-import { countHeadcountAsOf, countPendingPayrollMonths } from './dashboardMetrics';
+import { countRegisteredAsOf, countPendingPayrollMonths } from './dashboardMetrics';
 
-// Regression coverage for the real semantic bug: the Employee Growth chart
-// used to derive past-month counts from is_deleted=false employee rows
-// only, so anyone who had since been soft-deleted (terminated) vanished
-// from EVERY past month's count too, not just the current one -- silently
-// understating historical headcount. countHeadcountAsOf must reconstruct
-// "who was actually employed as of monthEnd" using hire_date/deleted_at.
-describe('countHeadcountAsOf', () => {
-  it('counts someone hired before monthEnd and never deleted', () => {
-    const employees = [{ hire_date: '2026-06-15', deleted_at: null }];
-    expect(countHeadcountAsOf(employees, '2026-06-30')).toBe(1);
+// Regression coverage for the real semantic finding: the Employee Growth
+// chart cannot prove real historical ACTIVE headcount at all, because there
+// are two independent departure paths in this app and only one of them
+// (Employees.tsx's soft delete) has a timestamp -- Security.tsx's Edit
+// Guard status dropdown can set status='Terminated'/'Suspended' via a plain
+// `.update({ status })` that never touches is_deleted/deleted_at, and there
+// is no termination_date/status_changed_at column anywhere in the schema.
+// countRegisteredAsOf deliberately counts cumulative REGISTRATIONS
+// (hire_date <= monthEnd) only, never attempting to subtract a departure
+// the schema cannot date.
+describe('countRegisteredAsOf', () => {
+  it('counts someone hired before monthEnd', () => {
+    const employees = [{ hire_date: '2026-06-15' }];
+    expect(countRegisteredAsOf(employees, '2026-06-30')).toBe(1);
   });
 
   it('does not count someone hired AFTER monthEnd', () => {
-    const employees = [{ hire_date: '2026-07-15', deleted_at: null }];
-    expect(countHeadcountAsOf(employees, '2026-06-30')).toBe(0);
+    const employees = [{ hire_date: '2026-07-15' }];
+    expect(countRegisteredAsOf(employees, '2026-06-30')).toBe(0);
   });
 
-  it('the exact reported scenario: hired June, terminated August -- still counts for June and July, not for August', () => {
-    const employees = [{ hire_date: '2026-06-10', deleted_at: '2026-08-05T00:00:00Z' }];
-    expect(countHeadcountAsOf(employees, '2026-06-30')).toBe(1);
-    expect(countHeadcountAsOf(employees, '2026-07-31')).toBe(1);
-    expect(countHeadcountAsOf(employees, '2026-08-31')).toBe(0);
+  it('counts someone hired exactly ON monthEnd', () => {
+    const employees = [{ hire_date: '2026-06-30' }];
+    expect(countRegisteredAsOf(employees, '2026-06-30')).toBe(1);
   });
 
-  it('someone whose departure date IS monthEnd itself is already gone by end of that day, so does not count for that month', () => {
-    const employees = [{ hire_date: '2026-06-01', deleted_at: '2026-06-30T23:00:00Z' }];
-    expect(countHeadcountAsOf(employees, '2026-06-30')).toBe(0);
-  });
-
-  it('someone who departs the day AFTER monthEnd still counts as present for monthEnd', () => {
-    const employees = [{ hire_date: '2026-06-01', deleted_at: '2026-07-01T00:00:00Z' }];
-    expect(countHeadcountAsOf(employees, '2026-06-30')).toBe(1);
+  it('the scenario that made deleted_at-based exclusion unsafe: hired June, status later set to Terminated with NO deleted_at -- still counts for every month from June onward, since this is a registration count, not an active-headcount count', () => {
+    const employees = [{ hire_date: '2026-06-10' }];
+    expect(countRegisteredAsOf(employees, '2026-06-30')).toBe(1);
+    expect(countRegisteredAsOf(employees, '2026-09-30')).toBe(1);
   });
 
   it('does not count a row with no hire_date at all', () => {
-    const employees = [{ hire_date: null, deleted_at: null }];
-    expect(countHeadcountAsOf(employees, '2026-06-30')).toBe(0);
+    const employees = [{ hire_date: null }];
+    expect(countRegisteredAsOf(employees, '2026-06-30')).toBe(0);
   });
 
-  it('mixed roster: sums only those actually present as of monthEnd', () => {
+  it('mixed roster: sums only those registered by monthEnd, regardless of current status', () => {
     const employees = [
-      { hire_date: '2026-06-01', deleted_at: null }, // still employed
-      { hire_date: '2026-06-10', deleted_at: '2026-08-01' }, // left after June
-      { hire_date: '2026-07-01', deleted_at: null }, // hired after June
-      { hire_date: '2026-05-01', deleted_at: '2026-06-01' }, // left before/at June start
+      { hire_date: '2026-06-01' },
+      { hire_date: '2026-06-10' },
+      { hire_date: '2026-07-01' }, // hired after June
+      { hire_date: null }, // no hire_date at all
     ];
-    expect(countHeadcountAsOf(employees, '2026-06-30')).toBe(2);
+    expect(countRegisteredAsOf(employees, '2026-06-30')).toBe(2);
+  });
+
+  it('is monotonically non-decreasing month over month (a cumulative count can never shrink)', () => {
+    const employees = [
+      { hire_date: '2026-06-05' },
+      { hire_date: '2026-07-10' },
+      { hire_date: '2026-08-20' },
+    ];
+    const june = countRegisteredAsOf(employees, '2026-06-30');
+    const july = countRegisteredAsOf(employees, '2026-07-31');
+    const august = countRegisteredAsOf(employees, '2026-08-31');
+    expect(june).toBeLessThanOrEqual(july);
+    expect(july).toBeLessThanOrEqual(august);
   });
 });
 

@@ -3,24 +3,25 @@
 // a component-test harness (this repo has none) -- Dashboard.tsx itself
 // just calls these against its own fetched data.
 
-export interface GrowthHistoryEmployee {
+export interface EmployeeRegistrationRecord {
   hire_date: string | null;
-  deleted_at: string | null;
 }
 
-// Real headcount AS OF THE END OF a given month (monthEnd, "YYYY-MM-DD"),
-// not "hired ever" and not "currently employed today". Someone counts for
-// a month if they had already been hired by monthEnd AND either haven't
-// left yet or left after monthEnd -- so a person hired in June and
-// terminated (soft-deleted) in August still counts toward June's and
-// July's headcount, even though they are invisible to any is_deleted=false
-// query by the time this runs.
-export function countHeadcountAsOf(employees: GrowthHistoryEmployee[], monthEnd: string): number {
-  return employees.filter(e => {
-    if (!e.hire_date || e.hire_date > monthEnd) return false;
-    if (!e.deleted_at) return true;
-    return e.deleted_at.slice(0, 10) > monthEnd;
-  }).length;
+// Cumulative employees REGISTERED as of the end of a given month (monthEnd,
+// "YYYY-MM-DD") -- NOT active headcount. Departures are deliberately never
+// subtracted: `employees.status` is unconstrained free TEXT with no
+// schema column recording when it changed, and there are TWO independent,
+// non-overlapping departure paths in this app -- Employees.tsx's soft
+// delete (is_deleted/deleted_at) and Security.tsx's Edit Guard status
+// dropdown (which can set status to 'Terminated'/'Suspended' via a plain
+// `.update({ status })` that never touches is_deleted/deleted_at at all).
+// An employee can therefore be genuinely terminated with deleted_at
+// forever NULL, so a deleted_at-based exclusion would silently miss some
+// departures and not others -- less honest than not attempting it. This
+// counts hire_date registrations only, a number the schema can actually
+// prove, regardless of current status or soft-delete state.
+export function countRegisteredAsOf(employees: EmployeeRegistrationRecord[], monthEnd: string): number {
+  return employees.filter(e => !!e.hire_date && e.hire_date <= monthEnd).length;
 }
 
 export interface PayrollRecordForApproval {

@@ -20,7 +20,7 @@ import {
 import { showNotification } from '../utils/clickHandlers';
 import { getErrorMessage } from '../utils/errorHandler';
 import { resolveDashboardPermissions, buildPendingTasks, PendingTask } from '../utils/dashboardPermissions';
-import { countHeadcountAsOf, countPendingPayrollMonths } from '../utils/dashboardMetrics';
+import { countRegisteredAsOf, countPendingPayrollMonths } from '../utils/dashboardMetrics';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
@@ -132,7 +132,7 @@ export function Dashboard() {
   const [pendingPayrollApprovalCount, setPendingPayrollApprovalCount] = useState(0);
   const [dataReady, setDataReady] = useState(false);
   const [initialLoad, setInitialLoad] = useState(true);
-  // Real connectivity/data-fetch signal for the "Data Status" card --
+  // Real connectivity/data-fetch signal for the "Data Load" card --
   // replaces a previously hardcoded "Online". True only when the LAST
   // fetchDashboardData() call actually threw; reset to false at the start
   // of every attempt so a stale error never survives a successful retry.
@@ -321,17 +321,22 @@ export function Dashboard() {
       // without security_personnel.view, so an Accountant session never
       // receives raw guard data in this fetch even though it isn't
       // rendered today.
-      // `.order('created_at', ...)` matters beyond cosmetics: "Recent Active
-      // Employees" below is `employeesData.slice(0, 6)` -- without an
-      // explicit order, that's whatever arbitrary order Postgres/PostgREST
-      // happens to return (not guaranteed stable, and never "newest
-      // first"), so the widget's own "Latest additions to your workforce"
-      // subtitle was not actually true before this.
+      // Ordered by `hire_date` DESC, not `created_at` DESC: "Recent Active
+      // Employees" below (`employeesData.slice(0, 6)`) is captioned "Latest
+      // additions to your workforce" -- that is a claim about hire_date
+      // (when someone joined the workforce), not created_at (when the row
+      // was entered into Safeguard). The Add Employee form's Date Hired
+      // field is a free date picker defaulting to today but editable to
+      // any past date (see Employees.tsx's dateHired field), so a
+      // backfilled/historical hire entered today would wrongly show as the
+      // "latest addition" under created_at ordering even though they
+      // joined the workforce months ago. `nullsFirst: false` keeps a row
+      // with no hire_date at all from wrongly sorting to the very top.
       let employeesQuery = supabase
         .from('employees_general')
         .select('*')
         .eq('is_deleted', false)
-        .order('created_at', { ascending: false });
+        .order('hire_date', { ascending: false, nullsFirst: false });
       
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
@@ -342,23 +347,32 @@ export function Dashboard() {
       // ===== Employee Growth history source -- deliberately a SEPARATE,
       // unfiltered-by-is_deleted fetch, not derived from `employeesData`
       // above =====
-      // `employeesData` (is_deleted=false) answers "who is employed
-      // TODAY" -- it cannot answer "who was employed as of the end of
-      // June" for anyone who has since left: a hire from June, soft-
-      // deleted in August, is invisible to that query entirely, so a
-      // growth chart built from it would silently UNDERcount every past
-      // month by however many people have left since. This fetch includes
-      // soft-deleted rows too (same tenant/region scope as the RLS/query
-      // above -- is_deleted is an application-level filter here, not an
-      // RLS restriction, confirmed by reading employees_general's own
-      // definition), using each row's own `deleted_at` to know exactly
-      // when they left, so a past month's count can correctly include
-      // someone who has since departed. Only `hire_date`/`deleted_at`/
-      // `region_id` are selected -- this never exposes anything beyond
-      // what the growth chart itself needs.
+      // This chart cannot show real historical ACTIVE headcount, only
+      // cumulative REGISTRATIONS -- confirmed by tracing every path that
+      // ends someone's employment: `employees.status` is free TEXT with no
+      // CHECK constraint and no schema column recording when it changed
+      // (no termination_date/status_changed_at anywhere), and Security.tsx
+      // exposes its own guardStatusList = ['Active','On Leave','Suspended',
+      // 'Terminated'] whose Edit Guard save path does
+      // `.update({ status: updatedGuard.status, ... })` with NO is_deleted/
+      // deleted_at touched at all -- so an employee can be genuinely
+      // terminated (status='Terminated') while deleted_at stays NULL
+      // forever, invisible to any deleted_at-based "did they leave"
+      // filter. Employees.tsx's own soft-delete (is_deleted/deleted_at) is
+      // a second, independent departure path with no guarantee the first
+      // one was also used. With no schema-provable timestamp covering
+      // every departure route, subtracting departures at all would silently
+      // under-report some past months and not others -- worse than not
+      // attempting it. So this deliberately counts hire_date registrations
+      // only, forever, once hired: a number the schema can actually prove.
+      // Same tenant/region scope as the query above (is_deleted is an
+      // application-level filter here, not an RLS restriction, confirmed
+      // by reading employees_general's own definition) -- soft-deleted
+      // rows are deliberately included too, since they were still real
+      // registrations. Only `hire_date`/`region_id` are selected.
       let growthHistoryQuery = supabase
         .from('employees_general')
-        .select('hire_date, deleted_at, region_id');
+        .select('hire_date, region_id');
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         growthHistoryQuery = growthHistoryQuery.eq('region_id', userProfile.region_id);
       }
@@ -549,26 +563,25 @@ export function Dashboard() {
       
       // ===== RECENT ACTIVE EMPLOYEES =====
       // `employeesData` is already non-deleted (is_deleted=false) and
-      // ordered created_at DESC (see employeesQuery above), but that alone
+      // ordered hire_date DESC (see employeesQuery above), but that alone
       // doesn't guarantee status='Active' -- an employee currently On
       // Leave is non-deleted too, and this widget's own title claims
       // "Active" specifically (the same meaning "Active Guards"/"Active
       // Supervisors" use elsewhere on this page: status === 'Active').
-      // Filtering (not re-querying) preserves the created_at DESC order
+      // Filtering (not re-querying) preserves the hire_date DESC order
       // already applied server-side.
       setRecent(employeesData.filter((e: any) => e.status === 'Active').slice(0, 6));
-      
-      // ===== GROWTH DATA — real headcount AS OF THE END OF each month,
-      // starting from the system's actual start month (June 2026), not a
-      // fabricated multi-year history the system never existed for. =====
-      // Uses `growthHistoryEmployees` (includes soft-deleted rows), NOT
-      // `employeesData` (is_deleted=false only) -- a person hired in June
-      // and terminated in August is still part of June's and July's real
-      // headcount, and `employeesData` alone cannot see them at all once
-      // they've left. A month counts someone if they had already been
-      // hired by monthEnd AND (they haven't left yet, OR they left after
-      // monthEnd) -- i.e. real headcount at that point in time, not
-      // "hired ever" and not "currently employed today".
+
+      // ===== GROWTH DATA — cumulative employees REGISTERED as of the end
+      // of each month, starting from the system's actual start month (June
+      // 2026), not a fabricated multi-year history the system never
+      // existed for. NOT active headcount -- see growthHistoryQuery's own
+      // comment above for why the schema cannot prove that (no timestamp
+      // covers every departure path, so departures are never subtracted).
+      // Uses `growthHistoryEmployees` (includes soft-deleted rows -- they
+      // were still real registrations), not `employeesData` (is_deleted=
+      // false only, which would silently drop anyone since deleted from
+      // every past month's count too, understating history).
       // (`chartMonths`/`monthNames`/`monthRanges` were computed earlier,
       // alongside the merged attendance fetch, and are reused here.)
       const growth = chartMonths.map(month => {
@@ -576,7 +589,7 @@ export function Dashboard() {
         const monthName = monthNames[monthNum - 1];
         const lastDay = new Date(year, monthNum, 0).getDate();
         const monthEnd = `${year}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
-        const count = countHeadcountAsOf(growthHistoryEmployees, monthEnd);
+        const count = countRegisteredAsOf(growthHistoryEmployees, monthEnd);
         return { month: `${monthName} ${year}`, employees: count };
       });
       setGrowthData(growth);
@@ -830,7 +843,7 @@ export function Dashboard() {
           <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
           <XAxis dataKey="month" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
           <YAxis tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} />
-          <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`${v} employees`, 'Workforce']} />
+          <Tooltip contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '12px' }} formatter={(v: any) => [`${v} employees`, 'Registered']} />
           <Line type="monotone" dataKey="employees" stroke="#D4A017" strokeWidth={3} dot={{ fill: '#081C3A', strokeWidth: 2, r: 4, stroke: '#fff' }} />
         </>
       )
@@ -1011,12 +1024,14 @@ export function Dashboard() {
         <Card className="p-4 flex items-center gap-3">
           <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${dashboardFetchError ? 'bg-red-100 text-red-600' : 'bg-emerald-100 text-emerald-600'}`}><Bell size={20} /></div>
           <div>
-            <p className="text-xs text-slate-500">Data Status</p>
+            <p className="text-xs text-slate-500">Data Load</p>
             {/* Reflects whether the LAST Dashboard data fetch actually
-                succeeded -- not a hardcoded "Online" -- see
-                dashboardFetchError, set in fetchDashboardData()'s own
-                catch block below. */}
-            <p className={`font-semibold text-sm ${dashboardFetchError ? 'text-red-600' : 'text-slate-800'}`}>{dashboardFetchError ? 'Load Failed' : 'Up to Date'}</p>
+                succeeded -- not a hardcoded "Online", and deliberately NOT
+                worded as "Up to Date": this proves the fetch completed
+                without error, not that the data is fresh (nothing on this
+                page measures freshness/staleness). See dashboardFetchError,
+                set in fetchDashboardData()'s own catch block below. */}
+            <p className={`font-semibold text-sm ${dashboardFetchError ? 'text-red-600' : 'text-slate-800'}`}>{dashboardFetchError ? 'Load Failed' : 'Successful'}</p>
           </div>
         </Card>
       </div>
@@ -1069,8 +1084,8 @@ export function Dashboard() {
 
         <Card className="p-5">
           <div className="flex items-center justify-between mb-4">
-            <div><h3 className="font-semibold text-slate-800">Employee Growth</h3><p className="text-xs text-slate-500">Workforce headcount since the system started (June 2026)</p></div>
-            <Badge color="navy">{stats.total} Total</Badge>
+            <div><h3 className="font-semibold text-slate-800">Cumulative Employees Registered</h3><p className="text-xs text-slate-500">Total employees added since the system started (June 2026) -- not a live active-headcount figure</p></div>
+            <Badge color="navy">{stats.total} Currently Active</Badge>
           </div>
           <div className="h-56">
             {renderGrowthChart}
