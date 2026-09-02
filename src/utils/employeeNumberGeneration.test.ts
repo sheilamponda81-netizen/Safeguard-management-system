@@ -17,7 +17,7 @@ vi.mock('../lib/supabase', () => ({
   },
 }));
 
-const { getRegionLetter, buildEmployeeNumberPrefix, nextEmployeeNumber, generateEmployeeNumberServerSide } =
+const { getRegionLetter, buildEmployeeNumberPrefix, nextEmployeeNumber, generateEmployeeNumberServerSide, shouldGenerateEmployeeNumber } =
   await import('./employeeNumberGeneration');
 
 describe('getRegionLetter', () => {
@@ -108,5 +108,56 @@ describe('generateEmployeeNumberServerSide', () => {
     ]);
     expect(first).not.toBe(second);
     expect([first, second].sort()).toEqual(['SFG-N-010', 'SFG-N-011']);
+  });
+});
+
+// Regression coverage for the real staging bug: a Human Resource Manager's
+// region is PRE-ASSIGNED into the Add Employee form's initial state (not
+// picked from the region <select>, which only a super admin ever sees --
+// see Employees.tsx's AddEmployeeForm), so the OLD implementation (which
+// only ever called generateEmployeeNumberServerSide from inside that
+// <select>'s onChange) never fired for HR at all: Employee Number stayed
+// permanently blank and the required-field validator refused to let HR
+// submit the form. shouldGenerateEmployeeNumber is the extracted decision
+// AddEmployeeForm's region-driven useEffect now calls instead.
+describe('shouldGenerateEmployeeNumber', () => {
+  it('HR Manager scenario: a region pre-assigned before any generation has happened (lastGeneratedForRegionId=null) should generate', () => {
+    expect(shouldGenerateEmployeeNumber('southern-region-id', null)).toBe(true);
+  });
+
+  it('HR Manager never manually selects/changes region -- this alone, with no onChange event at all, is what the auto-generation effect relies on', () => {
+    // No onChange required: the form's initial region_id is already the
+    // pre-assigned one, and that alone is enough for this function to say
+    // "generate" -- exactly what lets the useEffect trigger on mount.
+    const regionId = 'southern-region-id';
+    expect(shouldGenerateEmployeeNumber(regionId, null)).toBe(true);
+  });
+
+  it('Admin selects a region for the first time (lastGeneratedForRegionId=null): should generate', () => {
+    expect(shouldGenerateEmployeeNumber('any-region-id', null)).toBe(true);
+  });
+
+  it('Admin changes to a DIFFERENT region before submission: should generate again for the new region', () => {
+    expect(shouldGenerateEmployeeNumber('region-B', 'region-A')).toBe(true);
+  });
+
+  it('no region resolved yet (null/undefined/empty): never generates', () => {
+    expect(shouldGenerateEmployeeNumber(null, null)).toBe(false);
+    expect(shouldGenerateEmployeeNumber(undefined, null)).toBe(false);
+    expect(shouldGenerateEmployeeNumber('', null)).toBe(false);
+  });
+
+  it('normal re-render with the SAME region already generated for: does not regenerate (no duplicate generation, no wasted counter increments)', () => {
+    expect(shouldGenerateEmployeeNumber('southern-region-id', 'southern-region-id')).toBe(false);
+  });
+
+  it('an unrelated field changing does not affect this decision at all -- it is purely a function of region_id vs lastGeneratedForRegionId', () => {
+    // Simulates re-evaluating the same two arguments repeatedly, as a
+    // useEffect with `[form.region_id]` as its only dependency would do
+    // across renders triggered by unrelated form field edits.
+    const regionId = 'southern-region-id';
+    for (let i = 0; i < 5; i++) {
+      expect(shouldGenerateEmployeeNumber(regionId, regionId)).toBe(false);
+    }
   });
 });

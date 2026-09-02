@@ -1,4 +1,4 @@
-﻿import { useState, useMemo, useEffect, useCallback } from 'react';
+﻿import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, Heart, Archive, RotateCcw, Calendar, AlertCircle, Building2, Home, Loader2 } from 'lucide-react';
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs } from '../components/ui';
 import { formatKwacha } from '../data';
@@ -13,7 +13,7 @@ import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { toCsvRow } from '../utils/csvExport';
-import { generateEmployeeNumberServerSide } from '../utils/employeeNumberGeneration';
+import { generateEmployeeNumberServerSide, shouldGenerateEmployeeNumber } from '../utils/employeeNumberGeneration';
 import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
 import { checkEmployeeIdentifierConflicts, formatIdentifierConflictMessage, identifierColumnFromUniqueViolation } from '../utils/employeeConflicts';
@@ -331,7 +331,11 @@ const REQUIRED_EMPLOYEE_FIELDS: { key: keyof Employee; label: string }[] = [
 
 const validateEmployeeForm = (form: Partial<Employee>, isSuperAdmin?: boolean): string | null => {
   if (!form.employeeNumber || String(form.employeeNumber).trim() === '') {
-    return 'Employee Number (select a Region first so it can be generated)';
+    // Deliberately not "select a Region first" -- a non-super-admin's
+    // region is pre-assigned, not manually selected, so that phrasing
+    // describes an action they can't take. Covers both: a region not yet
+    // resolved at all, and generation still in flight or having failed.
+    return 'Employee Number (still generating -- wait for it to complete, or select/confirm a Region)';
   }
 
   for (const { key, label } of REQUIRED_EMPLOYEE_FIELDS) {
@@ -1588,6 +1592,13 @@ function AddEmployeeForm({
 
   const [positions, setPositions] = useState<{ name: string }[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
+  // Tracks which region_id the employee number was last generated (or is
+  // being generated) for, so the auto-generation effect below can tell "a
+  // NEW region just became current, generate for it" apart from "form
+  // re-rendered for an unrelated reason, region_id is unchanged, don't
+  // regenerate" -- a plain "regenerate whenever employeeNumber is blank"
+  // check can't make that distinction (employeeNumber starts blank too).
+  const lastGeneratedForRegion = useRef<string | null>(null);
   const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
   const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
   const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
@@ -1682,18 +1693,59 @@ function AddEmployeeForm({
     setIsGenerating(true);
     try {
       const region = regions.find((r) => r.id === regionId);
-      if (!region) return;
+      if (!region) {
+        console.error("Error generating employee number: region", regionId, "not found in the loaded regions list");
+        showNotification("Could not generate Employee Number: region not found. Please try again.", "error");
+        return;
+      }
 
       const formattedNumber = await generateEmployeeNumberServerSide(regionId, region);
       setTimeout(() => {
         update("employeeNumber", formattedNumber);
       }, 10);
     } catch (err) {
+      // Leaves form.employeeNumber blank -- validateEmployeeForm() already
+      // refuses to submit with a blank Employee Number, so this never
+      // results in an employee being created with a blank or guessed
+      // number; this notification just makes the failure visible instead
+      // of only reaching the browser console.
       console.error("Error generating employee number:", err);
+      showNotification("Failed to generate Employee Number. Please try again.", "error");
     } finally {
       setIsGenerating(false);
     }
   };
+
+  // ===== AUTO-GENERATE EMPLOYEE NUMBER WHENEVER THE FORM'S REGION
+  // RESOLVES TO A NEW VALUE -- covers BOTH ways a region reaches this
+  // form: a non-super-admin's region is preset directly into useState's
+  // initial value (see `region_id: userRegionId || ""` above) and the
+  // region field then renders as a locked, disabled <input> with no
+  // onChange of its own -- so a handler living only inside the region
+  // <select>'s onChange (the old approach) could never fire for that
+  // case, leaving Employee Number permanently blank and the form
+  // permanently unsubmittable. A super admin's own region <select> still
+  // works too: its onChange sets form.region_id, which is exactly this
+  // effect's dependency, so ONE code path now generates for both cases
+  // instead of two.
+  //
+  // `lastGeneratedForRegion` (not "is employeeNumber blank") is the guard
+  // against double-generating: employeeNumber is legitimately blank both
+  // before the FIRST generation for a region AND right after a super
+  // admin switches to a DIFFERENT region (see the onChange handler below,
+  // which clears it) -- a blank-check alone can't tell "never generated
+  // yet" apart from "already generated, still on the same region" once a
+  // super admin has switched back and forth. Comparing against the exact
+  // region_id last generated for makes a genuine region change always
+  // regenerate, while a re-render that leaves region_id untouched never
+  // does.
+  useEffect(() => {
+    const regionId = form.region_id;
+    if (!shouldGenerateEmployeeNumber(regionId, lastGeneratedForRegion.current)) return;
+    lastGeneratedForRegion.current = regionId;
+    generateEmployeeNumber(regionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.region_id]);
 
   useEffect(() => {
     const fetchPositions = async () => {
@@ -1826,11 +1878,16 @@ function AddEmployeeForm({
             <label className="block text-sm font-medium text-slate-700 mb-1.5">Employee Number</label>
             <input
               type="text"
-              value={form.employeeNumber}
+              value={isGenerating ? '' : form.employeeNumber}
+              placeholder={isGenerating ? 'Generating employee number...' : ''}
               disabled
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg bg-slate-50 font-mono"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg bg-slate-50 font-mono placeholder:font-sans placeholder:italic placeholder:text-slate-400"
             />
-            <p className="text-xs text-slate-400 mt-1">Auto-generated after selecting region</p>
+            <p className="text-xs text-slate-400 mt-1">
+              {isGenerating
+                ? 'Generating employee number...'
+                : 'System-generated for the assigned region -- not editable'}
+            </p>
           </div>
           {field("fullName", "Full Name", "text", true)}
           {field("dob", "Date of Birth", "date", true)}
@@ -2237,12 +2294,15 @@ function AddEmployeeForm({
                 value={form.region_id || ""}
                 onChange={(e) => {
                   const selectedId = e.target.value;
-                  setForm((prev) => ({ ...prev, region_id: selectedId }));
-                  if (selectedId) {
-                    generateEmployeeNumber(selectedId);
-                  } else {
-                    setForm((prev) => ({ ...prev, employeeNumber: "" }));
-                  }
+                  // Clears employeeNumber unconditionally (not just when
+                  // cleared to "") and resets the generation-tracking ref
+                  // so the auto-generation effect above always treats this
+                  // as a fresh region and regenerates -- the effect itself
+                  // (triggered by this same region_id change) is now the
+                  // ONLY place that calls generateEmployeeNumber, so there
+                  // is no risk of it firing twice for one selection.
+                  setForm((prev) => ({ ...prev, region_id: selectedId, employeeNumber: "" }));
+                  lastGeneratedForRegion.current = null;
                 }}
                 disabled={isSubmitting}
                 className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
@@ -2275,17 +2335,22 @@ function AddEmployeeForm({
         >
           Cancel
         </button>
-        <button 
-          type="submit" 
-          disabled={isSubmitting}
+        <button
+          type="submit"
+          disabled={isSubmitting || isGenerating}
           className={`px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] transition-all flex items-center gap-2 ${
-            isSubmitting ? 'opacity-70 cursor-not-allowed' : ''
+            (isSubmitting || isGenerating) ? 'opacity-70 cursor-not-allowed' : ''
           }`}
         >
           {isSubmitting ? (
             <>
               <Loader2 size={16} className="animate-spin" />
               Adding Employee...
+            </>
+          ) : isGenerating ? (
+            <>
+              <Loader2 size={16} className="animate-spin" />
+              Generating Employee Number...
             </>
           ) : (
             <>

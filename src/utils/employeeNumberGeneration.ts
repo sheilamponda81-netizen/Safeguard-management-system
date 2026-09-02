@@ -90,3 +90,34 @@ export async function generateEmployeeNumberServerSide(regionId: string, region:
     return fetchNextEmployeeNumberFromBrowser(region);
   }
 }
+
+/**
+ * Whether AddEmployeeForm's (src/pages/Employees.tsx) region-driven
+ * auto-generation effect should call generateEmployeeNumberServerSide()
+ * for `regionId`, given which region_id (if any) a number was already
+ * generated -- or is being generated -- for (`lastGeneratedForRegionId`).
+ *
+ * True exactly when there IS a region AND it's not the one already
+ * covered. This single rule handles two real form states identically:
+ * - Form just mounted with a PRE-ASSIGNED region (a non-super-admin's
+ *   region, set directly into the form's initial state rather than
+ *   picked from a dropdown) -- lastGeneratedForRegionId is still null,
+ *   so this returns true and generation fires once on mount.
+ * - A super admin manually changes the region <select> -- the caller
+ *   resets lastGeneratedForRegionId to null on every such change (see
+ *   Employees.tsx's onChange handler), so this again returns true and a
+ *   fresh number is generated for the new region.
+ *
+ * False for a re-render that leaves regionId unchanged (including one
+ * caused by the earlier generation call itself finishing and writing the
+ * number into form state) -- a component whose effect depends only on
+ * `[region_id]` and calls this function will therefore never generate
+ * twice for the same region, and never regenerate on an unrelated field
+ * edit.
+ */
+export function shouldGenerateEmployeeNumber(
+  regionId: string | null | undefined,
+  lastGeneratedForRegionId: string | null
+): boolean {
+  return !!regionId && regionId !== lastGeneratedForRegionId;
+}
