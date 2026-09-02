@@ -1,4 +1,5 @@
 import { canAccess, PERMISSIONS } from './permissions';
+import { canApprovePayroll as canApprovePayrollFor } from './payrollPermissions';
 import { UserProfile } from './currentProfile';
 
 export interface DashboardPermissions {
@@ -6,6 +7,12 @@ export interface DashboardPermissions {
   canViewAttendance: boolean;
   canViewRecruitment: boolean;
   canViewSecurity: boolean;
+  // Separate from canViewPayroll: payroll.approve (legacy role_level === 1)
+  // is strictly narrower than payroll.view. Resolved via the SAME
+  // canApprovePayrollFor() function Payroll.tsx itself uses for its own
+  // Approve button, so this can never drift from what the real action is
+  // actually gated by.
+  canApprovePayroll: boolean;
 }
 
 // Fail-closed by design: an error resolving any of the underlying
@@ -22,41 +29,66 @@ export interface DashboardPermissions {
 export async function resolveDashboardPermissions(profile: UserProfile | null): Promise<DashboardPermissions> {
   try {
     const isLegacy = (profile?.role_level ?? null) !== null;
+    const roleContext = { isSuperAdmin: profile?.is_super_admin || false, roleLevel: profile?.role_level || 4 };
     const [canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity] = await Promise.all([
       canAccess(isLegacy, PERMISSIONS.PAYROLL_VIEW),
       canAccess(isLegacy, PERMISSIONS.ATTENDANCE_VIEW),
       canAccess(isLegacy, PERMISSIONS.RECRUITMENT_VIEW),
       canAccess(isLegacy, PERMISSIONS.SECURITY_PERSONNEL_VIEW),
     ]);
-    return { canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity };
+    const canApprovePayroll = await canAccess(canApprovePayrollFor(roleContext), PERMISSIONS.PAYROLL_APPROVE);
+    return { canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity, canApprovePayroll };
   } catch (err) {
     console.error('Error resolving dashboard permissions:', err);
-    return { canViewPayroll: false, canViewAttendance: false, canViewRecruitment: false, canViewSecurity: false };
+    return { canViewPayroll: false, canViewAttendance: false, canViewRecruitment: false, canViewSecurity: false, canApprovePayroll: false };
   }
 }
 
 export interface PendingTask {
-  key: 'approve-payroll' | 'review-applications' | 'process-leave' | 'renew-licenses';
+  key: 'approve-payroll' | 'review-applications' | 'renew-licenses';
   title: string;
   due: string;
   priority: 'high' | 'medium';
+  count: number;
 }
 
-// Dashboard.tsx's static "Pending Tasks" widget, gated by the same
-// DashboardPermissions flags it already uses to gate its own data
-// fetches -- extracted so the filtering logic is independently
-// unit-testable without rendering the page. "Process Leave Requests" is
-// deliberately left ungated: no leave-management feature or permission
-// exists anywhere in this app to gate it against (confirmed by
+// Inputs for buildPendingTasks(): permission flags PLUS the real pending
+// counts each task represents. A task's own `visible` rule is always
+// "authorized for the action AND count > 0" -- never permission alone.
+// "Process Leave Requests" (the original 4th static demo task) is
+// deliberately REMOVED, not merely gated: no leave-management feature,
+// table, or permission exists anywhere in this app (confirmed by
 // inspecting permissions.ts's full PERMISSIONS list and every page in
-// src/pages) -- inventing one here would be a business rule this audit
-// has no source for.
-export function buildPendingTasks(permissions: DashboardPermissions): PendingTask[] {
+// src/pages) to determine who is responsible for it or whether anything
+// is actually pending -- showing it to anyone, gated or not, would be
+// decorative, not data-driven. If a real leave-management feature is
+// ever built, this task belongs back here then, backed by real data.
+export interface PendingTaskInputs {
+  canApprovePayroll: boolean;
+  pendingPayrollApprovalCount: number;
+  canViewRecruitment: boolean;
+  pendingRecruitmentCount: number;
+  canViewSecurity: boolean;
+  expiringLicensesCount: number;
+}
+
+export function buildPendingTasks(inputs: PendingTaskInputs): PendingTask[] {
   const allTasks: (PendingTask & { visible: boolean })[] = [
-    { key: 'approve-payroll', title: 'Approve Payroll', due: 'Today', priority: 'high', visible: permissions.canViewPayroll },
-    { key: 'review-applications', title: 'Review Job Applications', due: 'Tomorrow', priority: 'medium', visible: permissions.canViewRecruitment },
-    { key: 'process-leave', title: 'Process Leave Requests', due: '2 days', priority: 'medium', visible: true },
-    { key: 'renew-licenses', title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high', visible: permissions.canViewSecurity },
+    {
+      key: 'approve-payroll', title: 'Approve Payroll', due: 'Today', priority: 'high',
+      count: inputs.pendingPayrollApprovalCount,
+      visible: inputs.canApprovePayroll && inputs.pendingPayrollApprovalCount > 0,
+    },
+    {
+      key: 'review-applications', title: 'Review Job Applications', due: 'Tomorrow', priority: 'medium',
+      count: inputs.pendingRecruitmentCount,
+      visible: inputs.canViewRecruitment && inputs.pendingRecruitmentCount > 0,
+    },
+    {
+      key: 'renew-licenses', title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high',
+      count: inputs.expiringLicensesCount,
+      visible: inputs.canViewSecurity && inputs.expiringLicensesCount > 0,
+    },
   ];
   return allTasks.filter(task => task.visible).map(({ visible: _visible, ...task }) => task);
 }

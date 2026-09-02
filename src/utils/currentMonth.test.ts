@@ -4,7 +4,18 @@ import {
   getNextMonth,
   getAvailableMonthsFromSystem,
   getSystemStartDate,
+  getChartMonths,
 } from './currentMonth';
+
+// Local helper mirroring the file's own "YYYY-MM" key format, driven off
+// getSystemStartDate() rather than a hardcoded string -- these tests must
+// stay correct regardless of what the actual system start month is.
+function monthKey(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+function addMonths(date: Date, n: number): Date {
+  return new Date(date.getFullYear(), date.getMonth() + n, 1);
+}
 
 // These cover the actual month-navigation requirements from the historical-
 // navigation feature request: previous/next month math (including year
@@ -97,5 +108,70 @@ describe('getAvailableMonthsFromSystem', () => {
     expect(months[0]).toBe(startKey);
     expect(months).toContain(startKey);
     expect(months.length).toBe(48);
+  });
+});
+
+// Regression coverage for the real staging bug (both the Monthly Payroll
+// Trend and Employee Growth Dashboard charts showed all 6 points labeled
+// with the system start month and a flat/repeated line): the old
+// implementation, on hitting the FIRST out-of-range month in its i=5..0
+// loop, filled every remaining slot with a single hardcoded placeholder
+// and broke out of the loop entirely -- discarding even the later,
+// perfectly valid iterations (including the current month itself). See
+// getChartMonths()'s own header comment in currentMonth.ts for the full
+// trace.
+describe('getChartMonths', () => {
+  it('at the system start month itself, returns exactly ONE month -- never 6 duplicates of it', () => {
+    const start = getSystemStartDate();
+    const startKey = monthKey(start);
+    const months = getChartMonths(startKey);
+    expect(months).toEqual([startKey]);
+  });
+
+  it('one real month after start, returns exactly those TWO distinct real months, in order -- not 6 copies of the start month', () => {
+    const start = getSystemStartDate();
+    const startKey = monthKey(start);
+    const nextKey = monthKey(addMonths(start, 1));
+    const months = getChartMonths(nextKey);
+    expect(months).toEqual([startKey, nextKey]);
+    expect(new Set(months).size).toBe(2);
+  });
+
+  it('every returned month is unique -- no repeated/duplicated month key under any input', () => {
+    const start = getSystemStartDate();
+    for (let i = 0; i <= 8; i++) {
+      const key = monthKey(addMonths(start, i));
+      const months = getChartMonths(key);
+      expect(new Set(months).size).toBe(months.length);
+    }
+  });
+
+  it('the LAST entry is always exactly the requested (or current) month', () => {
+    const start = getSystemStartDate();
+    const key = monthKey(addMonths(start, 3));
+    const months = getChartMonths(key);
+    expect(months[months.length - 1]).toBe(key);
+  });
+
+  it('once the system has existed 6+ months, returns exactly 6 consecutive real months ending at the requested month', () => {
+    const start = getSystemStartDate();
+    const key = monthKey(addMonths(start, 7)); // 8 real months have now passed (0..7)
+    const months = getChartMonths(key);
+    expect(months).toHaveLength(6);
+    const expected = [2, 3, 4, 5, 6, 7].map(i => monthKey(addMonths(start, i)));
+    expect(months).toEqual(expected);
+  });
+
+  it('never returns a month before the actual system start, even when fewer than 6 real months exist', () => {
+    const start = getSystemStartDate();
+    const startKey = monthKey(start);
+    const months = getChartMonths(monthKey(addMonths(start, 2)));
+    months.forEach(m => expect(m >= startKey).toBe(true));
+  });
+
+  it('returns months in ascending chronological order', () => {
+    const start = getSystemStartDate();
+    const months = getChartMonths(monthKey(addMonths(start, 9)));
+    expect(months).toEqual([...months].sort());
   });
 });

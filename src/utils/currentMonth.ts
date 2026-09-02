@@ -280,10 +280,30 @@ export const getNextMonths = (count: number = 12): string[] => {
   return months;
 };
 
-// ===== NEW: Get months for charts (last 6 months from current) =====
+// ===== Get months for charts (last 6 REAL months from current) =====
+// BUG THIS REPLACES (found via real staging evidence -- both the Monthly
+// Payroll Trend and Employee Growth charts showed all 6 points labeled
+// "Jun 2026" with a flat/repeated line): the old loop iterated i=5..0
+// (farthest back first) and, the MOMENT any single iteration's date
+// landed before the system's actual start month, filled EVERY remaining
+// slot (`for (let j = i; j >= 0; j--)`) with the hardcoded start-month
+// placeholder and `break` -- abandoning the loop entirely, including the
+// later, closer-to-current iterations that were perfectly valid real
+// months (e.g. the current month itself, i=0). Since the system has
+// existed for well under 6 months for most of its life, the very first
+// iteration (i=5, 5 months back) was reliably before the start month, so
+// this fired on nearly every call: all 6 slots got overwritten with one
+// repeated placeholder string, which is exactly why every chart point
+// shared one label and one value (both derived from that single
+// duplicated month key).
+//
+// FIX: build the list of every REAL month from the system's actual start
+// through `currentDate` (inclusive), then take the last 6 -- never
+// padding with a duplicate/fake month before the system existed. A
+// system younger than 6 months genuinely returns FEWER than 6 entries;
+// callers (Dashboard.tsx's chart data derivation) already handle however
+// many months come back, since they just `.map()` over this array.
 export const getChartMonths = (systemMonth?: string): string[] => {
-  const months: string[] = [];
-  
   let currentDate: Date;
   if (systemMonth) {
     const [year, month] = systemMonth.split('-').map(Number);
@@ -297,29 +317,17 @@ export const getChartMonths = (systemMonth?: string): string[] => {
       currentDate = new Date(SYSTEM_START_YEAR, SYSTEM_START_MONTH - 1, 1);
     }
   }
-  
-  // Get 6 months before current (or from July 2026 if less than 6 months have passed)
-  for (let i = 5; i >= 0; i--) {
-    const date = new Date(currentDate.getFullYear(), currentDate.getMonth() - i, 1);
-    // If the date is before July 2026, use July 2026 for all earlier months
-    if (isBeforeSystemStart(date)) {
-      // Fill the remaining months with July 2026
-      for (let j = i; j >= 0; j--) {
-        months.push(`${SYSTEM_START_YEAR}-${String(SYSTEM_START_MONTH).padStart(2, '0')}`);
-      }
-      break;
-    }
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    months.push(`${year}-${month}`);
+
+  const realMonths: string[] = [];
+  let cursor = new Date(getSystemStartDate());
+  while (cursor <= currentDate) {
+    const year = cursor.getFullYear();
+    const month = String(cursor.getMonth() + 1).padStart(2, '0');
+    realMonths.push(`${year}-${month}`);
+    cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
   }
-  
-  // Ensure we have exactly 6 months
-  while (months.length < 6) {
-    months.unshift(`${SYSTEM_START_YEAR}-${String(SYSTEM_START_MONTH).padStart(2, '0')}`);
-  }
-  
-  return months.slice(0, 6);
+
+  return realMonths.slice(-6);
 };
 
 // Check if a month is in the past

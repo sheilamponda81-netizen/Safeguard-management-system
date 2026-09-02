@@ -1,7 +1,7 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { 
-  Users, Wallet, UserMinus, ClipboardList, CheckCircle2, TrendingUp, 
-  ArrowRight, Bell, ShieldCheck, Calendar, Shield, MapPin, 
+  Users, Wallet, UserMinus, ClipboardList, CheckCircle2, TrendingUp,
+  ArrowRight, Bell, ShieldCheck, Shield, MapPin,
   ChevronLeft, ChevronRight, RefreshCw, AlertCircle, Building2, Home
 } from '../utils/icons';
 import { Card, StatCard, Button, Badge, Table, THead, TBody, TR, TH, TD } from '../components/ui';
@@ -84,6 +84,14 @@ export function Dashboard() {
   const [canViewAttendance, setCanViewAttendance] = useState(false);
   const [canViewRecruitment, setCanViewRecruitment] = useState(false);
   const [canViewSecurity, setCanViewSecurity] = useState(false);
+  // Separate from canViewPayroll -- Payroll.tsx's own approve action is
+  // gated by payroll.approve (legacy: role_level === 1), a strictly
+  // narrower permission than payroll.view. The "Approve Payroll" pending
+  // task must follow the SAME gate as the real action it links to, not
+  // "can this caller merely see payroll at all" (an Accountant with only
+  // view access, if that combination existed, must never see a task
+  // implying they can approve something they can't act on).
+  const [canApprovePayroll, setCanApprovePayroll] = useState(false);
   const [permissionsResolved, setPermissionsResolved] = useState(false);
   
   // ===== PERFORMANCE: Track chart loading state =====
@@ -115,6 +123,11 @@ export function Dashboard() {
   const [recent, setRecent] = useState<any[]>([]);
   const [growthData, setGrowthData] = useState<any[]>([]);
   const [payrollStatusLabel, setPayrollStatusLabel] = useState('Not Processed');
+  // Real count of the selected month's processed-but-not-yet-approved
+  // payroll rows, in the caller's own authorized scope -- feeds the
+  // "Approve Payroll" pending task's visibility/count. 0 by default (fail-
+  // closed): never set except from the actual payroll fetch below.
+  const [pendingPayrollApprovalCount, setPendingPayrollApprovalCount] = useState(0);
   const [dataReady, setDataReady] = useState(false);
   const [initialLoad, setInitialLoad] = useState(true);
 
@@ -125,13 +138,19 @@ export function Dashboard() {
   // it's independently unit-testable. Icons stay here (React components
   // don't belong in a permissions-utility module).
   const pendingTasks = useMemo(
-    () => buildPendingTasks({ canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity }),
-    [canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity]
+    () => buildPendingTasks({
+      canApprovePayroll,
+      pendingPayrollApprovalCount,
+      canViewRecruitment,
+      pendingRecruitmentCount: stats.pendingRecruitment,
+      canViewSecurity,
+      expiringLicensesCount: stats.expiringLicenses,
+    }),
+    [canApprovePayroll, pendingPayrollApprovalCount, canViewRecruitment, stats.pendingRecruitment, canViewSecurity, stats.expiringLicenses]
   );
   const pendingTaskIcons: Record<PendingTask['key'], typeof Wallet> = {
     'approve-payroll': Wallet,
     'review-applications': ClipboardList,
-    'process-leave': Calendar,
     'renew-licenses': Shield,
   };
 
@@ -205,6 +224,7 @@ export function Dashboard() {
       setCanViewPayroll(false);
       setCanViewAttendance(false);
       setCanViewRecruitment(false);
+      setCanApprovePayroll(false);
       try {
         const { data: { user } } = await supabase.auth.getUser();
         if (user) {
@@ -221,6 +241,7 @@ export function Dashboard() {
           setCanViewAttendance(permissions.canViewAttendance);
           setCanViewRecruitment(permissions.canViewRecruitment);
           setCanViewSecurity(permissions.canViewSecurity);
+          setCanApprovePayroll(permissions.canApprovePayroll);
         }
       } finally {
         setPermissionsResolved(true);
@@ -292,10 +313,17 @@ export function Dashboard() {
       // without security_personnel.view, so an Accountant session never
       // receives raw guard data in this fetch even though it isn't
       // rendered today.
+      // `.order('created_at', ...)` matters beyond cosmetics: "Recent Active
+      // Employees" below is `employeesData.slice(0, 6)` -- without an
+      // explicit order, that's whatever arbitrary order Postgres/PostgREST
+      // happens to return (not guaranteed stable, and never "newest
+      // first"), so the widget's own "Latest additions to your workforce"
+      // subtitle was not actually true before this.
       let employeesQuery = supabase
         .from('employees_general')
         .select('*')
-        .eq('is_deleted', false);
+        .eq('is_deleted', false)
+        .order('created_at', { ascending: false });
       
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
@@ -372,8 +400,15 @@ export function Dashboard() {
         e.license_status === 'Expiring' || e.license_status === 'Expired'
       ).length;
       
-      const totalPayroll = employeesData.reduce((sum: number, e: any) => sum + (e.basic_salary || 0), 0);
-      
+      // "Monthly Payroll" is set further below, inside the canViewPayroll
+      // block, from the real processed `payroll` rows for the selected
+      // month -- not here. It used to be `sum(basic_salary)` across the
+      // active roster: a contracted-base-salary total that never reflected
+      // actual net disbursement (no PAYE/pension/uniform/attendance/salary-
+      // advance deductions applied), silently diverging from what the
+      // Monthly Payroll Trend chart below it calls the same real figure.
+      const totalPayroll = 0;
+
       const onLeave = employeesData.filter((e: any) => e.status === 'On Leave').length;
       
       // ===== ATTENDANCE — fetched ONCE for the full 6-month chart window,
@@ -543,6 +578,24 @@ export function Dashboard() {
               : 'Pending Approval'
         );
 
+        // "Monthly Payroll" stat card -- the real processed net-pay total
+        // for the selected month, matching exactly what the Monthly
+        // Payroll Trend chart below calls the same figure (both read from
+        // `payrollTotalsByMonthKey`, built from the same fetch). Patches
+        // the earlier setStats() call rather than being computed there,
+        // since this needs data only available after this (permission-
+        // gated) payroll fetch completes.
+        setStats(prev => ({ ...prev, totalPayroll: payrollTotalsByMonthKey.get(selectedMonthKey || '') || 0 }));
+
+        // Real count of THIS month's processed-but-not-yet-approved payroll
+        // rows, in the caller's own authorized scope (employeeIds already
+        // reflects tenant/region scoping) -- feeds the "Approve Payroll"
+        // pending task below. Reuses selectedMonthPayrollRecords, already
+        // computed above -- no extra query.
+        setPendingPayrollApprovalCount(
+          selectedMonthPayrollRecords.filter((r: any) => r.approval_status === 'pending').length
+        );
+
         const historyData = chartMonths.map(month => {
           const [year, monthNum] = month.split('-').map(Number);
           const monthName = monthNames[monthNum - 1];
@@ -552,6 +605,11 @@ export function Dashboard() {
           };
         });
         setPayrollHistory(historyData);
+      } else {
+        // Fail-closed: a caller who loses canViewPayroll (e.g. a
+        // mid-session role change) must never keep showing a stale
+        // "Approve Payroll" count from a previous fetch that had access.
+        setPendingPayrollApprovalCount(0);
       }
 
       // ===== ATTENDANCE DATA - Starting from June 2026 =====
@@ -742,9 +800,11 @@ export function Dashboard() {
             <p className="text-[#D4A017] text-sm font-medium mb-1">{greeting}, {userName || 'User'}</p>
             <h2 className="text-2xl md:text-3xl font-bold mb-2">Welcome to Safeguard Control Center</h2>
             <p className="text-white/70 text-sm md:text-base max-w-2xl">
-              {isSuperAdmin 
-                ? `Real-time overview of all ${stats.total} active employees across all regions.`
-                : `Real-time overview of ${stats.total} active employees in ${userRegion?.name || 'your'} region.`}
+              {/* Not "real-time": this reflects the last load/refresh, not
+                  an automatic live update -- see Refresh button below. */}
+              {isSuperAdmin
+                ? `Overview of all ${stats.total} active employees across all regions.`
+                : `Overview of ${stats.total} active employees in ${userRegion?.name || 'your'} region.`}
               {stats.activeGuards} security personnel deployed across {stats.sitesCount} sites.
             </p>
           </div>
@@ -1004,7 +1064,7 @@ export function Dashboard() {
                       <Icon size={16} />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-slate-800">{t.title}</p>
+                      <p className="text-sm font-medium text-slate-800">{t.title} ({t.count})</p>
                       <p className="text-xs text-slate-500 mt-0.5">Due: {t.due}</p>
                     </div>
                   </div>
