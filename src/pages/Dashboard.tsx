@@ -20,7 +20,9 @@ import {
 import { showNotification } from '../utils/clickHandlers';
 import { getErrorMessage } from '../utils/errorHandler';
 import { resolveDashboardPermissions, buildPendingTasks, PendingTask } from '../utils/dashboardPermissions';
-import { countRegisteredAsOf, countPendingPayrollMonths } from '../utils/dashboardMetrics';
+import { countRegisteredAsOf, countPendingPayrollMonths, estimateMonthlyPayrollTotal } from '../utils/dashboardMetrics';
+import { getPayrollRates } from '../utils/payrollSettings';
+import { AttendanceCount } from '../utils/payrollCalculations';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
@@ -125,6 +127,11 @@ export function Dashboard() {
   const [recent, setRecent] = useState<any[]>([]);
   const [growthData, setGrowthData] = useState<any[]>([]);
   const [payrollStatusLabel, setPayrollStatusLabel] = useState('Not Processed');
+  // True when `stats.totalPayroll` is a projected estimate (the selected
+  // month has no processed `payroll` rows yet), false when it's the real
+  // stored net-pay total -- the "Monthly Payroll" card's title/sub-text
+  // read this so an estimate is never presented as the final figure.
+  const [monthlyPayrollIsEstimate, setMonthlyPayrollIsEstimate] = useState(false);
   // Real count of the selected month's processed-but-not-yet-approved
   // payroll rows, in the caller's own authorized scope -- feeds the
   // "Approve Payroll" pending task's visibility/count. 0 by default (fail-
@@ -641,14 +648,68 @@ export function Dashboard() {
               : 'Pending Approval'
         );
 
-        // "Monthly Payroll" stat card -- the real processed net-pay total
-        // for the selected month, matching exactly what the Monthly
-        // Payroll Trend chart below calls the same figure (both read from
-        // `payrollTotalsByMonthKey`, built from the same fetch). Patches
-        // the earlier setStats() call rather than being computed there,
-        // since this needs data only available after this (permission-
-        // gated) payroll fetch completes.
-        setStats(prev => ({ ...prev, totalPayroll: payrollTotalsByMonthKey.get(selectedMonthKey || '') || 0 }));
+        // "Monthly Payroll" stat card. When the selected month HAS
+        // processed rows, this is the real net-pay total -- matching
+        // exactly what the Monthly Payroll Trend chart below calls the
+        // same figure (both read from `payrollTotalsByMonthKey`, built
+        // from the same fetch).
+        //
+        // When it does NOT, management still wants a large, useful figure
+        // rather than a bare "Not Processed" -- so this computes a
+        // PROJECTED total instead, using estimateMonthlyPayrollTotal()
+        // (dashboardMetrics.ts), which sums calculateLivePayroll() per
+        // employee -- the exact same formula Payroll.tsx/Payments.tsx
+        // already use for an unprocessed month's own live preview, not an
+        // invented figure. `monthlyPayrollIsEstimate` tracks which case
+        // this is so the card can label it honestly instead of presenting
+        // it as the final processed amount. This extra fetch (attendance
+        // RPC + payroll rates + position uniform flags) only runs for a
+        // month with zero processed rows -- an already-processed month
+        // never pays this cost.
+        if (selectedMonthPayrollRecords.length === 0) {
+          setMonthlyPayrollIsEstimate(true);
+          try {
+            const [payrollRates, positionsRequiringUniformMap, attendanceRpcRows] = await Promise.all([
+              getPayrollRates(),
+              (async () => {
+                try {
+                  const { data, error } = await supabase.from('positions').select('name, requires_uniform');
+                  if (error) throw error;
+                  return new Map((data || []).map((p: any) => [p.name, p.requires_uniform !== false]));
+                } catch (positionsErr) {
+                  console.error('Error fetching position uniform flags for payroll estimate:', positionsErr);
+                  return new Map<string, boolean>();
+                }
+              })(),
+              employeeIds.length === 0
+                ? Promise.resolve([] as { employee_id: string; absent_days: number; late_days: number }[])
+                : (async () => {
+                    try {
+                      const { data, error } = await supabase.rpc('get_payroll_attendance_counts', {
+                        p_employee_ids: employeeIds,
+                        p_month: selectedMonth,
+                      });
+                      if (error) throw error;
+                      return (data || []) as { employee_id: string; absent_days: number; late_days: number }[];
+                    } catch (attendanceErr) {
+                      console.error('Error fetching attendance for payroll estimate:', attendanceErr);
+                      return [] as { employee_id: string; absent_days: number; late_days: number }[];
+                    }
+                  })(),
+            ]);
+            const attendanceByEmployeeId = new Map<string, AttendanceCount>(
+              attendanceRpcRows.map(r => [r.employee_id, { absentDays: r.absent_days, lateDays: r.late_days }])
+            );
+            const estimate = estimateMonthlyPayrollTotal(employeesData, attendanceByEmployeeId, positionsRequiringUniformMap, payrollRates);
+            setStats(prev => ({ ...prev, totalPayroll: estimate }));
+          } catch (estimateErr) {
+            console.error('Error computing projected payroll estimate:', estimateErr);
+            setStats(prev => ({ ...prev, totalPayroll: 0 }));
+          }
+        } else {
+          setMonthlyPayrollIsEstimate(false);
+          setStats(prev => ({ ...prev, totalPayroll: payrollTotalsByMonthKey.get(selectedMonthKey || '') || 0 }));
+        }
 
         // Real count of DISTINCT payroll MONTHS/RUNS awaiting approval, in
         // the caller's own authorized scope (employeeIds already reflects
@@ -679,6 +740,7 @@ export function Dashboard() {
         // mid-session role change) must never keep showing a stale
         // "Approve Payroll" count from a previous fetch that had access.
         setPendingPayrollApprovalCount(0);
+        setMonthlyPayrollIsEstimate(false);
       }
 
       // ===== ATTENDANCE DATA - Starting from June 2026 =====
@@ -961,14 +1023,20 @@ export function Dashboard() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard title="Total Employees" value={String(stats.total)} icon={Users} accent="navy" sub={`${stats.activeGuards} Active Guards`} />
         {canViewPayroll && (
-          // Agrees with the "Payroll Status" card below rather than
-          // contradicting it: "MK 0" used to show even when NO payroll run
-          // exists yet for the selected month (payrollStatusLabel would
-          // simultaneously say "Not Processed" right next to it) --
-          // indistinguishable from "we processed payroll and it totaled
-          // zero". Reusing payrollStatusLabel here (no new state) means
-          // the two can never disagree.
-          <StatCard title="Monthly Payroll" value={payrollStatusLabel === 'Not Processed' ? 'Not Processed' : formatKwacha(stats.totalPayroll)} icon={Wallet} accent="gold" sub={`Period: ${monthLabel}`} />
+          // Still agrees with the "Payroll Status" card below rather than
+          // contradicting it: `monthlyPayrollIsEstimate` is set from the
+          // exact same "does the selected month have processed payroll
+          // rows" check that drives `payrollStatusLabel`, so the two can
+          // never disagree about whether this month has been processed --
+          // this card just also shows a truthfully-labeled projected
+          // figure instead of only bare status text when it hasn't.
+          <StatCard
+            title={monthlyPayrollIsEstimate ? 'Projected Payroll' : 'Monthly Payroll'}
+            value={formatKwacha(stats.totalPayroll)}
+            icon={Wallet}
+            accent="gold"
+            sub={monthlyPayrollIsEstimate ? `Estimated • ${monthLabel} • Not processed yet` : `Period: ${monthLabel}`}
+          />
         )}
         <StatCard title="On Leave" value={String(stats.onLeave)} icon={UserMinus} accent="red" sub="Currently on leave" />
         {canViewRecruitment && (

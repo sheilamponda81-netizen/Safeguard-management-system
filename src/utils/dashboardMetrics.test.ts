@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { countRegisteredAsOf, countPendingPayrollMonths } from './dashboardMetrics';
+import { countRegisteredAsOf, countPendingPayrollMonths, estimateMonthlyPayrollTotal } from './dashboardMetrics';
+import { DEFAULT_RATES } from './payrollSettings';
+import { AttendanceCount } from './payrollCalculations';
 
 // Regression coverage for the real semantic finding: the Employee Growth
 // chart cannot prove real historical ACTIVE headcount at all, because there
@@ -110,5 +112,69 @@ describe('countPendingPayrollMonths', () => {
       { month: '2026-07', approval_status: 'pending' },
     ];
     expect(countPendingPayrollMonths(records, normalizeWithFailure)).toBe(1);
+  });
+});
+
+// Regression coverage for the "Monthly Payroll" card's projected-figure
+// fix: when the selected month has no processed `payroll` rows, the card
+// must show a real, useful estimate rather than just "Not Processed" text
+// -- but that estimate has to come from the SAME formula (calculateLivePayroll)
+// Payroll.tsx/Payments.tsx already use, not an invented one.
+describe('estimateMonthlyPayrollTotal', () => {
+  const noAttendance = new Map<string, AttendanceCount>();
+  const uniformAlwaysRequired = new Map<string, boolean>(); // empty => defaults to true
+
+  it('single employee, no attendance, default rates: gross - PAYE - pension - default uniform deduction', () => {
+    // basicSalary 100000: gross 100000; paye = (100000-50000)*0.30 = 15000;
+    // pension = 100000*0.05 = 5000; uniform (no per-employee override) =
+    // DEFAULT_RATES.uniformDeduction = 10000. net = 100000-15000-5000-10000 = 70000.
+    const employees = [{ id: 'e1', basic_salary: 100000, position: 'Guard', uniform_deduction: null }];
+    expect(estimateMonthlyPayrollTotal(employees, noAttendance, uniformAlwaysRequired, DEFAULT_RATES)).toBe(70000);
+  });
+
+  it('sums across multiple employees, not just the first', () => {
+    const employees = [
+      { id: 'e1', basic_salary: 100000, position: 'Guard', uniform_deduction: null },
+      { id: 'e2', basic_salary: 100000, position: 'Guard', uniform_deduction: null },
+    ];
+    expect(estimateMonthlyPayrollTotal(employees, noAttendance, uniformAlwaysRequired, DEFAULT_RATES)).toBe(140000);
+  });
+
+  it('applies real attendance-derived deductions per employee (absent/late days), not zero for everyone', () => {
+    // Same base as the first test, but 2 absent + 1 late day:
+    // attendance deduction = 2*4200 + 1*4200 = 12600; uniform total = 10000+12600 = 22600.
+    // net = 100000-15000-5000-22600 = 57400.
+    const employees = [{ id: 'e1', basic_salary: 100000, position: 'Guard', uniform_deduction: null }];
+    const attendance = new Map<string, AttendanceCount>([['e1', { absentDays: 2, lateDays: 1 }]]);
+    expect(estimateMonthlyPayrollTotal(employees, attendance, uniformAlwaysRequired, DEFAULT_RATES)).toBe(57400);
+  });
+
+  it('honors a position explicitly NOT requiring a uniform deduction', () => {
+    const employees = [{ id: 'e1', basic_salary: 100000, position: 'Admin', uniform_deduction: null }];
+    const positions = new Map<string, boolean>([['Admin', false]]);
+    // net = 100000-15000-5000-0 = 80000 (no uniform deduction at all).
+    expect(estimateMonthlyPayrollTotal(employees, noAttendance, positions, DEFAULT_RATES)).toBe(80000);
+  });
+
+  it('honors a per-employee uniform_deduction override instead of the default rate', () => {
+    const employees = [{ id: 'e1', basic_salary: 100000, position: 'Guard', uniform_deduction: 5000 }];
+    // net = 100000-15000-5000-5000 = 75000.
+    expect(estimateMonthlyPayrollTotal(employees, noAttendance, uniformAlwaysRequired, DEFAULT_RATES)).toBe(75000);
+  });
+
+  it('empty roster yields 0, not a fallback nonzero value', () => {
+    expect(estimateMonthlyPayrollTotal([], noAttendance, uniformAlwaysRequired, DEFAULT_RATES)).toBe(0);
+  });
+
+  it('an employee with no attendance-map entry is treated as zero absent/late days, not skipped', () => {
+    const employees = [
+      { id: 'e1', basic_salary: 100000, position: 'Guard', uniform_deduction: null },
+      { id: 'e2', basic_salary: 100000, position: 'Guard', uniform_deduction: null },
+    ];
+    // Only e1 has an attendance row; e2 falls back to 0/0, not excluded from the sum.
+    const attendance = new Map<string, AttendanceCount>([['e1', { absentDays: 1, lateDays: 0 }]]);
+    const total = estimateMonthlyPayrollTotal(employees, attendance, uniformAlwaysRequired, DEFAULT_RATES);
+    // e1: 100000-15000-5000-(10000+4200) = 65800; e2: 70000 (from the first test). Sum = 135800.
+    expect(total).toBe(135800);
   });
 });
