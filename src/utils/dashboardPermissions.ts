@@ -73,9 +73,17 @@ export interface PendingTaskInputs {
 }
 
 export function buildPendingTasks(inputs: PendingTaskInputs): PendingTask[] {
+  // inputs.pendingPayrollApprovalCount counts DISTINCT payroll months/runs
+  // awaiting approval, not employee rows (see Dashboard.tsx's own
+  // pendingPayrollMonthKeys comment) -- so the title itself must say
+  // "month(s)"/"period(s)", not just show a bare number next to "Approve
+  // Payroll", or a reader would reasonably assume it means employees.
+  const payrollTaskTitle = inputs.pendingPayrollApprovalCount === 1
+    ? 'Payroll Awaiting Approval'
+    : 'Payroll Periods Awaiting Approval';
   const allTasks: (PendingTask & { visible: boolean })[] = [
     {
-      key: 'approve-payroll', title: 'Approve Payroll', due: 'Today', priority: 'high',
+      key: 'approve-payroll', title: payrollTaskTitle, due: 'Today', priority: 'high',
       count: inputs.pendingPayrollApprovalCount,
       visible: inputs.canApprovePayroll && inputs.pendingPayrollApprovalCount > 0,
     },

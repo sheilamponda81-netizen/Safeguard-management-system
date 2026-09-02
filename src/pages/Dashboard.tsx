@@ -1,7 +1,7 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { 
   Users, Wallet, UserMinus, ClipboardList, CheckCircle2, TrendingUp,
-  ArrowRight, Bell, ShieldCheck, Shield, MapPin,
+  Bell, ShieldCheck, Shield, MapPin,
   ChevronLeft, ChevronRight, RefreshCw, AlertCircle, Building2, Home
 } from '../utils/icons';
 import { Card, StatCard, Button, Badge, Table, THead, TBody, TR, TH, TD } from '../components/ui';
@@ -18,7 +18,9 @@ import {
   normalizeMonthKey
 } from '../utils/currentMonth';
 import { showNotification } from '../utils/clickHandlers';
+import { getErrorMessage } from '../utils/errorHandler';
 import { resolveDashboardPermissions, buildPendingTasks, PendingTask } from '../utils/dashboardPermissions';
+import { countHeadcountAsOf, countPendingPayrollMonths } from '../utils/dashboardMetrics';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
@@ -130,6 +132,11 @@ export function Dashboard() {
   const [pendingPayrollApprovalCount, setPendingPayrollApprovalCount] = useState(0);
   const [dataReady, setDataReady] = useState(false);
   const [initialLoad, setInitialLoad] = useState(true);
+  // Real connectivity/data-fetch signal for the "Data Status" card --
+  // replaces a previously hardcoded "Online". True only when the LAST
+  // fetchDashboardData() call actually threw; reset to false at the start
+  // of every attempt so a stale error never survives a successful retry.
+  const [dashboardFetchError, setDashboardFetchError] = useState(false);
 
   // ===== MEMOIZED PENDING TASKS =====
   // Filtering itself lives in buildPendingTasks() (dashboardPermissions.ts),
@@ -304,6 +311,7 @@ export function Dashboard() {
   const fetchDashboardData = useCallback(async () => {
     setLoading(true);
     setInitialLoad(true);
+    setDashboardFetchError(false);
     
     try {
       // ===== CRITICAL: Exclude deleted employees =====
@@ -330,6 +338,32 @@ export function Dashboard() {
       }
       
       const employeesRes = await employeesQuery;
+
+      // ===== Employee Growth history source -- deliberately a SEPARATE,
+      // unfiltered-by-is_deleted fetch, not derived from `employeesData`
+      // above =====
+      // `employeesData` (is_deleted=false) answers "who is employed
+      // TODAY" -- it cannot answer "who was employed as of the end of
+      // June" for anyone who has since left: a hire from June, soft-
+      // deleted in August, is invisible to that query entirely, so a
+      // growth chart built from it would silently UNDERcount every past
+      // month by however many people have left since. This fetch includes
+      // soft-deleted rows too (same tenant/region scope as the RLS/query
+      // above -- is_deleted is an application-level filter here, not an
+      // RLS restriction, confirmed by reading employees_general's own
+      // definition), using each row's own `deleted_at` to know exactly
+      // when they left, so a past month's count can correctly include
+      // someone who has since departed. Only `hire_date`/`deleted_at`/
+      // `region_id` are selected -- this never exposes anything beyond
+      // what the growth chart itself needs.
+      let growthHistoryQuery = supabase
+        .from('employees_general')
+        .select('hire_date, deleted_at, region_id');
+      if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        growthHistoryQuery = growthHistoryQuery.eq('region_id', userProfile.region_id);
+      }
+      const growthHistoryRes = await growthHistoryQuery;
+      const growthHistoryEmployees = growthHistoryRes.data || [];
 
       // Applicant counts come from a counts-only RPC, not a direct
       // `applicants` SELECT -- Supervisor/Staff (role_level 3/4) are
@@ -513,12 +547,28 @@ export function Dashboard() {
       });
       setPieData(Object.entries(deptCount).map(([name, value]) => ({ name, value })));
       
-      // ===== RECENT HIRES (non-deleted, active employees) =====
-      setRecent(employeesData.slice(0, 6));
+      // ===== RECENT ACTIVE EMPLOYEES =====
+      // `employeesData` is already non-deleted (is_deleted=false) and
+      // ordered created_at DESC (see employeesQuery above), but that alone
+      // doesn't guarantee status='Active' -- an employee currently On
+      // Leave is non-deleted too, and this widget's own title claims
+      // "Active" specifically (the same meaning "Active Guards"/"Active
+      // Supervisors" use elsewhere on this page: status === 'Active').
+      // Filtering (not re-querying) preserves the created_at DESC order
+      // already applied server-side.
+      setRecent(employeesData.filter((e: any) => e.status === 'Active').slice(0, 6));
       
-      // ===== GROWTH DATA — real cumulative headcount per month, starting from
-      // the system's actual start month (June 2026), not a fabricated
-      // multi-year history the system never existed for. =====
+      // ===== GROWTH DATA — real headcount AS OF THE END OF each month,
+      // starting from the system's actual start month (June 2026), not a
+      // fabricated multi-year history the system never existed for. =====
+      // Uses `growthHistoryEmployees` (includes soft-deleted rows), NOT
+      // `employeesData` (is_deleted=false only) -- a person hired in June
+      // and terminated in August is still part of June's and July's real
+      // headcount, and `employeesData` alone cannot see them at all once
+      // they've left. A month counts someone if they had already been
+      // hired by monthEnd AND (they haven't left yet, OR they left after
+      // monthEnd) -- i.e. real headcount at that point in time, not
+      // "hired ever" and not "currently employed today".
       // (`chartMonths`/`monthNames`/`monthRanges` were computed earlier,
       // alongside the merged attendance fetch, and are reused here.)
       const growth = chartMonths.map(month => {
@@ -526,7 +576,7 @@ export function Dashboard() {
         const monthName = monthNames[monthNum - 1];
         const lastDay = new Date(year, monthNum, 0).getDate();
         const monthEnd = `${year}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
-        const count = employeesData.filter((e: any) => e.hire_date && e.hire_date <= monthEnd).length;
+        const count = countHeadcountAsOf(growthHistoryEmployees, monthEnd);
         return { month: `${monthName} ${year}`, employees: count };
       });
       setGrowthData(growth);
@@ -587,14 +637,20 @@ export function Dashboard() {
         // gated) payroll fetch completes.
         setStats(prev => ({ ...prev, totalPayroll: payrollTotalsByMonthKey.get(selectedMonthKey || '') || 0 }));
 
-        // Real count of THIS month's processed-but-not-yet-approved payroll
-        // rows, in the caller's own authorized scope (employeeIds already
-        // reflects tenant/region scoping) -- feeds the "Approve Payroll"
-        // pending task below. Reuses selectedMonthPayrollRecords, already
-        // computed above -- no extra query.
-        setPendingPayrollApprovalCount(
-          selectedMonthPayrollRecords.filter((r: any) => r.approval_status === 'pending').length
-        );
+        // Real count of DISTINCT payroll MONTHS/RUNS awaiting approval, in
+        // the caller's own authorized scope (employeeIds already reflects
+        // tenant/region scoping) -- feeds the "Approve Payroll" pending
+        // task below. Deliberately NOT a count of pending employee rows:
+        // one payroll run for July with 469 employee rows still pending
+        // is ONE thing to approve ("Payroll Awaiting Approval — 1"), not
+        // 469 -- counting rows would wildly overstate the actual workload
+        // and misrepresent what "Approve Payroll" even means (Payroll.tsx
+        // approves a month's run, not individual employee rows one at a
+        // time). Scans ALL months in allPayrollRecords, not just the
+        // selected month, since a run from an earlier month can still be
+        // awaiting approval regardless of which month is currently
+        // selected on this dashboard.
+        setPendingPayrollApprovalCount(countPendingPayrollMonths(allPayrollRecords || [], normalizeMonthKey));
 
         const historyData = chartMonths.map(month => {
           const [year, monthNum] = month.split('-').map(Number);
@@ -636,6 +692,8 @@ export function Dashboard() {
     } catch (err: any) {
       console.error('Error fetching data:', err);
       setInitialLoad(false);
+      setDashboardFetchError(true);
+      showNotification('Failed to load dashboard data: ' + getErrorMessage(err), 'error');
     } finally {
       setLoading(false);
     }
@@ -805,7 +863,7 @@ export function Dashboard() {
               {isSuperAdmin
                 ? `Overview of all ${stats.total} active employees across all regions.`
                 : `Overview of ${stats.total} active employees in ${userRegion?.name || 'your'} region.`}
-              {stats.activeGuards} security personnel deployed across {stats.sitesCount} sites.
+              {stats.activeGuards} active security personnel across {stats.sitesCount} assigned sites.
             </p>
           </div>
           <div className="flex gap-3 flex-wrap">
@@ -890,7 +948,14 @@ export function Dashboard() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard title="Total Employees" value={String(stats.total)} icon={Users} accent="navy" sub={`${stats.activeGuards} Active Guards`} />
         {canViewPayroll && (
-          <StatCard title="Monthly Payroll" value={stats.totalPayroll > 0 ? formatKwacha(stats.totalPayroll) : 'MK 0'} icon={Wallet} accent="gold" sub={`Period: ${monthLabel}`} />
+          // Agrees with the "Payroll Status" card below rather than
+          // contradicting it: "MK 0" used to show even when NO payroll run
+          // exists yet for the selected month (payrollStatusLabel would
+          // simultaneously say "Not Processed" right next to it) --
+          // indistinguishable from "we processed payroll and it totaled
+          // zero". Reusing payrollStatusLabel here (no new state) means
+          // the two can never disagree.
+          <StatCard title="Monthly Payroll" value={payrollStatusLabel === 'Not Processed' ? 'Not Processed' : formatKwacha(stats.totalPayroll)} icon={Wallet} accent="gold" sub={`Period: ${monthLabel}`} />
         )}
         <StatCard title="On Leave" value={String(stats.onLeave)} icon={UserMinus} accent="red" sub="Currently on leave" />
         {canViewRecruitment && (
@@ -900,9 +965,18 @@ export function Dashboard() {
 
       {/* Security Personnel Dashboard */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard title="Active Guards" value={String(stats.activeGuards)} icon={Shield} accent="green" sub="On duty now" />
-        <StatCard title="Sites Covered" value={String(stats.sitesCount)} icon={MapPin} accent="navy" sub={`${stats.sitesCount} locations`} />
-        <StatCard title="Supervisors on Duty" value={String(stats.supervisorsOnDuty)} icon={ShieldCheck} accent="blue" sub="Active monitoring" />
+        {/* "On duty now"/"Active monitoring" removed from these two cards --
+            both counts come from position-keyword + status='Active' on the
+            employee record (currently employed), not from any attendance/
+            check-in/deployment signal, so neither can truthfully claim a
+            live duty state. "Supervisors on Duty" renamed to "Active
+            Supervisors" for the same reason -- "on duty" implies a real-
+            time signal this measures don't provide. "Sites Covered" renamed
+            to "Assigned Sites": the count is distinct `workstation` values
+            on current employee records, not a live coverage/patrol signal. */}
+        <StatCard title="Active Guards" value={String(stats.activeGuards)} icon={Shield} accent="green" sub="Currently employed" />
+        <StatCard title="Assigned Sites" value={String(stats.sitesCount)} icon={MapPin} accent="navy" sub={`${stats.sitesCount} locations`} />
+        <StatCard title="Active Supervisors" value={String(stats.supervisorsOnDuty)} icon={ShieldCheck} accent="blue" sub="Currently employed" />
         {canViewAttendance && (
           <StatCard title="Attendance Rate" value={`${stats.attendanceRate}%`} icon={CheckCircle2} accent="gold" sub={`${monthLabel}`} />
         )}
@@ -928,13 +1002,22 @@ export function Dashboard() {
             <div><p className="text-xs text-slate-500">Attendance Rate</p><p className="font-semibold text-slate-800 text-sm">{stats.attendanceRate}%</p></div>
           </Card>
         )}
+        {/* "On Duty Guards" removed -- it duplicated Active Guards' own
+            number (stats.activeGuards) under a label implying a live
+            duty/deployment signal the app doesn't actually measure
+            (no attendance/check-in data feeds this count). Two cards
+            showing the same number under different claimed meanings is
+            worse than one accurate card. */}
         <Card className="p-4 flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-[#FFF1CC] flex items-center justify-center text-[#D4A017]"><ShieldCheck size={20} /></div>
-          <div><p className="text-xs text-slate-500">On Duty Guards</p><p className="font-semibold text-slate-800 text-sm">{stats.activeGuards}</p></div>
-        </Card>
-        <Card className="p-4 flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-emerald-100 flex items-center justify-center text-emerald-600"><Bell size={20} /></div>
-          <div><p className="text-xs text-slate-500">System Status</p><p className="font-semibold text-slate-800 text-sm">Online</p></div>
+          <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${dashboardFetchError ? 'bg-red-100 text-red-600' : 'bg-emerald-100 text-emerald-600'}`}><Bell size={20} /></div>
+          <div>
+            <p className="text-xs text-slate-500">Data Status</p>
+            {/* Reflects whether the LAST Dashboard data fetch actually
+                succeeded -- not a hardcoded "Online" -- see
+                dashboardFetchError, set in fetchDashboardData()'s own
+                catch block below. */}
+            <p className={`font-semibold text-sm ${dashboardFetchError ? 'text-red-600' : 'text-slate-800'}`}>{dashboardFetchError ? 'Load Failed' : 'Up to Date'}</p>
+          </div>
         </Card>
       </div>
 
@@ -1000,7 +1083,13 @@ export function Dashboard() {
         <Card className="lg:col-span-2 overflow-hidden">
           <div className="flex items-center justify-between p-5 border-b border-slate-100">
             <div><h3 className="font-semibold text-slate-800">Recent Active Employees</h3><p className="text-xs text-slate-500">Latest additions to your workforce</p></div>
-            <Button variant="outline" className="text-xs py-1.5">View all <ArrowRight size={14} /></Button>
+            {/* "View all" removed -- it had no onClick handler at all (this
+                app has no cross-page navigation prop threaded into page
+                components today), so it was a decorative control that did
+                nothing when clicked. Wiring it for real requires a small
+                App.tsx-level change (passing a navigation callback into
+                page components, which no page currently receives) -- a
+                reasonable follow-up, not folded into this pass. */}
           </div>
           <Table className="border-0 rounded-none">
             <THead><TR hover={false}><TH>Name</TH><TH>Position</TH><TH>Department</TH><TH>Company/Resident</TH><TH>Status</TH></TR></THead>
@@ -1064,7 +1153,7 @@ export function Dashboard() {
                       <Icon size={16} />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-slate-800">{t.title} ({t.count})</p>
+                      <p className="text-sm font-medium text-slate-800">{t.title} — {t.count}</p>
                       <p className="text-xs text-slate-500 mt-0.5">Due: {t.due}</p>
                     </div>
                   </div>

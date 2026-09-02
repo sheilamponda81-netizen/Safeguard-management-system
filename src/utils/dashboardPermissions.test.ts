@@ -194,20 +194,31 @@ describe('buildPendingTasks', () => {
     };
   }
 
-  it('authorized AND something pending: Approve Payroll appears with the real count', () => {
+  it('authorized AND exactly ONE month pending: singular title "Payroll Awaiting Approval", count is the month count not a row count', () => {
+    // pendingPayrollApprovalCount is DISTINCT payroll months/runs, not
+    // employee rows -- Dashboard.tsx computes it via a Set of month keys
+    // before calling buildPendingTasks, so from this function's own
+    // perspective 1 always means exactly one pending run.
+    const tasks = buildPendingTasks(makeInputs({ canApprovePayroll: true, pendingPayrollApprovalCount: 1 }));
+    expect(tasks.map(t => t.title)).toEqual(['Payroll Awaiting Approval']);
+    expect(tasks[0].count).toBe(1);
+  });
+
+  it('authorized AND multiple months pending: plural title "Payroll Periods Awaiting Approval"', () => {
     const tasks = buildPendingTasks(makeInputs({ canApprovePayroll: true, pendingPayrollApprovalCount: 3 }));
-    expect(tasks.map(t => t.title)).toEqual(['Approve Payroll']);
+    expect(tasks.map(t => t.title)).toEqual(['Payroll Periods Awaiting Approval']);
     expect(tasks[0].count).toBe(3);
   });
 
-  it('authorized but NOTHING pending: Approve Payroll does not appear, even though the caller could approve', () => {
+  it('authorized but NOTHING pending: no payroll task appears, even though the caller could approve', () => {
     const tasks = buildPendingTasks(makeInputs({ canApprovePayroll: true, pendingPayrollApprovalCount: 0 }));
-    expect(tasks.map(t => t.title)).not.toContain('Approve Payroll');
+    expect(tasks.map(t => t.title)).not.toContain('Payroll Awaiting Approval');
+    expect(tasks.map(t => t.title)).not.toContain('Payroll Periods Awaiting Approval');
   });
 
-  it('something pending but NOT authorized: Approve Payroll does not appear -- a payroll.view-only caller must not see an action task they cannot perform', () => {
+  it('something pending but NOT authorized: no payroll task appears -- a payroll.view-only caller must not see an action task they cannot perform', () => {
     const tasks = buildPendingTasks(makeInputs({ canApprovePayroll: false, pendingPayrollApprovalCount: 5 }));
-    expect(tasks.map(t => t.title)).not.toContain('Approve Payroll');
+    expect(tasks.map(t => t.title)).not.toContain('Payroll Periods Awaiting Approval');
   });
 
   it('Review Job Applications: same authorized-AND-pending rule', () => {
@@ -239,7 +250,7 @@ describe('buildPendingTasks', () => {
       canViewSecurity: true, expiringLicensesCount: 1,
     }));
     expect(tasks).toHaveLength(3);
-    expect(tasks.map(t => t.title)).toEqual(['Approve Payroll', 'Review Job Applications', 'Renew Expiring Licenses']);
+    expect(tasks.map(t => t.title)).toEqual(['Payroll Periods Awaiting Approval', 'Review Job Applications', 'Renew Expiring Licenses']);
     expect(tasks.map(t => t.count)).toEqual([2, 5, 1]);
   });
 
