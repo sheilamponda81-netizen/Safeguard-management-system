@@ -16,6 +16,12 @@ import {
   AdvanceScheduleValidationError,
   RepaymentMethod,
 } from '../utils/salaryAdvanceCalculations';
+import {
+  getQualifyingEmployeeIds,
+  summarizeAdvanceStatuses,
+  getDominantStatusForColor,
+  getSlotsAvailableLabel,
+} from '../utils/salaryAdvanceGrouping';
 
 // Business rule: an employee may have at most this many simultaneously
 // 'pending'/'active' salary advances -- enforced authoritatively,
@@ -158,7 +164,10 @@ export function SalaryAdvancesPage() {
   const [search, setSearch] = useState('');
   const [filterStatus, setFilterStatus] = useState('all');
   const [showApplyModal, setShowApplyModal] = useState(false);
-  const [showDetailModal, setShowDetailModal] = useState<SalaryAdvanceRow | null>(null);
+  // Employee-scoped (not a single advance row) so the detail modal can
+  // show ALL of an employee's advances together -- see the modal's own
+  // render below for why.
+  const [showEmployeeDetailModal, setShowEmployeeDetailModal] = useState<string | null>(null);
   const [systemMonth, setSystemMonth] = useState('');
 
   const [advancesPage, setAdvancesPage] = useState(1);
@@ -350,11 +359,30 @@ export function SalaryAdvancesPage() {
     return result;
   }, [advances, filterStatus, search, employeesById]);
 
-  const paginatedAdvances = useMemo(() => {
+  // ===== EMPLOYEE GROUPING FOR THE MAIN TABLE =====
+  // The main list shows ONE row per employee, not one per advance --
+  // advances remain fully independent database records (see
+  // getEmployeeAdvanceSummary above); this only decides which employees
+  // qualify for a row. Derived from `displayedAdvances` (already
+  // search+status filtered) so filtering "Pending" surfaces an employee
+  // who has a pending advance even if they ALSO have an active one --
+  // their row still appears, its financial summary is computed
+  // separately from the FULL `advances` set below (never this filtered
+  // list), so an active debt can never appear to "disappear" just because
+  // the table is filtered to Pending.
+  const qualifyingEmployeeIds = useMemo(
+    () => getQualifyingEmployeeIds(displayedAdvances),
+    [displayedAdvances]
+  );
+
+  // Pagination now operates on EMPLOYEE groups, not individual advance
+  // rows -- "Show 20" means 20 employees. totalPages below (near the
+  // render) is derived from this same length.
+  const paginatedEmployeeIds = useMemo(() => {
     const startIndex = (advancesPage - 1) * advancesItemsPerPage;
-    const endIndex = Math.min(startIndex + advancesItemsPerPage, displayedAdvances.length);
-    return displayedAdvances.slice(startIndex, endIndex);
-  }, [displayedAdvances, advancesPage, advancesItemsPerPage]);
+    const endIndex = Math.min(startIndex + advancesItemsPerPage, qualifyingEmployeeIds.length);
+    return qualifyingEmployeeIds.slice(startIndex, endIndex);
+  }, [qualifyingEmployeeIds, advancesPage, advancesItemsPerPage]);
 
   useEffect(() => {
     setAdvancesPage(1);
@@ -841,7 +869,7 @@ export function SalaryAdvancesPage() {
   // modal) -- employee-scoped, since the combined plan itself is
   // employee-scoped, not advance-scoped. =====
   useEffect(() => {
-    if (!showDetailModal) {
+    if (!showEmployeeDetailModal) {
       setPlanChangeHistory([]);
       return;
     }
@@ -849,7 +877,7 @@ export function SalaryAdvancesPage() {
     supabase
       .from('salary_advance_repayment_plan_changes')
       .select('*')
-      .eq('employee_id', showDetailModal.employee_id)
+      .eq('employee_id', showEmployeeDetailModal)
       .order('changed_at', { ascending: false })
       .then(({ data, error }) => {
         if (cancelled) return;
@@ -860,7 +888,7 @@ export function SalaryAdvancesPage() {
         setPlanChangeHistory(data || []);
       });
     return () => { cancelled = true; };
-  }, [showDetailModal]);
+  }, [showEmployeeDetailModal]);
 
   // ===== STATUS BADGE COLOR =====
   const getStatusColor = useCallback((status: string) => {
@@ -892,7 +920,7 @@ export function SalaryAdvancesPage() {
     );
   }
 
-  const totalPages = Math.ceil(displayedAdvances.length / advancesItemsPerPage);
+  const totalPages = Math.ceil(qualifyingEmployeeIds.length / advancesItemsPerPage);
   // Deliberately sums ACTIVE advances only -- a pending application is a
   // request, not active debt, and must never be mixed into this figure.
   const totalActiveOutstanding = advances.reduce((sum, a) => sum + (a.status === 'active' ? getOutstandingBalance(a) : 0), 0);
@@ -976,60 +1004,62 @@ export function SalaryAdvancesPage() {
             <THead>
               <TR hover={false}>
                 <TH>Employee</TH>
-                <TH>Advance #</TH>
                 <TH>Employee #</TH>
-                <TH>Application Date</TH>
-                <TH className="text-right">Original Amount</TH>
+                <TH>Advances / Slots</TH>
+                <TH className="text-right">Active Outstanding</TH>
+                <TH className="text-right">Pending Requested</TH>
                 <TH className="text-right">Monthly Deduction</TH>
-                <TH>Remaining Period</TH>
-                <TH className="text-right">Amount Repaid</TH>
-                <TH className="text-right">Outstanding</TH>
                 <TH>Status</TH>
-                <TH>Expected Payoff</TH>
                 <TH className="text-right">Actions</TH>
               </TR>
             </THead>
             <TBody>
-              {paginatedAdvances.length === 0 ? (
+              {paginatedEmployeeIds.length === 0 ? (
                 <TR>
-                  <TD colSpan={12} className="text-center py-8 text-slate-500">
+                  <TD colSpan={8} className="text-center py-8 text-slate-500">
                     <Wallet size={32} className="mx-auto mb-2 text-slate-300" />
-                    {advances.length === 0 ? 'No salary advance applications found' : 'No matching applications found'}
+                    {advances.length === 0 ? 'No salary advance applications found' : 'No matching employees found'}
                   </TD>
                 </TR>
               ) : (
-                paginatedAdvances.map((advance) => {
-                  const emp = employeesById.get(advance.employee_id);
-                  const repaid = getRepaidAmount(advance.id);
-                  const outstanding = getOutstandingBalance(advance);
+                paginatedEmployeeIds.map((employeeId) => {
+                  const emp = employeesById.get(employeeId);
+                  const summary = getEmployeeAdvanceSummary(employeeId);
+                  // Status truthfulness (item 4/7): derived from the
+                  // employee's FULL advance set, never `displayedAdvances`
+                  // -- an employee filtered into view because of a
+                  // Pending request must still show their real Active
+                  // debt in the status label, not just "Pending".
+                  const employeeStatuses = advances.filter(a => a.employee_id === employeeId).map(a => a.status);
+                  const statusLabel = summarizeAdvanceStatuses(employeeStatuses);
+                  const statusColor = getStatusColor(getDominantStatusForColor(employeeStatuses));
                   // Editing the combined plan only makes sense once one
                   // actually exists for this employee (adjust_combined_repayment_plan()
-                  // raises otherwise) -- NOT simply whenever this row happens
-                  // to be pending/active, since a still-pending FIRST advance
-                  // has no plan yet at all.
-                  const canEditPlan = plansByEmployee.has(advance.employee_id);
+                  // raises otherwise) -- NOT simply whenever this employee
+                  // happens to have a pending/active advance, since a
+                  // still-pending FIRST advance has no plan yet at all.
+                  const canEditPlan = plansByEmployee.has(employeeId);
                   return (
-                    <TR key={advance.id} className="hover:bg-slate-50">
+                    <TR key={employeeId} className="hover:bg-slate-50">
                       <TD>
                         <p className="font-medium text-slate-800">{emp?.fullName || 'Unknown'}</p>
                       </TD>
-                      <TD className="text-xs">#{advanceSequenceByEmployee.get(advance.id) || 1}</TD>
                       <TD className="text-xs">{emp?.employeeNumber || 'N/A'}</TD>
-                      <TD className="text-xs">{new Date(advance.application_date).toLocaleDateString()}</TD>
-                      <TD className="text-right font-mono">{formatKwacha(advance.advance_amount)}</TD>
-                      <TD className="text-right font-mono">{formatKwacha(advance.configured_monthly_deduction)}</TD>
-                      <TD className="text-xs">{getRemainingPeriodMonths(advance)} of {advance.repayment_period_months} month{advance.repayment_period_months !== 1 ? 's' : ''}</TD>
-                      <TD className="text-right font-mono text-emerald-700">{formatKwacha(repaid)}</TD>
-                      <TD className="text-right font-mono font-semibold text-[#D4A017]">{formatKwacha(outstanding)}</TD>
                       <TD>
-                        <Badge color={getStatusColor(advance.status)}>{advance.status.toUpperCase()}</Badge>
+                        <p className="font-semibold">{summary.openCount} / {MAX_OPEN_ADVANCES_PER_EMPLOYEE}</p>
+                        <p className="text-xs text-slate-500">{getSlotsAvailableLabel(summary.openCount, MAX_OPEN_ADVANCES_PER_EMPLOYEE)}</p>
                       </TD>
-                      <TD className="text-xs">{getMonthLabel(advance.expected_payoff_month)}</TD>
+                      <TD className="text-right font-mono font-semibold text-[#D4A017]">{formatKwacha(summary.activeOutstanding)}</TD>
+                      <TD className="text-right font-mono">{formatKwacha(summary.pendingRequested)}</TD>
+                      <TD className="text-right font-mono">{formatKwacha(summary.currentMonthlyDeduction)}</TD>
+                      <TD>
+                        <Badge color={statusColor}>{statusLabel}</Badge>
+                      </TD>
                       <TD className="text-right">
                         <div className="flex items-center justify-end gap-1">
                           <button
                             type="button"
-                            onClick={() => setShowDetailModal(advance)}
+                            onClick={() => setShowEmployeeDetailModal(employeeId)}
                             className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
                             title="View details"
                           >
@@ -1038,50 +1068,13 @@ export function SalaryAdvancesPage() {
                           {canEditPlan && (
                             <button
                               type="button"
-                              onClick={() => openEditPlanModal(advance.employee_id)}
+                              onClick={() => openEditPlanModal(employeeId)}
                               className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
                               title="Edit / Adjust Combined Repayment Plan"
                             >
                               <Pencil size={14} />
                             </button>
                           )}
-                          {advance.status === 'pending' && (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => openApproveModal(advance)}
-                                className="w-7 h-7 rounded-lg hover:bg-emerald-100 text-emerald-600"
-                                title="Approve"
-                              >
-                                <CheckCircle size={14} />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => updateAdvanceStatus(advance, 'rejected')}
-                                className="w-7 h-7 rounded-lg hover:bg-red-100 text-red-600"
-                                title="Reject"
-                              >
-                                <XCircle size={14} />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (window.confirm('Cancel this pending application? It will not be approved.')) {
-                                    updateAdvanceStatus(advance, 'cancelled');
-                                  }
-                                }}
-                                className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-500"
-                                title="Cancel"
-                              >
-                                <Ban size={14} />
-                              </button>
-                            </>
-                          )}
-                          {/* An ACTIVE, unpaid advance has no cancel action --
-                              removed deliberately (see the schema migration's
-                              guard-trigger comment): there is no business-approved
-                              debt write-off process. Its only path forward is
-                              'active' -> 'paid', automatically, at zero balance. */}
                         </div>
                       </TD>
                     </TR>
@@ -1096,7 +1089,7 @@ export function SalaryAdvancesPage() {
       <Pagination
         currentPage={advancesPage}
         totalPages={totalPages}
-        totalItems={displayedAdvances.length}
+        totalItems={qualifyingEmployeeIds.length}
         itemsPerPage={advancesItemsPerPage}
         onPageChange={setAdvancesPage}
         onItemsPerPageChange={setAdvancesItemsPerPage}
@@ -1347,54 +1340,99 @@ export function SalaryAdvancesPage() {
       </Modal>
 
       {/* Detail Modal */}
-      <Modal open={!!showDetailModal} onClose={() => setShowDetailModal(null)} title="Salary Advance Details" size="lg">
-        {showDetailModal && (() => {
-          const emp = employeesById.get(showDetailModal.employee_id);
-          const repaid = getRepaidAmount(showDetailModal.id);
-          const outstanding = getOutstandingBalance(showDetailModal);
-          const summary = getEmployeeAdvanceSummary(showDetailModal.employee_id);
+      {/* Employee-scoped: shows EVERY one of this employee's advances,
+          independently -- never just the one that happened to be clicked,
+          and never limited to whatever the main table's current search/
+          status filter narrowed to (see employeeAdvances below, built
+          from the FULL `advances` array). Approve/Reject/Cancel/Adjust
+          still each target one specific advance -- approving Advance #1
+          and rejecting Advance #2 in the same session is exactly what
+          this loop is for. */}
+      <Modal open={!!showEmployeeDetailModal} onClose={() => setShowEmployeeDetailModal(null)} title="Salary Advance Details" size="lg">
+        {showEmployeeDetailModal && (() => {
+          const employeeId = showEmployeeDetailModal;
+          const emp = employeesById.get(employeeId);
+          const summary = getEmployeeAdvanceSummary(employeeId);
+          const employeeAdvances = advances
+            .filter(a => a.employee_id === employeeId)
+            .sort((a, b) => (advanceSequenceByEmployee.get(a.id) || 0) - (advanceSequenceByEmployee.get(b.id) || 0));
           return (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-3 text-sm">
                 <div><p className="text-slate-500">Employee</p><p className="font-semibold">{emp?.fullName || 'Unknown'}</p></div>
                 <div><p className="text-slate-500">Employee #</p><p className="font-semibold">{emp?.employeeNumber || 'N/A'}</p></div>
-                <div><p className="text-slate-500">Status</p><Badge color={getStatusColor(showDetailModal.status)}>{showDetailModal.status.toUpperCase()}</Badge></div>
-                <div><p className="text-slate-500">Application Date</p><p className="font-semibold">{new Date(showDetailModal.application_date).toLocaleDateString()}</p></div>
+                <div><p className="text-slate-500">Open Advances / Slots</p><p className="font-semibold">{summary.openCount} / {MAX_OPEN_ADVANCES_PER_EMPLOYEE}</p></div>
+                <div><p className="text-slate-500">Active Outstanding</p><p className="font-semibold">{formatKwacha(summary.activeOutstanding)}</p></div>
+                <div><p className="text-slate-500">Pending Requested{summary.pendingCount > 0 ? ` (${summary.pendingCount})` : ''}</p><p className="font-semibold">{formatKwacha(summary.pendingRequested)}</p></div>
+                <div><p className="text-slate-500">Current Combined Monthly Deduction</p><p className="font-semibold">{formatKwacha(summary.currentMonthlyDeduction)}</p></div>
+                {summary.expectedPayoffMonth && (
+                  <div className="col-span-2"><p className="text-slate-500">Expected Payoff</p><p className="font-semibold">{getMonthLabel(summary.expectedPayoffMonth)}</p></div>
+                )}
               </div>
-              <div className="border-t pt-4">
-                <h4 className="font-semibold text-slate-800 mb-1">Advance #{advanceSequenceByEmployee.get(showDetailModal.id) || 1} -- As Originally Applied For</h4>
-                <p className="text-xs text-slate-400 mb-3">
-                  These figures are immutable financial history. Ongoing payroll deductions follow the
-                  employee's current combined plan below, not necessarily this advance's own original terms.
-                </p>
-                <div className="space-y-2 text-sm">
-                  <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Advance Amount</span><span className="font-medium">{formatKwacha(showDetailModal.advance_amount)}</span></div>
-                  <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Monthly Deduction</span><span className="font-medium">{formatKwacha(showDetailModal.configured_monthly_deduction)}</span></div>
-                  <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Final Deduction</span><span className="font-medium">{formatKwacha(showDetailModal.final_deduction_amount)}</span></div>
-                  <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Repayment Period</span><span className="font-medium">{showDetailModal.repayment_period_months} months</span></div>
-                  <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Deduction Start Month</span><span className="font-medium">{getMonthLabel(showDetailModal.deduction_start_month)}</span></div>
-                  <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Expected Payoff Month</span><span className="font-medium">{getMonthLabel(showDetailModal.expected_payoff_month)}</span></div>
-                  <div className="flex justify-between border-b pb-2 text-emerald-700"><span>Amount Repaid</span><span>{formatKwacha(repaid)}</span></div>
-                  <div className="flex justify-between pt-2 font-bold text-lg text-[#D4A017]"><span>Outstanding Balance</span><span>{formatKwacha(outstanding)}</span></div>
+
+              {plansByEmployee.has(employeeId) && (
+                <div className="flex justify-end border-t pt-3">
+                  <Button variant="outline" onClick={() => { openEditPlanModal(employeeId); setShowEmployeeDetailModal(null); }}>
+                    <Pencil size={14} className="mr-1" /> Edit / Adjust Combined Plan
+                  </Button>
                 </div>
-              </div>
-              {(showDetailModal.status === 'pending' || showDetailModal.status === 'active') && (
-                <div className="border-t pt-4">
-                  <h4 className="font-semibold text-slate-800 mb-3">Employee Summary -- Active Debt vs Pending Requests</h4>
-                  <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div><p className="text-slate-500">Open Slots</p><p className="font-semibold">{summary.openCount} / {MAX_OPEN_ADVANCES_PER_EMPLOYEE}</p></div>
-                    <div><p className="text-slate-500">Active Outstanding</p><p className="font-semibold">{formatKwacha(summary.activeOutstanding)}</p></div>
-                    <div><p className="text-slate-500">Pending Requested{summary.pendingCount > 0 ? ` (${summary.pendingCount})` : ''}</p><p className="font-semibold">{formatKwacha(summary.pendingRequested)}</p></div>
-                    <div><p className="text-slate-500">Current Combined Monthly Deduction</p><p className="font-semibold">{formatKwacha(summary.currentMonthlyDeduction)}</p></div>
-                    <div className="col-span-2"><p className="text-slate-500">Expected Payoff</p><p className="font-semibold">{summary.expectedPayoffMonth ? getMonthLabel(summary.expectedPayoffMonth) : 'N/A'}</p></div>
+              )}
+
+              {employeeAdvances.map((advance) => {
+                const repaid = getRepaidAmount(advance.id);
+                const outstanding = getOutstandingBalance(advance);
+                return (
+                  <div key={advance.id} className="border-t pt-4">
+                    <div className="flex items-center justify-between mb-1">
+                      <h4 className="font-semibold text-slate-800">Advance #{advanceSequenceByEmployee.get(advance.id) || 1} -- As Originally Applied For</h4>
+                      <Badge color={getStatusColor(advance.status)}>{advance.status.toUpperCase()}</Badge>
+                    </div>
+                    <p className="text-xs text-slate-400 mb-3">
+                      Applied {new Date(advance.application_date).toLocaleDateString()}. These figures are immutable
+                      financial history. Ongoing payroll deductions follow the employee's current combined plan
+                      above, not necessarily this advance's own original terms.
+                    </p>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Advance Amount</span><span className="font-medium">{formatKwacha(advance.advance_amount)}</span></div>
+                      <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Monthly Deduction</span><span className="font-medium">{formatKwacha(advance.configured_monthly_deduction)}</span></div>
+                      <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Final Deduction</span><span className="font-medium">{formatKwacha(advance.final_deduction_amount)}</span></div>
+                      <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Repayment Period</span><span className="font-medium">{advance.repayment_period_months} months</span></div>
+                      <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Remaining Period</span><span className="font-medium">{getRemainingPeriodMonths(advance)} of {advance.repayment_period_months} month{advance.repayment_period_months !== 1 ? 's' : ''}</span></div>
+                      <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Deduction Start Month</span><span className="font-medium">{getMonthLabel(advance.deduction_start_month)}</span></div>
+                      <div className="flex justify-between border-b pb-2"><span className="text-slate-600">Expected Payoff Month</span><span className="font-medium">{getMonthLabel(advance.expected_payoff_month)}</span></div>
+                      <div className="flex justify-between border-b pb-2 text-emerald-700"><span>Amount Repaid</span><span>{formatKwacha(repaid)}</span></div>
+                      <div className="flex justify-between pt-2 font-bold text-lg text-[#D4A017]"><span>Outstanding Balance</span><span>{formatKwacha(outstanding)}</span></div>
+                    </div>
+                    {advance.reason && <p className="text-xs text-slate-500 pt-2">Reason: {advance.reason}</p>}
+                    {advance.status === 'pending' && (
+                      <div className="flex justify-end gap-2 pt-3">
+                        <Button variant="secondary" onClick={() => { openApproveModal(advance); setShowEmployeeDetailModal(null); }}>
+                          <CheckCircle size={14} className="mr-1" /> Approve
+                        </Button>
+                        <Button variant="danger" onClick={() => updateAdvanceStatus(advance, 'rejected')}>
+                          <XCircle size={14} className="mr-1" /> Reject
+                        </Button>
+                        <Button
+                          variant="outline"
+                          onClick={() => {
+                            if (window.confirm('Cancel this pending application? It will not be approved.')) {
+                              updateAdvanceStatus(advance, 'cancelled');
+                            }
+                          }}
+                        >
+                          <Ban size={14} className="mr-1" /> Cancel
+                        </Button>
+                      </div>
+                    )}
+                    {/* An ACTIVE, unpaid advance has no cancel action --
+                        removed deliberately (see the schema migration's
+                        guard-trigger comment): there is no business-approved
+                        debt write-off process. Its only path forward is
+                        'active' -> 'paid', automatically, at zero balance. */}
                   </div>
-                </div>
-              )}
-              {showDetailModal.reason && (
-                <div className="border-t pt-4">
-                  <p className="text-xs text-slate-500">Reason: {showDetailModal.reason}</p>
-                </div>
-              )}
+                );
+              })}
+
               {planChangeHistory.length > 0 && (
                 <div className="border-t pt-4">
                   <h4 className="font-semibold text-slate-800 mb-3">Combined Repayment Plan Change History</h4>
@@ -1415,33 +1453,7 @@ export function SalaryAdvancesPage() {
                 </div>
               )}
               <div className="flex justify-end gap-2 pt-4 border-t">
-                {plansByEmployee.has(showDetailModal.employee_id) && (
-                  <Button variant="outline" onClick={() => { openEditPlanModal(showDetailModal.employee_id); setShowDetailModal(null); }}>
-                    <Pencil size={14} className="mr-1" /> Edit / Adjust Combined Plan
-                  </Button>
-                )}
-                {showDetailModal.status === 'pending' && (
-                  <>
-                    <Button variant="secondary" onClick={() => { openApproveModal(showDetailModal); setShowDetailModal(null); }}>
-                      <CheckCircle size={14} className="mr-1" /> Approve
-                    </Button>
-                    <Button variant="danger" onClick={() => { updateAdvanceStatus(showDetailModal, 'rejected'); setShowDetailModal(null); }}>
-                      <XCircle size={14} className="mr-1" /> Reject
-                    </Button>
-                    <Button
-                      variant="outline"
-                      onClick={() => {
-                        if (window.confirm('Cancel this pending application? It will not be approved.')) {
-                          updateAdvanceStatus(showDetailModal, 'cancelled');
-                          setShowDetailModal(null);
-                        }
-                      }}
-                    >
-                      <Ban size={14} className="mr-1" /> Cancel
-                    </Button>
-                  </>
-                )}
-                <Button variant="outline" onClick={() => setShowDetailModal(null)}>Close</Button>
+                <Button variant="outline" onClick={() => setShowEmployeeDetailModal(null)}>Close</Button>
               </div>
             </div>
           );
