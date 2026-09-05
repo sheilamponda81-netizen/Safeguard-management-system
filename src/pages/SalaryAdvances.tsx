@@ -11,6 +11,7 @@ import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
 import { getErrorMessage } from '../utils/errorHandler';
+import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import {
   calculateAdvanceSchedule,
   AdvanceScheduleValidationError,
@@ -432,8 +433,8 @@ export function SalaryAdvancesPage() {
   const fetchAdvances = useCallback(async () => {
     setLoading(true);
     try {
-      let query = supabase.from('salary_advances').select('*').order('created_at', { ascending: false });
-      let employeeScope: string[] | null = null;
+      let rows: SalaryAdvanceRow[];
+      let plansData: CombinedPlanRow[];
 
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         const { data: regionEmployees } = await supabase
@@ -442,7 +443,6 @@ export function SalaryAdvancesPage() {
           .eq('region_id', userProfile.region_id)
           .eq('is_deleted', false);
         const employeeIds = regionEmployees?.map(e => e.id) || [];
-        employeeScope = employeeIds;
         if (employeeIds.length === 0) {
           setAdvances([]);
           setDeductionLedger([]);
@@ -450,13 +450,53 @@ export function SalaryAdvancesPage() {
           setLoading(false);
           return;
         }
-        query = query.in('employee_id', employeeIds);
+
+        // Large regions can hold far more employees than fit in one PostgREST
+        // URL's `.in('employee_id', [...])` filter -- batch the id list
+        // instead of building a single unbounded request (see
+        // employeeBatchFetch.ts). Both employee_id-scoped fetches below use
+        // the same batching, since both risk the same giant-URL failure mode.
+        const advanceBatches = await fetchInEmployeeIdBatches<SalaryAdvanceRow>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('salary_advances')
+              .select('*', withCount ? { count: 'exact' } : undefined)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        rows = dedupeById(advanceBatches);
+        rows.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+
+        // salary_advance_repayment_plans has no `id` column (one row per
+        // employee_id) -- batches never overlap by construction, so no
+        // separate dedup step is needed here.
+        plansData = await fetchInEmployeeIdBatches<CombinedPlanRow>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('salary_advance_repayment_plans')
+              .select('*', withCount ? { count: 'exact' } : undefined)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+      } else {
+        const { data, error } = await supabase
+          .from('salary_advances')
+          .select('*')
+          .order('created_at', { ascending: false });
+        if (error) throw error;
+        rows = data || [];
+
+        const { data: allPlansData, error: plansError } = await supabase
+          .from('salary_advance_repayment_plans')
+          .select('*');
+        if (plansError) throw plansError;
+        plansData = allPlansData || [];
       }
 
-      const { data, error } = await query;
-      if (error) throw error;
-      const rows = data || [];
       setAdvances(rows);
+      setCombinedPlans(plansData);
 
       const advanceIds = rows.map(a => a.id);
       if (advanceIds.length > 0) {
@@ -469,16 +509,6 @@ export function SalaryAdvancesPage() {
       } else {
         setDeductionLedger([]);
       }
-
-      // Each employee's ONE current combined repayment plan -- scoped the
-      // same way as `advances` above (region-restricted for a non-super-admin).
-      let plansQuery = supabase.from('salary_advance_repayment_plans').select('*');
-      if (employeeScope) {
-        plansQuery = plansQuery.in('employee_id', employeeScope);
-      }
-      const { data: plansData, error: plansError } = await plansQuery;
-      if (plansError) throw plansError;
-      setCombinedPlans(plansData || []);
     } catch (err) {
       console.error('Error fetching salary advances:', err);
       showNotification('Failed to load salary advances', 'error');

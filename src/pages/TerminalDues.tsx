@@ -10,6 +10,7 @@ import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { calculateTerminalDues as calculateTerminalDuesPure } from '../utils/terminalDuesCalculations';
+import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { UserProfile } from '../utils/currentProfile';
 
 interface Employee {
@@ -236,11 +237,6 @@ export function TerminalDuesPage() {
   const fetchCalculations = useCallback(async () => {
     setLoading(true);
     try {
-      let query = supabase
-        .from('terminal_dues')
-        .select('*')
-        .order('created_at', { ascending: false });
-
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         const { data: regionEmployees } = await supabase
           .from('employees')
@@ -256,12 +252,31 @@ export function TerminalDuesPage() {
           setLoading(false);
           return;
         }
-        query = query.in('employee_id', employeeIds);
+
+        // Large regions can hold far more employees than fit in one PostgREST
+        // URL's `.in('employee_id', [...])` filter -- batch the id list instead
+        // of building a single unbounded request (see employeeBatchFetch.ts).
+        const rows = await fetchInEmployeeIdBatches<TerminalDue>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('terminal_dues')
+              .select('*', withCount ? { count: 'exact' } : undefined)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        const deduped = dedupeById(rows);
+        deduped.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+        setCalculations(deduped);
+        return;
       }
 
-      const { data, error } = await query;
+      const { data, error } = await supabase
+        .from('terminal_dues')
+        .select('*')
+        .order('created_at', { ascending: false });
       if (error) throw error;
-      
+
       setCalculations(data || []);
     } catch (err) {
       console.error('Error fetching calculations:', err);
