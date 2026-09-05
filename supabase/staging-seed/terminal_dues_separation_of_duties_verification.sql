@@ -78,29 +78,39 @@ SELECT COUNT(*) AS process_rows_remaining
 FROM role_permissions WHERE permission = 'terminal_dues.process';
 -- EXPECTED: 0.
 
--- 8. The active UPDATE RLS policy on terminal_dues (should be exactly one,
--- with the new name and the 'pending'-locked USING/WITH CHECK clauses).
+-- 8. The active UPDATE and INSERT RLS policies on terminal_dues (should be
+-- exactly one each, both permission-gated by has_explicit_permission()).
 SELECT policyname, cmd, qual, with_check
 FROM pg_policies
-WHERE tablename = 'terminal_dues' AND cmd = 'UPDATE';
--- EXPECTED: exactly 1 row, policyname = 'Terminal dues: edit Pending
--- calculation only, status via RPC'. Both qual and with_check must each
--- contain the substring "status = 'pending'::text" -- if either clause is
--- missing that substring, a direct client UPDATE can still change status
--- and this migration did not apply cleanly.
+WHERE tablename = 'terminal_dues' AND cmd IN ('UPDATE', 'INSERT')
+ORDER BY cmd;
+-- EXPECTED: exactly 2 rows.
+--   INSERT row: policyname = 'Terminal dues: create within tenant+region,
+--   explicit permission only'. with_check must contain the substring
+--   "has_explicit_permission('terminal_dues.create'" and must NOT contain
+--   "current_user_role_level" or "has_permission(".
+--   UPDATE row: policyname = 'Terminal dues: edit Pending calculation
+--   only, status via RPC'. Both qual and with_check must each contain the
+--   substring "status = 'pending'::text" (if missing, a direct client
+--   UPDATE can still change status) AND the substring
+--   "has_explicit_permission('terminal_dues.edit'" and must NOT contain
+--   "current_user_role_level" or "has_permission(".
 --
 -- SEPARATION-OF-DUTIES CHECK (found and fixed before this migration was
--- ever applied anywhere -- confirm the fix, not the original shape): both
--- qual and with_check must contain "has_explicit_permission('terminal_dues.edit'"
--- and must NOT contain "current_user_role_level" or "has_permission(". If
--- either clause contains current_user_role_level or has_permission(, a
--- legacy Manager (role_level=2), a legacy Admin (role_level=1), or a
--- FUNCTIONAL Admin (role='admin', via has_permission()'s business-admin
--- shortcut) can directly PATCH a Pending calculation's financial fields
--- despite having no business role in calculating it -- this was an
--- empirically-reproduced real gap, not a theoretical one. Only
--- has_explicit_permission('terminal_dues.edit') (currently seeded to
--- hr_manager only) may gate this policy's edit branch.
+-- ever applied anywhere -- confirm the fix, not the original shape, for
+-- BOTH policies): if either policy's qual/with_check contains
+-- current_user_role_level or has_permission(, a legacy Manager
+-- (role_level=2), a legacy Admin (role_level=1), or a FUNCTIONAL Admin
+-- (role='admin', via has_permission()'s business-admin shortcut) can
+-- directly PATCH a Pending calculation's financial fields (UPDATE) or
+-- directly INSERT a brand-new terminal_dues row (INSERT) despite having
+-- no business role in calculating or originating it -- both were
+-- empirically-reproduced real gaps, not theoretical ones. Only
+-- has_explicit_permission('terminal_dues.edit'/'terminal_dues.create')
+-- (currently seeded to hr_manager only, for both) may gate either
+-- policy's permission branch. SELECT (view) is deliberately untouched --
+-- Admin and Accountant both still need read access for the approve/pay
+-- workflow.
 
 -- 9. Existing Pending/Approved/Paid row counts are unchanged by this
 -- migration (it only ADDS columns/rows -- it must never touch existing
