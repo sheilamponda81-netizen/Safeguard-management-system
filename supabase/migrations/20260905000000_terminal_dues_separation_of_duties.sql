@@ -63,10 +63,17 @@
 -- Supervisor (role_level 2/3, profiles.role typically 'manager'/
 -- 'supervisor' or NULL) gets neither, by construction -- there is no seed
 -- row for those role strings and no role_level-based fallback exists.
--- Existing view/create/edit RLS on terminal_dues is UNCHANGED (still uses
--- current_user_role_level() <= 2 OR has_permission(...), preserving legacy
--- compatibility exactly as before) -- only status-changing actions move to
--- the new narrow model.
+-- Existing view/create RLS (SELECT/INSERT) on terminal_dues is UNCHANGED
+-- (still uses current_user_role_level() <= 2 OR has_permission(...),
+-- preserving legacy compatibility exactly as before). The UPDATE (edit)
+-- policy is NOT left unchanged -- see PART 4 below: it now requires
+-- has_explicit_permission('terminal_dues.edit') with NO role_level
+-- fallback and NO has_permission() business-admin shortcut, since editing
+-- a Pending calculation's financial fields is itself part of the
+-- separation-of-duties boundary this migration exists to close (a
+-- legacy role_level <= 2 bypass here would let a legacy Manager OR a
+-- legacy/functional Admin directly PATCH HR's financial figures, which is
+-- exactly as much a violation as letting them approve/pay directly).
 --
 -- WHAT THIS MIGRATION DOES NOT DO
 -- -----------------------------------------------------------
@@ -188,9 +195,37 @@ ON CONFLICT (role, permission) DO NOTHING;
 -- retain emergency/bypass capability according to the existing platform
 -- architecture") -- a true super admin can still directly UPDATE any row
 -- including its status, exactly as before this migration.
+--
+-- CORRECTED (same pass, before this migration was ever applied anywhere):
+-- the edit-permission branch uses has_explicit_permission('terminal_dues.edit')
+-- ONLY -- NOT current_user_role_level() <= 2 OR has_permission('terminal_dues.edit'),
+-- which was the ORIGINAL shape of this policy and is a real separation-of-
+-- duties hole, empirically reproduced: has_permission()'s is_business_admin()
+-- shortcut means a FUNCTIONAL Admin (role='admin') and a LEGACY Admin
+-- (role_level=1) both satisfy has_permission('terminal_dues.edit') "for
+-- free", and current_user_role_level() <= 2 ADDITIONALLY lets a LEGACY
+-- Manager (role_level=2) through -- all three could previously issue a raw
+-- `UPDATE terminal_dues SET deductions = ...` against a Pending row despite
+-- having no business role in calculating it, exactly the kind of PATCH the
+-- frontend hides but RLS did not actually block. Business direction is
+-- explicit: Admin/Accountant must NOT edit Pending financial fields under
+-- ANY path (only approve/return, only pay/nothing, respectively), and
+-- legacy role_level is NEVER an acceptable substitute for an explicit
+-- terminal_dues.edit grant on this specific boundary -- unlike the
+-- INSERT/SELECT policies below (deliberately left alone; view/create was
+-- not the reported gap and is out of this fix's scope). Consequence:
+-- hr_manager keeps edit access via its existing explicit
+-- ('hr_manager','terminal_dues.edit') seed row (20260817000000); NO other
+-- role (including 'admin', whether functional or legacy role_level=1, and
+-- legacy role_level=2 'manager'/'supervisor' strings) gets Pending-edit
+-- access unless a future migration explicitly seeds it a terminal_dues.edit
+-- row -- a deliberate, real behavior tightening for any such legacy
+-- account, per explicit instruction not to preserve role_level as a
+-- financial-edit bypass.
 -- ============================================================
 
 DROP POLICY IF EXISTS "Terminal dues: update within tenant+region, action or legacy permitted" ON terminal_dues;
+DROP POLICY IF EXISTS "Terminal dues: edit Pending calculation only, status via RPC" ON terminal_dues;
 CREATE POLICY "Terminal dues: edit Pending calculation only, status via RPC" ON terminal_dues
 FOR UPDATE USING (
   is_current_user_active()
@@ -200,7 +235,7 @@ FOR UPDATE USING (
       tenant_id = get_current_tenant_id()
       AND status = 'pending'
       AND EXISTS (SELECT 1 FROM employees e WHERE e.id = terminal_dues.employee_id AND region_allowed(e.region_id))
-      AND (current_user_role_level() <= 2 OR has_permission('terminal_dues.edit'))
+      AND has_explicit_permission('terminal_dues.edit')
     )
   )
 )
@@ -212,12 +247,16 @@ WITH CHECK (
       tenant_id = get_current_tenant_id()
       AND status = 'pending'
       AND EXISTS (SELECT 1 FROM employees e WHERE e.id = terminal_dues.employee_id AND region_allowed(e.region_id))
-      AND (current_user_role_level() <= 2 OR has_permission('terminal_dues.edit'))
+      AND has_explicit_permission('terminal_dues.edit')
     )
   )
 );
 -- SELECT/INSERT policies and "Super admins can delete terminal dues"
--- unchanged -- this migration only touches the UPDATE policy.
+-- unchanged -- this migration only touches the UPDATE policy. has_explicit_
+-- permission() is defined in PART 2 ABOVE this policy in file order, but
+-- since it is CREATE OR REPLACE'd before this CREATE POLICY statement runs
+-- (both execute in the same migration transaction, in file order), there is
+-- no forward-reference problem.
 
 -- ============================================================
 -- PART 5: approve_terminal_due(), record_terminal_due_payment(),
@@ -485,13 +524,26 @@ GRANT EXECUTE ON FUNCTION return_terminal_due_for_correction(UUID, TEXT) TO auth
 --     of the migration and applies to every non-super-admin caller,
 --     regardless of what permission they held before.
 --   * hr_manager loses terminal_dues.process (PART 1/3) -- HR can still
---     view/create/edit a PENDING calculation, exactly as before, but can
---     no longer change its status by any path.
+--     view/create/edit a PENDING calculation, exactly as before (via its
+--     explicit terminal_dues.edit seed row), but can no longer change its
+--     status by any path.
 --   * A caller who is is_business_admin() (role='admin' or legacy
 --     role_level=1) does NOT automatically gain terminal_dues.approve/pay
 --     -- unlike every other permission in this app. Only a profile whose
 --     literal `role` is 'admin' (approve) or 'accountant' (pay) gets these,
 --     per the new explicit seed rows -- see this migration's header.
+--   * REAL TIGHTENING (found and fixed before this migration was ever
+--     applied anywhere): the UPDATE policy's edit-permission branch no
+--     longer accepts current_user_role_level() <= 2 OR has_permission(...)
+--     -- it requires has_explicit_permission('terminal_dues.edit') only.
+--     A legacy Manager (role_level=2), a legacy Admin (role_level=1), and
+--     a FUNCTIONAL Admin (role='admin') can each no longer directly PATCH
+--     a Pending calculation's financial fields -- only hr_manager (its
+--     existing explicit seed row) retains this. This was empirically
+--     reproduced as a real gap (all three could edit before this fix) and
+--     is a deliberate tightening, not a regression -- editing HR's
+--     financial figures is exactly as much a separation-of-duties concern
+--     as directly approving/paying.
 --   * True super admin (is_super_admin()) behavior is unchanged everywhere
 --     in this migration.
 --
@@ -510,6 +562,10 @@ GRANT EXECUTE ON FUNCTION return_terminal_due_for_correction(UUID, TEXT) TO auth
 --   -- admin/terminal_dues.approve, admin/terminal_dues.view,
 --   -- hr_manager/terminal_dues.create, hr_manager/terminal_dues.edit,
 --   -- hr_manager/terminal_dues.view (NO hr_manager/terminal_dues.process row)
+--   SELECT qual, with_check FROM pg_policies WHERE tablename = 'terminal_dues' AND cmd = 'UPDATE';
+--   -- expected: both qual and with_check contain "has_explicit_permission"
+--   -- and neither contains "current_user_role_level" or "has_permission(" --
+--   -- if either does, the separation-of-duties fix above did not apply.
 --
 -- ROLLBACK SQL:
 --   DROP FUNCTION IF EXISTS return_terminal_due_for_correction(UUID, TEXT);

@@ -88,6 +88,19 @@ WHERE tablename = 'terminal_dues' AND cmd = 'UPDATE';
 -- contain the substring "status = 'pending'::text" -- if either clause is
 -- missing that substring, a direct client UPDATE can still change status
 -- and this migration did not apply cleanly.
+--
+-- SEPARATION-OF-DUTIES CHECK (found and fixed before this migration was
+-- ever applied anywhere -- confirm the fix, not the original shape): both
+-- qual and with_check must contain "has_explicit_permission('terminal_dues.edit'"
+-- and must NOT contain "current_user_role_level" or "has_permission(". If
+-- either clause contains current_user_role_level or has_permission(, a
+-- legacy Manager (role_level=2), a legacy Admin (role_level=1), or a
+-- FUNCTIONAL Admin (role='admin', via has_permission()'s business-admin
+-- shortcut) can directly PATCH a Pending calculation's financial fields
+-- despite having no business role in calculating it -- this was an
+-- empirically-reproduced real gap, not a theoretical one. Only
+-- has_explicit_permission('terminal_dues.edit') (currently seeded to
+-- hr_manager only) may gate this policy's edit branch.
 
 -- 9. Existing Pending/Approved/Paid row counts are unchanged by this
 -- migration (it only ADDS columns/rows -- it must never touch existing
