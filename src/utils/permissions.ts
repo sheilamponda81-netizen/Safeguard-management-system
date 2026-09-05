@@ -24,7 +24,12 @@ export const PERMISSIONS = {
   TERMINAL_DUES_VIEW: 'terminal_dues.view',
   TERMINAL_DUES_CREATE: 'terminal_dues.create',
   TERMINAL_DUES_EDIT: 'terminal_dues.edit',
-  TERMINAL_DUES_PROCESS: 'terminal_dues.process',
+  // terminal_dues.process retired (separation-of-duties migration,
+  // 20260905000000) -- status changes now go through the narrow
+  // approve/pay/return RPCs below, each gated by its own permission key,
+  // never a single blanket "process" permission.
+  TERMINAL_DUES_APPROVE: 'terminal_dues.approve',
+  TERMINAL_DUES_PAY: 'terminal_dues.pay',
   SECURITY_PERSONNEL_VIEW: 'security_personnel.view',
   SECURITY_PERSONNEL_CREATE: 'security_personnel.create',
   SECURITY_PERSONNEL_EDIT: 'security_personnel.edit',
@@ -131,6 +136,24 @@ export async function hasPermission(permission: PermissionKey): Promise<boolean>
   if (isBusinessAdmin(profile)) return true;
   const perms = await getMyPermissions();
   return perms.has(permission);
+}
+
+// hasExplicitPermission(): a DELIBERATELY NARROWER cousin of hasPermission()
+// -- calls the has_explicit_permission() SQL RPC (see migration
+// 20260905000000), which has NO is_business_admin() shortcut. Use this
+// ONLY where a business admin/functional Admin account must NOT receive a
+// capability "for free" the way every other permission in this app grants
+// it (currently: Terminal Dues approve/pay/return-for-correction, where
+// Admin explicitly must not gain payment authority merely by being an
+// Admin). Mirrors the true-super-admin bypass only -- never role_level,
+// never is_business_admin().
+export async function hasExplicitPermission(permission: PermissionKey): Promise<boolean> {
+  const profile = await getCurrentProfile();
+  if (!profile || !profile.is_active || profile.deleted_at) return false;
+  if (profile.is_super_admin) return true;
+  const { data, error } = await supabase.rpc('has_explicit_permission', { p_permission: permission });
+  if (error) return false;
+  return !!data;
 }
 
 // canAccess(): the composable frontend shape matching every RLS
