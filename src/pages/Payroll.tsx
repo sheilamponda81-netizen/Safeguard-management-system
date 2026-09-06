@@ -567,24 +567,48 @@ export function PayrollPage() {
       const advanceMap = new Map<string, ActiveSalaryAdvance[]>();
       const planMap = new Map<string, number>();
       if (employeeIds.length > 0) {
-        const { data: activeAdvances, error: advancesError } = await supabase
-          .from('salary_advances')
-          .select('id, employee_id, advance_amount, application_date, created_at')
-          .eq('status', 'active')
-          .lte('deduction_start_month', selectedMonth)
-          .in('employee_id', employeeIds);
-        if (advancesError) throw advancesError;
+        // Batched the same way payroll/employee_deductions above already
+        // are: a plain `.in('employee_id', employeeIds)` here reintroduces
+        // the exact oversized-request pattern that already broke production
+        // once at ~500+ employees (see employeeBatchFetch.ts's own header).
+        // `activeAdvancesRaw` genuinely can contain more than one row per
+        // employee (max-2-open-advances business rule), so dedupeById is
+        // real insurance here, not just convention-following, exactly like
+        // `payrollData`/`deductionsData` above.
+        const activeAdvancesRaw = await fetchInEmployeeIdBatches<{
+          id: string; employee_id: string; advance_amount: number; application_date: string; created_at: string;
+        }>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('salary_advances')
+              .select('id, employee_id, advance_amount, application_date, created_at', withCount ? { count: 'exact' } : undefined)
+              .eq('status', 'active')
+              .lte('deduction_start_month', selectedMonth)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        const activeAdvances = dedupeById(activeAdvancesRaw);
 
-        if (activeAdvances && activeAdvances.length > 0) {
+        if (activeAdvances.length > 0) {
           const advanceIds = activeAdvances.map(a => a.id);
-          const { data: ledgerRows, error: ledgerError } = await supabase
-            .from('salary_advance_deductions')
-            .select('salary_advance_id, deduction_amount')
-            .in('salary_advance_id', advanceIds);
-          if (ledgerError) throw ledgerError;
+          // Batched on advance_id (disjoint across batches by construction,
+          // same reasoning as employeeBatchFetch.ts's own note on why a
+          // dedupe step isn't needed for a sum computed from disjoint
+          // batches) -- advanceIds can also grow past a safe single-request
+          // URL size for a large enough tenant, independent of employeeIds.
+          const ledgerRows = await fetchInEmployeeIdBatches<{ salary_advance_id: string; deduction_amount: number }>(
+            advanceIds,
+            (batch, from, to, withCount) =>
+              supabase
+                .from('salary_advance_deductions')
+                .select('salary_advance_id, deduction_amount', withCount ? { count: 'exact' } : undefined)
+                .in('salary_advance_id', batch)
+                .range(from, to)
+          );
 
           const repaidByAdvance = new Map<string, number>();
-          (ledgerRows || []).forEach(row => {
+          ledgerRows.forEach(row => {
             repaidByAdvance.set(row.salary_advance_id, (repaidByAdvance.get(row.salary_advance_id) || 0) + row.deduction_amount);
           });
 
@@ -601,12 +625,19 @@ export function PayrollPage() {
             advanceMap.set(advance.employee_id, existing);
           });
 
-          const { data: plans, error: plansError } = await supabase
-            .from('salary_advance_repayment_plans')
-            .select('employee_id, combined_monthly_deduction')
-            .in('employee_id', Array.from(advanceMap.keys()));
-          if (plansError) throw plansError;
-          (plans || []).forEach(plan => {
+          // Batched on the (deduped, already-bounded-by-active-advances)
+          // employee ids with an active advance -- a subset of employeeIds,
+          // but still unbounded in principle for a large enough tenant.
+          const plans = await fetchInEmployeeIdBatches<{ employee_id: string; combined_monthly_deduction: number }>(
+            Array.from(advanceMap.keys()),
+            (batch, from, to, withCount) =>
+              supabase
+                .from('salary_advance_repayment_plans')
+                .select('employee_id, combined_monthly_deduction', withCount ? { count: 'exact' } : undefined)
+                .in('employee_id', batch)
+                .range(from, to)
+          );
+          plans.forEach(plan => {
             planMap.set(plan.employee_id, plan.combined_monthly_deduction);
           });
         }

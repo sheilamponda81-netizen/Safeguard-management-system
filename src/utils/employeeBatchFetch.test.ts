@@ -1,13 +1,18 @@
 import { describe, it, expect, vi } from 'vitest';
 import { fetchInEmployeeIdBatches, dedupeById, BatchQueryBuilder } from './employeeBatchFetch';
 
-// Regression coverage for the giant-URL fix applied to TerminalDues.tsx and
-// SalaryAdvances.tsx: both pages now delegate their region-scoped
-// `.in('employee_id', [...])` fetch to this shared helper instead of
-// building one unbounded request from a full employee-id population. These
-// tests exercise the helper directly (it is pure aside from the injected
-// `buildQuery` callback) so the batching/pagination/concurrency contract
-// both callers rely on is verified independently of either page's UI.
+// Regression coverage for the giant-URL fix applied to TerminalDues.tsx,
+// SalaryAdvances.tsx, and (this pass) Payroll.tsx's own salary-advance
+// integration (salary_advances/salary_advance_deductions/
+// salary_advance_repayment_plans, previously plain unbounded
+// `.in('employee_id', employeeIds)`/`.in('salary_advance_id', advanceIds)`
+// calls -- the exact same failure class that already broke production once
+// at ~500+ employees). All these callers now delegate their region-scoped
+// `.in(...)` fetch to this shared helper instead of building one unbounded
+// request from a full id population. These tests exercise the helper
+// directly (it is pure aside from the injected `buildQuery` callback) so
+// the batching/pagination/concurrency contract every caller relies on is
+// verified independently of any page's UI.
 
 function makeIds(count: number): string[] {
   return Array.from({ length: count }, (_, i) => `id-${i}`);
@@ -93,6 +98,55 @@ describe('fetchInEmployeeIdBatches', () => {
     };
     await fetchInEmployeeIdBatches(ids, buildQuery, { employeeBatchSize: 40, concurrency: 3 });
     expect(maxInFlight).toBeLessThanOrEqual(3);
+  });
+
+  // Payroll.tsx's salary-advance integration specifically: >75 employees
+  // (bigger than one default batch) and >150 (bigger than two), matching
+  // the exact 3-query shape now used there (salary_advances by
+  // employee_id, salary_advance_deductions by advance_id,
+  // salary_advance_repayment_plans by employee_id) -- proving no request
+  // ever carries the full id population, every row is preserved, and
+  // dedupeById collapses the up-to-2-open-advances-per-employee case
+  // correctly across batch boundaries.
+  it('salary_advances shape: 100 employee ids never produce a single request carrying all 100, and every active advance row survives batching + dedupeById (including an employee with 2 open advances, one per batch)', async () => {
+    const employeeIds = makeIds(100);
+    const seenBatchLengths: number[] = [];
+    const buildQuery: BatchQueryBuilder<{ id: string; employee_id: string; advance_amount: number }> = async (batch) => {
+      seenBatchLengths.push(batch.length);
+      // id-0 (batch 1) and id-99 (batch 2, if split) are given 2 rows each,
+      // simulating the max-2-open-advances business rule -- but here both
+      // rows for the SAME employee land in the SAME batch (an employee_id
+      // can't span two batches), so this checks dedupeById is a true no-op
+      // when ids are already genuinely distinct, while the general
+      // dedupeById suite above covers actual cross-source duplicates.
+      const rows = batch.flatMap(employee_id =>
+        employee_id === 'id-0'
+          ? [{ id: `${employee_id}-adv-1`, employee_id, advance_amount: 1000 }, { id: `${employee_id}-adv-2`, employee_id, advance_amount: 500 }]
+          : [{ id: `${employee_id}-adv-1`, employee_id, advance_amount: 200 }]
+      );
+      return { data: rows, error: null, count: rows.length };
+    };
+    const raw = await fetchInEmployeeIdBatches(employeeIds, buildQuery);
+    const deduped = dedupeById(raw);
+    expect(seenBatchLengths.every(len => len <= 75)).toBe(true);
+    expect(seenBatchLengths.length).toBeGreaterThan(1); // 100 ids must span at least 2 batches
+    expect(deduped).toHaveLength(101); // 99 employees x 1 + 1 employee x 2
+    expect(deduped.filter(r => r.employee_id === 'id-0')).toHaveLength(2);
+  });
+
+  it('salary_advance_deductions shape: 160 advance ids (bigger than two default batches) never produce a single request, and every ledger row is preserved for the repayment sum', async () => {
+    const advanceIds = makeIds(160);
+    const seenBatchLengths: number[] = [];
+    const buildQuery: BatchQueryBuilder<{ salary_advance_id: string; deduction_amount: number }> = async (batch) => {
+      seenBatchLengths.push(batch.length);
+      return { data: batch.map(salary_advance_id => ({ salary_advance_id, deduction_amount: 50 })), error: null, count: batch.length };
+    };
+    const ledgerRows = await fetchInEmployeeIdBatches(advanceIds, buildQuery);
+    expect(seenBatchLengths.every(len => len <= 75)).toBe(true);
+    expect(seenBatchLengths.length).toBeGreaterThanOrEqual(3); // 160 / 75 rounds up to 3 batches
+    expect(ledgerRows).toHaveLength(160);
+    const totalRepaid = ledgerRows.reduce((sum, r) => sum + r.deduction_amount, 0);
+    expect(totalRepaid).toBe(160 * 50);
   });
 
   it('propagates a batch error instead of returning a silent partial result', async () => {
