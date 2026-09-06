@@ -152,7 +152,7 @@ const defaultTemplate: PayslipTemplate = {
   showPayPoint: true,
   showContractType: true,
   showAuthorizedBy: true,
-  authorizedName: 'William Banda',
+  authorizedName: 'J.BUSSILEY',
   authorizedTitle: 'Admin',
   footerText: 'This is a system-generated payslip. No signature required.',
   primaryColor: '#081C3A',
