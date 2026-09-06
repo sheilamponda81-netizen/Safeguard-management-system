@@ -12,6 +12,8 @@ import { getDefaultPageSize } from '../utils/uiSettings';
 import { calculateTerminalDues as calculateTerminalDuesPure } from '../utils/terminalDuesCalculations';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { formatAuditTimestamp, formatAuditValue } from '../utils/terminalDuesAudit';
+import { buildOpenDueStatusMap, getOpenDueLabel, isOpenDueUniqueViolation, DUPLICATE_OPEN_DUE_MESSAGE } from '../utils/terminalDuesDuplicates';
+import { getErrorMessage } from '../utils/errorHandler';
 import { UserProfile } from '../utils/currentProfile';
 
 interface Employee {
@@ -164,9 +166,22 @@ export function TerminalDuesPage() {
   // Preview calculation state
   const [previewCalculation, setPreviewCalculation] = useState<TerminalDue | null>(null);
 
+  // In-flight guard for saveCalculation() -- closes the same-session
+  // double-click race that (alongside the missing DB constraint) let HR
+  // create two open Terminal Dues for one employee in real staging
+  // testing. This is a UX backstop only; the database's partial unique
+  // index (idx_terminal_dues_one_open_per_employee) is the real authority.
+  const [isSavingCalculation, setIsSavingCalculation] = useState(false);
+
   // ===== MEMOIZED VALUES =====
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
   const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
+
+  // employee_id -> its open (pending/approved) status, from the currently
+  // loaded terminal_dues rows. Drives the employee-selector disabling
+  // below and the pre-flight duplicate check in saveCalculation() -- a
+  // Paid-only employee is absent from this map and remains selectable.
+  const openDueByEmployeeId = useMemo(() => buildOpenDueStatusMap(calculations), [calculations]);
 
   const displayedCalculations = useMemo(() => {
     let result = calculations;
@@ -427,6 +442,17 @@ export function TerminalDuesPage() {
       return;
     }
 
+    // Defensive, non-authoritative pre-check -- the database's partial
+    // unique index (idx_terminal_dues_one_open_per_employee) is what
+    // actually prevents a duplicate open due; this only avoids a round
+    // trip for the common case (e.g. stale `calculations` from before a
+    // refresh) and always has a race window, which is why the 23505
+    // handling below exists regardless of this check.
+    if (openDueByEmployeeId.has(selectedEmployee.id)) {
+      showNotification(DUPLICATE_OPEN_DUE_MESSAGE, 'error');
+      return;
+    }
+
     const calculation = calculateTerminalDues();
     if (!calculation) return;
 
@@ -434,44 +460,53 @@ export function TerminalDuesPage() {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { id, ...calculationToSave } = calculation;
 
-    const { data, error } = await supabase
-      .from('terminal_dues')
-      .insert([calculationToSave])
-      .select();
+    setIsSavingCalculation(true);
+    try {
+      const { data, error } = await supabase
+        .from('terminal_dues')
+        .insert([calculationToSave])
+        .select();
 
-    if (error) {
-      showNotification('Error saving calculation: ' + error.message, 'error');
-      console.error('Error:', error);
-    } else {
-      await logAudit({
-        action: 'CREATE',
-        entity_type: 'terminal_due',
-        entity_id: data?.[0]?.id || 'new',
-        new_data: {
-          employee_name: calculation.employee_name,
-          employee_number: calculation.employee_number,
-          position: calculation.position,
-          total_payable: calculation.total_payable,
-          gratuity: calculation.gratuity,
-          annual_leave: calculation.annual_leave,
-          uniform_refund: calculation.uniform_refund,
-          deductions: calculation.deductions,
-          termination_type: calculation.termination_type,
-          reason: calculation.reason_for_termination,
-          period_months: calculation.period_months
-        },
-        region_id: userProfile?.region_id
-      });
+      if (error) {
+        if (isOpenDueUniqueViolation(error)) {
+          showNotification(DUPLICATE_OPEN_DUE_MESSAGE, 'error');
+        } else {
+          showNotification('Error saving calculation: ' + getErrorMessage(error), 'error');
+        }
+        console.error('Error:', error);
+      } else {
+        await logAudit({
+          action: 'CREATE',
+          entity_type: 'terminal_due',
+          entity_id: data?.[0]?.id || 'new',
+          new_data: {
+            employee_name: calculation.employee_name,
+            employee_number: calculation.employee_number,
+            position: calculation.position,
+            total_payable: calculation.total_payable,
+            gratuity: calculation.gratuity,
+            annual_leave: calculation.annual_leave,
+            uniform_refund: calculation.uniform_refund,
+            deductions: calculation.deductions,
+            termination_type: calculation.termination_type,
+            reason: calculation.reason_for_termination,
+            period_months: calculation.period_months
+          },
+          region_id: userProfile?.region_id
+        });
 
-      showNotification('Terminal dues calculated successfully', 'success');
-      setPreviewCalculation(null);
-      setShowCalculateModal(false);
-      setEmployeeSearch('');
-      setSelectedEmployee(null);
-      setFormData(getInitialFormData());
-      await fetchCalculations();
+        showNotification('Terminal dues calculated successfully', 'success');
+        setPreviewCalculation(null);
+        setShowCalculateModal(false);
+        setEmployeeSearch('');
+        setSelectedEmployee(null);
+        setFormData(getInitialFormData());
+        await fetchCalculations();
+      }
+    } finally {
+      setIsSavingCalculation(false);
     }
-  }, [selectedEmployee, calculateTerminalDues, userProfile, fetchCalculations]);
+  }, [selectedEmployee, calculateTerminalDues, userProfile, fetchCalculations, openDueByEmployeeId]);
 
   // ===== APPROVE (Pending -> Approved) =====
   // Status transitions go through narrow SECURITY DEFINER RPCs, never a
@@ -939,29 +974,42 @@ export function TerminalDuesPage() {
                       No active employees found matching "{employeeSearch}"
                     </div>
                   ) : (
-                    filteredEmployees.map((emp) => (
-                      <button
-                        key={emp.id}
-                        type="button"
-                        onClick={() => selectEmployee(emp)}
-                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors flex items-center gap-3"
-                      >
-                        <div className="w-8 h-8 rounded-full bg-[#081C3A] text-white text-xs font-bold flex items-center justify-center flex-shrink-0">
-                          {((emp.fullName || 'U').split(' ').map(n => n[0]).join('').slice(0, 2)).toUpperCase()}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium text-slate-800 truncate">{emp.fullName || 'Unknown'}</p>
-                          <div className="flex items-center gap-2 text-xs text-slate-500">
-                            <span>{emp.employeeNumber || 'N/A'}</span>
-                            <span className="w-1 h-1 rounded-full bg-slate-300" />
-                            <span>{emp.position || 'N/A'}</span>
+                    filteredEmployees.map((emp) => {
+                      const openLabel = getOpenDueLabel(openDueByEmployeeId.get(emp.id));
+                      return (
+                        <button
+                          key={emp.id}
+                          type="button"
+                          disabled={!!openLabel}
+                          onClick={() => selectEmployee(emp)}
+                          title={openLabel ?? undefined}
+                          className={`w-full text-left px-4 py-2.5 border-b border-slate-100 last:border-0 transition-colors flex items-center gap-3 ${
+                            openLabel ? 'opacity-50 cursor-not-allowed bg-slate-50' : 'hover:bg-slate-50'
+                          }`}
+                        >
+                          <div className="w-8 h-8 rounded-full bg-[#081C3A] text-white text-xs font-bold flex items-center justify-center flex-shrink-0">
+                            {((emp.fullName || 'U').split(' ').map(n => n[0]).join('').slice(0, 2)).toUpperCase()}
                           </div>
-                        </div>
-                        <div className="text-xs font-medium text-[#D4A017]">
-                          {formatKwacha(emp.basicSalary || 0)}
-                        </div>
-                      </button>
-                    ))
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium text-slate-800 truncate">{emp.fullName || 'Unknown'}</p>
+                            <div className="flex items-center gap-2 text-xs text-slate-500">
+                              <span>{emp.employeeNumber || 'N/A'}</span>
+                              <span className="w-1 h-1 rounded-full bg-slate-300" />
+                              <span>{emp.position || 'N/A'}</span>
+                            </div>
+                          </div>
+                          {openLabel ? (
+                            <div className="text-xs font-medium text-amber-700">
+                              {openLabel}
+                            </div>
+                          ) : (
+                            <div className="text-xs font-medium text-[#D4A017]">
+                              {formatKwacha(emp.basicSalary || 0)}
+                            </div>
+                          )}
+                        </button>
+                      );
+                    })
                   )}
                 </div>
               )}
@@ -1123,8 +1171,8 @@ export function TerminalDuesPage() {
               setSelectedEmployee(null);
               setFormData(getInitialFormData());
             }}>Cancel</Button>
-            <Button variant="secondary" onClick={saveCalculation} disabled={!selectedEmployee}>
-              <Save size={14} className="mr-1" /> Save Calculation
+            <Button variant="secondary" onClick={saveCalculation} disabled={!selectedEmployee || isSavingCalculation}>
+              <Save size={14} className="mr-1" /> {isSavingCalculation ? 'Saving...' : 'Save Calculation'}
             </Button>
           </div>
         </div>
