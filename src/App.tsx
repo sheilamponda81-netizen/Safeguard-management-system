@@ -87,7 +87,15 @@ const rolePages: Record<number, NavKey[]> = {
     "user-manual",
   ],
   3: ["dashboard", "attendance", "security", "user-manual"],
-  4: ["dashboard", "payslips", "user-manual"],
+  // "payslips" deliberately removed for role_level 4 (Legacy Staff):
+  // profiles has no employee_id link, so payroll RLS cannot express "only
+  // this Staff account's own payslip" -- 20260908000000 disables Staff
+  // payroll SELECT at the database level as a temporary security
+  // restriction (see that migration's header), and this route-guard entry
+  // is the matching frontend half so the page is unreachable rather than
+  // rendering with zero/blocked data. Restore only once a real profile<->
+  // employee identity link exists and can back a genuinely self-scoped policy.
+  4: ["dashboard", "user-manual"],
 };
 
 // ===== TITLES CONFIGURATION =====

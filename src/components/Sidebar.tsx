@@ -84,7 +84,13 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "user-manual",
   ],
   3: ["dashboard", "attendance", "security", "user-manual"],
-  4: ["dashboard", "payslips", "user-manual"],
+  // "payslips" deliberately removed for role_level 4 (Legacy Staff) -- see
+  // App.tsx's matching rolePages[4] comment and migration
+  // 20260908000000_employees_attendance_payroll_legacy_role_hardening.sql:
+  // profiles has no employee_id link, so payroll RLS cannot express "only
+  // this account's own payslip," and Staff payroll SELECT is now disabled
+  // at the database level as a temporary restriction.
+  4: ["dashboard", "user-manual"],
 };
 
 // "security" and "features" are rendered separately (the "Special"
@@ -521,7 +527,10 @@ export function BottomNav({
     1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings", "auditlogs", "user-manual"],
     2: ["dashboard", "employees", "terminal-dues", "attendance", "reports", "user-manual"],
     3: ["dashboard", "employees", "attendance","terminal-dues", "reports", "user-manual"],
-    4: ["dashboard", "employees", "payments", "payslips", "reports", "user-manual"],
+    // "payslips" removed for role_level 4 -- see roleMenuItems[4]'s comment
+    // above and App.tsx's matching rolePages[4] -- Staff payroll SELECT is
+    // now disabled at the database level (20260908000000).
+    4: ["dashboard", "employees", "payments", "reports", "user-manual"],
   };
 
   useEffect(() => {
