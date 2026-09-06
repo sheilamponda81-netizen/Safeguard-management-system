@@ -40,3 +40,21 @@ export function getVisibleTerminalDueActions(
     showRecordPayment: perms.canPay && status === 'approved',
   };
 }
+
+// Whether the "RETURNED FOR CORRECTION" panel belongs in View Details.
+// return_reason (20260907000000) is populated by
+// return_terminal_due_for_correction() and cleared by
+// approve_terminal_due() on re-approval, so it is non-null ONLY while a
+// Pending row is CURRENTLY awaiting correction -- an ordinary Pending
+// record that was never returned has return_reason NULL and this
+// correctly returns false. The status check is redundant with that
+// invariant (return_reason is always cleared before a row leaves
+// Pending) but kept explicit as a second, independent guard: this panel
+// must never render on an Approved or Paid row even if some future bug
+// left a stale return_reason behind.
+export function shouldShowReturnedForCorrectionBanner(
+  status: TerminalDueStatus,
+  returnReason: string | null
+): boolean {
+  return status === 'pending' && !!returnReason;
+}

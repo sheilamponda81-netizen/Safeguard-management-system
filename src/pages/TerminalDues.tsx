@@ -5,7 +5,7 @@ import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { hasExplicitPermission, PERMISSIONS } from '../utils/permissions';
-import { getVisibleTerminalDueActions, TerminalDueStatus } from '../utils/terminalDueRowActions';
+import { getVisibleTerminalDueActions, shouldShowReturnedForCorrectionBanner, TerminalDueStatus } from '../utils/terminalDueRowActions';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
@@ -82,6 +82,18 @@ interface TerminalDue {
   payment_method: string | null;
   payment_reference: string | null;
   payment_notes: string | null;
+  // Populated only while a Pending row is CURRENTLY awaiting correction
+  // (set by return_terminal_due_for_correction(), cleared by
+  // approve_terminal_due() on re-approval -- 20260907000000). All four are
+  // NULL for an ordinary Pending record that was never returned.
+  // returned_by_name is a server-resolved snapshot, not a live profiles
+  // join -- HR cannot read the returning Admin's own profiles row under
+  // profiles' own RLS (non-admin, self-only SELECT), so the name is
+  // captured once at return time by the SECURITY DEFINER RPC instead.
+  returned_by: string | null;
+  returned_by_name: string | null;
+  returned_at: string | null;
+  return_reason: string | null;
 }
 
 const terminationReasons = [
@@ -435,7 +447,11 @@ export function TerminalDuesPage() {
       payment_date: null,
       payment_method: null,
       payment_reference: null,
-      payment_notes: null
+      payment_notes: null,
+      returned_by: null,
+      returned_by_name: null,
+      returned_at: null,
+      return_reason: null
     };
 
     setPreviewCalculation(calculation);
@@ -1249,6 +1265,22 @@ export function TerminalDuesPage() {
               <p className="text-xs text-slate-500">Type: {showDetailModal.termination_type?.replace('_', ' ') || 'N/A'}</p>
               <p className="text-xs text-slate-500">Date Left: {new Date(showDetailModal.date_left).toLocaleDateString()}</p>
             </div>
+
+            {/* Only while a Pending row is CURRENTLY awaiting correction --
+                return_reason is cleared on re-approval (approve_terminal_due(),
+                20260907000000), so an ordinary Pending record that was never
+                returned (return_reason NULL) never shows this, matching
+                required behavior exactly. */}
+            {shouldShowReturnedForCorrectionBanner(showDetailModal.status, showDetailModal.return_reason) && (
+              <div className="border-t pt-4">
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-1">
+                  <p className="text-sm font-semibold text-amber-800">RETURNED FOR CORRECTION</p>
+                  <p className="text-xs text-amber-700"><span className="font-medium">Reason:</span> {showDetailModal.return_reason}</p>
+                  <p className="text-xs text-amber-700"><span className="font-medium">Returned by:</span> {showDetailModal.returned_by_name || 'Unknown'}</p>
+                  <p className="text-xs text-amber-700"><span className="font-medium">Returned on:</span> {formatAuditTimestamp(showDetailModal.returned_at)}</p>
+                </div>
+              </div>
+            )}
 
             {(showDetailModal.status === 'approved' || showDetailModal.status === 'paid') && (
               <div className="border-t pt-4 space-y-1">

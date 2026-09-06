@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getVisibleTerminalDueActions, TerminalDuePermissions } from './terminalDueRowActions';
+import { getVisibleTerminalDueActions, shouldShowReturnedForCorrectionBanner, TerminalDuePermissions } from './terminalDueRowActions';
 
 // Regression coverage for the real staging bug: a functional Admin's row
 // still showed the Edit/pencil action on a Pending Terminal Due, because
@@ -104,5 +104,31 @@ describe('getVisibleTerminalDueActions', () => {
       showReturnForCorrection: true,
       showRecordPayment: true,
     });
+  });
+});
+
+// Regression coverage for the real staging gap: the Return for Correction
+// reason was written by return_terminal_due_for_correction() but nowhere
+// visible in the UI (only inside audit_logs.new_data, which HR has no
+// SELECT access to at all -- see 20260907000000's migration header).
+describe('shouldShowReturnedForCorrectionBanner', () => {
+  it('an ordinary Pending record that was never returned (return_reason NULL) never shows the banner', () => {
+    expect(shouldShowReturnedForCorrectionBanner('pending', null)).toBe(false);
+  });
+
+  it('a Pending record that WAS returned (return_reason set) shows the banner', () => {
+    expect(shouldShowReturnedForCorrectionBanner('pending', 'Uniform refund amount looks wrong')).toBe(true);
+  });
+
+  it('an empty-string return_reason does not show the banner', () => {
+    expect(shouldShowReturnedForCorrectionBanner('pending', '')).toBe(false);
+  });
+
+  it('never shows on an Approved row even if return_reason were somehow still set', () => {
+    expect(shouldShowReturnedForCorrectionBanner('approved', 'stale reason')).toBe(false);
+  });
+
+  it('never shows on a Paid row even if return_reason were somehow still set', () => {
+    expect(shouldShowReturnedForCorrectionBanner('paid', 'stale reason')).toBe(false);
   });
 });
