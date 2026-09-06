@@ -1,29 +1,35 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { UserProfile } from './currentProfile';
 
-// Mock the underlying canAccess() so these tests exercise
-// resolveDashboardPermissions()'s own fail-closed/branching logic without
-// hitting Supabase -- canAccess() itself (legacyAllowed OR
-// has_permission()) is already covered by permissions.test.ts.
+// Mock the underlying canAccess()/hasExplicitPermission() so these tests
+// exercise resolveDashboardPermissions()'s own fail-closed/branching logic
+// without hitting Supabase -- canAccess() itself (legacyAllowed OR
+// has_permission()) is already covered by permissions.test.ts, as is
+// hasExplicitPermission() (super-admin-only bypass, no legacy/business-
+// admin shortcut).
 // canApprovePayrollFor() (from payrollPermissions.ts) is NOT mocked -- it's
 // a pure, dependency-free function ({isSuperAdmin, roleLevel} => boolean),
 // so these tests just drive it via the profile's own is_super_admin/
 // role_level, the same way Payroll.tsx's real call site does.
 vi.mock('./permissions', () => ({
   canAccess: vi.fn(),
+  hasExplicitPermission: vi.fn(),
   PERMISSIONS: {
     PAYROLL_VIEW: 'payroll.view',
     PAYROLL_APPROVE: 'payroll.approve',
     ATTENDANCE_VIEW: 'attendance.view',
     RECRUITMENT_VIEW: 'recruitment.view',
     SECURITY_PERSONNEL_VIEW: 'security_personnel.view',
+    TERMINAL_DUES_APPROVE: 'terminal_dues.approve',
+    TERMINAL_DUES_PAY: 'terminal_dues.pay',
   },
 }));
 
-import { canAccess } from './permissions';
+import { canAccess, hasExplicitPermission } from './permissions';
 import { resolveDashboardPermissions, buildPendingTasks } from './dashboardPermissions';
 
 const mockedCanAccess = vi.mocked(canAccess);
+const mockedHasExplicitPermission = vi.mocked(hasExplicitPermission);
 
 function makeProfile(overrides: Partial<UserProfile>): UserProfile {
   return {
@@ -47,6 +53,8 @@ function makeProfile(overrides: Partial<UserProfile>): UserProfile {
 describe('resolveDashboardPermissions', () => {
   beforeEach(() => {
     mockedCanAccess.mockReset();
+    mockedHasExplicitPermission.mockReset();
+    mockedHasExplicitPermission.mockResolvedValue(false);
   });
 
   it('Operations Manager (functional, no payroll.view/recruitment.view/payroll.approve): payroll and recruitment denied, attendance and security allowed', async () => {
@@ -64,6 +72,8 @@ describe('resolveDashboardPermissions', () => {
       canViewRecruitment: false,
       canViewSecurity: true,
       canApprovePayroll: false,
+      canApproveTerminalDues: false,
+      canPayTerminalDues: false,
     });
   });
 
@@ -93,6 +103,8 @@ describe('resolveDashboardPermissions', () => {
       canViewRecruitment: false,
       canViewSecurity: false,
       canApprovePayroll: true,
+      canApproveTerminalDues: false,
+      canPayTerminalDues: false,
     });
   });
 
@@ -156,11 +168,14 @@ describe('resolveDashboardPermissions', () => {
       canViewRecruitment: false,
       canViewSecurity: false,
       canApprovePayroll: false,
+      canApproveTerminalDues: false,
+      canPayTerminalDues: false,
     });
   });
 
   it('fails closed for a null profile', async () => {
     mockedCanAccess.mockResolvedValue(true); // even if canAccess would say yes
+    mockedHasExplicitPermission.mockResolvedValue(true); // even if hasExplicitPermission would say yes
     const result = await resolveDashboardPermissions(null);
     // isLegacy is false for a null profile, so this still goes through
     // canAccess -- the mock above returning true is a control to prove
@@ -171,13 +186,74 @@ describe('resolveDashboardPermissions', () => {
     // its own, but canAccess(false, 'payroll.approve') is mocked true above,
     // so canApprovePayroll still resolves true here -- consistent with
     // every other flag in this same "canAccess always says yes" control.
+    // hasExplicitPermission is mocked true too, purely as the same kind of
+    // control -- resolveDashboardPermissions() itself never special-cases
+    // a null profile into skipping either call.
     expect(result).toEqual({
       canViewPayroll: true,
       canViewAttendance: true,
       canViewRecruitment: true,
       canViewSecurity: true,
       canApprovePayroll: true,
+      canApproveTerminalDues: true,
+      canPayTerminalDues: true,
     });
+  });
+
+  it('Admin (functional, terminal_dues.approve granted, terminal_dues.pay NOT granted): approve true, pay false -- resolved independently via hasExplicitPermission, never canAccess', async () => {
+    mockedCanAccess.mockResolvedValue(false);
+    mockedHasExplicitPermission.mockImplementation(async (permission) => permission === 'terminal_dues.approve');
+
+    const result = await resolveDashboardPermissions(makeProfile({ role: 'admin', role_level: null }));
+
+    expect(result.canApproveTerminalDues).toBe(true);
+    expect(result.canPayTerminalDues).toBe(false);
+  });
+
+  it('Accountant (functional, terminal_dues.pay granted, terminal_dues.approve NOT granted): pay true, approve false', async () => {
+    mockedCanAccess.mockResolvedValue(false);
+    mockedHasExplicitPermission.mockImplementation(async (permission) => permission === 'terminal_dues.pay');
+
+    const result = await resolveDashboardPermissions(makeProfile({ role: 'accountant', role_level: null }));
+
+    expect(result.canApproveTerminalDues).toBe(false);
+    expect(result.canPayTerminalDues).toBe(true);
+  });
+
+  it('HR Manager (functional, neither terminal_dues.approve nor .pay seeded): both false, regardless of canAccess', async () => {
+    // canAccess mocked true here as a control -- proves
+    // canApproveTerminalDues/canPayTerminalDues go through
+    // hasExplicitPermission ONLY and never fall back to canAccess/
+    // hasPermission's business-admin-or-legacy shortcut the way the OLD
+    // (buggy) TerminalDues.tsx create/edit checks used to.
+    mockedCanAccess.mockResolvedValue(true);
+    mockedHasExplicitPermission.mockResolvedValue(false);
+
+    const result = await resolveDashboardPermissions(makeProfile({ role: 'hr_manager', role_level: null }));
+
+    expect(result.canApproveTerminalDues).toBe(false);
+    expect(result.canPayTerminalDues).toBe(false);
+  });
+
+  it('legacy Admin (role_level 1): terminal_dues approve/pay still false unless hasExplicitPermission itself says so -- no legacy role_level bypass', async () => {
+    mockedCanAccess.mockImplementation(async (legacyAllowed) => legacyAllowed);
+    mockedHasExplicitPermission.mockResolvedValue(false);
+
+    const result = await resolveDashboardPermissions(makeProfile({ role: null, role_level: 1 }));
+
+    expect(result.canViewPayroll).toBe(true); // legacy view flags still bypass via canAccess
+    expect(result.canApproveTerminalDues).toBe(false);
+    expect(result.canPayTerminalDues).toBe(false);
+  });
+
+  it('true super admin: terminal_dues approve/pay both true via hasExplicitPermission\'s own super-admin bypass', async () => {
+    mockedCanAccess.mockResolvedValue(false);
+    mockedHasExplicitPermission.mockResolvedValue(true);
+
+    const result = await resolveDashboardPermissions(makeProfile({ role: 'admin', role_level: null, is_super_admin: true }));
+
+    expect(result.canApproveTerminalDues).toBe(true);
+    expect(result.canPayTerminalDues).toBe(true);
   });
 });
 
@@ -190,6 +266,10 @@ describe('buildPendingTasks', () => {
       pendingRecruitmentCount: 0,
       canViewSecurity: false,
       expiringLicensesCount: 0,
+      canApproveTerminalDues: false,
+      pendingTerminalDuesApprovalCount: 0,
+      canPayTerminalDues: false,
+      approvedTerminalDuesPaymentCount: 0,
       ...overrides,
     };
   }
@@ -243,19 +323,66 @@ describe('buildPendingTasks', () => {
     expect(tasks.map(t => t.key)).not.toContain('process-leave');
   });
 
-  it('everything authorized and everything pending: all 3 real tasks appear with correct counts', () => {
+  it('everything authorized and everything pending: all 5 real tasks appear with correct counts', () => {
     const tasks = buildPendingTasks(makeInputs({
       canApprovePayroll: true, pendingPayrollApprovalCount: 2,
       canViewRecruitment: true, pendingRecruitmentCount: 5,
       canViewSecurity: true, expiringLicensesCount: 1,
+      canApproveTerminalDues: true, pendingTerminalDuesApprovalCount: 1,
+      canPayTerminalDues: true, approvedTerminalDuesPaymentCount: 3,
     }));
-    expect(tasks).toHaveLength(3);
-    expect(tasks.map(t => t.title)).toEqual(['Payroll Periods Awaiting Approval', 'Review Job Applications', 'Renew Expiring Licenses']);
-    expect(tasks.map(t => t.count)).toEqual([2, 5, 1]);
+    expect(tasks).toHaveLength(5);
+    expect(tasks.map(t => t.title)).toEqual([
+      'Payroll Periods Awaiting Approval', 'Review Job Applications', 'Renew Expiring Licenses',
+      'Terminal Dues Awaiting Approval', 'Terminal Dues Awaiting Payment',
+    ]);
+    expect(tasks.map(t => t.count)).toEqual([2, 5, 1, 1, 3]);
   });
 
   it('nothing authorized and nothing pending: empty list, not a fallback ungated task -- proves the filter fails closed, not open', () => {
     const tasks = buildPendingTasks(makeInputs({}));
+    expect(tasks).toEqual([]);
+  });
+
+  // ===== TERMINAL DUES ===== (real staging bug: Admin Dashboard showed
+  // 0 Pending Tasks despite a real Pending terminal_dues row Admin was
+  // authorized and able to approve)
+  it('Admin with terminal_dues.approve AND 1 Pending due: exactly one "Terminal Dues Awaiting Approval" task, count 1', () => {
+    const tasks = buildPendingTasks(makeInputs({ canApproveTerminalDues: true, pendingTerminalDuesApprovalCount: 1 }));
+    expect(tasks.map(t => t.title)).toEqual(['Terminal Dues Awaiting Approval']);
+    expect(tasks[0].count).toBe(1);
+  });
+
+  it('Admin with terminal_dues.approve but 0 Pending dues: no terminal-dues approval task', () => {
+    const tasks = buildPendingTasks(makeInputs({ canApproveTerminalDues: true, pendingTerminalDuesApprovalCount: 0 }));
+    expect(tasks.map(t => t.title)).not.toContain('Terminal Dues Awaiting Approval');
+  });
+
+  it('Accountant with terminal_dues.pay AND 1 Approved due: exactly one "Terminal Dues Awaiting Payment" task, count 1', () => {
+    const tasks = buildPendingTasks(makeInputs({ canPayTerminalDues: true, approvedTerminalDuesPaymentCount: 1 }));
+    expect(tasks.map(t => t.title)).toEqual(['Terminal Dues Awaiting Payment']);
+    expect(tasks[0].count).toBe(1);
+  });
+
+  it('Accountant with terminal_dues.pay but ONLY Pending dues exist (approvedTerminalDuesPaymentCount 0): no payment task -- Pending is not Approved', () => {
+    const tasks = buildPendingTasks(makeInputs({ canPayTerminalDues: true, approvedTerminalDuesPaymentCount: 0 }));
+    expect(tasks.map(t => t.title)).not.toContain('Terminal Dues Awaiting Payment');
+  });
+
+  it('HR Manager (can view/create/edit but holds neither terminal_dues.approve nor .pay): sees NEITHER task even if counts are nonzero', () => {
+    const tasks = buildPendingTasks(makeInputs({
+      canApproveTerminalDues: false, pendingTerminalDuesApprovalCount: 4,
+      canPayTerminalDues: false, approvedTerminalDuesPaymentCount: 4,
+    }));
+    expect(tasks.map(t => t.title)).not.toContain('Terminal Dues Awaiting Approval');
+    expect(tasks.map(t => t.title)).not.toContain('Terminal Dues Awaiting Payment');
+  });
+
+  it('unauthorized rows are never counted into a visible task: authorized=false always suppresses the task regardless of how large the count is (real region/tenant scoping happens upstream, in the RLS-authorized count query itself -- this function only ever sees the already-authorized number)', () => {
+    const tasks = buildPendingTasks(makeInputs({
+      canApproveTerminalDues: false, pendingTerminalDuesApprovalCount: 999,
+      canPayTerminalDues: false, approvedTerminalDuesPaymentCount: 999,
+    }));
     expect(tasks).toEqual([]);
   });
 });

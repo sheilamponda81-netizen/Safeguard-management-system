@@ -1,7 +1,7 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { 
+import {
   Users, Wallet, UserMinus, ClipboardList, CheckCircle2, TrendingUp,
-  Bell, ShieldCheck, Shield, MapPin,
+  Bell, ShieldCheck, Shield, MapPin, Banknote,
   ChevronLeft, ChevronRight, RefreshCw, AlertCircle, Building2, Home
 } from '../utils/icons';
 import { Card, StatCard, Button, Badge, Table, THead, TBody, TR, TH, TD } from '../components/ui';
@@ -96,6 +96,11 @@ export function Dashboard() {
   // view access, if that combination existed, must never see a task
   // implying they can approve something they can't act on).
   const [canApprovePayroll, setCanApprovePayroll] = useState(false);
+  // Terminal Dues approve/pay tasks: gated the same narrow way
+  // TerminalDues.tsx itself gates its Approve/Record Payment actions --
+  // see resolveDashboardPermissions() (dashboardPermissions.ts).
+  const [canApproveTerminalDues, setCanApproveTerminalDues] = useState(false);
+  const [canPayTerminalDues, setCanPayTerminalDues] = useState(false);
   const [permissionsResolved, setPermissionsResolved] = useState(false);
   
   // ===== PERFORMANCE: Track chart loading state =====
@@ -137,6 +142,14 @@ export function Dashboard() {
   // "Approve Payroll" pending task's visibility/count. 0 by default (fail-
   // closed): never set except from the actual payroll fetch below.
   const [pendingPayrollApprovalCount, setPendingPayrollApprovalCount] = useState(0);
+  // Real counts of authorized terminal_dues rows by status -- a plain
+  // head-count query (no rows fetched), never an employee_id IN-list
+  // batch: terminal_dues's own SELECT RLS already restricts to the
+  // caller's tenant/region/permission (20260817000002 PART 5), so no
+  // client-side re-filtering is needed just to count. 0 by default
+  // (fail-closed): never set except from the actual count fetch below.
+  const [pendingTerminalDuesApprovalCount, setPendingTerminalDuesApprovalCount] = useState(0);
+  const [approvedTerminalDuesPaymentCount, setApprovedTerminalDuesPaymentCount] = useState(0);
   const [dataReady, setDataReady] = useState(false);
   const [initialLoad, setInitialLoad] = useState(true);
   // Real connectivity/data-fetch signal for the "Data Load" card --
@@ -159,13 +172,23 @@ export function Dashboard() {
       pendingRecruitmentCount: stats.pendingRecruitment,
       canViewSecurity,
       expiringLicensesCount: stats.expiringLicenses,
+      canApproveTerminalDues,
+      pendingTerminalDuesApprovalCount,
+      canPayTerminalDues,
+      approvedTerminalDuesPaymentCount,
     }),
-    [canApprovePayroll, pendingPayrollApprovalCount, canViewRecruitment, stats.pendingRecruitment, canViewSecurity, stats.expiringLicenses]
+    [
+      canApprovePayroll, pendingPayrollApprovalCount, canViewRecruitment, stats.pendingRecruitment,
+      canViewSecurity, stats.expiringLicenses,
+      canApproveTerminalDues, pendingTerminalDuesApprovalCount, canPayTerminalDues, approvedTerminalDuesPaymentCount,
+    ]
   );
   const pendingTaskIcons: Record<PendingTask['key'], typeof Wallet> = {
     'approve-payroll': Wallet,
     'review-applications': ClipboardList,
     'renew-licenses': Shield,
+    'approve-terminal-dues': CheckCircle2,
+    'pay-terminal-dues': Banknote,
   };
 
   // ===== PERFORMANCE: Lazy load charts after data is ready =====
@@ -239,6 +262,8 @@ export function Dashboard() {
       setCanViewAttendance(false);
       setCanViewRecruitment(false);
       setCanApprovePayroll(false);
+      setCanApproveTerminalDues(false);
+      setCanPayTerminalDues(false);
       try {
         const { data: { user } } = await supabase.auth.getUser();
         if (user) {
@@ -256,6 +281,8 @@ export function Dashboard() {
           setCanViewRecruitment(permissions.canViewRecruitment);
           setCanViewSecurity(permissions.canViewSecurity);
           setCanApprovePayroll(permissions.canApprovePayroll);
+          setCanApproveTerminalDues(permissions.canApproveTerminalDues);
+          setCanPayTerminalDues(permissions.canPayTerminalDues);
         }
       } finally {
         setPermissionsResolved(true);
@@ -743,6 +770,41 @@ export function Dashboard() {
         setMonthlyPayrollIsEstimate(false);
       }
 
+      // ===== TERMINAL DUES — real counts feeding the "Terminal Dues
+      // Awaiting Approval"/"Terminal Dues Awaiting Payment" pending tasks.
+      // Deliberately a head-count query (count: 'exact', head: true, no
+      // rows returned) against `terminal_dues` directly -- NOT an
+      // employee_id IN-list batch like the payroll fetch above. Unlike
+      // `payroll`, terminal_dues's own SELECT RLS already restricts rows
+      // to the caller's tenant + region_allowed() + permission
+      // (20260817000002 PART 5), so a plain filtered count is already
+      // fully authorized server-side; re-deriving the same scope via a
+      // client-side employee_id list here would just reintroduce the
+      // oversized `.in(...)` request this rollout already removed
+      // elsewhere. Each query only runs for a caller who actually holds
+      // the matching explicit permission -- an HR Manager (view/create/
+      // edit only, no terminal_dues.approve/.pay row) issues neither.
+      if (canApproveTerminalDues) {
+        const { count, error: pendingTdError } = await supabase
+          .from('terminal_dues')
+          .select('id', { count: 'exact', head: true })
+          .eq('status', 'pending');
+        if (pendingTdError) throw pendingTdError;
+        setPendingTerminalDuesApprovalCount(count || 0);
+      } else {
+        setPendingTerminalDuesApprovalCount(0);
+      }
+      if (canPayTerminalDues) {
+        const { count, error: approvedTdError } = await supabase
+          .from('terminal_dues')
+          .select('id', { count: 'exact', head: true })
+          .eq('status', 'approved');
+        if (approvedTdError) throw approvedTdError;
+        setApprovedTerminalDuesPaymentCount(count || 0);
+      } else {
+        setApprovedTerminalDuesPaymentCount(0);
+      }
+
       // ===== ATTENDANCE DATA - Starting from June 2026 =====
       // Reuses `allAttendanceRecords`, already fetched once (in full, for
       // this same 6-month window, gated by canViewAttendance) alongside the
@@ -772,7 +834,7 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance, canViewRecruitment]);
+  }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance, canViewRecruitment, canApproveTerminalDues, canPayTerminalDues]);
 
   useEffect(() => {
     // permissionsResolved is required here, not just userProfile/selectedMonth

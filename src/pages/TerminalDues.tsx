@@ -4,7 +4,8 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
-import { canAccess, hasExplicitPermission, PERMISSIONS } from '../utils/permissions';
+import { hasExplicitPermission, PERMISSIONS } from '../utils/permissions';
+import { getVisibleTerminalDueActions, TerminalDueStatus } from '../utils/terminalDueRowActions';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
@@ -134,17 +135,24 @@ export function TerminalDuesPage() {
   const [filterStatus, setFilterStatus] = useState('all');
   // Permission-driven action gating. HR Manager: create/edit a Pending
   // calculation, never approve/pay. Functional Admin: approve a Pending
-  // calculation (and return an Approved one for correction), never pay
-  // by default. Accountant: record payment for an Approved calculation
-  // only, never create/edit/approve. canApproveTerminalDue/
+  // calculation (and return an Approved one for correction), never
+  // create/edit/pay. Accountant: record payment for an Approved
+  // calculation only, never create/edit/approve. ALL FOUR of
+  // canCreateTerminalDue/canEditTerminalDue/canApproveTerminalDue/
   // canPayTerminalDue deliberately use hasExplicitPermission() (see
-  // permissions.ts), NOT canAccess()/hasPermission() -- approve/pay must
-  // come from an explicit terminal_dues.approve/.pay grant (or true
-  // super admin), never a legacy role_level bypass or the usual
-  // is_business_admin() "Admin gets everything" shortcut (separation-of-
-  // duties migration, 20260905000000).
-  const [canCreateTerminalDue, setCanCreateTerminalDue] = useState(true);
-  const [canEditTerminalDue, setCanEditTerminalDue] = useState(true);
+  // permissions.ts), NOT canAccess()/hasPermission() -- every one of
+  // create/edit/approve/pay must come from an explicit
+  // terminal_dues.create/.edit/.approve/.pay grant (or true super admin),
+  // never a legacy role_level bypass or the usual is_business_admin()
+  // "Admin gets everything" shortcut (separation-of-duties migration,
+  // 20260905000000). Real staging testing caught canCreateTerminalDue/
+  // canEditTerminalDue still using the broad canAccess()/hasPermission()
+  // path here, which let a functional Admin see Edit "for free" via
+  // hasPermission()'s business-admin shortcut despite the database
+  // boundary already denying it. All four default to false (fail-closed):
+  // never true before fetchUserProfile() actually resolves.
+  const [canCreateTerminalDue, setCanCreateTerminalDue] = useState(false);
+  const [canEditTerminalDue, setCanEditTerminalDue] = useState(false);
   const [canApproveTerminalDue, setCanApproveTerminalDue] = useState(false);
   const [canPayTerminalDue, setCanPayTerminalDue] = useState(false);
   
@@ -218,9 +226,8 @@ export function TerminalDuesPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
-    const isLegacy = (profile?.role_level ?? null) !== null;
-    setCanCreateTerminalDue(await canAccess(isLegacy, PERMISSIONS.TERMINAL_DUES_CREATE));
-    setCanEditTerminalDue(await canAccess(isLegacy, PERMISSIONS.TERMINAL_DUES_EDIT));
+    setCanCreateTerminalDue(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_CREATE));
+    setCanEditTerminalDue(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_EDIT));
     setCanApproveTerminalDue(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_APPROVE));
     setCanPayTerminalDue(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_PAY));
   }, []);
@@ -826,7 +833,14 @@ export function TerminalDuesPage() {
                   </TD>
                 </TR>
               ) : (
-                paginatedDues.map((calc) => (
+                paginatedDues.map((calc) => {
+                  const rowActions = getVisibleTerminalDueActions(calc.status as TerminalDueStatus, {
+                    canCreate: canCreateTerminalDue,
+                    canEdit: canEditTerminalDue,
+                    canApprove: canApproveTerminalDue,
+                    canPay: canPayTerminalDue,
+                  });
+                  return (
                   <TR key={calc.id} className="hover:bg-slate-50">
                     <TD>
                       <div>
@@ -858,7 +872,7 @@ export function TerminalDuesPage() {
                         >
                           <Eye size={14} />
                         </button>
-                        {canEditTerminalDue && calc.status === 'pending' && (
+                        {rowActions.showEdit && (
                           <button
                             type="button"
                             onClick={() => {
@@ -871,7 +885,7 @@ export function TerminalDuesPage() {
                             <Edit2 size={14} />
                           </button>
                         )}
-                        {canApproveTerminalDue && calc.status === 'pending' && (
+                        {rowActions.showApprove && (
                           <button
                             type="button"
                             onClick={() => approveTerminalDue(calc.id)}
@@ -881,7 +895,7 @@ export function TerminalDuesPage() {
                             <CheckCircle size={14} />
                           </button>
                         )}
-                        {canApproveTerminalDue && calc.status === 'approved' && (
+                        {rowActions.showReturnForCorrection && (
                           <button
                             type="button"
                             onClick={() => openReturnModal(calc)}
@@ -891,7 +905,7 @@ export function TerminalDuesPage() {
                             <RotateCcw size={14} />
                           </button>
                         )}
-                        {canPayTerminalDue && calc.status === 'approved' && (
+                        {rowActions.showRecordPayment && (
                           <button
                             type="button"
                             onClick={() => openPaymentModal(calc)}
@@ -904,7 +918,8 @@ export function TerminalDuesPage() {
                       </div>
                     </TD>
                   </TR>
-                ))
+                  );
+                })
               )}
             </TBody>
           </table>

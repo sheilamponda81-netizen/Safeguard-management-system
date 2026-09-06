@@ -1,4 +1,4 @@
-import { canAccess, PERMISSIONS } from './permissions';
+import { canAccess, hasExplicitPermission, PERMISSIONS } from './permissions';
 import { canApprovePayroll as canApprovePayrollFor } from './payrollPermissions';
 import { UserProfile } from './currentProfile';
 
@@ -13,6 +13,17 @@ export interface DashboardPermissions {
   // Approve button, so this can never drift from what the real action is
   // actually gated by.
   canApprovePayroll: boolean;
+  // Terminal Dues approve/pay: resolved via hasExplicitPermission(), the
+  // SAME narrow helper TerminalDues.tsx itself uses for its Approve/Record
+  // Payment actions (see permissions.ts) -- deliberately NOT canAccess()/
+  // hasPermission(), which would grant these "for free" to a business
+  // admin/legacy role_level<=2 account the same way TerminalDues.tsx's own
+  // Edit/Create checks used to (the bug this pass fixes). Only a true
+  // super admin or an account with an explicit terminal_dues.approve/.pay
+  // role_permissions row gets a task here -- an HR Manager (view/create/
+  // edit only) never does.
+  canApproveTerminalDues: boolean;
+  canPayTerminalDues: boolean;
 }
 
 // Fail-closed by design: an error resolving any of the underlying
@@ -37,15 +48,19 @@ export async function resolveDashboardPermissions(profile: UserProfile | null): 
       canAccess(isLegacy, PERMISSIONS.SECURITY_PERSONNEL_VIEW),
     ]);
     const canApprovePayroll = await canAccess(canApprovePayrollFor(roleContext), PERMISSIONS.PAYROLL_APPROVE);
-    return { canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity, canApprovePayroll };
+    const [canApproveTerminalDues, canPayTerminalDues] = await Promise.all([
+      hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_APPROVE),
+      hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_PAY),
+    ]);
+    return { canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity, canApprovePayroll, canApproveTerminalDues, canPayTerminalDues };
   } catch (err) {
     console.error('Error resolving dashboard permissions:', err);
-    return { canViewPayroll: false, canViewAttendance: false, canViewRecruitment: false, canViewSecurity: false, canApprovePayroll: false };
+    return { canViewPayroll: false, canViewAttendance: false, canViewRecruitment: false, canViewSecurity: false, canApprovePayroll: false, canApproveTerminalDues: false, canPayTerminalDues: false };
   }
 }
 
 export interface PendingTask {
-  key: 'approve-payroll' | 'review-applications' | 'renew-licenses';
+  key: 'approve-payroll' | 'review-applications' | 'renew-licenses' | 'approve-terminal-dues' | 'pay-terminal-dues';
   title: string;
   due: string;
   priority: 'high' | 'medium';
@@ -70,6 +85,17 @@ export interface PendingTaskInputs {
   pendingRecruitmentCount: number;
   canViewSecurity: boolean;
   expiringLicensesCount: number;
+  // Terminal Dues: a real, actionable count (rows the caller is actually
+  // authorized to see, per RLS -- tenant/region/permission), never derived
+  // from employee headcount. canApproveTerminalDues/canPayTerminalDues come
+  // from hasExplicitPermission() (see resolveDashboardPermissions above),
+  // so an HR Manager -- who can view/create/edit but holds neither
+  // permission -- never gets either task, regardless of how many Pending
+  // or Approved rows exist.
+  canApproveTerminalDues: boolean;
+  pendingTerminalDuesApprovalCount: number;
+  canPayTerminalDues: boolean;
+  approvedTerminalDuesPaymentCount: number;
 }
 
 export function buildPendingTasks(inputs: PendingTaskInputs): PendingTask[] {
@@ -96,6 +122,16 @@ export function buildPendingTasks(inputs: PendingTaskInputs): PendingTask[] {
       key: 'renew-licenses', title: 'Renew Expiring Licenses', due: 'This Week', priority: 'high',
       count: inputs.expiringLicensesCount,
       visible: inputs.canViewSecurity && inputs.expiringLicensesCount > 0,
+    },
+    {
+      key: 'approve-terminal-dues', title: 'Terminal Dues Awaiting Approval', due: 'Today', priority: 'high',
+      count: inputs.pendingTerminalDuesApprovalCount,
+      visible: inputs.canApproveTerminalDues && inputs.pendingTerminalDuesApprovalCount > 0,
+    },
+    {
+      key: 'pay-terminal-dues', title: 'Terminal Dues Awaiting Payment', due: 'This Week', priority: 'high',
+      count: inputs.approvedTerminalDuesPaymentCount,
+      visible: inputs.canPayTerminalDues && inputs.approvedTerminalDuesPaymentCount > 0,
     },
   ];
   return allTasks.filter(task => task.visible).map(({ visible: _visible, ...task }) => task);
