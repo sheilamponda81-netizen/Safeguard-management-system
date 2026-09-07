@@ -194,12 +194,33 @@ WITH CHECK (
 -- must not ALSO be required to pass `employees`' own, separately-scoped
 -- SELECT policy just to resolve a region for a security check -- that
 -- coupling is exactly what broke Legacy Supervisor's Attendance access
--- once `employees` SELECT was tightened in PART 1. Does not check
--- tenant_id: neither does the EXISTS-subquery pattern it replaces, since
--- the calling policy's own `tenant_id = get_current_tenant_id()` check on
--- the ATTENDANCE row plus the FK from attendance.employee_id ->
--- employees.id already guarantee the referenced employee is in the same
--- tenant.
+-- once `employees` SELECT was tightened in PART 1.
+--
+-- SECURITY NOTE (added after review, before this migration was ever
+-- applied anywhere): unlike the EXISTS-subquery pattern it replaces, this
+-- is a standalone function taking an ARBITRARY employee_id argument, and
+-- `GRANT EXECUTE ... TO authenticated` makes every such function directly
+-- callable via PostgREST's own RPC endpoint
+-- (`/rest/v1/rpc/employee_region_id`), not just from inside a policy's
+-- USING/WITH CHECK clause. An earlier draft of this function had NO
+-- internal tenant check at all, relying entirely on it only ever being
+-- invoked from within Attendance's own tenant-scoped policy -- but
+-- Postgres/PostgREST cannot enforce "only call this from inside a
+-- policy," so any authenticated caller could have called it directly
+-- with a guessed/enumerated employee_id from a DIFFERENT tenant and
+-- learned that employee's region_id, a real (if narrow) cross-tenant
+-- information disclosure no other query path in this schema allows.
+-- Every other arbitrary-ID-parameterized SECURITY DEFINER function in
+-- this schema (approve_terminal_due, record_terminal_due_payment, etc.)
+-- checks tenant ownership internally before returning or acting on
+-- anything -- this function now does too: it only resolves a region_id
+-- for an employee in the CALLER's OWN tenant (or for any employee if the
+-- caller is a super admin), and fails closed (NULL) for an inactive
+-- caller, exactly like current_user_role_level()/current_user_role()
+-- already do. This changes nothing about Attendance's own policies'
+-- behavior (an attendance row's employee is always same-tenant already,
+-- per the FK and the policy's own tenant_id check) -- it only closes the
+-- unintended direct-RPC-callable surface.
 CREATE OR REPLACE FUNCTION employee_region_id(p_employee_id UUID)
 RETURNS UUID
 LANGUAGE plpgsql
@@ -209,7 +230,12 @@ AS $$
 DECLARE
   v_region_id UUID;
 BEGIN
-  SELECT region_id INTO v_region_id FROM employees WHERE id = p_employee_id;
+  IF NOT is_current_user_active() THEN
+    RETURN NULL;
+  END IF;
+  SELECT region_id INTO v_region_id FROM employees
+    WHERE id = p_employee_id
+      AND (is_super_admin() OR tenant_id = get_current_tenant_id());
   RETURN v_region_id;
 END;
 $$;
@@ -325,9 +351,21 @@ FOR SELECT USING (
 --     WHERE tablename = 'employees' AND cmd IN ('INSERT','UPDATE');
 --   -- expected: both show "<= 2", not "IS NOT NULL".
 --
+--   SELECT p.prosecdef AS security_definer,
+--          (SELECT array_agg(cfg) FROM unnest(p.proconfig) cfg WHERE cfg LIKE 'search_path=%') AS search_path,
+--          has_function_privilege('public', 'employee_region_id(uuid)', 'EXECUTE') AS public_can_execute,
+--          has_function_privilege('anon', 'employee_region_id(uuid)', 'EXECUTE') AS anon_can_execute,
+--          has_function_privilege('authenticated', 'employee_region_id(uuid)', 'EXECUTE') AS authenticated_can_execute
+--   FROM pg_proc p WHERE p.oid = 'employee_region_id(uuid)'::regprocedure;
+--   -- expected: security_definer=true, search_path={search_path=public,pg_temp},
+--   -- public_can_execute=false, anon_can_execute=false, authenticated_can_execute=true.
+--
 -- ROLLBACK SQL:
 --   -- Re-apply 20260817000001's original 3 employees policies and
 --   -- 20260817000002's original attendance/payroll SELECT policies
 --   -- (all reproduced in this file's own history, substituting
---   -- `IS NOT NULL` back in for `<= 2`/`<= 3`).
+--   -- `IS NOT NULL` back in for `<= 2`/`<= 3`), and 20260817000002's
+--   -- original attendance INSERT/UPDATE policies (the EXISTS-subquery
+--   -- form, restoring `employee_region_id` to unused rather than DROPping
+--   -- it -- DROP FUNCTION would fail while any policy still references it).
 -- ============================================================
