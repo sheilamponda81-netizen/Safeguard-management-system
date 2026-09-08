@@ -50,6 +50,23 @@ WHERE schemaname = 'storage' AND tablename = 'objects'
 ORDER BY cmd;
 -- expected: all 3 rows show `is_current_user_active() = true` in qual/with_check
 
+-- 4. Legacy-scope correction (2026-09-08, separate from the fail-closed
+--    fix above): get_payroll_attendance_counts() originally used
+--    `v_role_level IS NOT NULL` -- admits EVERY legacy role_level,
+--    including Supervisor(3)/Staff(4), who never had Payroll nav access.
+--    Corrected to `v_role_level <= 2`, matching the same threshold
+--    20260908000000 already uses for the `payroll` table's own SELECT
+--    policy. Functional Accountant access (has_permission('payroll.view'))
+--    is unaffected.
+-- Matched against the specific executable phrase (not just any mention of
+-- "v_role_level IS NOT NULL" -- the function's own header comment quotes
+-- that exact old rule for documentation purposes, so a bare substring
+-- match against the whole body would false-positive on the comment).
+SELECT
+  pg_get_functiondef('get_payroll_attendance_counts(uuid[],text)'::regprocedure) LIKE '%OR v_role_level <= 2 OR has_permission(''payroll.view'')%' AS has_legacy_le2_rule,
+  pg_get_functiondef('get_payroll_attendance_counts(uuid[],text)'::regprocedure) LIKE '%OR v_role_level IS NOT NULL OR has_permission%' AS still_has_old_blanket_rule;
+-- expected: has_legacy_le2_rule = true, still_has_old_blanket_rule = false
+
 -- ============================================================
 -- LIVE SIMULATION -- requires a real inactive (or a deliberately
 -- disposable, never-authenticated) profile id. Wrap in BEGIN/ROLLBACK so

@@ -113,9 +113,18 @@ BEGIN
     RAISE EXCEPTION 'Your account is disabled';
   END IF;
 
-  -- AUTHORIZATION RULE: unchanged from 20260901000000 -- identical shape
-  -- to `payroll` table's own SELECT RLS.
-  IF NOT (v_is_super_admin OR v_role_level IS NOT NULL OR has_permission('payroll.view')) THEN
+  -- AUTHORIZATION RULE (2026-09-08 legacy-scope correction): was
+  -- `v_role_level IS NOT NULL`, which admits EVERY legacy account
+  -- regardless of level -- the same blanket-bypass class already closed
+  -- for the `employees`/`attendance`/`payroll` tables themselves in
+  -- 20260908000000 (which uses `current_user_role_level() <= 2` for
+  -- payroll SELECT). This RPC backs the exact same live payroll preview
+  -- as that table's SELECT policy, so it must use the same threshold --
+  -- legacy role_level 3 (Supervisor)/4 (Staff) never had Payroll nav
+  -- access and must not be able to call this RPC either. Functional
+  -- Accountant access is unaffected -- unchanged, still via
+  -- has_permission('payroll.view').
+  IF NOT (v_is_super_admin OR v_role_level <= 2 OR has_permission('payroll.view')) THEN
     RAISE EXCEPTION 'You do not have permission to view payroll attendance totals';
   END IF;
 
