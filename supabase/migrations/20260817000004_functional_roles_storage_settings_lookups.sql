@@ -2,6 +2,20 @@
 -- MIGRATION: Storage, system_settings, and lookup-table policies for the
 -- functional-roles rollout (Phase B, part 4)
 -- Date: 2026-08-17
+-- SECURITY-RECONCILED (2026-09-08, production preflight): each of the 3
+-- company-logo storage.objects policies below now ALSO explicitly
+-- requires is_current_user_active() = true, not only
+-- is_super_admin()/is_business_admin(). This bucket's policies have no
+-- tenant_id/get_current_tenant_id() check at all (a single shared bucket,
+-- not tenant-scoped), so is_business_admin() was the ONLY gate -- and
+-- while 20260817000000's is_business_admin() has itself been hardened to
+-- fail closed for an inactive caller, this file adds the same explicit,
+-- redundant active-user check already used elsewhere in this migration
+-- set (e.g. 20260817000001's region-reassignment guards) as defense in
+-- depth, so this file's own policies are self-evidently correct without
+-- depending on a caller correctly reasoning through is_business_admin()'s
+-- internal implementation. Logo upload/update/delete functionality and
+-- the Admin-only access decision are otherwise byte-for-byte unchanged.
 -- ============================================================
 --
 -- PART 1 -- company-logo storage bucket (item 38): write access tightened
@@ -39,6 +53,7 @@ DROP POLICY IF EXISTS "Admin and managers can upload company logo" ON storage.ob
 CREATE POLICY "Admins can upload company logo" ON storage.objects
 FOR INSERT TO authenticated WITH CHECK (
   bucket_id = 'company-logo'
+  AND is_current_user_active() = true
   AND (is_super_admin() = true OR is_business_admin() = true)
 );
 
@@ -47,9 +62,11 @@ DROP POLICY IF EXISTS "Admin and managers can update company logo" ON storage.ob
 CREATE POLICY "Admins can update company logo" ON storage.objects
 FOR UPDATE TO authenticated USING (
   bucket_id = 'company-logo'
+  AND is_current_user_active() = true
   AND (is_super_admin() = true OR is_business_admin() = true)
 ) WITH CHECK (
   bucket_id = 'company-logo'
+  AND is_current_user_active() = true
   AND (is_super_admin() = true OR is_business_admin() = true)
 );
 
@@ -58,6 +75,7 @@ DROP POLICY IF EXISTS "Admin and managers can delete company logo" ON storage.ob
 CREATE POLICY "Admins can delete company logo" ON storage.objects
 FOR DELETE TO authenticated USING (
   bucket_id = 'company-logo'
+  AND is_current_user_active() = true
   AND (is_super_admin() = true OR is_business_admin() = true)
 );
 

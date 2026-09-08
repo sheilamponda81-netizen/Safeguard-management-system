@@ -107,6 +107,8 @@ DECLARE
   v_is_super BOOLEAN;
   v_role_level INTEGER;
   v_region_id UUID;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
   v_requested_count INTEGER;
   v_updated_count INTEGER;
 BEGIN
@@ -149,8 +151,8 @@ BEGIN
   -- reference in this function, and returns the exact same data those
   -- helpers would have (same columns, same profiles row, same
   -- auth.uid()) without any search_path dependency at all.
-  SELECT p.tenant_id, COALESCE(p.is_super_admin, false), p.role_level, p.region_id
-  INTO v_tenant_id, v_is_super, v_role_level, v_region_id
+  SELECT p.tenant_id, COALESCE(p.is_super_admin, false), p.role_level, p.region_id, p.is_active, p.deleted_at
+  INTO v_tenant_id, v_is_super, v_role_level, v_region_id, v_is_active, v_deleted_at
   FROM public.profiles p
   WHERE p.id = v_caller_id;
 
@@ -159,6 +161,20 @@ BEGIN
   -- same as the helper functions it replaces would have returned).
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the authenticated caller' USING ERRCODE = '42501';
+  END IF;
+
+  -- SECURITY (2026-09-08 production preflight): this function was
+  -- deliberately written to bypass get_current_tenant_id()/
+  -- is_super_admin()/current_user_role_level() (see the header note
+  -- above -- those helpers broke under this function's SET search_path =
+  -- '' at the time). Doing so also lost the is_active/deleted_at gating
+  -- those helpers provide -- v_is_super/v_role_level were being read as
+  -- raw column values with only a row-existence check, so a DEACTIVATED
+  -- super-admin or deactivated legacy Admin (role_level = 1) could still
+  -- approve/reject real payroll. Restored here, explicitly, matching what
+  -- get_current_tenant_id() etc. would have enforced.
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled' USING ERRCODE = '42501';
   END IF;
 
   -- Same rule as canApprovePayroll client-side and the existing payroll

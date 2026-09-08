@@ -64,6 +64,8 @@ DECLARE
   v_tenant_id UUID;
   v_role_level INTEGER;
   v_is_super_admin BOOLEAN;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
   v_employee_ids UUID[];
   v_foreign_employee_count INTEGER;
   v_approved_count INTEGER;
@@ -82,13 +84,21 @@ BEGIN
   -- so it must enforce every authorization check itself rather than
   -- relying on RLS the way a normal client-side query would.
   -- ============================================================
-  SELECT tenant_id, role_level, is_super_admin
-    INTO v_tenant_id, v_role_level, v_is_super_admin
+  SELECT tenant_id, role_level, is_super_admin, is_active, deleted_at
+    INTO v_tenant_id, v_role_level, v_is_super_admin, v_is_active, v_deleted_at
   FROM profiles
   WHERE id = v_caller_id;
 
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the current user';
+  END IF;
+
+  -- SECURITY (2026-09-08 production preflight): reject an inactive/
+  -- deleted caller before considering super-admin/role_level authority --
+  -- this draft (superseded by 20260813000001, then 20260817000003, both
+  -- of which carry the same fix) previously had no such check at all.
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled';
   END IF;
 
   IF NOT (v_is_super_admin OR v_role_level = 1) THEN

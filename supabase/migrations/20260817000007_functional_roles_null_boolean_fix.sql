@@ -1,6 +1,20 @@
 -- ============================================================
 -- MIGRATION: Fix is_business_admin() NULL-propagation (found via local SQL validation)
 -- Date: 2026-08-20
+-- SECURITY-RECONCILED (2026-09-08, production preflight): this file's own
+-- CREATE OR REPLACE FUNCTION is_business_admin() runs AFTER
+-- 20260817000000's, so it is the version that actually ends up live --
+-- silently dropping 20260817000000's explicit
+-- `IF NOT is_current_user_active() THEN RETURN false; END IF;` fail-closed
+-- guard if this file were left unchanged. Confirmed NOT an active
+-- security bypass either way (current_user_role()/current_user_role_level()
+-- are themselves gated, and COALESCE(..., false) below already reduces
+-- their NULL result to a real `false` for an inactive caller -- verified
+-- empirically), but the explicit guard is restored here too so this
+-- function is self-evidently fail-closed on its own, consistent with
+-- is_current_user_active()/region_allowed()/has_permission() elsewhere,
+-- rather than depending on a reader tracing through two other functions'
+-- NULL-propagation to confirm safety.
 -- ============================================================
 --
 -- WHAT WAS FOUND
@@ -39,6 +53,9 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
+  IF NOT is_current_user_active() THEN
+    RETURN false;
+  END IF;
   RETURN COALESCE(current_user_role() = 'admin', false) OR COALESCE(current_user_role_level() = 1, false);
 END;
 $$;

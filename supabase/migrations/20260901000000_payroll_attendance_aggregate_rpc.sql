@@ -77,6 +77,8 @@ DECLARE
   v_tenant_id UUID;
   v_role_level INTEGER;
   v_is_super_admin BOOLEAN;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
   v_month_start DATE;
   v_month_end DATE;
   v_employee_ids UUID[];
@@ -90,13 +92,22 @@ BEGIN
   -- schema-qualified -- never trust a tenant/role/region asserted by the
   -- client, this function bypasses RLS entirely (SECURITY DEFINER) so its
   -- own body is the complete authorization boundary.
-  SELECT p.tenant_id, p.role_level, p.is_super_admin
-    INTO v_tenant_id, v_role_level, v_is_super_admin
+  SELECT p.tenant_id, p.role_level, p.is_super_admin, p.is_active, p.deleted_at
+    INTO v_tenant_id, v_role_level, v_is_super_admin, v_is_active, v_deleted_at
   FROM public.profiles p
   WHERE p.id = v_caller_id;
 
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the current user';
+  END IF;
+
+  -- SECURITY (2026-09-08 production preflight): reject an inactive/
+  -- deleted caller before considering super-admin/role_level/permission
+  -- authority -- this function (superseded by 20260901010000's scope-fix
+  -- version, which carries the same fix) previously had no such check at
+  -- all.
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled';
   END IF;
 
   -- AUTHORIZATION RULE: identical shape to `payroll` table's own SELECT

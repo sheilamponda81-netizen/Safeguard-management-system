@@ -1,6 +1,16 @@
 -- ============================================================
 -- MIGRATION: Functional role / permission system -- FOUNDATION (Phase A)
 -- Date: 2026-08-17
+-- SECURITY-RECONCILED (2026-09-08, production preflight): current_user_role()
+-- and current_user_region_id() now reject inactive/deleted callers the
+-- same way PART 0's three functions already do. is_business_admin() and
+-- region_allowed() now ALSO explicitly fail closed on their own -- this
+-- closes a residual gap where region_allowed(NULL) could otherwise return
+-- TRUE for an inactive caller against a NULL-region row, since
+-- `NULL IS NOT DISTINCT FROM NULL` evaluates TRUE regardless of what
+-- current_user_region_id() returns. None of these vulnerable forms were
+-- ever applied to any real environment; this is the only version that has
+-- ever shipped in this migration.
 -- ============================================================
 --
 -- *** THIS IS PHASE A OF A MULTI-PHASE ROLLOUT. ***
@@ -160,6 +170,18 @@ $$;
 -- search_path, never accepts a caller-supplied identity/role/tenant as a
 -- parameter. Nothing here is safe to call with a parameter that lets the
 -- CALLER assert who they are -- these functions look themselves up.
+--
+-- SECURITY RECONCILIATION (2026-09-08, production preflight):
+-- current_user_role() and current_user_region_id() now reject
+-- inactive/deleted callers the same way PART 0's three functions do.
+-- is_business_admin() and region_allowed(), further below, now ALSO
+-- explicitly fail closed on their own (rather than relying only on their
+-- component calls) -- this closes a residual gap where
+-- region_allowed(NULL) could otherwise return TRUE for an inactive caller
+-- against a NULL-region row, since `NULL IS NOT DISTINCT FROM NULL`
+-- evaluates TRUE regardless of what current_user_region_id() returns.
+-- Zero behavior change for any active, non-deleted caller anywhere in
+-- this file.
 -- ============================================================
 
 CREATE OR REPLACE FUNCTION current_user_role()
@@ -168,8 +190,17 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+  v_role TEXT;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
 BEGIN
-  RETURN (SELECT role FROM profiles WHERE id = auth.uid() LIMIT 1);
+  SELECT role, is_active, deleted_at INTO v_role, v_is_active, v_deleted_at
+  FROM profiles WHERE id = auth.uid() LIMIT 1;
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RETURN NULL;
+  END IF;
+  RETURN v_role;
 END;
 $$;
 
@@ -179,8 +210,17 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+  v_region_id UUID;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
 BEGIN
-  RETURN (SELECT region_id FROM profiles WHERE id = auth.uid() LIMIT 1);
+  SELECT region_id, is_active, deleted_at INTO v_region_id, v_is_active, v_deleted_at
+  FROM profiles WHERE id = auth.uid() LIMIT 1;
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RETURN NULL;
+  END IF;
+  RETURN v_region_id;
 END;
 $$;
 
@@ -220,7 +260,10 @@ $$;
 -- role in this schema (cross-TENANT bypass, platform/emergency concept) --
 -- is_business_admin() is a same-tenant, business-facing concept and must
 -- never be treated as equivalent to, or folded into, cross-tenant
--- super-admin authority.
+-- super-admin authority. Explicitly fails closed on its own (rather than
+-- relying solely on current_user_role()/current_user_role_level()'s own
+-- NULL-propagation) for deterministic BOOLEAN semantics -- an inactive or
+-- profile-less caller always gets a real `false`, never SQL NULL.
 CREATE OR REPLACE FUNCTION is_business_admin()
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -228,6 +271,9 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
+  IF NOT is_current_user_active() THEN
+    RETURN false;
+  END IF;
   RETURN current_user_role() = 'admin' OR current_user_role_level() = 1;
 END;
 $$;
@@ -241,7 +287,13 @@ $$;
 -- separately, by the caller -- this function is region-only). Uses
 -- IS NOT DISTINCT FROM (not =) so two NULL regions correctly compare
 -- equal instead of evaluating to NULL/false, matching Postgres's usual
--- NULL-unsafe `=` footgun.
+-- NULL-unsafe `=` footgun. Explicitly fails closed on its own FIRST,
+-- before that NULL-safe comparison ever runs -- without this, an inactive
+-- caller (current_user_region_id() = NULL) checked against a NULL-region
+-- row would otherwise pass via `NULL IS NOT DISTINCT FROM NULL = TRUE`,
+-- regardless of is_super_admin()/is_business_admin(). This makes
+-- region_allowed() safe to call from ANY context, not only ones already
+-- wrapped in their own outer is_current_user_active() check.
 CREATE OR REPLACE FUNCTION region_allowed(p_row_region_id UUID)
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -249,6 +301,9 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
+  IF NOT is_current_user_active() THEN
+    RETURN false;
+  END IF;
   RETURN is_super_admin() OR is_business_admin() OR p_row_region_id IS NOT DISTINCT FROM current_user_region_id();
 END;
 $$;
@@ -487,20 +542,20 @@ CHECK (
 -- EXISTS or OR REPLACE throughout, ON CONFLICT DO NOTHING on the seed
 -- INSERT, DROP CONSTRAINT IF EXISTS before ADD CONSTRAINT.
 --
--- BEHAVIOR CHANGE FOR EXISTING CALLERS: only ONE, deliberate, and it is
--- the entire point of PART 0 -- any account with profiles.is_active =
--- false or a non-NULL deleted_at IMMEDIATELY loses all access everywhere
--- get_current_tenant_id()/is_super_admin()/current_user_role_level() are
--- used (i.e. everywhere, across the whole schema), the moment this
--- migration is applied -- not waiting on any later migration. Any
--- account with is_active = true and deleted_at IS NULL (every real
--- account today, as far as this migration's own audit could determine)
--- sees ZERO behavior change -- these functions return exactly what they
--- always returned for an active caller. No RLS policy or RPC calls
--- has_permission()/is_business_admin()/region_allowed()/
--- get_my_permissions() yet -- that happens in the following migrations,
--- one business area at a time. The new
--- profiles_functional_role_region_required constraint can only ever
+-- BEHAVIOR CHANGE FOR EXISTING CALLERS: any account with profiles.is_active
+-- = false or a non-NULL deleted_at IMMEDIATELY loses all access everywhere
+-- get_current_tenant_id()/is_super_admin()/current_user_role_level()/
+-- current_user_role()/current_user_region_id()/is_business_admin()/
+-- region_allowed() are used (i.e. everywhere, across the whole schema and
+-- every later migration that calls them), the moment this migration is
+-- applied -- not waiting on any later migration. Any account with
+-- is_active = true and deleted_at IS NULL (every real account today, as
+-- far as this migration's own audit could determine) sees ZERO behavior
+-- change -- these functions return exactly what they always returned for
+-- an active caller. No RLS policy or RPC calls has_permission()/
+-- is_business_admin()/region_allowed()/get_my_permissions() yet -- that
+-- happens in the following migrations, one business area at a time. The
+-- new profiles_functional_role_region_required constraint can only ever
 -- reject a row whose `role` is already exactly 'hr_manager'/'accountant'/
 -- 'operations_manager' AND has a NULL region_id -- no such row can exist
 -- yet (nothing before this migration ever wrote those values), so this
@@ -517,6 +572,11 @@ CHECK (
 --   -- expected: 3 rows (hr_manager, accountant, operations_manager) -- no 'admin' row
 --   SELECT conname FROM pg_constraint WHERE conname = 'profiles_functional_role_region_required';
 --   -- expected: 1 row
+--   -- Fail-closed check, as a caller with NO profile row (simulate via
+--   -- SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claim.sub', '<uuid-with-no-profile>', true);):
+--   --   SELECT is_current_user_active(), is_business_admin(), current_user_role(),
+--   --          current_user_region_id(), region_allowed(NULL);
+--   --   expected: false, false, NULL, NULL, false
 --
 -- ROLLBACK SQL:
 --   ALTER TABLE profiles DROP CONSTRAINT IF EXISTS profiles_functional_role_region_required;

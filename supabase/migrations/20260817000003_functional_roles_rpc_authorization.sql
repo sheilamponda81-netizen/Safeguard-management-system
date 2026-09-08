@@ -3,6 +3,23 @@
 -- Date: 2026-08-17 (Phase B, part 3 of the functional-roles rollout --
 -- see 20260817000000/1/2 for the security-helper foundation and the
 -- direct/indirect regional RLS this migration's checks are modeled on)
+-- SECURITY-RECONCILED (2026-09-08, production preflight): process_payroll_batch(),
+-- create_salary_advance(), approve_salary_advance(), and
+-- adjust_combined_repayment_plan() each read tenant_id/role_level/
+-- is_super_admin directly off `profiles` via a raw SELECT, and only
+-- checked that the row EXISTED -- never that it was active or
+-- non-deleted. A DEACTIVATED super-admin, or a deactivated legacy
+-- Admin/Manager (role_level = 1/2), could still call any of these four
+-- and have their v_is_super_admin/v_role_level values read as-is from
+-- the row, bypassing the account-disabled state entirely. All four now
+-- explicitly reject `is_active = false OR deleted_at IS NOT NULL` before
+-- considering any authorization branch, matching the same fail-closed
+-- guarantee has_permission()/is_business_admin()/region_allowed()
+-- (20260817000000) already provide everywhere else. None of these
+-- vulnerable forms were ever applied to any real environment; this is
+-- the only version that has ever shipped in this migration. Every
+-- signature, every tenant/region check, every salary-advance/payroll
+-- calculation is otherwise byte-for-byte unchanged.
 -- ============================================================
 --
 -- WHY THIS MIGRATION EXISTS
@@ -76,6 +93,8 @@ DECLARE
   v_tenant_id UUID;
   v_role_level INTEGER;
   v_is_super_admin BOOLEAN;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
   v_employee_ids UUID[];
   v_foreign_employee_count INTEGER;
   v_out_of_region_count INTEGER;
@@ -102,13 +121,26 @@ BEGIN
   -- ============================================================
   -- STEP 1: Resolve the caller's own tenant/role (unchanged).
   -- ============================================================
-  SELECT tenant_id, role_level, is_super_admin
-    INTO v_tenant_id, v_role_level, v_is_super_admin
+  SELECT tenant_id, role_level, is_super_admin, is_active, deleted_at
+    INTO v_tenant_id, v_role_level, v_is_super_admin, v_is_active, v_deleted_at
   FROM profiles
   WHERE id = v_caller_id;
 
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the current user';
+  END IF;
+
+  -- SECURITY (2026-09-08 production preflight): reject an inactive/
+  -- deleted caller BEFORE considering super-admin/role_level/permission
+  -- authority. This function previously read v_is_super_admin/
+  -- v_role_level as raw column values with no active/deleted_at check at
+  -- all -- a DEACTIVATED super-admin or deactivated legacy Admin
+  -- (role_level = 1) could still process payroll. Matches the same
+  -- fail-closed guarantee has_permission()/is_business_admin()/
+  -- region_allowed() (20260817000000) already provide for every other
+  -- authorization path in this schema.
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled';
   END IF;
 
   -- AUTHORIZATION (functional-role branch added -- legacy check unchanged):
@@ -381,6 +413,8 @@ DECLARE
   v_tenant_id UUID;
   v_role_level INTEGER;
   v_is_super_admin BOOLEAN;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
   v_open_count INTEGER;
   v_new_id UUID;
 BEGIN
@@ -388,11 +422,20 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated';
   END IF;
 
-  SELECT tenant_id, role_level, is_super_admin INTO v_tenant_id, v_role_level, v_is_super_admin
+  SELECT tenant_id, role_level, is_super_admin, is_active, deleted_at
+  INTO v_tenant_id, v_role_level, v_is_super_admin, v_is_active, v_deleted_at
   FROM profiles WHERE id = v_caller_id;
 
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the current user';
+  END IF;
+
+  -- SECURITY (2026-09-08 production preflight): reject an inactive/
+  -- deleted caller before considering super-admin/role_level/permission
+  -- authority -- see process_payroll_batch's own header note above for
+  -- the full rationale, identical here.
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled';
   END IF;
 
   -- AUTHORIZATION -- functional-role branch added, legacy check unchanged.
@@ -489,6 +532,8 @@ DECLARE
   v_tenant_id UUID;
   v_role_level INTEGER;
   v_is_super_admin BOOLEAN;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
   v_advance RECORD;
   v_other_active_outstanding NUMERIC;
   v_other_active_count INTEGER;
@@ -506,11 +551,20 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated';
   END IF;
 
-  SELECT tenant_id, role_level, is_super_admin INTO v_tenant_id, v_role_level, v_is_super_admin
+  SELECT tenant_id, role_level, is_super_admin, is_active, deleted_at
+  INTO v_tenant_id, v_role_level, v_is_super_admin, v_is_active, v_deleted_at
   FROM profiles WHERE id = v_caller_id;
 
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the current user';
+  END IF;
+
+  -- SECURITY (2026-09-08 production preflight): reject an inactive/
+  -- deleted caller before considering super-admin/role_level/permission
+  -- authority -- see process_payroll_batch's own header note above for
+  -- the full rationale, identical here.
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled';
   END IF;
 
   -- AUTHORIZATION -- functional-role branch added, legacy check unchanged.
@@ -699,6 +753,8 @@ DECLARE
   v_tenant_id UUID;
   v_role_level INTEGER;
   v_is_super_admin BOOLEAN;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
   v_plan RECORD;
   v_total_outstanding NUMERIC;
   v_last_posted_month TEXT;
@@ -711,11 +767,20 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated';
   END IF;
 
-  SELECT tenant_id, role_level, is_super_admin INTO v_tenant_id, v_role_level, v_is_super_admin
+  SELECT tenant_id, role_level, is_super_admin, is_active, deleted_at
+  INTO v_tenant_id, v_role_level, v_is_super_admin, v_is_active, v_deleted_at
   FROM profiles WHERE id = v_caller_id;
 
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the current user';
+  END IF;
+
+  -- SECURITY (2026-09-08 production preflight): reject an inactive/
+  -- deleted caller before considering super-admin/role_level/permission
+  -- authority -- see process_payroll_batch's own header note above for
+  -- the full rationale, identical here.
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled';
   END IF;
 
   -- AUTHORIZATION -- functional-role branch added, legacy check unchanged.
