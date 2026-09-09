@@ -506,11 +506,94 @@ FOR SELECT USING (
   )
 );
 
+-- SECURITY FIX 3 (2026-09-09, production preflight -- found by explicit
+-- request to re-review this exact policy after SECURITY FIX 2 above): the
+-- original WITH CHECK gated WHO could insert (active, own tenant) but
+-- never bound the row's own actor-attribution columns to the caller's real
+-- identity. `user_id` (`REFERENCES profiles(id)`), `user_email`, and
+-- `user_role` are all plain client-supplied text/uuid with nothing
+-- stopping an active authenticated caller from inserting a row that FALSELY
+-- attributes an action to a different user_id, a fabricated user_email, or
+-- an inflated user_role (e.g. a real business Admin inserting a row that
+-- claims 'super_admin') -- audit-trail forgery, not a privileged-read
+-- concern, but still a real integrity gap: AuditLogs.tsx/components/
+-- AuditLogs.tsx render these columns as who-did-it, trusted at face value.
+--
+-- INSPECTED EVERY WRITER before fixing (per explicit instruction):
+--   - src/utils/auditLogger.ts's logAudit() -- the ONLY live, imported
+--     direct-insert call site (13 pages import it) -- always sets
+--     user_id: user.id and user_email: user.email from
+--     supabase.auth.getUser() (the caller's OWN session, never a
+--     parameter), and user_role computed from the CALLER's OWN profile
+--     (is_super_admin -> 'super_admin', role_level 1/2/3 ->
+--     'admin'/'manager'/'supervisor', else 'user') -- never a different
+--     user's identity.
+--   - src/utils/currentMonth.ts has its OWN separate direct insert (not
+--     routed through auditLogger.ts): sets user_id/user_email the same
+--     way (the caller's own auth.getUser()), but does NOT set user_role at
+--     all (omitted -> NULL) -- a second real, live, legitimate call site
+--     this fix must not break.
+--   - src/utils/audit.ts's logAudit() calls an RPC, `log_audit_event`,
+--     that does not exist anywhere in this migration set (grepped every
+--     migration -- zero hits) and is not imported by any page (grepped
+--     every import of 'utils/audit' -- zero hits) -- dead code, not a real
+--     call site, does not need to be accommodated.
+--   - src/utils/logging.ts's sendToDatabase() has
+--     LOG_CONFIG.enableDatabase hardcoded `false` ("Temporarily disabled
+--     to prevent errors") -- its insert is unreachable, and even if
+--     re-enabled it omits the NOT NULL `action` column and would fail on
+--     that constraint regardless of RLS -- dead/broken code, not a real
+--     call site.
+--   - Every SECURITY DEFINER RPC that writes audit_logs directly
+--     (process_payroll_batch, salary-advance RPCs, terminal-dues RPCs,
+--     the user-edit RPC) bypasses RLS entirely for its own writes --
+--     confirmed audit_logs has relforcerowsecurity = false (the default;
+--     no migration in this repo ever sets FORCE ROW LEVEL SECURITY on any
+--     table), so this policy change has zero effect on them. Same for the
+--     create-user/disable-user Edge Functions' service-role inserts.
+--
+-- FIX: user_id is now REQUIRED to equal auth.uid() exactly -- no
+-- legitimate direct-authenticated-insert workflow was found that needs a
+-- NULL or different actor, so this is a strict equality, not a
+-- permissive NULL-allowed check. user_email, if supplied, must equal
+-- auth.email() (Supabase's own built-in JWT-email helper, the same
+-- platform-provided function family as auth.uid()/auth.role() -- not
+-- defined by this repo, same as those two aren't) -- NULL remains allowed
+-- only because nothing in the schema (no NOT NULL constraint) requires it
+-- and no forgery is possible by OMITTING a claim, only by supplying a
+-- false one. user_role, if supplied, must equal a value recomputed here
+-- from the CALLER'S OWN real profile row using the exact same
+-- is_super_admin/role_level -> label mapping auditLogger.ts itself uses
+-- (including its own existing quirk: a functional-role account, e.g.
+-- role='admin' with role_level NULL, maps to 'user' here exactly as it
+-- does client-side today, since role_level is the only column that
+-- mapping ever inspects -- this fix enforces what the app actually
+-- produces, not a redesigned labeling scheme) -- NULL remains allowed
+-- because currentMonth.ts's real, live insert legitimately omits it.
+-- tenant_id forgery was already blocked by the pre-existing
+-- `tenant_id = get_current_tenant_id()` check -- unchanged, restated here
+-- only for completeness of this comment, not modified.
 DROP POLICY IF EXISTS "Users can insert audit logs" ON audit_logs;
+DROP POLICY IF EXISTS "Audit logs: any active tenant member may insert their own audit event" ON audit_logs;
 CREATE POLICY "Audit logs: any active tenant member may insert their own audit event" ON audit_logs
 FOR INSERT WITH CHECK (
   is_current_user_active()
   AND (is_super_admin() OR tenant_id = get_current_tenant_id())
+  AND user_id = auth.uid()
+  AND (user_email IS NULL OR user_email = auth.email())
+  AND (
+    user_role IS NULL
+    OR user_role = (
+      SELECT CASE
+        WHEN p.is_super_admin THEN 'super_admin'
+        WHEN p.role_level = 1 THEN 'admin'
+        WHEN p.role_level = 2 THEN 'manager'
+        WHEN p.role_level = 3 THEN 'supervisor'
+        ELSE 'user'
+      END
+      FROM profiles p WHERE p.id = auth.uid()
+    )
+  )
 );
 
 -- ============================================================
@@ -630,6 +713,123 @@ FOR INSERT WITH CHECK (
 -- Empirically run (disposable local Postgres, matching Supabase's default
 -- authenticated table grants): all 5 produced exactly the expected
 -- outcome above.
+--
+-- REGRESSION TEST -- audit_logs INSERT, actor-attribution forgery
+-- (2026-09-09): confirms SECURITY FIX 3 above without persisting anything.
+-- Requires an active legacy role_level=1 caller (<LEGACY_ADMIN_ID>, real
+-- email <LEGACY_ADMIN_EMAIL>), an active functional-role caller with
+-- role_level NULL (<FUNCTIONAL_ADMIN_ID>, real email
+-- <FUNCTIONAL_ADMIN_EMAIL>), a genuinely active super-admin
+-- (<SUPER_ADMIN_ID>, real email <SUPER_ADMIN_EMAIL>), an inactive caller
+-- (<INACTIVE_ID>), a deleted caller (<DELETED_ID>), a second tenant id
+-- (<OTHER_TENANT_ID>), and a disposable never-used auth id
+-- (<PROFILELESS_ID>). Every test wraps its own BEGIN/ROLLBACK.
+--
+--   -- 1. Legitimate auditLogger.ts shape (user_id+email+role, role_level=1
+--   --    -> 'admin') -- expect SUCCESS:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<LEGACY_ADMIN_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, user_role, action, entity_type, entity_id)
+--     VALUES (auth.uid(), '<LEGACY_ADMIN_EMAIL>', 'admin', 'CREATE', 'employees', 'regtest1');
+--   ROLLBACK;
+--   -- expected: INSERT 0 1, no error.
+--
+--   -- 2. Legitimate currentMonth.ts shape (user_id+email, NO user_role,
+--   --    functional-role caller) -- expect SUCCESS:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<FUNCTIONAL_ADMIN_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, action, entity_type, entity_id)
+--     VALUES (auth.uid(), '<FUNCTIONAL_ADMIN_EMAIL>', 'UPDATE', 'system_settings', 'current_payroll_month');
+--   ROLLBACK;
+--   -- expected: INSERT 0 1, no error.
+--
+--   -- 3. Forged user_id -- expect FAILURE:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<LEGACY_ADMIN_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, user_role, action, entity_type, entity_id)
+--     VALUES ('<some other real profile id>', '<LEGACY_ADMIN_EMAIL>', 'admin', 'CREATE', 'employees', 'regtest3');
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "audit_logs".
+--
+--   -- 4. Forged user_email -- expect FAILURE:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<LEGACY_ADMIN_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, user_role, action, entity_type, entity_id)
+--     VALUES (auth.uid(), 'someone-else@evil.example', 'admin', 'CREATE', 'employees', 'regtest4');
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "audit_logs".
+--
+--   -- 5. Forged user_role (claims super_admin while actually a business
+--   --    Admin) -- expect FAILURE:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<LEGACY_ADMIN_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, user_role, action, entity_type, entity_id)
+--     VALUES (auth.uid(), '<LEGACY_ADMIN_EMAIL>', 'super_admin', 'CREATE', 'employees', 'regtest5');
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "audit_logs".
+--
+--   -- 6. Cross-tenant insert -- expect FAILURE (pre-existing tenant check,
+--   --    unrelated to this fix, must still hold):
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<LEGACY_ADMIN_ID>', true);
+--   INSERT INTO audit_logs (tenant_id, user_id, user_email, user_role, action, entity_type, entity_id)
+--     VALUES ('<OTHER_TENANT_ID>', auth.uid(), '<LEGACY_ADMIN_EMAIL>', 'admin', 'CREATE', 'employees', 'regtest6');
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "audit_logs".
+--
+--   -- 7. Inactive caller -- expect FAILURE:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<INACTIVE_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, action, entity_type, entity_id)
+--     VALUES (auth.uid(), 'inactive@test.local', 'CREATE', 'employees', 'regtest7');
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "audit_logs".
+--
+--   -- 8. Deleted caller -- expect FAILURE:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<DELETED_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, action, entity_type, entity_id)
+--     VALUES (auth.uid(), 'deleted@test.local', 'CREATE', 'employees', 'regtest8');
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "audit_logs".
+--
+--   -- 9. Profile-less caller -- expect FAILURE:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<PROFILELESS_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, action, entity_type, entity_id)
+--     VALUES (auth.uid(), 'nobody@test.local', 'CREATE', 'employees', 'regtest9');
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "audit_logs".
+--
+--   -- 10. Genuine active super-admin, correct own shape -- expect SUCCESS
+--   --     (deliberately unrestricted, per this table's existing
+--   --     is_super_admin() bypass, unchanged by this fix):
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<SUPER_ADMIN_ID>', true);
+--   INSERT INTO audit_logs (user_id, user_email, user_role, action, entity_type, entity_id)
+--     VALUES (auth.uid(), '<SUPER_ADMIN_EMAIL>', 'super_admin', 'CREATE', 'employees', 'regtest10');
+--   ROLLBACK;
+--   -- expected: INSERT 0 1, no error.
+--
+-- Empirically run (disposable local Postgres, matching Supabase's default
+-- authenticated table grants, plus auth.email() -- a real Supabase
+-- platform-provided JWT-email helper this repo does not itself define,
+-- same as auth.uid()/auth.role() -- stubbed locally only for this test):
+-- all 10 produced exactly the expected outcome above. Also confirmed
+-- audit_logs.relforcerowsecurity = false (the platform/repo-wide default),
+-- which structurally guarantees every SECURITY DEFINER RPC's own
+-- audit_logs write, and every service-role Edge Function write, remains
+-- entirely unaffected by this policy regardless of the values it sets.
 --
 -- ROLLBACK: re-run each superseded migration's own CREATE POLICY blocks
 -- verbatim (20260727000000 for profiles/employees/applicants/audit_logs
