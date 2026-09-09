@@ -72,6 +72,50 @@
 -- migration in this audit; applying this migration promptly is still
 -- recommended to get the actual concurrency-safety benefit, just not
 -- deployment-blocking the way the payroll RPC is.
+--
+-- ================= CONCURRENCY FIX (2026-09-09, production preflight) =================
+-- FIRST-CALL RACE, confirmed empirically (not just reasoned about) against a
+-- disposable local Postgres 16 instance running this exact function body:
+-- `SELECT ... FOR UPDATE` takes no lock at all when the target row does not
+-- yet exist (there is nothing to lock). So two concurrent FIRST calls for the
+-- SAME brand-new tenant can both reach `IF NOT FOUND`, both independently
+-- compute the same legacy-max seed, and both attempt
+-- `INSERT INTO guard_id_counters (tenant_id, last_number)` for the same
+-- tenant_id. The loser does not serialize behind the winner -- it raises an
+-- uncaught `duplicate key value violates unique constraint
+-- "guard_id_counters_pkey"` and the whole call fails. Reproduced directly:
+-- two simultaneous first calls for one new tenant, one returns 'G-0001', the
+-- other errors with exactly that duplicate-key exception. Every call AFTER
+-- the first is unaffected -- once the row exists, `SELECT ... FOR UPDATE`
+-- correctly takes a real row lock and serializes concurrent callers exactly
+-- as documented above.
+--
+-- FIX: acquire a transaction-scoped advisory lock, keyed per-tenant, as the
+-- very first thing this function does -- BEFORE the row-level
+-- `SELECT ... FOR UPDATE`, so it also covers the window where no row exists
+-- yet to lock. A second concurrent call for the SAME tenant now blocks on
+-- the advisory lock itself until the first call's transaction commits (or
+-- rolls back), then proceeds against whatever state the first call actually
+-- left behind -- whether that's a freshly-inserted row or an existing one.
+-- `pg_advisory_xact_lock` is released automatically at COMMIT/ROLLBACK, so
+-- there is no separate unlock call to forget, and it uses the SAME
+-- hashtext-keyed advisory-lock pattern already established and load-bearing
+-- elsewhere in this schema (process_payroll_batch's
+-- `pg_advisory_xact_lock(hashtext(...))`, 20260803000002) -- not a new
+-- concurrency-control mechanism, applied consistently. The lock key is
+-- prefixed ('guard_id_counter:') so it cannot collide with
+-- process_payroll_batch's own tenant-keyed advisory lock namespace beyond
+-- the same inherent, already-accepted hashtext collision risk that
+-- precedent already carries. A DIFFERENT tenant's call takes a lock on a
+-- DIFFERENT hash key and is not blocked by this one at all -- confirmed
+-- empirically: two different tenants' first calls, both deliberately delayed
+-- by the same test harness, still complete in parallel, not serialized.
+--
+-- Nothing else about this function changes: tenant-scoped counters, legacy
+-- MAX("guardId") seeding, SECURITY DEFINER, the REVOKE/GRANT hardening
+-- below, UNIQUE(tenant_id, "guardId"), and strictly monotonic per-tenant
+-- numbering are all unchanged -- this is a single added statement closing
+-- one specific first-call race window, not a redesign.
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS guard_id_counters (
@@ -152,11 +196,27 @@ BEGIN
     RAISE EXCEPTION 'No profile found for the current user';
   END IF;
 
+  -- CONCURRENCY FIX (2026-09-09): acquire a transaction-scoped, per-tenant
+  -- advisory lock BEFORE the row lock below. This is what actually closes
+  -- the first-call race -- `SELECT ... FOR UPDATE` on a row that does not
+  -- exist yet takes no lock at all, so without this, two concurrent FIRST
+  -- calls for the same brand-new tenant could both reach `IF NOT FOUND`,
+  -- both compute the same seed, and both attempt to INSERT the same
+  -- tenant_id -- the loser raising an uncaught duplicate-key error instead
+  -- of serializing safely. Released automatically at COMMIT/ROLLBACK, same
+  -- pattern as process_payroll_batch's own tenant-keyed advisory lock
+  -- (20260803000002). A different tenant hashes to a different lock key and
+  -- is never blocked by this one.
+  PERFORM pg_advisory_xact_lock(hashtext('guard_id_counter:' || v_tenant_id::text));
+
   -- Lock (or create) this tenant's counter row for the rest of this
   -- transaction -- a second concurrent call for the SAME tenant blocks
   -- here until the first call's transaction commits, then proceeds
   -- against the post-commit value. A different tenant's call takes a
-  -- lock on a DIFFERENT row and is not blocked by this one at all.
+  -- lock on a DIFFERENT row and is not blocked by this one at all. (For
+  -- the very first call ever made for a tenant, before any row exists,
+  -- the advisory lock above is what actually provides the serialization --
+  -- this FOR UPDATE alone cannot lock a row that isn't there yet.)
   SELECT last_number INTO v_last_number
     FROM guard_id_counters
     WHERE tenant_id = v_tenant_id
@@ -268,6 +328,30 @@ GRANT EXECUTE ON FUNCTION generate_guard_id() TO authenticated;
 --
 --   Expected: two distinct, consecutive numbers -- session B visibly
 --   waits for session A's transaction to commit before proceeding.
+--
+-- 2b. TWO SIMULTANEOUS *FIRST* REQUESTS FOR A BRAND-NEW TENANT -- the
+--    specific race this migration's CONCURRENCY FIX section addresses.
+--    Distinct from test #2 above: that test's tenant already has a
+--    guard_id_counters row (created by test #1), so it only exercises the
+--    row-lock path, never the no-row-yet path where the original bug
+--    lived. This test requires a tenant with ZERO prior generate_guard_id()
+--    calls and ZERO existing "guardId" values (confirm first:
+--    `SELECT * FROM guard_id_counters WHERE tenant_id = '<new tenant id>';`
+--    -- expect 0 rows):
+--
+--   -- Session A:                 -- Session B (same moment):
+--   SELECT generate_guard_id();   SELECT generate_guard_id();
+--
+--   Expected: BOTH sessions succeed (neither raises a duplicate-key
+--   error), returning two distinct, consecutive values (e.g. G-0001 and
+--   G-0002, in whichever order the advisory lock admits them) -- not one
+--   success plus one `duplicate key value violates unique constraint
+--   "guard_id_counters_pkey"` error, which is what this exact scenario
+--   produced before the CONCURRENCY FIX above was added (reproduced
+--   empirically against a disposable local Postgres instance running the
+--   pre-fix function body). Afterward:
+--   `SELECT last_number FROM guard_id_counters WHERE tenant_id = '<new
+--   tenant id>';` -- expect exactly 1 row, last_number = 2.
 --
 -- 3. TEN SIMULTANEOUS REQUESTS -- a stronger automated version of #2
 --    within one session (real concurrency across sessions is the more
