@@ -95,11 +95,63 @@ FOR SELECT USING (
 -- own authorization + validation BEFORE inserting -- see that function),
 -- or (b) a business Admin/super-admin creating a row for someone else
 -- within their own tenant.
+--
+-- SECURITY FIX 2 (2026-09-09, production preflight -- found by re-review of
+-- this exact policy): the business-Admin branch above restricted WHO could
+-- insert (an active business Admin, same tenant) but placed no restriction
+-- on the NEW row's OWN `is_super_admin` value -- WITH CHECK only inspects
+-- the row being inserted, never who is inserting it beyond the function
+-- calls it names, so nothing here stopped a genuine (non-super) business
+-- Admin from inserting a brand-new profiles row, in their own tenant, with
+-- is_super_admin = true -- a direct platform-privilege-escalation path,
+-- contradicting this file's own stated invariant ("a normal Admin must
+-- never be able to create/promote another is_super_admin account through
+-- browser-supplied input" -- see PART 1's target-shape comment above).
+-- `prevent_profile_privilege_escalation()` does NOT cover this: it is a
+-- BEFORE UPDATE trigger only, never fires on INSERT.
+--
+-- Reproduced empirically against a disposable local Postgres instance
+-- (with the table-level GRANTs Supabase applies by default, matching the
+-- window this migration's own policy actually governs -- before
+-- 20260817000009's later, unrelated REVOKE INSERT ON profiles FROM
+-- authenticated happens to also close this path from a different layer):
+-- an active, non-super business Admin (is_super_admin() = false,
+-- is_business_admin() = true) successfully inserted a new same-tenant
+-- profiles row with is_super_admin = true under the pre-fix policy.
+-- Relying on 20260817000009's later grant revocation as the real boundary
+-- here would leave a live escalation window during any staged,
+-- one-migration-at-a-time rollout between the two migrations, and is an
+-- incidental side effect of an unrelated architectural decision (browser
+-- self-profile-creation was never a legitimate flow), not a substitute for
+-- this policy being correct on its own terms.
+--
+-- FIX: the business-Admin branch now additionally requires the NEW row's
+-- own `is_super_admin` to be false. `profiles.is_super_admin` (the column)
+-- is explicitly table-qualified to disambiguate it from the same-named
+-- `is_super_admin()` function called earlier in this same expression --
+-- Postgres itself does not require the qualification (a function call
+-- always needs parentheses; a bare identifier is always a column
+-- reference), but the schema-wide reuse of this exact name for both a
+-- column and a function makes explicit qualification the only reading
+-- that is unambiguous to a human reviewer, which matters as much here as
+-- syntactic correctness does. COALESCE(...,false) treats a NULL
+-- is_super_admin (not expected -- the column defaults to false -- but not
+-- guaranteed by a NOT NULL constraint either) the same as false, i.e.
+-- fails closed rather than accidentally permitting it through a NULL
+-- comparison. The genuine platform-super-admin branch is deliberately left
+-- unrestricted -- a real super admin creating another super-admin account
+-- is expected, existing behavior, not the gap being closed here.
 DROP POLICY IF EXISTS "Users can insert their own profile" ON profiles;
+DROP POLICY IF EXISTS "Only an authorized Admin may insert a profile" ON profiles;
 CREATE POLICY "Only an authorized Admin may insert a profile" ON profiles
 FOR INSERT WITH CHECK (
   is_super_admin()
-  OR (is_current_user_active() AND is_business_admin() AND tenant_id = get_current_tenant_id())
+  OR (
+    is_current_user_active()
+    AND is_business_admin()
+    AND tenant_id = get_current_tenant_id()
+    AND COALESCE(profiles.is_super_admin, false) = false
+  )
 );
 
 DROP POLICY IF EXISTS "Users can update their own profile" ON profiles;
@@ -509,6 +561,75 @@ FOR INSERT WITH CHECK (
 --   -- "Applicants: view within tenant+region, action or legacy permitted"
 --   -- -- NOT also "Users can view applicants in their tenant" or
 --   -- "Managers can view applicants in their tenant".
+--
+-- REGRESSION TEST -- profiles INSERT, is_super_admin escalation (2026-09-09):
+-- confirms SECURITY FIX 2 above without persisting anything. Requires an
+-- active, non-super business Admin id (<BUSINESS_ADMIN_ID>, is_active=true,
+-- role='admin' or role_level=1, is_super_admin=false), a genuinely active
+-- platform super-admin id (<SUPER_ADMIN_ID>, is_active=true,
+-- is_super_admin=true), a second tenant id (<OTHER_TENANT_ID>) different
+-- from the business Admin's own tenant, and a disposable never-used auth
+-- id for the profile-less case (<PROFILELESS_ID>). Every INSERT below
+-- targets a fresh, not-yet-existing profiles.id and is wrapped in its own
+-- BEGIN/ROLLBACK -- nothing persists regardless of pass/fail.
+--
+--   -- 1. Business Admin inserts an ORDINARY same-tenant profile (no
+--   --    is_super_admin supplied -- defaults false) -- expect SUCCESS:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<BUSINESS_ADMIN_ID>', true);
+--   INSERT INTO profiles (id, tenant_id, email, full_name, role_level, is_active)
+--     VALUES (gen_random_uuid(), (SELECT tenant_id FROM profiles WHERE id = '<BUSINESS_ADMIN_ID>'),
+--             'regtest-ordinary@test.local', 'Regression Ordinary', 4, true);
+--   ROLLBACK;
+--   -- expected: INSERT 0 1, no error.
+--
+--   -- 2. Business Admin inserts is_super_admin=true (own tenant) -- expect
+--   --    the exact failure SECURITY FIX 2 exists to produce:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<BUSINESS_ADMIN_ID>', true);
+--   INSERT INTO profiles (id, tenant_id, email, full_name, is_super_admin, is_active)
+--     VALUES (gen_random_uuid(), (SELECT tenant_id FROM profiles WHERE id = '<BUSINESS_ADMIN_ID>'),
+--             'regtest-escalate@test.local', 'Regression Escalation', true, true);
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "profiles".
+--
+--   -- 3. Business Admin inserts into a DIFFERENT tenant -- expect FAILURE
+--   --    (unrelated to this fix -- the pre-existing tenant check must still hold):
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<BUSINESS_ADMIN_ID>', true);
+--   INSERT INTO profiles (id, tenant_id, email, full_name, is_super_admin, is_active)
+--     VALUES (gen_random_uuid(), '<OTHER_TENANT_ID>', 'regtest-crosstenant@test.local', 'Regression Cross-Tenant', false, true);
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "profiles".
+--
+--   -- 4. Genuine platform super-admin inserts is_super_admin=true -- expect
+--   --    SUCCESS (the super-admin branch is deliberately unrestricted):
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<SUPER_ADMIN_ID>', true);
+--   INSERT INTO profiles (id, tenant_id, email, full_name, is_super_admin, is_active)
+--     VALUES (gen_random_uuid(), (SELECT tenant_id FROM profiles WHERE id = '<BUSINESS_ADMIN_ID>'),
+--             'regtest-newsuper@test.local', 'Regression New Super Admin', true, true);
+--   ROLLBACK;
+--   -- expected: INSERT 0 1, no error.
+--
+--   -- 5. Profile-less authenticated caller (no matching profiles row at
+--   --    all) attempts to self-insert an elevated profile -- expect FAILURE:
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claim.sub', '<PROFILELESS_ID>', true);
+--   INSERT INTO profiles (id, tenant_id, email, full_name, is_super_admin, is_active)
+--     VALUES ('<PROFILELESS_ID>', (SELECT tenant_id FROM profiles WHERE id = '<BUSINESS_ADMIN_ID>'),
+--             'regtest-nobody@test.local', 'Regression Nobody', true, true);
+--   ROLLBACK;
+--   -- expected: ERROR -- new row violates row-level security policy for table "profiles".
+--
+-- Empirically run (disposable local Postgres, matching Supabase's default
+-- authenticated table grants): all 5 produced exactly the expected
+-- outcome above.
 --
 -- ROLLBACK: re-run each superseded migration's own CREATE POLICY blocks
 -- verbatim (20260727000000 for profiles/employees/applicants/audit_logs
