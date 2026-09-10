@@ -180,7 +180,33 @@ BEGIN
   -- Same rule as canApprovePayroll client-side and the existing payroll
   -- UPDATE RLS policy's WITH CHECK: only role_level = 1 (Admin) or a
   -- super admin may approve/reject payroll.
-  IF NOT (v_is_super OR v_role_level = 1) THEN
+  --
+  -- SECURITY (release-blocking, found during PR #36 audit, confirmed
+  -- against the actual production function body): `v_role_level` is NULL
+  -- for every functional-role account (hr_manager/accountant/
+  -- operations_manager/functional admin -- by design). A bare
+  -- `v_role_level = 1` comparison against NULL evaluates to SQL NULL, not
+  -- false: `false OR NULL` is NULL, and `NOT NULL` is NULL. PL/pgSQL
+  -- treats a NULL IF condition the same as false, so the RAISE EXCEPTION
+  -- below was silently SKIPPED for any non-super, functional-role caller
+  -- -- there is no third has_permission(...) branch here (unlike
+  -- get_payroll_attendance_counts()), so this single gate is the ONLY
+  -- thing standing between an unauthorized caller and the UPDATE below,
+  -- whose own WHERE clause checks tenant/region for a non-super caller
+  -- but never re-checks role/permission. Empirically reproduced against
+  -- this exact function body: a functional Accountant (role_level NULL,
+  -- own tenant+region, not super-admin) successfully called this RPC and
+  -- it actually approved a real payroll row. Both operands are now
+  -- wrapped in COALESCE(..., false) so the expression is always a real
+  -- boolean, closing that bypass without changing the intended
+  -- authorization model in any way -- functional roles (including a
+  -- functional `role = 'admin'` account, whose role_level is also NULL)
+  -- remain NOT authorized to approve payroll through this RPC; only a
+  -- genuine legacy role_level = 1 account or a super admin is.
+  IF NOT (
+    COALESCE(v_is_super, false)
+    OR COALESCE(v_role_level = 1, false)
+  ) THEN
     RAISE EXCEPTION 'Only managers and admins can approve payroll' USING ERRCODE = '42501';
   END IF;
 
