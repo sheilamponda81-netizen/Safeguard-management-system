@@ -58,14 +58,52 @@ ORDER BY cmd;
 --    20260908000000 already uses for the `payroll` table's own SELECT
 --    policy. Functional Accountant access (has_permission('payroll.view'))
 --    is unaffected.
+--
+--    NULL-PROPAGATION FIX (release-blocking, found during PR #36 audit):
+--    the `v_role_level <= 2` correction above was itself NOT NULL-safe --
+--    for a functional-role caller (role_level IS NULL), the bare
+--    comparison evaluates to SQL NULL rather than false, which poisons the
+--    enclosing `IF NOT (...)` to NULL. PL/pgSQL treats a NULL IF condition
+--    the same as false, so the RAISE EXCEPTION was silently SKIPPED for
+--    any functional-role caller lacking payroll.view -- empirically
+--    reproduced against this exact function body (see PR #36 audit
+--    history) before being fixed here. Every operand is now wrapped in
+--    COALESCE(..., false). This check below now asserts the NULL-safe
+--    form is present and that BOTH unsafe forms (the original blanket
+--    `IS NOT NULL` rule, and the un-COALESCEd `<= 2` rule this migration
+--    used before the NULL-propagation fix) are absent.
 -- Matched against the specific executable phrase (not just any mention of
--- "v_role_level IS NOT NULL" -- the function's own header comment quotes
--- that exact old rule for documentation purposes, so a bare substring
--- match against the whole body would false-positive on the comment).
+-- "v_role_level IS NOT NULL"/"v_role_level <= 2" -- the function's own
+-- header comments quote both of those old rules for documentation
+-- purposes, so a bare substring match against the whole body would
+-- false-positive on the comments).
 SELECT
-  pg_get_functiondef('get_payroll_attendance_counts(uuid[],text)'::regprocedure) LIKE '%OR v_role_level <= 2 OR has_permission(''payroll.view'')%' AS has_legacy_le2_rule,
-  pg_get_functiondef('get_payroll_attendance_counts(uuid[],text)'::regprocedure) LIKE '%OR v_role_level IS NOT NULL OR has_permission%' AS still_has_old_blanket_rule;
--- expected: has_legacy_le2_rule = true, still_has_old_blanket_rule = false
+  pg_get_functiondef('get_payroll_attendance_counts(uuid[],text)'::regprocedure) LIKE '%COALESCE(v_role_level <= 2, false)%' AS has_null_safe_le2_rule,
+  pg_get_functiondef('get_payroll_attendance_counts(uuid[],text)'::regprocedure) LIKE '%COALESCE(has_permission(''payroll.view''), false)%' AS has_null_safe_permission_rule,
+  pg_get_functiondef('get_payroll_attendance_counts(uuid[],text)'::regprocedure) LIKE '%OR v_role_level IS NOT NULL OR has_permission%' AS still_has_old_blanket_rule,
+  pg_get_functiondef('get_payroll_attendance_counts(uuid[],text)'::regprocedure) LIKE '%IF NOT (v_is_super_admin OR v_role_level <= 2 OR has_permission(''payroll.view''))%' AS still_has_unsafe_bare_le2_rule;
+-- expected: has_null_safe_le2_rule = true, has_null_safe_permission_rule =
+-- true, still_has_old_blanket_rule = false, still_has_unsafe_bare_le2_rule
+-- = false
+
+-- 4b. LIVE SIMULATION of the exact NULL-propagation bypass this fix
+--     closes -- requires a real, active, not-soft-deleted functional-role
+--     profile id (role_level IS NULL) that does NOT hold payroll.view
+--     (e.g. an Operations Manager without that permission). Wrapped in
+--     BEGIN/ROLLBACK; the call is expected to RAISE, so this block itself
+--     will show the exception when run interactively -- run it with
+--     `\set ON_ERROR_STOP off` (or catch the error at the client) to see
+--     the ROLLBACK still complete cleanly afterward.
+-- BEGIN;
+-- SET LOCAL ROLE authenticated;
+-- SELECT set_config('request.jwt.claim.sub', '<ACTIVE_FUNCTIONAL_ROLE_PROFILE_ID_WITHOUT_PAYROLL_VIEW>', true);
+-- SELECT * FROM get_payroll_attendance_counts(
+--   ARRAY['<ANY_EMPLOYEE_ID_IN_CALLERS_TENANT>']::uuid[], '2026-09'
+-- );
+-- -- expected: RAISES 'You do not have permission to view payroll
+-- -- attendance totals' -- a successful, non-erroring result here means
+-- -- the NULL-propagation bypass has regressed.
+-- ROLLBACK;
 
 -- ============================================================
 -- LIVE SIMULATION -- requires a real inactive (or a deliberately

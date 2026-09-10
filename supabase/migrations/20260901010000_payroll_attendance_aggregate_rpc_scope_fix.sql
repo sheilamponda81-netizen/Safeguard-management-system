@@ -124,7 +124,27 @@ BEGIN
   -- access and must not be able to call this RPC either. Functional
   -- Accountant access is unaffected -- unchanged, still via
   -- has_permission('payroll.view').
-  IF NOT (v_is_super_admin OR v_role_level <= 2 OR has_permission('payroll.view')) THEN
+  --
+  -- SECURITY (release-blocking, found during PR #36 audit): `v_role_level`
+  -- is NULL for every functional-role account (by design). A bare
+  -- `v_role_level <= 2` comparison against NULL evaluates to SQL NULL, not
+  -- false, which makes the whole `IF NOT (...)` condition NULL for a
+  -- functional-role caller who also lacks has_permission('payroll.view')
+  -- -- and PL/pgSQL treats a NULL IF condition the same as false, silently
+  -- skipping the RAISE EXCEPTION below instead of rejecting the caller.
+  -- Empirically reproduced against this exact function body: an
+  -- Operations Manager session (role_level NULL, payroll.view NOT
+  -- granted) received real attendance day-counts instead of an error.
+  -- Every operand is now wrapped in COALESCE(..., false) so the whole
+  -- expression is always a real boolean, closing that bypass without
+  -- changing behavior for any legacy account (whose role_level is never
+  -- NULL) or any functional account that legitimately holds
+  -- payroll.view/is a super admin.
+  IF NOT (
+    COALESCE(v_is_super_admin, false)
+    OR COALESCE(v_role_level <= 2, false)
+    OR COALESCE(has_permission('payroll.view'), false)
+  ) THEN
     RAISE EXCEPTION 'You do not have permission to view payroll attendance totals';
   END IF;
 
