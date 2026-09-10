@@ -37,19 +37,26 @@
 -- after this migration -- confirmed intentional per item 38.
 -- ============================================================
 
--- Drops BOTH the correct repo-lineage name ("Admins and managers...") AND
--- a singular-"Admin" variant ("Admin and managers...") that repository
+-- Drops the correct repo-lineage name ("Admins and managers..."), a
+-- singular-"Admin" variant ("Admin and managers...") that repository
 -- history never created but that direct live STAGING pg_policies
 -- evidence confirmed actually exists there after this migration was
 -- first applied -- real deployed-state drift from the committed
--- migration lineage, not something this file's own history explains.
--- Since Production may carry the same drift, this migration is made
--- defensive against both known naming variants rather than assuming the
--- repo's own history is the complete picture of what's actually live.
--- Each DROP is IF EXISTS, so this is safe/idempotent regardless of which
--- variant (if either) is actually present in a given environment.
+-- migration lineage, not something this file's own history explains --
+-- AND this migration's own new/current name ("Admins can ... company
+-- logo"), immediately before that same name's CREATE POLICY below.
+-- Since Production may carry the drift variant, this migration is made
+-- defensive against both known pre-existing naming variants rather than
+-- assuming the repo's own history is the complete picture of what's
+-- actually live; the new-name DROP is what actually makes a SECOND
+-- application of this migration safe (RUN TWICE below), since without
+-- it a re-run's CREATE POLICY would fail with "policy already exists"
+-- the moment the first application's own new-named policy is already in
+-- place. Each DROP is IF EXISTS, so this is safe/idempotent regardless
+-- of which variant (if any) is actually present in a given environment.
 DROP POLICY IF EXISTS "Admins and managers can upload company logo" ON storage.objects;
 DROP POLICY IF EXISTS "Admin and managers can upload company logo" ON storage.objects;
+DROP POLICY IF EXISTS "Admins can upload company logo" ON storage.objects;
 CREATE POLICY "Admins can upload company logo" ON storage.objects
 FOR INSERT TO authenticated WITH CHECK (
   bucket_id = 'company-logo'
@@ -59,6 +66,7 @@ FOR INSERT TO authenticated WITH CHECK (
 
 DROP POLICY IF EXISTS "Admins and managers can update company logo" ON storage.objects;
 DROP POLICY IF EXISTS "Admin and managers can update company logo" ON storage.objects;
+DROP POLICY IF EXISTS "Admins can update company logo" ON storage.objects;
 CREATE POLICY "Admins can update company logo" ON storage.objects
 FOR UPDATE TO authenticated USING (
   bucket_id = 'company-logo'
@@ -72,6 +80,7 @@ FOR UPDATE TO authenticated USING (
 
 DROP POLICY IF EXISTS "Admins and managers can delete company logo" ON storage.objects;
 DROP POLICY IF EXISTS "Admin and managers can delete company logo" ON storage.objects;
+DROP POLICY IF EXISTS "Admins can delete company logo" ON storage.objects;
 CREATE POLICY "Admins can delete company logo" ON storage.objects
 FOR DELETE TO authenticated USING (
   bucket_id = 'company-logo'
@@ -202,7 +211,14 @@ FOR UPDATE USING (
 -- ============================================================
 --
 -- RUN ONCE / RUN TWICE: idempotent -- every change is `DROP POLICY IF
--- EXISTS` (old name) + `CREATE POLICY` (new name).
+-- EXISTS` (old name(s), INCLUDING this migration's own current name) +
+-- `CREATE POLICY` (current name). The 3 storage.objects write policies
+-- each drop 3 names (the repo-lineage name, the known drift variant, and
+-- their own current "Admins can ... company logo" name) before creating;
+-- the system_settings policies each drop their own current name before
+-- creating. A second application is safe: every `DROP POLICY IF EXISTS`
+-- is a no-op the second time (the row is already gone), and every
+-- `CREATE POLICY` then runs against a guaranteed-absent name.
 --
 -- DEPENDENCIES: requires 20260817000000_functional_role_permissions_foundation.sql
 -- (is_business_admin(), has_permission()) to already be applied. Must be
