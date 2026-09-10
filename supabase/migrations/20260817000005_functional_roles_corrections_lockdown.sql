@@ -449,8 +449,13 @@ GRANT SELECT ON employees_general TO authenticated;
 --   -- their tenant" policy bodies from 20260727000000 verbatim (tenant
 --   -- check only, no role gate) for each of the 4 tables.
 --   -- PART 2: GRANT INSERT, UPDATE, DELETE ON role_permissions TO authenticated; (not recommended)
---   -- PART 3: re-run 20260817000004's "Admins can view settings in their
---   -- tenant" policy body verbatim.
+--   -- PART 3: no rollback action needed at current lineage -- corrected
+--   -- 20260817000004 already establishes tenant-wide-active
+--   -- "Users can view settings in their tenant" SELECT, and this PART
+--   -- only reinforces/leaves that same policy in place. Re-introducing
+--   -- the old Admin-only "Admins can view settings in their tenant"
+--   -- policy would reopen the exact production regression already fixed
+--   -- and is NOT a valid rollback step.
 --   -- PART 4: GRANT EXECUTE ON FUNCTION generate_employee_number(UUID) TO PUBLIC; (not recommended)
 --   -- PART 5: DROP VIEW IF EXISTS employees_general;
 -- ============================================================
