@@ -349,12 +349,16 @@ export function Dashboard() {
     
     try {
       // ===== CRITICAL: Exclude deleted employees =====
-      // Reads from `employees_general` (20260817000005), not `employees`
-      // directly -- same row-level tenant/region access, but guard-
-      // specific columns (license_status, etc.) are NULLed for a caller
-      // without security_personnel.view, so an Accountant session never
-      // receives raw guard data in this fetch even though it isn't
-      // rendered today.
+      // Reads from `employees_general` (20260817000008), not `employees`
+      // directly -- same row-level tenant/region access. As of
+      // 20260817000008, `employees_general` no longer carries the 8 guard/
+      // security-only columns at all (they were NULLed for an unprivileged
+      // caller in the earlier 20260817000005 shape; now they are entirely
+      // absent from this view for EVERY caller, privileged or not) -- any
+      // guard-only field (e.g. license_status, used below for the expiring-
+      // licenses count) must be read from `employees_security` instead,
+      // gated by `canViewSecurity`, exactly like the applicant-counts RPC
+      // below is gated by `canViewRecruitment`.
       // Ordered by `hire_date` DESC, not `created_at` DESC: "Recent Active
       // Employees" below (`employeesData.slice(0, 6)`) is captioned "Latest
       // additions to your workforce" -- that is a claim about hire_date
@@ -445,6 +449,38 @@ export function Dashboard() {
         }
       }
 
+      // `license_status` is one of the 8 guard/security-only fields Step 18
+      // (20260817000008) removed from `employees_general` entirely -- it is
+      // only ever present in `employees_security`, which applies its own
+      // server-side WHERE-clause authorization (legacy-account bypass, or
+      // super-admin/business-admin bypass, or `security_personnel.view`).
+      // `canViewSecurity` is the exact client-side mirror of that same rule
+      // (see resolveDashboardPermissions()/canAccess()), so gating this
+      // fetch on it reproduces the identical authorization outcome the view
+      // itself would enforce -- and, per the same permission-aware-fetching
+      // pattern used above for `get_applicant_dashboard_counts()`, a caller
+      // without security_personnel.view never even issues this request.
+      let licenseStatusRows: { license_status: string | null }[] = [];
+      if (canViewSecurity) {
+        let licenseQuery = supabase
+          .from('employees_security')
+          .select('license_status')
+          .eq('is_deleted', false);
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          licenseQuery = licenseQuery.eq('region_id', userProfile.region_id);
+        }
+        const licenseRes = await licenseQuery;
+        if (licenseRes.error) {
+          // Fails closed to zero, matching the applicant-counts RPC pattern
+          // above -- a transient error must degrade this one stat, not the
+          // whole Dashboard, and must never fall back to reading guard
+          // fields off `employees_general` (they no longer exist there).
+          console.error('Error fetching employee license statuses:', licenseRes.error);
+        } else {
+          licenseStatusRows = licenseRes.data || [];
+        }
+      }
+
       const employeesData = employeesRes.data || [];
       const employeeIds = employeesData.map((e: any) => e.id);
 
@@ -478,7 +514,7 @@ export function Dashboard() {
         }
       });
       
-      const expiringLicenses = employeesData.filter((e: any) => 
+      const expiringLicenses = licenseStatusRows.filter((e) =>
         e.license_status === 'Expiring' || e.license_status === 'Expired'
       ).length;
       
@@ -834,7 +870,7 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance, canViewRecruitment, canApproveTerminalDues, canPayTerminalDues]);
+  }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity, canApproveTerminalDues, canPayTerminalDues]);
 
   useEffect(() => {
     // permissionsResolved is required here, not just userProfile/selectedMonth
