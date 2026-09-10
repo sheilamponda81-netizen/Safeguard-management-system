@@ -84,37 +84,67 @@ FOR DELETE TO authenticated USING (
 -- reasoning (pre-login Sidebar/Login.tsx display, not sensitive data).
 
 -- ============================================================
--- PART 2 -- system_settings (item 39): view AND manage both tightened to
--- Admin only. Previously: SELECT was tenant-wide for every role_level;
--- INSERT/UPDATE required role_level = 1. No new role has any
--- 'settings.*' permission in the seeded matrix (deliberately -- Settings
--- stays Admin-only under the new model too, matching the legacy "settings"
--- nav page already being role_level-1-only per src/App.tsx's rolePages),
--- so has_permission('settings.view')/('settings.manage') resolves to
--- exactly "is_business_admin(), nothing else" today -- using
+-- PART 2 -- system_settings (item 39): only INSERT/UPDATE (write access)
+-- are tightened to Admin only. SELECT is DELIBERATELY LEFT AS-IS --
+-- tenant-wide for any active tenant member, exactly matching existing
+-- production behavior -- see the RELEASE-BLOCKING CORRECTION note
+-- immediately below for why.
+--
+-- INSERT/UPDATE: previously required role_level = 1. No new role has any
+-- 'settings.manage' permission in the seeded matrix (deliberately --
+-- writing Settings stays Admin-only under the new model too, matching
+-- the legacy "settings" nav page already being role_level-1-only per
+-- src/App.tsx's rolePages), so has_permission('settings.manage')
+-- resolves to exactly "is_business_admin(), nothing else" today -- using
 -- has_permission() rather than a bare is_business_admin() check simply
 -- future-proofs this policy the same way every other permission-gated
 -- policy in this rollout is written, at no cost since no role_permissions
 -- row exists to widen it beyond Admin.
 --
--- REAL BEHAVIOR CHANGE: SELECT on system_settings is no longer tenant-wide
--- -- a legacy Manager/Supervisor/Staff account (or a new hr_manager/
--- accountant/operations_manager account) can no longer read
--- system_settings rows (e.g. current_payroll_month, payroll rate
--- settings) directly. CONFIRM before applying to STAGING/production that
--- no non-Admin page relies on a direct system_settings SELECT for a
--- value it still needs -- src/utils/currentMonth.ts's reads happen via
--- this same table and this same tightened policy, so a non-Admin session
--- calling getSystemCurrentMonth() will now get nothing back. This is
--- flagged explicitly in the final report as a point requiring frontend
--- verification (Phase C) before this is safe to rely on.
+-- RELEASE-BLOCKING CORRECTION (2026-09-10, production preflight): an
+-- earlier version of this file also tightened system_settings SELECT to
+-- Admin-only (via has_permission('settings.view')). A read-only source
+-- audit against the live frontend proved that regresses production: this
+-- table is the shared key/value store behind getSystemCurrentMonth()
+-- (src/utils/currentMonth.ts), getPayrollRates() (src/utils/
+-- payrollSettings.ts), and getCompanySettings() (src/utils/
+-- companySettings.ts), and those are called directly -- unconditionally,
+-- on page init, with no permission gate of their own -- from live code
+-- reachable by hr_manager (Dashboard, Salary Advances), accountant
+-- (Payroll, Payslips, Payments, Dashboard, Reports, Salary Advances), and
+-- operations_manager (Dashboard, Attendance, Reports), plus
+-- src/components/Sidebar.tsx (every authenticated session, any role,
+-- reads getCompanySettings() for the logo on every page).
+--
+-- Because a denied SELECT returns zero rows with NO error (RLS filters
+-- silently, it does not raise), none of these call sites fail loudly --
+-- each one's existing try/catch treats "no data" as "no setting exists
+-- yet" and silently substitutes a hardcoded fallback (a fixed default
+-- month, fixed default PAYE/deduction rates, fixed placeholder company
+-- info) instead of the real, Admin-configured value. For payroll rates
+-- specifically this is a live financial-correctness regression, not
+-- merely cosmetic: src/pages/Payroll.tsx and src/pages/Payslips.tsx feed
+-- getPayrollRates()'s result directly into the deduction/PAYE figures an
+-- Accountant computes and submits, so an Admin-only SELECT would silently
+-- replace the tenant's real configured rates with generic defaults for
+-- exactly the functional role this rollout exists to support.
+--
+-- The fix is SELECT-only: restore the original tenant-wide policy verbatim
+-- (same name, same predicate the table has always used), so every
+-- existing direct SELECT caller keeps working exactly as it does in
+-- production today. This does not reopen any INSERT/UPDATE/DELETE gap --
+-- writes stay Admin-only (below) exactly as this migration intended, and
+-- the values readable here (payroll rates, current month, company info)
+-- are the same non-secret operational settings already tenant-wide
+-- readable in production; no new key was ever added, and no permission is
+-- added or removed from any role by this correction.
 -- ============================================================
 
+DROP POLICY IF EXISTS "Admins can view settings in their tenant" ON system_settings;
 DROP POLICY IF EXISTS "Users can view settings in their tenant" ON system_settings;
-CREATE POLICY "Admins can view settings in their tenant" ON system_settings
+CREATE POLICY "Users can view settings in their tenant" ON system_settings
 FOR SELECT USING (
-  (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
-  AND (is_super_admin() = true OR has_permission('settings.view'))
+  tenant_id = get_current_tenant_id() OR is_super_admin() = true
 );
 
 DROP POLICY IF EXISTS "Admins can insert settings in their tenant" ON system_settings;
@@ -183,15 +213,22 @@ FOR UPDATE USING (
 -- LOCKING / PRODUCTION TRAFFIC IMPACT: policy-only changes -- no table
 -- alter, no data touched.
 --
--- BEHAVIOR CHANGES FOR EXISTING CALLERS (both confirmed intentional,
--- flagged for STAGING verification before relying on them):
+-- BEHAVIOR CHANGES FOR EXISTING CALLERS (confirmed intentional, flagged
+-- for STAGING verification before relying on them):
 --   1. A legacy Manager (role_level = 2) can no longer upload/replace/
 --      delete the company logo.
 --   2. A legacy Manager/Supervisor/Staff (and new hr_manager/accountant/
---      operations_manager) account can no longer SELECT from
---      system_settings at all -- verify no non-Admin page/utility still
---      depends on a direct read from this table before this reaches
---      STAGING.
+--      operations_manager) account can no longer INSERT/UPDATE
+--      system_settings rows directly -- write access is now Admin-only.
+--      SELECT is UNCHANGED from existing production behavior -- every
+--      active tenant member (any role, legacy or functional) can still
+--      read system_settings directly, exactly as before this migration.
+--      This is deliberate, not an oversight: see the RELEASE-BLOCKING
+--      CORRECTION note above PART 2 for why a non-Admin-readable
+--      system_settings is required by live code (getSystemCurrentMonth(),
+--      getPayrollRates(), getCompanySettings()) reachable by hr_manager,
+--      accountant, operations_manager, and every authenticated session
+--      via Sidebar.tsx's logo fetch.
 --
 -- VERIFICATION SQL (run immediately after applying):
 --   SELECT policyname, cmd FROM pg_policies WHERE schemaname = 'storage'
@@ -203,12 +240,21 @@ FOR UPDATE USING (
 --   -- singular-typo variant confirmed present on live STAGING via direct
 --   -- pg_policies evidence) survived alongside the new Admin-only ones.
 --   SELECT policyname, cmd FROM pg_policies WHERE tablename = 'system_settings' ORDER BY cmd;
---   -- expected: SELECT/INSERT/UPDATE = "Admins can ...", DELETE = "Super admins can delete settings"
---   -- Functional check: as a legacy Manager or a new hr_manager/accountant/
---   -- operations_manager session, attempt SELECT/INSERT/UPDATE on
---   -- system_settings directly -- expect denial (0 rows / permission error).
+--   -- expected: EXACTLY 4 rows -- SELECT = "Users can view settings in
+--   -- their tenant" (unchanged tenant-wide policy), INSERT/UPDATE =
+--   -- "Admins can ... settings in their tenant", DELETE = "Super admins
+--   -- can delete settings". Confirms only one SELECT policy exists (no
+--   -- leftover "Admins can view settings in their tenant" row from an
+--   -- earlier, superseded version of this migration).
+--   -- Functional check: as a legacy Manager/Supervisor/Staff or a new
+--   -- hr_manager/accountant/operations_manager session --
+--   --   SELECT * FROM system_settings;                    -- expect real
+--   --     rows back (tenant-wide read, unchanged from pre-migration).
+--   --   INSERT/UPDATE on system_settings directly           -- expect
+--   --     denial (0 rows affected / permission error).
 --   -- As an Admin (legacy role_level = 1, or new role = 'admin') or super
---   -- admin session -- expect success, matching pre-migration behavior.
+--   -- admin session -- expect SELECT and INSERT/UPDATE to both succeed,
+--   -- matching pre-migration behavior.
 --
 -- ROLLBACK SQL (safe at any time -- restores the pre-functional-roles
 -- policies verbatim):
@@ -229,9 +275,10 @@ FOR UPDATE USING (
 --   FOR DELETE TO authenticated USING (
 --     bucket_id = 'company-logo' AND (is_super_admin() = true OR current_user_role_level() <= 2)
 --   );
---   DROP POLICY IF EXISTS "Admins can view settings in their tenant" ON system_settings;
---   CREATE POLICY "Users can view settings in their tenant" ON system_settings
---   FOR SELECT USING (tenant_id = get_current_tenant_id() OR is_super_admin() = true);
+--   -- SELECT: no action needed -- this migration's corrected version
+--   -- already recreates "Users can view settings in their tenant" with
+--   -- the exact same name and predicate system_settings had before this
+--   -- migration was ever applied, so there is nothing to roll back here.
 --   DROP POLICY IF EXISTS "Admins can insert settings in their tenant" ON system_settings;
 --   CREATE POLICY "Admins can insert settings in their tenant" ON system_settings
 --   FOR INSERT WITH CHECK (
