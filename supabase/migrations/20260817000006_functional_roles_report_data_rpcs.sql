@@ -61,7 +61,9 @@ ON CONFLICT (role, permission) DO NOTHING;
 -- recruitment report table actually uses (id, name, position,
 -- qualification, interview_status, application_date) -- verified against
 -- the component, not a full `SELECT *`. Gated by reports.recruitment.view
--- (or legacy/business-admin/super-admin), region-scoped via
+-- (or legacy role_level 1/2 [Admin/Manager] -- the only legacy role_levels
+-- with Reports access per App.tsx's rolePages route guard, confirmed
+-- 2026-09-10 -- or business-admin/super-admin), region-scoped via
 -- region_allowed(region_id) for the same non-business-admin callers every
 -- other region-scoped policy in this rollout applies to. This does NOT
 -- grant recruitment.view -- a caller authorized only via
@@ -69,6 +71,18 @@ ON CONFLICT (role, permission) DO NOTHING;
 -- applicant field (e.g. phone/email/cover_letter/decision), and cannot
 -- write to `applicants` at all (this function is SELECT-only, no
 -- corresponding write RPC).
+--
+-- RELEASE-BLOCKING FIX (2026-09-10, production preflight): the legacy
+-- bypass below was originally `current_user_role_level() IS NOT NULL`,
+-- which authorized EVERY legacy account (role_level 1-4), including
+-- Supervisor (3) and Staff (4) -- neither of which has ever had Reports
+-- access in the frontend (App.tsx's rolePages[3]/[4] omit "reports"; only
+-- rolePages[1]/[2] include it, matched by Sidebar's own roleMenuItems).
+-- A direct RPC/REST call from either account (bypassing the UI, which
+-- never renders a reachable Reports nav item for them) could therefore
+-- retrieve region-scoped recruitment report data despite having no
+-- legitimate Reports visibility at all. Narrowed to
+-- `current_user_role_level() <= 2` to match the real legacy rule exactly.
 -- ============================================================
 
 CREATE OR REPLACE FUNCTION get_report_recruitment_data()
@@ -95,7 +109,7 @@ BEGIN
   IF NOT (
     is_super_admin()
     OR is_business_admin()
-    OR current_user_role_level() IS NOT NULL
+    OR COALESCE(current_user_role_level() <= 2, false)
     OR has_permission('reports.recruitment.view')
   ) THEN
     RAISE EXCEPTION 'You do not have permission to view the recruitment report';
@@ -129,7 +143,9 @@ GRANT EXECUTE ON FUNCTION get_report_recruitment_data() TO authenticated;
 -- region_allowed() per row server-side, so a caller who tampered with the
 -- array to include out-of-region employee ids simply gets no rows back for
 -- those ids -- it cannot be used to fish for attendance data outside the
--- caller's own region. Gated by reports.operational.view (or legacy/
+-- caller's own region. Gated by reports.operational.view (or legacy
+-- role_level 1/2 [Admin/Manager] -- the only legacy role_levels with
+-- Reports access, see PART 2's RELEASE-BLOCKING FIX note -- or
 -- business-admin/super-admin) -- NOT attendance.view, so this does not
 -- grant Accountant (or anyone else with only reports.operational.view) any
 -- ability to browse the live Attendance module/grid.
@@ -160,7 +176,7 @@ BEGIN
   IF NOT (
     is_super_admin()
     OR is_business_admin()
-    OR current_user_role_level() IS NOT NULL
+    OR COALESCE(current_user_role_level() <= 2, false)
     OR has_permission('reports.operational.view')
   ) THEN
     RAISE EXCEPTION 'You do not have permission to view the attendance report';
@@ -212,7 +228,13 @@ GRANT EXECUTE ON FUNCTION get_report_attendance_summary(UUID[], TEXT) TO authent
 -- own existing RLS, unaffected by these new functions. The only NEW
 -- capability is Accountant gaining read access to recruitment/attendance
 -- report data it did not have before, exactly as the approved "Accountant:
--- all reports" requirement specifies.
+-- all reports" requirement specifies. RELEASE-BLOCKING FIX (2026-09-10):
+-- a legacy Supervisor (role_level 3) or Staff (role_level 4) account,
+-- which never had a reachable Reports page (App.tsx's rolePages[3]/[4]
+-- omit "reports"), can no longer call either RPC directly (previously
+-- could, via the too-broad `current_user_role_level() IS NOT NULL`
+-- bypass) -- no legitimate caller loses anything, since neither role_level
+-- ever had a real Reports use case for these functions.
 --
 -- VERIFICATION SQL (run immediately after applying):
 --   SELECT role, permission FROM role_permissions WHERE permission LIKE 'reports.recruitment%';
@@ -230,7 +252,12 @@ GRANT EXECUTE ON FUNCTION get_report_attendance_summary(UUID[], TEXT) TO authent
 --   -- reports.recruitment.view), and get_report_attendance_summary()
 --   -- succeeds (has reports.operational.view). As an HR Manager session,
 --   -- confirm both RAISE (HR Manager never reaches Reports.tsx via nav
---   -- anyway, but the RPC itself should also independently refuse).
+--   -- anyway, but the RPC itself should also independently refuse). As a
+--   -- legacy Admin (role_level 1) or Manager (role_level 2) session,
+--   -- confirm both RPCs succeed (region-scoped), unchanged from before
+--   -- this fix. As a legacy Supervisor (role_level 3) or Staff
+--   -- (role_level 4) session with no reports.* permission, confirm both
+--   -- RPCs now RAISE (previously succeeded before this fix).
 --
 -- ROLLBACK SQL:
 --   DELETE FROM role_permissions WHERE permission IN ('reports.recruitment.view', 'reports.recruitment.export');
