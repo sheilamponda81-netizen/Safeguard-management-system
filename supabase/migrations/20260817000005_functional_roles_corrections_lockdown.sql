@@ -5,13 +5,24 @@
 --
 -- This migration fixes several gaps identified in a review of
 -- 20260817000000-000004: lookup/config table write security, explicit
--- role_permissions/function privilege hardening, a genuine regression in
--- 20260817000004 (system_settings SELECT was over-restricted to Admin-only,
--- breaking every non-Admin role's legitimate reads of current month/payroll
--- rates/page size/company display info), a pre-existing anon-EXECUTE gap on
--- generate_employee_number(), and a general-employee read projection that
--- excludes Security/guard-specific columns for callers without
+-- role_permissions/function privilege hardening, a pre-existing anon-EXECUTE
+-- gap on generate_employee_number(), and a general-employee read projection
+-- that excludes Security/guard-specific columns for callers without
 -- security_personnel.view.
+--
+-- system_settings SELECT (PART 3, RELEASE-BLOCKING FIX, 2026-09-10): at
+-- CURRENT HEAD, 20260817000004_functional_roles_storage_settings_lookups.sql
+-- was itself corrected at source (production preflight, 2026-09-10) to
+-- preserve tenant-wide-active system_settings SELECT -- the Admin-only
+-- over-restriction this PART was originally written to undo never actually
+-- reaches a database migrated from the current lineage. PART 3 below is
+-- KEPT, but now serves a narrower purpose: defensive/idempotent
+-- reinforcement for a database that may carry the OLDER, uncorrected
+-- 20260817000004 (Admin-only SELECT, named "Admins can view settings in
+-- their tenant") -- or, on a database already migrated from the corrected
+-- 20260817000004, a same-name no-op re-application of the policy that is
+-- already there ("Users can view settings in their tenant"). It is not a
+-- new correction required by the current migration lineage.
 --
 -- ============================================================
 -- PART 1: LOOKUP/CONFIG TABLE WRITE LOCKDOWN
@@ -43,6 +54,7 @@
 -- ============================================================
 
 DROP POLICY IF EXISTS "Users can insert regions in their tenant" ON regions;
+DROP POLICY IF EXISTS "Admins can insert regions in their tenant" ON regions;
 CREATE POLICY "Admins can insert regions in their tenant" ON regions
 FOR INSERT WITH CHECK (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -50,6 +62,7 @@ FOR INSERT WITH CHECK (
 );
 
 DROP POLICY IF EXISTS "Users can update regions in their tenant" ON regions;
+DROP POLICY IF EXISTS "Admins can update regions in their tenant" ON regions;
 CREATE POLICY "Admins can update regions in their tenant" ON regions
 FOR UPDATE USING (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -60,6 +73,7 @@ FOR UPDATE USING (
 );
 
 DROP POLICY IF EXISTS "Users can delete regions in their tenant" ON regions;
+DROP POLICY IF EXISTS "Admins can delete regions in their tenant" ON regions;
 CREATE POLICY "Admins can delete regions in their tenant" ON regions
 FOR DELETE USING (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -67,6 +81,7 @@ FOR DELETE USING (
 );
 
 DROP POLICY IF EXISTS "Users can insert positions in their tenant" ON positions;
+DROP POLICY IF EXISTS "Admins can insert positions in their tenant" ON positions;
 CREATE POLICY "Admins can insert positions in their tenant" ON positions
 FOR INSERT WITH CHECK (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -74,6 +89,7 @@ FOR INSERT WITH CHECK (
 );
 
 DROP POLICY IF EXISTS "Users can update positions in their tenant" ON positions;
+DROP POLICY IF EXISTS "Admins can update positions in their tenant" ON positions;
 CREATE POLICY "Admins can update positions in their tenant" ON positions
 FOR UPDATE USING (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -84,6 +100,7 @@ FOR UPDATE USING (
 );
 
 DROP POLICY IF EXISTS "Users can delete positions in their tenant" ON positions;
+DROP POLICY IF EXISTS "Admins can delete positions in their tenant" ON positions;
 CREATE POLICY "Admins can delete positions in their tenant" ON positions
 FOR DELETE USING (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -91,6 +108,7 @@ FOR DELETE USING (
 );
 
 DROP POLICY IF EXISTS "Users can insert companies in their tenant" ON companies;
+DROP POLICY IF EXISTS "Admins can insert companies in their tenant" ON companies;
 CREATE POLICY "Admins can insert companies in their tenant" ON companies
 FOR INSERT WITH CHECK (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -98,6 +116,7 @@ FOR INSERT WITH CHECK (
 );
 
 DROP POLICY IF EXISTS "Users can update companies in their tenant" ON companies;
+DROP POLICY IF EXISTS "Admins can update companies in their tenant" ON companies;
 CREATE POLICY "Admins can update companies in their tenant" ON companies
 FOR UPDATE USING (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -108,6 +127,7 @@ FOR UPDATE USING (
 );
 
 DROP POLICY IF EXISTS "Users can delete companies in their tenant" ON companies;
+DROP POLICY IF EXISTS "Admins can delete companies in their tenant" ON companies;
 CREATE POLICY "Admins can delete companies in their tenant" ON companies
 FOR DELETE USING (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -115,6 +135,7 @@ FOR DELETE USING (
 );
 
 DROP POLICY IF EXISTS "Users can insert roles in their tenant" ON user_roles;
+DROP POLICY IF EXISTS "Admins can insert roles in their tenant" ON user_roles;
 CREATE POLICY "Admins can insert roles in their tenant" ON user_roles
 FOR INSERT WITH CHECK (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -122,6 +143,7 @@ FOR INSERT WITH CHECK (
 );
 
 DROP POLICY IF EXISTS "Users can update roles in their tenant" ON user_roles;
+DROP POLICY IF EXISTS "Admins can update roles in their tenant" ON user_roles;
 CREATE POLICY "Admins can update roles in their tenant" ON user_roles
 FOR UPDATE USING (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -132,6 +154,7 @@ FOR UPDATE USING (
 );
 
 DROP POLICY IF EXISTS "Users can delete roles in their tenant" ON user_roles;
+DROP POLICY IF EXISTS "Admins can delete roles in their tenant" ON user_roles;
 CREATE POLICY "Admins can delete roles in their tenant" ON user_roles
 FOR DELETE USING (
   (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
@@ -163,13 +186,17 @@ REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON role_permissions
 GRANT SELECT ON role_permissions TO authenticated;
 
 -- ============================================================
--- PART 3: FIX system_settings SELECT REGRESSION (20260817000004)
+-- PART 3: system_settings SELECT -- DEFENSIVE/IDEMPOTENT REINFORCEMENT
+-- (historically written to fix a 20260817000004 regression; see the
+-- RELEASE-BLOCKING FIX note at the top of this file for why that
+-- regression no longer exists in the current migration lineage)
 -- ============================================================
--- 20260817000004 changed system_settings SELECT from tenant-wide-active to
--- Admin-only, reasoning that "settings.view" should be Admin-only like the
--- Settings PAGE. This was WRONG: `system_settings` is a generic key/value
--- table holding operational configuration that many PERMITTED modules
--- legitimately read regardless of role --
+-- An EARLIER, uncorrected version of 20260817000004 changed system_settings
+-- SELECT from tenant-wide-active to Admin-only, reasoning that
+-- "settings.view" should be Admin-only like the Settings PAGE. This was
+-- WRONG: `system_settings` is a generic key/value table holding operational
+-- configuration that many PERMITTED modules legitimately read regardless of
+-- role --
 --   current_payroll_month           (src/utils/currentMonth.ts)  --
 --                                     Payroll/Payslips/Payments/Terminal
 --                                     Dues/Attendance/Reports all call
@@ -198,9 +225,18 @@ GRANT SELECT ON role_permissions TO authenticated;
 -- it would need to duplicate ~15 keys across getSystemCurrentMonth/
 -- getPayrollRates/getDefaultPageSize/getCompanySettings for no additional
 -- security benefit, since none of these values are sensitive.
+--
+-- Both possible pre-existing names are dropped before recreating, so this
+-- PART is safe regardless of which historical state a given database is
+-- in: "Admins can view settings in their tenant" (the uncorrected,
+-- Admin-only 20260817000004) OR "Users can view settings in their tenant"
+-- (the corrected-at-source 20260817000004 already live at current HEAD,
+-- which this PART's own CREATE POLICY below would otherwise collide with
+-- on a second/later application).
 -- ============================================================
 
 DROP POLICY IF EXISTS "Admins can view settings in their tenant" ON system_settings;
+DROP POLICY IF EXISTS "Users can view settings in their tenant" ON system_settings;
 CREATE POLICY "Users can view settings in their tenant" ON system_settings
 FOR SELECT USING (tenant_id = get_current_tenant_id() OR is_super_admin() = true);
 
@@ -337,13 +373,20 @@ GRANT SELECT ON employees_general TO authenticated;
 -- MIGRATION SAFETY NOTES
 -- ============================================================
 --
--- RUN ONCE / RUN TWICE: idempotent -- DROP POLICY IF EXISTS + CREATE
--- POLICY, REVOKE/GRANT (idempotent by nature), CREATE OR REPLACE VIEW.
+-- RUN ONCE / RUN TWICE: idempotent -- every PART 1/PART 3 policy DROPs
+-- BOTH its pre-existing legacy name AND its own current name before
+-- CREATE POLICY (so a second application's CREATE POLICY never collides
+-- with a policy the first application already created), REVOKE/GRANT are
+-- idempotent by nature, and CREATE OR REPLACE VIEW is idempotent by
+-- definition. A second application of this whole file succeeds cleanly.
 --
 -- DEPENDENCIES: requires 20260817000000 (is_business_admin(),
--- has_permission(), current_user_role_level() redefinition) and
--- 20260817000004 (the system_settings policies this PART 3 partially
--- reverts) to already be applied.
+-- has_permission(), current_user_role_level() redefinition) to already be
+-- applied. 20260817000004 must also already be applied -- PART 3 is
+-- defensive/idempotent reinforcement of that file's system_settings SELECT
+-- policy (safe against either its corrected or its historically-uncorrected
+-- state, see PART 3's own header), not a dependency on any particular
+-- state of it.
 --
 -- POSTGRES VERSION: `security_invoker` view option requires Postgres 15+.
 -- Supabase's current baseline is Postgres 15/16, so this should be
@@ -360,8 +403,13 @@ GRANT SELECT ON employees_general TO authenticated;
 --      operations_manager) account can no longer INSERT/UPDATE/DELETE
 --      regions/positions/companies/user_roles directly -- Admin-only now.
 --      SELECT is unchanged.
---   2. system_settings SELECT restored to tenant-wide-active -- undoes
---      20260817000004's over-restriction; INSERT/UPDATE remain Admin-only.
+--   2. system_settings SELECT: no behavior change at current HEAD --
+--      20260817000004 already carries tenant-wide-active SELECT (corrected
+--      at source), so PART 3 here just re-applies the same policy
+--      idempotently. On a database still running the OLDER, uncorrected
+--      20260817000004 (Admin-only SELECT), PART 3 restores tenant-wide
+--      access as originally intended. INSERT/UPDATE remain Admin-only
+--      either way, unchanged.
 --   3. generate_employee_number(UUID) no longer callable by `anon`
 --      (previously could be called, but would always fail with 'no tenant
 --      resolved' -- no functional change for any legitimate authenticated
