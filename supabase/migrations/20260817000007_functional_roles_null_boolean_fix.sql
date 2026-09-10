@@ -31,19 +31,40 @@
 -- `region_allowed('some-other-region')` returned NULL instead of the
 -- expected `false`.
 --
--- IMPACT ASSESSMENT: NOT a security bypass. Every call site either wraps
--- this in `... = true` (used throughout the RLS policies in this
--- rollout) or as a plpgsql `IF` condition -- Postgres treats NULL as NOT
+-- IMPACT ASSESSMENT (CORRECTED 2026-09-10, production preflight -- the
+-- original assessment below was WRONG for one call-site shape and is kept
+-- struck through for the record, not because it is still believed true):
+-- ~~NOT a security bypass. Every call site either wraps this in `... =
+-- true` ... or as a plpgsql `IF` condition -- Postgres treats NULL as NOT
 -- true in both a WHERE/USING clause and a plpgsql IF statement (same
--- practical effect as false: the row is excluded / the branch is
--- skipped). No account has ever been incorrectly authorized by this. It
--- is, however, a real correctness/robustness gap: a boolean-typed
--- function that can silently return NULL contradicts the NULL-safety
--- discipline this whole rollout otherwise follows (e.g. region_allowed()
--- deliberately using IS NOT DISTINCT FROM to avoid exactly this class of
--- footgun), and would bite any FUTURE caller that compares the result
--- directly (e.g. `is_business_admin() = false`, which does NOT match
--- NULL) instead of wrapping it in `= true` or an IF.
+-- practical effect as false ...). No account has ever been incorrectly
+-- authorized by this.~~
+--
+-- That is correct for a positive `IF is_business_admin() THEN ...` guard
+-- and for `... = true` in a WHERE/USING clause (NULL behaves like false
+-- in both). It is FALSE for the negative rejection-gate shape used
+-- throughout this schema's SECURITY DEFINER functions and triggers:
+--   IF NOT (is_super_admin() OR is_business_admin() OR ...) THEN
+--     RAISE EXCEPTION ...
+--   END IF;
+-- When is_business_admin() returns NULL and every other disjunct is
+-- false, the whole `(... OR NULL OR ...)` expression is NULL, not false --
+-- and PL/pgSQL treats a NULL `IF` condition exactly like false, so
+-- `IF NOT (NULL)` = `IF NULL` silently SKIPS the RAISE EXCEPTION instead
+-- of rejecting the caller. A 2026-09-10 audit confirmed this is a REAL,
+-- currently-live bypass in already-applied migrations, not a theoretical
+-- one: guard_employee_region_reassignment() (20260817000001) lets a
+-- functional-role caller reassign an employee's region without being an
+-- Admin; process_payroll_batch(), create_salary_advance(),
+-- approve_salary_advance(), and adjust_combined_repayment_plan()
+-- (20260817000003) each skip their region-boundary check entirely for a
+-- functional-role caller who otherwise passed their top-level
+-- authorization gate; get_applicant_dashboard_counts() (20260817000003)
+-- returns real region-scoped recruitment counts instead of the intended
+-- 0/0/0 refusal for a functional-role caller without recruitment.view.
+-- This fix closes all of those, for every current and future caller of
+-- is_business_admin(), by guaranteeing it can never return anything but a
+-- real true/false.
 -- ============================================================
 
 CREATE OR REPLACE FUNCTION is_business_admin()
@@ -72,10 +93,19 @@ $$;
 -- current_user_role_level(), and the original is_business_admin() this
 -- replaces).
 --
--- BEHAVIOR CHANGE FOR EXISTING CALLERS: none observable -- every existing
--- call site already treats NULL and false identically (see IMPACT
--- ASSESSMENT above). This purely makes the function's own return value
--- match its declared BOOLEAN type honestly.
+-- BEHAVIOR CHANGE FOR EXISTING CALLERS (CORRECTED 2026-09-10): real and
+-- security-relevant for the negative rejection-gate call sites named in
+-- the IMPACT ASSESSMENT above -- each of those functions/triggers now
+-- correctly REJECTS or REGION-RESTRICTS a functional-role caller it was
+-- previously letting through unchecked when is_business_admin() returned
+-- NULL. No change for any legacy account (role_level is never NULL, so
+-- is_business_admin() never returned NULL for them) and no change for any
+-- caller for whom another disjunct in the same OR-chain was already true
+-- (e.g. is_super_admin(), or a caller who legitimately holds the relevant
+-- has_permission() grant). For every other call site (RLS USING/WITH
+-- CHECK clauses, and positive `IF is_business_admin() THEN` guards), this
+-- purely makes the function's own return value match its declared
+-- BOOLEAN type honestly, with no behavior change, as originally stated.
 --
 -- VERIFICATION SQL (run immediately after applying, as a non-admin
 -- functional-role session, e.g. an Accountant with role_level = NULL):

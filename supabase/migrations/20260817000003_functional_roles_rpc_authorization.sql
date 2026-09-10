@@ -144,7 +144,18 @@ BEGIN
   END IF;
 
   -- AUTHORIZATION (functional-role branch added -- legacy check unchanged):
-  IF NOT (v_is_super_admin OR v_role_level = 1 OR has_permission('payroll.process')) THEN
+  -- RELEASE-BLOCKING FIX (2026-09-10, production preflight): v_role_level
+  -- is NULL for every functional-role account (by design). A bare
+  -- `v_role_level = 1` comparison against NULL evaluates to SQL NULL, not
+  -- false, which makes the whole `IF NOT (...)` condition NULL for a
+  -- functional-role caller who also lacks has_permission('payroll.process')
+  -- -- and PL/pgSQL treats a NULL IF condition the same as false, silently
+  -- skipping the RAISE EXCEPTION below instead of rejecting the caller.
+  -- Wrapped in COALESCE(..., false) so the comparison is always a real
+  -- boolean, closing that bypass without changing behavior for any legacy
+  -- account (whose role_level is never NULL) or any functional account
+  -- that legitimately holds payroll.process.
+  IF NOT (v_is_super_admin OR COALESCE(v_role_level = 1, false) OR has_permission('payroll.process')) THEN
     RAISE EXCEPTION 'Only Admins or super admins may process payroll';
   END IF;
 
@@ -439,7 +450,18 @@ BEGIN
   END IF;
 
   -- AUTHORIZATION -- functional-role branch added, legacy check unchanged.
-  IF NOT (v_is_super_admin OR v_role_level <= 2 OR has_permission('salary_advances.create')) THEN
+  -- RELEASE-BLOCKING FIX (2026-09-10, production preflight): v_role_level
+  -- is NULL for every functional-role account. A bare `v_role_level <= 2`
+  -- comparison against NULL evaluates to SQL NULL, not false, which makes
+  -- this whole `IF NOT (...)` NULL for a functional-role caller who also
+  -- lacks has_permission('salary_advances.create') -- and PL/pgSQL treats
+  -- a NULL IF condition the same as false, silently skipping the RAISE
+  -- EXCEPTION below instead of rejecting the caller. Wrapped in
+  -- COALESCE(..., false) so the comparison is always a real boolean,
+  -- closing that bypass without changing behavior for any legacy account
+  -- (role_level never NULL) or functional account that legitimately holds
+  -- salary_advances.create.
+  IF NOT (v_is_super_admin OR COALESCE(v_role_level <= 2, false) OR has_permission('salary_advances.create')) THEN
     RAISE EXCEPTION 'Only Admins, Managers, or super admins may create salary advances';
   END IF;
 
@@ -568,7 +590,18 @@ BEGIN
   END IF;
 
   -- AUTHORIZATION -- functional-role branch added, legacy check unchanged.
-  IF NOT (v_is_super_admin OR v_role_level <= 2 OR has_permission('salary_advances.approve')) THEN
+  -- RELEASE-BLOCKING FIX (2026-09-10, production preflight): v_role_level
+  -- is NULL for every functional-role account. A bare `v_role_level <= 2`
+  -- comparison against NULL evaluates to SQL NULL, not false, which makes
+  -- this whole `IF NOT (...)` NULL for a functional-role caller who also
+  -- lacks has_permission('salary_advances.approve') -- and PL/pgSQL treats
+  -- a NULL IF condition the same as false, silently skipping the RAISE
+  -- EXCEPTION below instead of rejecting the caller. Wrapped in
+  -- COALESCE(..., false) so the comparison is always a real boolean,
+  -- closing that bypass without changing behavior for any legacy account
+  -- (role_level never NULL) or functional account that legitimately holds
+  -- salary_advances.approve.
+  IF NOT (v_is_super_admin OR COALESCE(v_role_level <= 2, false) OR has_permission('salary_advances.approve')) THEN
     RAISE EXCEPTION 'Only Admins, Managers, or super admins may approve salary advances';
   END IF;
 
@@ -784,7 +817,18 @@ BEGIN
   END IF;
 
   -- AUTHORIZATION -- functional-role branch added, legacy check unchanged.
-  IF NOT (v_is_super_admin OR v_role_level <= 2 OR has_permission('salary_advances.adjust')) THEN
+  -- RELEASE-BLOCKING FIX (2026-09-10, production preflight): v_role_level
+  -- is NULL for every functional-role account. A bare `v_role_level <= 2`
+  -- comparison against NULL evaluates to SQL NULL, not false, which makes
+  -- this whole `IF NOT (...)` NULL for a functional-role caller who also
+  -- lacks has_permission('salary_advances.adjust') -- and PL/pgSQL treats
+  -- a NULL IF condition the same as false, silently skipping the RAISE
+  -- EXCEPTION below instead of rejecting the caller. Wrapped in
+  -- COALESCE(..., false) so the comparison is always a real boolean,
+  -- closing that bypass without changing behavior for any legacy account
+  -- (role_level never NULL) or functional account that legitimately holds
+  -- salary_advances.adjust.
+  IF NOT (v_is_super_admin OR COALESCE(v_role_level <= 2, false) OR has_permission('salary_advances.adjust')) THEN
     RAISE EXCEPTION 'Only Admins, Managers, or super admins may adjust a repayment plan';
   END IF;
 
