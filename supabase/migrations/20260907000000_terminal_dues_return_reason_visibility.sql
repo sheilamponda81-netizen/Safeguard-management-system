@@ -64,6 +64,95 @@ ALTER TABLE terminal_dues
   ADD COLUMN IF NOT EXISTS return_reason TEXT;
 
 -- ============================================================
+-- protect_terminal_dues_workflow_columns(): extended to cover the 4 new
+-- columns above (release-blocking fix, found during PR #36 audit, before
+-- this migration was ever applied anywhere)
+-- ============================================================
+-- 20260905000000 PART 6 already protects status/approved_by/approved_at/
+-- paid_by/paid_at/payment_date/payment_method/payment_reference/
+-- payment_notes against a direct client INSERT/UPDATE via this exact
+-- trigger function (same caller-identity logic: true super admin, or a
+-- write already running inside one of the 3 SECURITY DEFINER RPCs, passes
+-- through unchanged; an ordinary direct `authenticated` INSERT/UPDATE is
+-- rejected if it touches any protected column). The 4 columns this
+-- migration adds need the SAME protection -- without it, an HR caller
+-- (terminal_dues.edit only) could directly UPDATE returned_by/
+-- returned_by_name/returned_at/return_reason on a Pending row, forging a
+-- fake "Returned for Correction" panel (or erasing/altering a real one)
+-- with no Admin ever having actually returned it -- empirically
+-- reproduced against this exact migration chain before this fix was
+-- written.
+--
+-- CAREFUL DISTINCTION FROM THE OTHER 8 COLUMNS: those 8 are NEVER
+-- legitimately non-NULL while status='pending' (the RPCs only ever
+-- populate them together with a non-'pending' status, or clear them back
+-- to NULL on return), so an INSERT-time "must be NULL"/UPDATE-time "must
+-- be unchanged from OLD" check is unconditionally correct for them. These
+-- 4 return-metadata columns are DIFFERENT: they ARE legitimately non-NULL
+-- on a real, currently-Pending row (one that was returned for correction
+-- and has not yet been re-approved), and HR must remain able to edit such
+-- a row's ordinary financial fields without being blocked or forced to
+-- also touch this metadata. The fix below therefore uses the exact same
+-- "must be unchanged from OLD" rule already used for the other 8 columns
+-- on UPDATE (never an "must be NULL" rule) -- an ordinary HR financial-
+-- field edit never lists these 4 columns in its own UPDATE, so they stay
+-- at OLD's value regardless (plain SQL UPDATE semantics: an unlisted
+-- column keeps its current value), which trivially satisfies "unchanged"
+-- and is never rejected; only an explicit attempt to SET a different
+-- value is. For INSERT, the same "must be NULL" rule as the other 8
+-- columns applies without qualification -- a BRAND NEW terminal due can
+-- never legitimately already be "returned," regardless of status.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION protect_terminal_dues_workflow_columns()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF is_super_admin() OR current_user <> 'authenticated' THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status IS DISTINCT FROM 'pending'
+       OR NEW.approved_by IS NOT NULL OR NEW.approved_at IS NOT NULL
+       OR NEW.paid_by IS NOT NULL OR NEW.paid_at IS NOT NULL
+       OR NEW.payment_date IS NOT NULL OR NEW.payment_method IS NOT NULL
+       OR NEW.payment_reference IS NOT NULL OR NEW.payment_notes IS NOT NULL
+       OR NEW.returned_by IS NOT NULL OR NEW.returned_by_name IS NOT NULL
+       OR NEW.returned_at IS NOT NULL OR NEW.return_reason IS NOT NULL
+    THEN
+      RAISE EXCEPTION 'A new terminal due must be created as pending, with no approval/payment/return metadata -- those fields are set only by the approve/pay/return workflow actions';
+    END IF;
+  ELSE
+    IF NEW.status IS DISTINCT FROM OLD.status
+       OR NEW.approved_by IS DISTINCT FROM OLD.approved_by
+       OR NEW.approved_at IS DISTINCT FROM OLD.approved_at
+       OR NEW.paid_by IS DISTINCT FROM OLD.paid_by
+       OR NEW.paid_at IS DISTINCT FROM OLD.paid_at
+       OR NEW.payment_date IS DISTINCT FROM OLD.payment_date
+       OR NEW.payment_method IS DISTINCT FROM OLD.payment_method
+       OR NEW.payment_reference IS DISTINCT FROM OLD.payment_reference
+       OR NEW.payment_notes IS DISTINCT FROM OLD.payment_notes
+       OR NEW.returned_by IS DISTINCT FROM OLD.returned_by
+       OR NEW.returned_by_name IS DISTINCT FROM OLD.returned_by_name
+       OR NEW.returned_at IS DISTINCT FROM OLD.returned_at
+       OR NEW.return_reason IS DISTINCT FROM OLD.return_reason
+    THEN
+      RAISE EXCEPTION 'Status and approval/payment/return metadata may only be changed via the approve/pay/return workflow actions, not by directly editing a terminal due';
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+-- Trigger itself (trigger_protect_terminal_dues_workflow_columns,
+-- BEFORE INSERT OR UPDATE) and this function's REVOKE ALL from PUBLIC/
+-- anon/authenticated are both already in place from 20260905000000 PART 6
+-- -- CREATE OR REPLACE FUNCTION here does not need to re-create either.
+
+-- ============================================================
 -- return_terminal_due_for_correction(): now also stamps the row itself
 -- ============================================================
 -- Everything above the final UPDATE is UNCHANGED from 20260905000000
@@ -243,7 +332,9 @@ GRANT EXECUTE ON FUNCTION approve_terminal_due(UUID) TO authenticated;
 -- ============================================================
 --
 -- RUN ONCE / RUN TWICE: idempotent. ADD COLUMN IF NOT EXISTS x4; CREATE OR
--- REPLACE FUNCTION x2 (same signatures, no DROP).
+-- REPLACE FUNCTION x3 (protect_terminal_dues_workflow_columns(),
+-- return_terminal_due_for_correction(), approve_terminal_due() -- same
+-- signatures throughout, no DROP).
 --
 -- EXISTING ROWS: all 4 new columns are NULL on every existing row --
 -- reads correctly as "never returned for correction," including every
@@ -256,10 +347,27 @@ GRANT EXECUTE ON FUNCTION approve_terminal_due(UUID) TO authenticated;
 -- approving (a no-op UPDATE-wise for a record that was never returned,
 -- since they are already NULL). Neither function's authorization checks,
 -- state-transition guards, or audit_logs writes changed in any way.
+-- RELEASE-BLOCKING FIX (found during PR #36 audit, before this migration
+-- was ever applied anywhere): protect_terminal_dues_workflow_columns()
+-- (the BEFORE INSERT OR UPDATE trigger added in 20260905000000 PART 6) is
+-- extended here, via CREATE OR REPLACE, to also reject a direct client
+-- INSERT/UPDATE that sets or changes these 4 new columns -- without this,
+-- an HR caller (terminal_dues.edit only) could directly UPDATE
+-- returned_by/returned_by_name/returned_at/return_reason on a Pending
+-- row, forging a fake "Returned for Correction" panel with no Admin ever
+-- having actually returned it. Empirically reproduced and fixed before
+-- this migration was ever applied anywhere -- see this migration's own
+-- PART comment above the trigger function for the full analysis,
+-- including why an "always NULL" rule (correct for the other 8 protected
+-- columns) does NOT apply to these 4 -- they legitimately stay non-NULL
+-- on a real returned-to-Pending row, so the rule here is "unchanged from
+-- OLD," not "NULL."
 --
--- RLS: no policy changes. terminal_dues's existing SELECT policy already
--- covers every column (RLS in Postgres is row-level, not column-level),
--- so HR/Accountant/Admin/super-admin all see these 4 new columns exactly
+-- RLS: no policy changes in THIS migration (20260905000000 already added
+-- both the trigger and an INSERT status='pending' check -- see that
+-- file). terminal_dues's existing SELECT policy already covers every
+-- column (RLS in Postgres is row-level, not column-level), so HR/
+-- Accountant/Admin/super-admin all see these 4 new columns exactly
 -- wherever they could already see the row -- no new grant needed for the
 -- return reason to become visible.
 --
@@ -274,10 +382,23 @@ GRANT EXECUTE ON FUNCTION approve_terminal_due(UUID) TO authenticated;
 --   SELECT pg_get_functiondef('approve_terminal_due(uuid)'::regprocedure) LIKE '%returned_by_name = NULL%';
 --   -- expected: both true
 --
+--   SELECT pg_get_functiondef('protect_terminal_dues_workflow_columns()'::regprocedure) LIKE '%NEW.returned_by IS DISTINCT FROM OLD.returned_by%';
+--   -- expected: true -- confirms the trigger extension applied
+--   -- Functional check, as an HR Manager session (terminal_dues.edit,
+--   -- no .approve): a direct UPDATE of a Pending row setting returned_by/
+--   -- returned_by_name/returned_at/return_reason to any value must RAISE.
+--   -- A row genuinely returned via return_terminal_due_for_correction()
+--   -- must remain editable by that same HR session for its ordinary
+--   -- financial fields (deductions/uniform_refund/other_benefits/etc.),
+--   -- with returned_by/return_reason persisting unchanged afterward.
+--
 -- ROLLBACK SQL:
---   -- Re-apply 20260905000000's original CREATE OR REPLACE FUNCTION
---   -- bodies for return_terminal_due_for_correction() and
---   -- approve_terminal_due() (drops the new SET clauses), then:
+--   -- Re-apply 20260905000000's CREATE OR REPLACE FUNCTION body for
+--   -- protect_terminal_dues_workflow_columns() (the 8-column-only
+--   -- version, dropping the 4 returned_* checks), and its original
+--   -- CREATE OR REPLACE FUNCTION bodies for
+--   -- return_terminal_due_for_correction() and approve_terminal_due()
+--   -- (drops the new SET clauses), then:
 --   ALTER TABLE terminal_dues
 --     DROP COLUMN IF EXISTS returned_by,
 --     DROP COLUMN IF EXISTS returned_by_name,

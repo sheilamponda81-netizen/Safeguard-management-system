@@ -281,6 +281,7 @@ WITH CHECK (
 -- ============================================================
 
 DROP POLICY IF EXISTS "Terminal dues: create within tenant+region, action or legacy permitted" ON terminal_dues;
+DROP POLICY IF EXISTS "Terminal dues: create within tenant+region, explicit permission only" ON terminal_dues;
 CREATE POLICY "Terminal dues: create within tenant+region, explicit permission only" ON terminal_dues
 FOR INSERT WITH CHECK (
   is_current_user_active()
@@ -288,17 +289,199 @@ FOR INSERT WITH CHECK (
     is_super_admin()
     OR (
       tenant_id = get_current_tenant_id()
+      AND status = 'pending'
       AND EXISTS (SELECT 1 FROM employees e WHERE e.id = terminal_dues.employee_id AND region_allowed(e.region_id))
       AND has_explicit_permission('terminal_dues.create')
     )
   )
 );
 -- SELECT policy and "Super admins can delete terminal dues" unchanged --
--- this migration touches the UPDATE and INSERT policies only.
+-- this migration touches the UPDATE and INSERT policies only. The
+-- `AND status = 'pending'` clause added above (release-blocking fix, see
+-- PART 6 below for the full explanation and the primary mechanism that
+-- actually closes this gap) is cheap, redundant-for-a-well-behaved-client
+-- defense-in-depth, matching the UPDATE policy's own pre-existing
+-- status='pending' requirement -- it is NOT by itself sufficient (see
+-- PART 6), since it says nothing about approved_by/paid_by/payment_*/
+-- returned_* being forgeable while status stays 'pending' or 'INSERT'ed
+-- as NULL-violating values; PART 6's trigger is the real, complete fix.
 -- has_explicit_permission() is defined in PART 2 ABOVE both of these
 -- policies in file order, but since it is CREATE OR REPLACE'd before
 -- either CREATE POLICY statement runs (all execute in the same migration
 -- transaction, in file order), there is no forward-reference problem.
+
+-- ============================================================
+-- PART 6: protect_terminal_dues_workflow_columns() -- RELEASE-BLOCKING FIX
+-- (found during PR #36 audit, before this migration was ever applied to
+-- any environment)
+-- ============================================================
+--
+-- THE GAP: PART 4's UPDATE policy requires the row to already be, and
+-- remain, 'pending' -- but says nothing about the OTHER 8 columns this
+-- migration adds. PART 4b's INSERT policy (even with the status='pending'
+-- clause just added above) says nothing about them either. Empirically
+-- reproduced, against this exact migration chain, in a disposable local
+-- Postgres instance before this fix was written:
+--   * An HR caller (terminal_dues.create only) could INSERT a brand-new
+--     row with status='approved' or status='paid' directly, skipping
+--     Admin approval, Accountant payment recording, and the authoritative
+--     audit_logs trail entirely.
+--   * An HR caller (terminal_dues.edit only) could UPDATE a still-'pending'
+--     row to set approved_by/approved_at/paid_by/paid_at/payment_date/
+--     payment_method/payment_reference/payment_notes directly -- forging
+--     approval/payment evidence on a record nobody has actually approved
+--     or paid, while status='pending' satisfies PART 4's own USING/WITH
+--     CHECK trivially (neither clause says anything about these 8 other
+--     columns).
+-- Both are a direct, complete bypass of the separation-of-duties boundary
+-- this whole migration exists to build, contradicting its own explicit
+-- premise ("The lifecycle is strictly pending -> approved -> paid...
+-- enforced SERVER-SIDE").
+--
+-- WHY NOT COLUMN-LEVEL INSERT/UPDATE PRIVILEGES (REVOKE/GRANT): the
+-- obvious-looking alternative -- REVOKE INSERT/UPDATE on these columns
+-- from `authenticated`, GRANT only on the safe ones -- was seriously
+-- considered and empirically prototyped first, but rejected: column-level
+-- privilege is granted per ROLE, and every application session
+-- (ordinary HR/Admin/Accountant AND a true super admin) connects to
+-- PostgREST as the SAME `authenticated` role -- "is this caller a super
+-- admin" is a `profiles.is_super_admin` DATA flag, not a distinct
+-- Postgres role. A blanket column-level REVOKE would therefore ALSO block
+-- the true super admin's own direct UPDATE of status/approved_by/etc. --
+-- explicitly contradicting this migration's own documented, unchanged
+-- "TRUE PLATFORM SUPER ADMIN may retain emergency/bypass capability"
+-- architecture (PART 4's own comment: "a true super admin can still
+-- directly UPDATE any row including its status, exactly as before this
+-- migration"). Column-level privilege cannot express that conditional
+-- bypass; only a caller-identity-aware mechanism (RLS or a trigger) can.
+--
+-- WHY NOT PURE RLS (WITH CHECK alone): WITH CHECK can express "this
+-- column must equal a fixed value" (e.g. `approved_by IS NULL`), which
+-- DOES work for the 8 columns this migration adds (they are NEVER
+-- legitimately non-NULL while status='pending' -- the RPCs in PART 5 only
+-- ever populate them together with a non-'pending' status, or clear them
+-- back to NULL on return). But it CANNOT express "this column must be
+-- UNCHANGED from its value before this UPDATE" -- RLS has no OLD-row
+-- reference inside a single WITH CHECK expression. This distinction
+-- matters once Step 26 (20260907000000) adds returned_by/
+-- returned_by_name/returned_at/return_reason: those CAN legitimately be
+-- non-NULL on a real, currently-Pending row (one returned for
+-- correction), and HR must remain able to edit such a row's financial
+-- fields without being forced to also clear (or being blocked by) that
+-- return metadata -- an `IS NULL` requirement on those 4 columns would
+-- incorrectly reject that legitimate edit.
+--
+-- THE FIX: a BEFORE INSERT OR UPDATE trigger -- the same class of
+-- mechanism this schema already uses for the analogous problem on
+-- `profiles` (prevent_profile_privilege_escalation(), 20260727000001/
+-- 20260817000001/20260822000000) -- which has real OLD/NEW row access and
+-- can branch on caller identity. It:
+--   1. Lets a true super admin (is_super_admin()) through completely
+--      unchanged, on every column, preserving the documented bypass
+--      exactly.
+--   2. Lets a write through completely unchanged whenever it did NOT come
+--      directly from the `authenticated` role -- i.e. whenever it is
+--      running from INSIDE one of the 3 SECURITY DEFINER RPCs in PART 5
+--      (approve_terminal_due/record_terminal_due_payment/
+--      return_terminal_due_for_correction). SECURITY DEFINER re-points
+--      `current_user` to the FUNCTION'S OWNER for the duration of that
+--      function's body (a distinct, separate mechanism from the RLS/
+--      privilege-check role and from auth.uid()/the caller's real
+--      identity) -- so an UPDATE issued by those RPCs' own bodies always
+--      executes with current_user equal to their owner, NEVER
+--      `authenticated`, regardless of which real caller invoked the RPC.
+--      Empirically proven (not assumed) against this exact mechanism in a
+--      disposable local Postgres instance before this migration was
+--      written: a direct client UPDATE showed current_user =
+--      'authenticated' inside this exact trigger shape; an UPDATE issued
+--      from inside a SECURITY DEFINER function owned by a different role
+--      showed current_user equal to that owner, confirming the trigger
+--      can reliably tell the two apart.
+--   3. For every other case (an ordinary, non-super-admin, DIRECT client
+--      INSERT or UPDATE) -- the only case this fix needs to actually
+--      restrict -- REJECTS (RAISE EXCEPTION, not a silent value
+--      substitution, so a caller gets an explicit error rather than a
+--      confusingly different result than requested) any attempt to set
+--      status away from 'pending' or to set/change any of the 8 workflow/
+--      audit/payment columns this migration adds. `returned_by`/
+--      `returned_by_name`/`returned_at`/`return_reason` do not exist on
+--      this table until Step 26 (20260907000000) adds them -- see that
+--      migration's PART for how it extends this SAME function (via
+--      CREATE OR REPLACE) to cover those 4 columns identically once they
+--      exist, closing the same class of gap for them without touching
+--      this file again.
+--
+-- This function is deliberately declared WITHOUT SECURITY DEFINER
+-- (ordinary SECURITY INVOKER, the default) -- if it were SECURITY
+-- DEFINER, current_user would switch to ITS OWN owner the instant it
+-- began executing, destroying the exact signal it needs to read. Trigger
+-- functions do not need elevated privileges to read/write NEW/OLD (the
+-- trigger mechanism itself provides that row data regardless of invoker
+-- status) or to call is_super_admin() (itself independently SECURITY
+-- DEFINER).
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION protect_terminal_dues_workflow_columns()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  -- 1/2. True super admin, or a write already running inside one of the
+  -- 3 SECURITY DEFINER transition RPCs (current_user is their OWNER, not
+  -- `authenticated`, by the time their own UPDATE reaches this trigger) --
+  -- let it through completely unchanged, on every column.
+  IF is_super_admin() OR current_user <> 'authenticated' THEN
+    RETURN NEW;
+  END IF;
+
+  -- 3. An ordinary direct client INSERT or UPDATE -- reject any attempt
+  -- to set status away from 'pending' (INSERT) or to set/change status or
+  -- any workflow/audit/payment column at all (INSERT or UPDATE). This is
+  -- deliberately independent of has_explicit_permission(...) -- even a
+  -- caller who legitimately holds terminal_dues.approve/.pay must use the
+  -- PART 5 RPCs, never a raw INSERT/UPDATE, so that the authoritative
+  -- audit_logs entry and the RPCs' own state-transition/concurrency
+  -- guards (FOR UPDATE row lock, exact status-transition checks) can
+  -- never be bypassed.
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status IS DISTINCT FROM 'pending'
+       OR NEW.approved_by IS NOT NULL OR NEW.approved_at IS NOT NULL
+       OR NEW.paid_by IS NOT NULL OR NEW.paid_at IS NOT NULL
+       OR NEW.payment_date IS NOT NULL OR NEW.payment_method IS NOT NULL
+       OR NEW.payment_reference IS NOT NULL OR NEW.payment_notes IS NOT NULL
+    THEN
+      RAISE EXCEPTION 'A new terminal due must be created as pending, with no approval/payment metadata -- those fields are set only by the approve/pay workflow actions';
+    END IF;
+  ELSE
+    IF NEW.status IS DISTINCT FROM OLD.status
+       OR NEW.approved_by IS DISTINCT FROM OLD.approved_by
+       OR NEW.approved_at IS DISTINCT FROM OLD.approved_at
+       OR NEW.paid_by IS DISTINCT FROM OLD.paid_by
+       OR NEW.paid_at IS DISTINCT FROM OLD.paid_at
+       OR NEW.payment_date IS DISTINCT FROM OLD.payment_date
+       OR NEW.payment_method IS DISTINCT FROM OLD.payment_method
+       OR NEW.payment_reference IS DISTINCT FROM OLD.payment_reference
+       OR NEW.payment_notes IS DISTINCT FROM OLD.payment_notes
+    THEN
+      RAISE EXCEPTION 'Status and approval/payment metadata may only be changed via the approve/pay workflow actions, not by directly editing a terminal due';
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- Deliberately NOT callable directly by anyone -- this is a trigger-only
+-- function, same convention as prevent_profile_privilege_escalation().
+REVOKE ALL ON FUNCTION protect_terminal_dues_workflow_columns() FROM PUBLIC;
+REVOKE ALL ON FUNCTION protect_terminal_dues_workflow_columns() FROM anon;
+REVOKE ALL ON FUNCTION protect_terminal_dues_workflow_columns() FROM authenticated;
+
+DROP TRIGGER IF EXISTS trigger_protect_terminal_dues_workflow_columns ON terminal_dues;
+CREATE TRIGGER trigger_protect_terminal_dues_workflow_columns
+BEFORE INSERT OR UPDATE ON terminal_dues
+FOR EACH ROW EXECUTE FUNCTION protect_terminal_dues_workflow_columns();
 
 -- ============================================================
 -- PART 5: approve_terminal_due(), record_terminal_due_payment(),
@@ -600,6 +783,24 @@ GRANT EXECUTE ON FUNCTION return_terminal_due_for_correction(UUID, TEXT) TO auth
 --     grant) and remain so.
 --   * True super admin (is_super_admin()) behavior is unchanged everywhere
 --     in this migration.
+--   * REAL TIGHTENING #3 (release-blocking, found during PR #36 audit,
+--     before this migration was ever applied anywhere): the ORIGINAL
+--     shape of PART 4/4b's UPDATE/INSERT policies -- even with the
+--     has_explicit_permission()-only fix from tightenings #1/#2 already
+--     applied -- still let any caller holding terminal_dues.create/.edit
+--     directly INSERT a row with status='approved'/'paid' or forge
+--     approved_by/approved_at/paid_by/paid_at/payment_date/
+--     payment_method/payment_reference/payment_notes on an UPDATE while
+--     leaving status='pending' (which trivially satisfies both policies'
+--     own status check). Empirically reproduced against this exact
+--     migration chain in a disposable local Postgres instance. PART 6
+--     (protect_terminal_dues_workflow_columns(), a BEFORE INSERT OR
+--     UPDATE trigger) now closes this completely -- see PART 6's own
+--     header for the full analysis, including why column-level INSERT/
+--     UPDATE privileges were considered and rejected (they cannot express
+--     the required is_super_admin() conditional bypass, since every
+--     session -- super admin or not -- connects as the SAME
+--     `authenticated` Postgres role).
 --
 -- VERIFICATION SQL (run immediately after applying):
 --   SELECT column_name FROM information_schema.columns
@@ -611,6 +812,12 @@ GRANT EXECUTE ON FUNCTION return_terminal_due_for_correction(UUID, TEXT) TO auth
 --     ('has_explicit_permission','approve_terminal_due',
 --      'record_terminal_due_payment','return_terminal_due_for_correction');
 --   -- expected: 4 rows, all prosecdef = true
+--   SELECT proname, prosecdef FROM pg_proc WHERE proname = 'protect_terminal_dues_workflow_columns';
+--   -- expected: 1 row, prosecdef = false (deliberately SECURITY INVOKER --
+--   -- see PART 6's own comment for why)
+--   SELECT tgname, tgenabled FROM pg_trigger
+--     WHERE tgrelid = 'terminal_dues'::regclass AND tgname = 'trigger_protect_terminal_dues_workflow_columns';
+--   -- expected: 1 row, tgenabled = 'O' (enabled)
 --   SELECT role, permission FROM role_permissions WHERE permission LIKE 'terminal_dues.%' ORDER BY role, permission;
 --   -- expected: accountant/terminal_dues.pay, accountant/terminal_dues.view,
 --   -- admin/terminal_dues.approve, admin/terminal_dues.view,
@@ -622,9 +829,21 @@ GRANT EXECUTE ON FUNCTION return_terminal_due_for_correction(UUID, TEXT) TO auth
 --   -- row's with_check must each contain "has_explicit_permission" and
 --   -- must NOT contain "current_user_role_level" or "has_permission(" --
 --   -- if either does, the corresponding separation-of-duties fix above
---   -- did not apply.
+--   -- did not apply. The INSERT row's with_check must also contain
+--   -- "status = 'pending'".
+--   -- Functional check, as an HR Manager session (terminal_dues.create/
+--   -- .edit, no .approve/.pay): a direct INSERT with status='approved' or
+--   -- status='paid' must RAISE; a direct UPDATE of an existing pending
+--   -- row setting approved_by/paid_by/payment_reference must RAISE; a
+--   -- normal create (status omitted or 'pending', no other workflow
+--   -- fields set) and a normal edit of financial fields only must both
+--   -- SUCCEED. As a super admin session: a direct UPDATE setting status/
+--   -- approved_by directly must still SUCCEED (documented bypass,
+--   -- unchanged).
 --
 -- ROLLBACK SQL:
+--   DROP TRIGGER IF EXISTS trigger_protect_terminal_dues_workflow_columns ON terminal_dues;
+--   DROP FUNCTION IF EXISTS protect_terminal_dues_workflow_columns();
 --   DROP FUNCTION IF EXISTS return_terminal_due_for_correction(UUID, TEXT);
 --   DROP FUNCTION IF EXISTS record_terminal_due_payment(UUID, DATE, TEXT, TEXT, TEXT);
 --   DROP FUNCTION IF EXISTS approve_terminal_due(UUID);
