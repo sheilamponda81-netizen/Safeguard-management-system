@@ -380,34 +380,61 @@ FOR SELECT USING (
 -- (20260817000002) has the SAME unwrapped `EXISTS (SELECT 1 FROM
 -- employees e WHERE e.id = employee_deductions.employee_id AND
 -- region_allowed(e.region_id))` pattern Attendance had, in all 3 of its
--- own policies:
---   * SELECT's own gate is `current_user_role_level() IS NOT NULL OR
---     has_permission('attendance.view') OR has_permission('payslips.view')`
---     -- unlike employees/attendance/payroll, this table's own legacy
---     threshold is NOT part of this migration's PART 1 scope and is left
---     completely unchanged here -- but it means EVERY legacy account,
---     including role_level 3 and 4, is intended to keep passing this
---     table's OWN gate (per 20260817000002's own header: "SELECT
---     tenant-only (no gate -- Payslips.tsx, role_level 4-reachable, reads
---     this directly)"). Once PART 1 tightens `employees` SELECT to `<= 2`,
---     a role_level 3 or 4 caller newly fails the nested EXISTS subquery
---     even though employee_deductions' own SELECT policy still says yes --
---     the exact same silent-zero-rows failure mode PART 2 already fixed
---     for Attendance, confirmed here empirically the same way.
+-- own policies. FIX (region-check coupling only): identical in shape to
+-- PART 2 -- swap the inline EXISTS-against-employees subquery for
+-- employee_region_allowed(employee_deductions.employee_id).
+--
 --   * INSERT/UPDATE's own gate is `current_user_role_level() <= 3 OR
 --     has_permission('attendance.create'/'.edit')` -- a role_level 3
 --     (Legacy Supervisor) caller, who this table's own policy intends to
 --     keep allowing (matching Attendance's own <= 3 write threshold, per
 --     20260817000002's own header: "Write gated the same way as
---     attendance itself"), newly fails the nested EXISTS subquery for the
---     same reason.
--- FIX: identical in shape to PART 2 -- swap the inline EXISTS-against-
--- employees subquery for employee_region_allowed(employee_deductions.
--- employee_id). Each policy's own legacy-role/permission gate (the
--- `current_user_role_level()`/`has_permission(...)` clause) is otherwise
--- BYTE-IDENTICAL to its 20260817000002 original -- this PART changes
--- nothing about WHO is authorized, only HOW the region check underneath
--- that authorization is evaluated, exactly like PART 2.
+--     attendance itself"), newly fails the nested EXISTS subquery once
+--     PART 1 tightens `employees` SELECT -- fixed by the region-predicate
+--     swap above; this gate's own threshold is otherwise BYTE-IDENTICAL
+--     to its 20260817000002 original, unchanged.
+--
+--   * SELECT's own gate is ALSO tightened here, unlike INSERT/UPDATE
+--     above -- a genuine THIRD finding, found during pre-production
+--     review of this same PART, not merely the region-coupling fix:
+--     20260817000002's original SELECT gate,
+--     `current_user_role_level() IS NOT NULL OR has_permission(...)`,
+--     was justified at the time by that migration's own header ("SELECT
+--     tenant-only (no gate -- Payslips.tsx, role_level 4-reachable, reads
+--     this directly)") -- true when written, but THIS migration's own
+--     accompanying frontend change (see PART 3's header and App.tsx/
+--     Sidebar.tsx's rolePages[4]/roleMenuItems[4]) removes "payslips" from
+--     role_level 4's reachable pages entirely, for the same reason this
+--     migration disables Staff payroll SELECT at the database level (no
+--     profiles<->employees identity link to scope a self-only policy).
+--     Confirmed by auditing every CURRENT frontend read path for
+--     `employee_deductions` (Attendance.tsx: SELECT+INSERT+UPDATE;
+--     Payroll.tsx, Payments.tsx, Payslips.tsx, Reports.tsx: SELECT only)
+--     against rolePages/roleMenuItems as they exist in THIS commit: role_
+--     level 4's reachable page set is `["dashboard", "user-manual"]` --
+--     NONE of the 5 pages that read this table. Role_level 3 (Legacy
+--     Supervisor) reaches only `attendance` of the 5 (matching its own
+--     `<= 3` INSERT/UPDATE gate above and Attendance's own `<= 3` SELECT
+--     gate from PART 2). Role_level 1/2 reach the rest (payroll/payslips/
+--     payments/reports) via their existing, broader page sets. There is
+--     therefore no longer any legitimate role_level 4 workflow requiring
+--     `employee_deductions` SELECT, and the blanket `IS NOT NULL` bypass
+--     for it is now a stale grant this migration's own frontend change
+--     silently orphaned -- left uncorrected, a role_level 4 account could
+--     still SELECT this table directly via a raw API call despite having
+--     zero frontend path that ever would. Tightened to `<= 3`, the exact
+--     same threshold as Attendance's own SELECT/INSERT/UPDATE and this
+--     table's own INSERT/UPDATE (all already correct, all matching
+--     20260817000002's own header note that deductions are "edited from
+--     the Attendance page" and gated the same way) -- role_level 1/2/3
+--     keep this access unchanged (matching PR3's own frontend reachability
+--     above); only role_level 4 loses it, with no frontend path lost since
+--     none existed after this migration's own payslips removal. The
+--     `has_permission('attendance.view')`/`has_permission('payslips.view')`
+--     functional branches are untouched -- Operations Manager
+--     (attendance.view, 20260817000000) and Accountant (payslips.view,
+--     20260817000000) both keep this access exactly as before, via their
+--     own explicit permission grants, independent of any legacy threshold.
 -- ============================================================
 
 DROP POLICY IF EXISTS "Deductions: view within tenant+region, legacy open or new permission" ON employee_deductions;
@@ -419,7 +446,7 @@ FOR SELECT USING (
     OR (
       tenant_id = get_current_tenant_id()
       AND employee_region_allowed(employee_deductions.employee_id)
-      AND (current_user_role_level() IS NOT NULL OR has_permission('attendance.view') OR has_permission('payslips.view'))
+      AND (current_user_role_level() <= 3 OR has_permission('attendance.view') OR has_permission('payslips.view'))
     )
   )
 );
@@ -494,9 +521,14 @@ WITH CHECK (
 --     redesign exists to prevent (without it, this caller would have
 --     silently lost this access as a side effect of PART 1, despite
 --     neither table's own policy intending to restrict them).
---   - Legacy Staff (4): employee_deductions SELECT continues to work
---     exactly as before PART 1 (Payslips.tsx's own deductions read),
---     for the same reason.
+--   - Legacy Staff (4): loses direct SELECT on `employee_deductions` --
+--     a THIRD real tightening (PART 4's own header has the full audit):
+--     this migration's own accompanying frontend change removes every
+--     page that read this table for role_level 4 (Payslips already
+--     removed; role_level 4 never had Attendance/Payroll/Payments/Reports
+--     nav access to begin with), so the table's own SELECT gate is
+--     tightened from `IS NOT NULL` to `<= 3` to match -- no frontend
+--     workflow is lost, since none remained.
 --   - No caller gains anything they did not already have -- PART 2/3/4's
 --     employee_region_allowed() calls are a drop-in, same-result
 --     replacement for the EXISTS-subquery/region_allowed(region_id)
@@ -513,6 +545,10 @@ WITH CHECK (
 --   SELECT tablename, policyname, qual FROM pg_policies
 --     WHERE tablename = 'employees' AND cmd IN ('INSERT','UPDATE');
 --   -- expected: both show "<= 2", not "IS NOT NULL".
+--
+--   SELECT policyname, qual FROM pg_policies
+--     WHERE tablename = 'employee_deductions' AND cmd = 'SELECT';
+--   -- expected: qual shows "<= 3", not "IS NOT NULL".
 --
 --   SELECT tablename, policyname, cmd, qual, with_check FROM pg_policies
 --     WHERE tablename IN ('attendance','payroll','employee_deductions')
@@ -550,6 +586,7 @@ WITH CHECK (
 --   -- INSERT/UPDATE policies (also the EXISTS-subquery form) -- all
 --   -- reproduced verbatim in that migration's own file, substituting
 --   -- `IS NOT NULL` back in for `<= 2`/`<= 3` on employees/attendance/
---   -- payroll only (employee_deductions' own gates were never changed by
---   -- this migration and need no substitution).
+--   -- payroll, AND for employee_deductions' own SELECT policy (its
+--   -- INSERT/UPDATE gates were never changed by this migration and need
+--   -- no substitution).
 -- ============================================================
