@@ -107,6 +107,8 @@ DECLARE
   v_is_super BOOLEAN;
   v_role_level INTEGER;
   v_region_id UUID;
+  v_is_active BOOLEAN;
+  v_deleted_at TIMESTAMPTZ;
   v_requested_count INTEGER;
   v_updated_count INTEGER;
 BEGIN
@@ -149,8 +151,8 @@ BEGIN
   -- reference in this function, and returns the exact same data those
   -- helpers would have (same columns, same profiles row, same
   -- auth.uid()) without any search_path dependency at all.
-  SELECT p.tenant_id, COALESCE(p.is_super_admin, false), p.role_level, p.region_id
-  INTO v_tenant_id, v_is_super, v_role_level, v_region_id
+  SELECT p.tenant_id, COALESCE(p.is_super_admin, false), p.role_level, p.region_id, p.is_active, p.deleted_at
+  INTO v_tenant_id, v_is_super, v_role_level, v_region_id, v_is_active, v_deleted_at
   FROM public.profiles p
   WHERE p.id = v_caller_id;
 
@@ -161,10 +163,50 @@ BEGIN
     RAISE EXCEPTION 'No profile found for the authenticated caller' USING ERRCODE = '42501';
   END IF;
 
+  -- SECURITY (2026-09-08 production preflight): this function was
+  -- deliberately written to bypass get_current_tenant_id()/
+  -- is_super_admin()/current_user_role_level() (see the header note
+  -- above -- those helpers broke under this function's SET search_path =
+  -- '' at the time). Doing so also lost the is_active/deleted_at gating
+  -- those helpers provide -- v_is_super/v_role_level were being read as
+  -- raw column values with only a row-existence check, so a DEACTIVATED
+  -- super-admin or deactivated legacy Admin (role_level = 1) could still
+  -- approve/reject real payroll. Restored here, explicitly, matching what
+  -- get_current_tenant_id() etc. would have enforced.
+  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled' USING ERRCODE = '42501';
+  END IF;
+
   -- Same rule as canApprovePayroll client-side and the existing payroll
   -- UPDATE RLS policy's WITH CHECK: only role_level = 1 (Admin) or a
   -- super admin may approve/reject payroll.
-  IF NOT (v_is_super OR v_role_level = 1) THEN
+  --
+  -- SECURITY (release-blocking, found during PR #36 audit, confirmed
+  -- against the actual production function body): `v_role_level` is NULL
+  -- for every functional-role account (hr_manager/accountant/
+  -- operations_manager/functional admin -- by design). A bare
+  -- `v_role_level = 1` comparison against NULL evaluates to SQL NULL, not
+  -- false: `false OR NULL` is NULL, and `NOT NULL` is NULL. PL/pgSQL
+  -- treats a NULL IF condition the same as false, so the RAISE EXCEPTION
+  -- below was silently SKIPPED for any non-super, functional-role caller
+  -- -- there is no third has_permission(...) branch here (unlike
+  -- get_payroll_attendance_counts()), so this single gate is the ONLY
+  -- thing standing between an unauthorized caller and the UPDATE below,
+  -- whose own WHERE clause checks tenant/region for a non-super caller
+  -- but never re-checks role/permission. Empirically reproduced against
+  -- this exact function body: a functional Accountant (role_level NULL,
+  -- own tenant+region, not super-admin) successfully called this RPC and
+  -- it actually approved a real payroll row. Both operands are now
+  -- wrapped in COALESCE(..., false) so the expression is always a real
+  -- boolean, closing that bypass without changing the intended
+  -- authorization model in any way -- functional roles (including a
+  -- functional `role = 'admin'` account, whose role_level is also NULL)
+  -- remain NOT authorized to approve payroll through this RPC; only a
+  -- genuine legacy role_level = 1 account or a super admin is.
+  IF NOT (
+    COALESCE(v_is_super, false)
+    OR COALESCE(v_role_level = 1, false)
+  ) THEN
     RAISE EXCEPTION 'Only managers and admins can approve payroll' USING ERRCODE = '42501';
   END IF;
 

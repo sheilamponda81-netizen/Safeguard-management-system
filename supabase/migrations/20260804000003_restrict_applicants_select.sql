@@ -1,0 +1,115 @@
+-- ============================================================
+-- MIGRATION: Restrict direct `applicants` SELECT to Admin/Manager/Super Admin
+-- Date: 2026-08-04
+-- ============================================================
+--
+-- *** THIS IS PHASE 2 (CONTRACT) OF A 2-PHASE ROLLOUT. ***
+-- Phase 1 (EXPAND) is 20260804000002_applicant_dashboard_counts_rpc.sql,
+-- which must already be applied -- and the frontend commit that calls
+-- get_applicant_dashboard_counts() (src/pages/Dashboard.tsx) must already
+-- be the one actually deployed -- BEFORE this migration is applied
+-- anywhere. Applying this migration first, or applying it while an older
+-- frontend build (one still doing a direct `applicants` count SELECT) is
+-- still live, silently breaks the Dashboard's recruitment-count tile for
+-- every Supervisor/Staff user: their direct SELECT would return an empty
+-- set (not an error), so the tile would show 0/0/0 instead of the real
+-- counts, with nothing in the UI indicating why.
+--
+-- PRECONDITION CHECKLIST (verify all of these before applying this file):
+--   [ ] 20260804000002_applicant_dashboard_counts_rpc.sql has been applied
+--       to this database. Verify: SELECT proname FROM pg_proc WHERE
+--       proname = 'get_applicant_dashboard_counts'; -- expect 1 row.
+--   [ ] The frontend deployment that calls this RPC (the Dashboard.tsx
+--       commit introducing this 2-phase rollout) is confirmed live for
+--       ALL traffic to this database's environment -- no stale/cached
+--       build still issuing the old direct-SELECT count queries. For a
+--       Vercel deployment, this means the new build is promoted to
+--       Production (or the relevant Preview) and any CDN/edge cache for
+--       the old bundle has rolled off.
+--   [ ] A Supervisor or Staff test account, against the now-deployed
+--       frontend, has been manually confirmed to see correct (non-zero,
+--       where applicable) recruitment counts on the Dashboard BEFORE this
+--       migration narrows SELECT -- i.e. the RPC path is confirmed
+--       *working*, not just *present*.
+--
+-- WHY THIS IS ITS OWN MIGRATION, NOT PART OF
+-- 20260803000000_role_level_rls_hardening.sql
+-- -----------------------------------------------------------
+-- That migration was written and (at the time) both it and this file's
+-- Phase-1 RPC migration were new/unapplied to any database. An earlier
+-- version of that file bundled this exact SELECT restriction in
+-- alongside its other, ordering-independent changes (payment_status/
+-- terminal_dues SELECT+DELETE, employee_deductions DELETE, system_settings
+-- DELETE). Splitting it out here, after a dedicated safe-rollout review,
+-- is a deliberate correction: every other change in that file has no
+-- frontend dependency and is safe to apply the moment it's written, but
+-- THIS one specific change (`applicants` SELECT) does have a real
+-- dependency -- the counts RPC -- and deserves its own migration so the
+-- two can be applied at different times, in different environments, on
+-- different days if needed, without ever having to reason about partial
+-- application of a single larger file.
+--
+-- WHAT THIS MIGRATION DOES
+-- -----------------------------------------------------------
+-- Narrows `applicants`' SELECT policy from tenant-wide (any authenticated
+-- tenant member) to role_level <= 2 (Admin/Manager) OR super-admin --
+-- identical predicate shape to every other role-restricted policy in
+-- this schema. INSERT/UPDATE/DELETE on `applicants` are unaffected --
+-- they were already restricted to role_level <= 2 by
+-- 20260803000000_role_level_rls_hardening.sql.
+-- ============================================================
+
+DROP POLICY IF EXISTS "Users can view applicants in their tenant" ON applicants;
+DROP POLICY IF EXISTS "Managers can view applicants in their tenant" ON applicants;
+CREATE POLICY "Managers can view applicants in their tenant" ON applicants
+FOR SELECT USING (
+  (tenant_id = get_current_tenant_id() OR is_super_admin() = true)
+  AND (current_user_role_level() <= 2 OR is_super_admin() = true)
+);
+
+-- ============================================================
+-- MIGRATION SAFETY NOTES
+-- ============================================================
+--
+-- RUN ONCE / RUN TWICE: idempotent either way -- `DROP POLICY IF EXISTS`
+-- (both the original tenant-wide name and this migration's own name, so
+-- a re-run is safe regardless of which is currently in place) followed
+-- by `CREATE POLICY`.
+--
+-- DEPENDENCIES: `current_user_role_level()` (from
+-- 20260727000001_security_hardening.sql) and `get_current_tenant_id()`/
+-- `is_super_admin()` (from 20240619000000_tenant_isolation.sql) must
+-- already exist -- all three are already required by
+-- 20260803000000_role_level_rls_hardening.sql, which this migration is
+-- dated after. The REAL dependency this file adds beyond that is the
+-- deploy-ordering one described above (the RPC + frontend), which SQL
+-- itself cannot enforce -- it is a process precondition, not a technical
+-- one, hence the checklist above rather than a migration-time guard.
+--
+-- LOCKS TAKEN / PRODUCTION TRAFFIC IMPACT: brief `ACCESS EXCLUSIVE` for
+-- the policy catalog update only, same as every other pure-policy
+-- migration in this set -- no table scan, near-instantaneous.
+--
+-- PREFLIGHT: none needed -- policy change only, no data touched or
+-- validated.
+--
+-- VERIFICATION SQL (run immediately after applying):
+--   SELECT policyname, cmd FROM pg_policies WHERE tablename = 'applicants' ORDER BY cmd;
+--   -- Expected: SELECT/INSERT/UPDATE/DELETE all = "Managers can ... applicants in their tenant".
+--   -- As a Supervisor or Staff session:
+--   SELECT * FROM applicants LIMIT 1;                -- expect 0 rows (RLS denies silently, not an error)
+--   SELECT * FROM get_applicant_dashboard_counts();   -- expect a real row, 3 integers -- confirms the
+--                                                      -- RPC still works after this restriction, since
+--                                                      -- SECURITY DEFINER bypasses RLS entirely.
+--   -- As an Admin or Manager session:
+--   SELECT * FROM applicants LIMIT 1;                 -- expect real rows (subject to tenant scoping).
+--
+-- ROLLBACK SQL (safe at any time -- widens `applicants` SELECT back to
+-- tenant-wide; does so independently of Phase 1, so rolling back this
+-- migration alone does not remove the counts RPC):
+--   DROP POLICY IF EXISTS "Managers can view applicants in their tenant" ON applicants;
+--   CREATE POLICY "Users can view applicants in their tenant" ON applicants
+--   FOR SELECT USING (tenant_id = get_current_tenant_id() OR is_super_admin() = true);
+--
+-- END OF APPLICANTS SELECT RESTRICTION MIGRATION (PHASE 2 / CONTRACT)
+-- ============================================================

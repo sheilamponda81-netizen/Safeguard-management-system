@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Search,
   Download,
@@ -7,7 +7,6 @@ import {
   User,
   Clock,
   Calendar,
-  Filter,
   RefreshCw,
 } from "lucide-react";
 import {
@@ -15,24 +14,70 @@ import {
   Button,
   Badge,
   PageHeader,
-  THead,
-  TBody,
-  TR,
-  TH,
-  TD,
   Modal,
 } from "../components/ui";
 import { supabase } from "../lib/supabase";
 import { showNotification } from "../utils/clickHandlers";
+import { toCsvRow } from "../utils/csvExport";
+import { UserProfile } from "../utils/currentProfile";
+
+// Raw `audit_logs` row shape (query below is `select('*')`). `old_data`/
+// `new_data` stay `unknown` -- they're a generic per-entity_type payload
+// (see auditLogger.ts), only ever displayed via JSON.stringify or diffed
+// key-by-key here, never assumed to have a fixed shape.
+interface AuditLogRow {
+  id: string;
+  user_id: string | null;
+  user_email: string | null;
+  user_role: string | null;
+  region_id: string | null;
+  action: string;
+  entity_type: string | null;
+  entity_id: string | null;
+  old_data: unknown;
+  new_data: unknown;
+  user_agent: string | null;
+  ip_address: string | null;
+  created_at: string;
+  // Not a real column -- added client-side below (see fetchAuditLogs)
+  // by looking `region_id` up in the fetched `regions` Map.
+  region_name?: string | null;
+}
+
+// Loose shape covering every field the detail-modal's per-entity_type/
+// action panels below read out of old_data/new_data (LOGIN, attendance,
+// payment_status, ...). Each panel is already gated by a real
+// entity_type/action check at render time, so casting old_data/new_data to
+// this shape there reflects what that runtime check guarantees, not a
+// blind assumption -- these payloads are still genuinely variable per
+// entity_type (see auditLogger.ts), so no single named interface fits.
+interface AuditPayloadFields {
+  success?: boolean;
+  email?: string;
+  full_name?: string;
+  role_level?: number;
+  is_super_admin?: boolean;
+  region_name?: string;
+  error?: string;
+  status?: string;
+  employee_name?: string;
+  employee_number?: string;
+  date?: string;
+  month?: string;
+  payment_date?: string;
+  account_number?: string;
+  transaction_id?: string;
+  notes?: string;
+}
 
 export function AuditLogsPage() {
-  const [logs, setLogs] = useState<any[]>([]);
+  const [logs, setLogs] = useState<AuditLogRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [filterAction, setFilterAction] = useState("all");
   const [filterEntity, setFilterEntity] = useState("all");
-  const [userProfile, setUserProfile] = useState<any>(null);
-  const [selectedLog, setSelectedLog] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [selectedLog, setSelectedLog] = useState<AuditLogRow | null>(null);
   const [userLoading, setUserLoading] = useState(true);
   const [regions, setRegions] = useState<Map<string, string>>(new Map());
 
@@ -98,8 +143,8 @@ export function AuditLogsPage() {
     const fetchRegions = async () => {
       const { data } = await supabase.from("regions").select("id, name");
       if (data) {
-        const regionMap = new Map();
-        data.forEach((r: any) => regionMap.set(r.id, r.name));
+        const regionMap = new Map<string, string>();
+        data.forEach((r: { id: string; name: string }) => regionMap.set(r.id, r.name));
         setRegions(regionMap);
       }
     };
@@ -125,13 +170,7 @@ export function AuditLogsPage() {
     fetchUserProfile();
   }, []);
 
-  useEffect(() => {
-    if (userProfile) {
-      fetchAuditLogs();
-    }
-  }, [userProfile, filterAction, filterEntity]);
-
-  const fetchAuditLogs = async () => {
+  const fetchAuditLogs = useCallback(async () => {
     setLoading(true);
     try {
       let query = supabase
@@ -155,19 +194,25 @@ export function AuditLogsPage() {
       if (error) throw error;
       
       // Add region names to logs
-      const logsWithRegion = (data || []).map((log: any) => ({
+      const logsWithRegion = (data || []).map((log: AuditLogRow) => ({
         ...log,
         region_name: log.region_id ? regions.get(log.region_id) || null : null
       }));
-      
+
       setLogs(logsWithRegion);
-    } catch (err: any) {
+    } catch (err) {
       console.error("Error fetching audit logs:", err);
       showNotification("Failed to load audit logs", "error");
     } finally {
       setLoading(false);
     }
-  };
+  }, [filterAction, filterEntity, userProfile, regions]);
+
+  useEffect(() => {
+    if (userProfile) {
+      fetchAuditLogs();
+    }
+  }, [userProfile, filterAction, filterEntity, fetchAuditLogs]);
 
   const getActionBadgeColor = (action: string) => {
     switch (action) {
@@ -220,18 +265,18 @@ export function AuditLogsPage() {
   };
 
   // Helper to format attendance data
-  const formatAttendanceData = (data: any) => {
+  const formatAttendanceData = (data: Record<string, unknown>) => {
     if (!data) return null;
-    const formatted: any = {};
-    
+    const formatted: Record<string, unknown> = {};
+
     if (data.status) {
-      formatted.Status = statusLabels[data.status] || data.status;
+      formatted.Status = statusLabels[String(data.status)] || data.status;
     }
     if (data.employee_id) {
       formatted.Employee = data.employee_name || data.employee_id;
     }
     if (data.date) {
-      formatted.Date = new Date(data.date).toLocaleDateString();
+      formatted.Date = new Date(String(data.date)).toLocaleDateString();
     }
     if (data.employee_name) {
       formatted.Employee = data.employee_name;
@@ -239,24 +284,24 @@ export function AuditLogsPage() {
     if (data.employee_number) {
       formatted["Employee #"] = data.employee_number;
     }
-    
+
     // Copy any remaining fields
     Object.keys(data).forEach(key => {
       if (!['status', 'employee_id', 'date', 'employee_name', 'employee_number'].includes(key)) {
         formatted[key] = data[key];
       }
     });
-    
+
     return formatted;
   };
 
   // Helper to format payment data
-  const formatPaymentData = (data: any) => {
+  const formatPaymentData = (data: Record<string, unknown>) => {
     if (!data) return null;
-    const formatted: any = {};
-    
+    const formatted: Record<string, unknown> = {};
+
     if (data.status) {
-      formatted.Status = paymentStatusLabels[data.status] || data.status;
+      formatted.Status = paymentStatusLabels[String(data.status)] || data.status;
     }
     if (data.employee_name) {
       formatted.Employee = data.employee_name;
@@ -265,19 +310,19 @@ export function AuditLogsPage() {
       formatted["Employee #"] = data.employee_number;
     }
     if (data.pay_point) {
-      formatted["Pay Point"] = payPointLabels[data.pay_point] || data.pay_point;
+      formatted["Pay Point"] = payPointLabels[String(data.pay_point)] || data.pay_point;
     }
     if (data.amount) {
-      formatted.Amount = `MK ${data.amount.toLocaleString()}`;
+      formatted.Amount = `MK ${Number(data.amount).toLocaleString()}`;
     }
     if (data.net_pay) {
-      formatted["Net Pay"] = `MK ${data.net_pay.toLocaleString()}`;
+      formatted["Net Pay"] = `MK ${Number(data.net_pay).toLocaleString()}`;
     }
     if (data.payment_date) {
-      formatted["Payment Date"] = new Date(data.payment_date).toLocaleDateString();
+      formatted["Payment Date"] = new Date(String(data.payment_date)).toLocaleDateString();
     }
     if (data.month) {
-      const [year, month] = data.month.split('-');
+      const [year, month] = String(data.month).split('-');
       formatted.Month = new Date(parseInt(year), parseInt(month) - 1).toLocaleString('default', { month: 'long', year: 'numeric' });
     }
     if (data.account_number) {
@@ -289,22 +334,22 @@ export function AuditLogsPage() {
     if (data.notes) {
       formatted.Notes = data.notes;
     }
-    
+
     // Copy any remaining fields
     Object.keys(data).forEach(key => {
       if (!['status', 'employee_name', 'employee_number', 'pay_point', 'amount', 'net_pay', 'payment_date', 'month', 'account_number', 'transaction_id', 'notes'].includes(key)) {
         formatted[key] = data[key];
       }
     });
-    
+
     return formatted;
   };
 
   // Helper to format employee data
-  const formatEmployeeData = (data: any) => {
+  const formatEmployeeData = (data: Record<string, unknown>) => {
     if (!data) return null;
-    const formatted: any = {};
-    
+    const formatted: Record<string, unknown> = {};
+
     if (data.full_name) {
       formatted["Full Name"] = data.full_name;
     }
@@ -324,7 +369,7 @@ export function AuditLogsPage() {
       formatted.Workstation = data.workstation;
     }
     if (data.basic_salary) {
-      formatted["Basic Salary"] = `MK ${data.basic_salary.toLocaleString()}`;
+      formatted["Basic Salary"] = `MK ${Number(data.basic_salary).toLocaleString()}`;
     }
     if (data.phone) {
       formatted.Phone = data.phone;
@@ -335,12 +380,12 @@ export function AuditLogsPage() {
     if (data.status) {
       formatted.Status = data.status;
     }
-    
+
     return formatted;
   };
 
   // Main formatter that routes to the right formatter based on entity type
-  const formatEntityData = (entityType: string, data: any) => {
+  const formatEntityData = (entityType: string | null, data: Record<string, unknown>) => {
     if (!data) return null;
     
     switch (entityType) {
@@ -357,10 +402,10 @@ export function AuditLogsPage() {
   };
 
   // Render formatted data in a nice way
-  const renderFormattedData = (entityType: string, data: any, title: string) => {
-    if (!data || Object.keys(data).length === 0) return null;
-    
-    const formatted = formatEntityData(entityType, data);
+  const renderFormattedData = (entityType: string | null, data: unknown, title: string) => {
+    if (!data || typeof data !== "object" || Object.keys(data).length === 0) return null;
+
+    const formatted = formatEntityData(entityType, data as Record<string, unknown>);
     if (!formatted) return null;
     
     return (
@@ -406,7 +451,7 @@ export function AuditLogsPage() {
       JSON.stringify(log.new_data || log.old_data || {}),
     ]);
 
-    const csv = [headers.join(","), ...rows.map((row) => row.join(","))].join("\n");
+    const csv = [headers, ...rows].map(toCsvRow).join("\n");
 
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -652,14 +697,14 @@ export function AuditLogsPage() {
                       </span>
                     </td>
                     <td className="px-4 py-3">
-                      {log.new_data && Object.keys(log.new_data).length > 0 && (
+                      {typeof log.new_data === "object" && log.new_data !== null && Object.keys(log.new_data).length > 0 && (
                         <div className="text-xs text-slate-600 truncate max-w-[150px]">
                           {Object.keys(log.new_data).slice(0, 2).join(", ")}
                           {Object.keys(log.new_data).length > 2 &&
                             ` +${Object.keys(log.new_data).length - 2}`}
                         </div>
                       )}
-                      {!log.new_data && log.old_data && Object.keys(log.old_data).length > 0 && (
+                      {!log.new_data && typeof log.old_data === "object" && log.old_data !== null && Object.keys(log.old_data).length > 0 && (
                         <div className="text-xs text-slate-400 truncate max-w-[150px]">
                           Changed data
                         </div>
@@ -702,7 +747,10 @@ export function AuditLogsPage() {
         title="Audit Log Details"
         size="lg"
       >
-        {selectedLog && (
+        {selectedLog && (() => {
+          const oldData = selectedLog.old_data as AuditPayloadFields | null | undefined;
+          const newData = selectedLog.new_data as AuditPayloadFields | null | undefined;
+          return (
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div>
@@ -741,48 +789,48 @@ export function AuditLogsPage() {
             </div>
 
             {/* Show login details specially */}
-            {selectedLog.action === "LOGIN" && selectedLog.new_data && (
+            {selectedLog.action === "LOGIN" && newData && (
               <div className="p-3 bg-blue-50 rounded-lg border border-blue-200">
                 <p className="text-xs text-blue-700 font-semibold mb-2">🔐 Login Details</p>
                 <div className="grid grid-cols-2 gap-2 text-xs">
                   <div>
                     <span className="text-slate-500">Status:</span>
-                    <span className={`ml-2 font-semibold ${selectedLog.new_data.success ? 'text-green-600' : 'text-red-600'}`}>
-                      {selectedLog.new_data.success ? '✅ Success' : '❌ Failed'}
+                    <span className={`ml-2 font-semibold ${newData.success ? 'text-green-600' : 'text-red-600'}`}>
+                      {newData.success ? '✅ Success' : '❌ Failed'}
                     </span>
                   </div>
                   <div>
                     <span className="text-slate-500">Email:</span>
-                    <span className="ml-2">{selectedLog.new_data.email || 'N/A'}</span>
+                    <span className="ml-2">{newData.email || 'N/A'}</span>
                   </div>
-                  {selectedLog.new_data.full_name && (
+                  {newData.full_name && (
                     <div>
                       <span className="text-slate-500">Name:</span>
-                      <span className="ml-2">{selectedLog.new_data.full_name}</span>
+                      <span className="ml-2">{newData.full_name}</span>
                     </div>
                   )}
-                  {selectedLog.new_data.role_level !== undefined && (
+                  {newData.role_level !== undefined && (
                     <div>
                       <span className="text-slate-500">Role Level:</span>
-                      <span className="ml-2">{selectedLog.new_data.role_level}</span>
+                      <span className="ml-2">{newData.role_level}</span>
                     </div>
                   )}
-                  {selectedLog.new_data.is_super_admin !== undefined && (
+                  {newData.is_super_admin !== undefined && (
                     <div className="col-span-2">
                       <span className="text-slate-500">Super Admin:</span>
-                      <span className="ml-2">{selectedLog.new_data.is_super_admin ? '✅ Yes' : '❌ No'}</span>
+                      <span className="ml-2">{newData.is_super_admin ? '✅ Yes' : '❌ No'}</span>
                     </div>
                   )}
-                  {selectedLog.new_data.region_name && (
+                  {newData.region_name && (
                     <div className="col-span-2">
                       <span className="text-slate-500">Region:</span>
-                      <span className="ml-2">{selectedLog.new_data.region_name}</span>
+                      <span className="ml-2">{newData.region_name}</span>
                     </div>
                   )}
-                  {selectedLog.new_data.error && (
+                  {newData.error && (
                     <div className="col-span-2">
                       <span className="text-slate-500">Error:</span>
-                      <span className="ml-2 text-red-600">{selectedLog.new_data.error}</span>
+                      <span className="ml-2 text-red-600">{newData.error}</span>
                     </div>
                   )}
                 </div>
@@ -794,51 +842,51 @@ export function AuditLogsPage() {
               <div className="p-3 bg-purple-50 rounded-lg border border-purple-200">
                 <p className="text-xs text-purple-700 font-semibold mb-2">📋 Attendance Details</p>
                 <div className="grid grid-cols-2 gap-2 text-xs">
-                  {selectedLog.old_data && selectedLog.old_data.status && (
+                  {oldData && oldData.status && (
                     <div>
                       <span className="text-slate-500">Previous Status:</span>
                       <span className="ml-2 font-medium">
-                        {statusLabels[selectedLog.old_data.status] || selectedLog.old_data.status}
+                        {statusLabels[oldData.status] || oldData.status}
                       </span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.status && (
+                  {newData && newData.status && (
                     <div>
                       <span className="text-slate-500">New Status:</span>
                       <span className={`ml-2 font-medium ${
-                        selectedLog.new_data.status === 'P' ? 'text-emerald-600' :
-                        selectedLog.new_data.status === 'A' ? 'text-red-600' :
-                        selectedLog.new_data.status === 'L' ? 'text-yellow-600' :
-                        selectedLog.new_data.status === 'LV' ? 'text-blue-600' :
-                        selectedLog.new_data.status === 'SL' ? 'text-purple-600' :
+                        newData.status === 'P' ? 'text-emerald-600' :
+                        newData.status === 'A' ? 'text-red-600' :
+                        newData.status === 'L' ? 'text-yellow-600' :
+                        newData.status === 'LV' ? 'text-blue-600' :
+                        newData.status === 'SL' ? 'text-purple-600' :
                         'text-slate-600'
                       }`}>
-                        {statusLabels[selectedLog.new_data.status] || selectedLog.new_data.status}
+                        {statusLabels[newData.status] || newData.status}
                       </span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.employee_name && (
+                  {newData && newData.employee_name && (
                     <div className="col-span-2">
                       <span className="text-slate-500">Employee:</span>
-                      <span className="ml-2 font-medium">{selectedLog.new_data.employee_name}</span>
+                      <span className="ml-2 font-medium">{newData.employee_name}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.employee_number && (
+                  {newData && newData.employee_number && (
                     <div>
                       <span className="text-slate-500">Employee #:</span>
-                      <span className="ml-2">{selectedLog.new_data.employee_number}</span>
+                      <span className="ml-2">{newData.employee_number}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.date && (
+                  {newData && newData.date && (
                     <div>
                       <span className="text-slate-500">Date:</span>
-                      <span className="ml-2">{new Date(selectedLog.new_data.date).toLocaleDateString()}</span>
+                      <span className="ml-2">{new Date(newData.date).toLocaleDateString()}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.month && (
+                  {newData && newData.month && (
                     <div>
                       <span className="text-slate-500">Month:</span>
-                      <span className="ml-2">{selectedLog.new_data.month}</span>
+                      <span className="ml-2">{newData.month}</span>
                     </div>
                   )}
                 </div>
@@ -850,69 +898,69 @@ export function AuditLogsPage() {
               <div className="p-3 bg-green-50 rounded-lg border border-green-200">
                 <p className="text-xs text-green-700 font-semibold mb-2">💰 Payment Details</p>
                 <div className="grid grid-cols-2 gap-2 text-xs">
-                  {selectedLog.old_data && selectedLog.old_data.status && (
+                  {oldData && oldData.status && (
                     <div>
                       <span className="text-slate-500">Previous Status:</span>
                       <span className="ml-2 font-medium">
-                        {paymentStatusLabels[selectedLog.old_data.status] || selectedLog.old_data.status}
+                        {paymentStatusLabels[oldData.status] || oldData.status}
                       </span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.status && (
+                  {newData && newData.status && (
                     <div>
                       <span className="text-slate-500">New Status:</span>
                       <span className={`ml-2 font-medium ${
-                        selectedLog.new_data.status === 'confirmed' ? 'text-emerald-600' :
-                        selectedLog.new_data.status === 'paid' ? 'text-indigo-600' :
-                        selectedLog.new_data.status === 'processing' ? 'text-blue-600' :
-                        selectedLog.new_data.status === 'pending' ? 'text-yellow-600' :
-                        selectedLog.new_data.status === 'failed' ? 'text-red-600' :
+                        newData.status === 'confirmed' ? 'text-emerald-600' :
+                        newData.status === 'paid' ? 'text-indigo-600' :
+                        newData.status === 'processing' ? 'text-blue-600' :
+                        newData.status === 'pending' ? 'text-yellow-600' :
+                        newData.status === 'failed' ? 'text-red-600' :
                         'text-slate-600'
                       }`}>
-                        {paymentStatusLabels[selectedLog.new_data.status] || selectedLog.new_data.status}
+                        {paymentStatusLabels[newData.status] || newData.status}
                       </span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.employee_name && (
+                  {newData && newData.employee_name && (
                     <div className="col-span-2">
                       <span className="text-slate-500">Employee:</span>
-                      <span className="ml-2 font-medium">{selectedLog.new_data.employee_name}</span>
+                      <span className="ml-2 font-medium">{newData.employee_name}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.employee_number && (
+                  {newData && newData.employee_number && (
                     <div>
                       <span className="text-slate-500">Employee #:</span>
-                      <span className="ml-2">{selectedLog.new_data.employee_number}</span>
+                      <span className="ml-2">{newData.employee_number}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.month && (
+                  {newData && newData.month && (
                     <div>
                       <span className="text-slate-500">Month:</span>
-                      <span className="ml-2">{selectedLog.new_data.month}</span>
+                      <span className="ml-2">{newData.month}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.payment_date && (
+                  {newData && newData.payment_date && (
                     <div>
                       <span className="text-slate-500">Payment Date:</span>
-                      <span className="ml-2">{new Date(selectedLog.new_data.payment_date).toLocaleDateString()}</span>
+                      <span className="ml-2">{new Date(newData.payment_date).toLocaleDateString()}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.account_number && (
+                  {newData && newData.account_number && (
                     <div>
                       <span className="text-slate-500">Account #:</span>
-                      <span className="ml-2">{selectedLog.new_data.account_number}</span>
+                      <span className="ml-2">{newData.account_number}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.transaction_id && (
+                  {newData && newData.transaction_id && (
                     <div className="col-span-2">
                       <span className="text-slate-500">Transaction ID:</span>
-                      <span className="ml-2">{selectedLog.new_data.transaction_id}</span>
+                      <span className="ml-2">{newData.transaction_id}</span>
                     </div>
                   )}
-                  {selectedLog.new_data && selectedLog.new_data.notes && (
+                  {newData && newData.notes && (
                     <div className="col-span-2">
                       <span className="text-slate-500">Notes:</span>
-                      <span className="ml-2">{selectedLog.new_data.notes}</span>
+                      <span className="ml-2">{newData.notes}</span>
                     </div>
                   )}
                 </div>
@@ -924,11 +972,11 @@ export function AuditLogsPage() {
              selectedLog.entity_type !== "payment_status" && 
              selectedLog.action !== "LOGIN" && (
               <>
-                {selectedLog.old_data && Object.keys(selectedLog.old_data).length > 0 && (
-                  renderFormattedData(selectedLog.entity_type, selectedLog.old_data, "Previous Data")
+                {oldData && Object.keys(oldData).length > 0 && (
+                  renderFormattedData(selectedLog.entity_type, oldData, "Previous Data")
                 )}
-                {selectedLog.new_data && Object.keys(selectedLog.new_data).length > 0 && (
-                  renderFormattedData(selectedLog.entity_type, selectedLog.new_data, "New Data")
+                {newData && Object.keys(newData).length > 0 && (
+                  renderFormattedData(selectedLog.entity_type, newData, "New Data")
                 )}
               </>
             )}
@@ -936,27 +984,27 @@ export function AuditLogsPage() {
             {/* Show raw JSON if there's extra data not shown in the special views */}
             {selectedLog.entity_type === "attendance" && (
               <>
-                {selectedLog.old_data && Object.keys(selectedLog.old_data).filter(k => !['status'].includes(k)).length > 0 && (
-                  renderFormattedData(selectedLog.entity_type, selectedLog.old_data, "Previous Data (Additional)")
+                {oldData && Object.keys(oldData).filter(k => !['status'].includes(k)).length > 0 && (
+                  renderFormattedData(selectedLog.entity_type, oldData, "Previous Data (Additional)")
                 )}
-                {selectedLog.new_data && Object.keys(selectedLog.new_data).filter(k => !['status', 'employee_name', 'employee_number', 'date', 'month'].includes(k)).length > 0 && (
-                  renderFormattedData(selectedLog.entity_type, selectedLog.new_data, "New Data (Additional)")
+                {newData && Object.keys(newData).filter(k => !['status', 'employee_name', 'employee_number', 'date', 'month'].includes(k)).length > 0 && (
+                  renderFormattedData(selectedLog.entity_type, newData, "New Data (Additional)")
                 )}
               </>
             )}
 
             {selectedLog.entity_type === "payment_status" && (
               <>
-                {selectedLog.old_data && Object.keys(selectedLog.old_data).filter(k => !['status'].includes(k)).length > 0 && (
-                  renderFormattedData(selectedLog.entity_type, selectedLog.old_data, "Previous Data (Additional)")
+                {oldData && Object.keys(oldData).filter(k => !['status'].includes(k)).length > 0 && (
+                  renderFormattedData(selectedLog.entity_type, oldData, "Previous Data (Additional)")
                 )}
-                {selectedLog.new_data && Object.keys(selectedLog.new_data).filter(k => !['status', 'employee_name', 'employee_number', 'month', 'payment_date', 'account_number', 'transaction_id', 'notes'].includes(k)).length > 0 && (
-                  renderFormattedData(selectedLog.entity_type, selectedLog.new_data, "New Data (Additional)")
+                {newData && Object.keys(newData).filter(k => !['status', 'employee_name', 'employee_number', 'month', 'payment_date', 'account_number', 'transaction_id', 'notes'].includes(k)).length > 0 && (
+                  renderFormattedData(selectedLog.entity_type, newData, "New Data (Additional)")
                 )}
               </>
             )}
 
-            {!selectedLog.old_data && !selectedLog.new_data && (
+            {!oldData && !newData && (
               <div className="text-center py-4 text-slate-500 text-sm">
                 No additional data available for this log entry
               </div>
@@ -968,7 +1016,8 @@ export function AuditLogsPage() {
               </Button>
             </div>
           </div>
-        )}
+          );
+        })()}
       </Modal>
     </div>
   );

@@ -1,10 +1,12 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, UserCheck, XCircle, CheckCircle2, Eye, UserPlus, FileText } from '../utils/icons';
+import { Search, UserCheck, XCircle, CheckCircle2, Eye, Edit2, UserPlus, FileText } from '../utils/icons';
 
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { showNotification } from '../utils/clickHandlers';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
+import { buildApplicantUpdatePatch } from '../utils/applicantEditing';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
@@ -20,7 +22,7 @@ interface Applicant {
   interview_status: string;
   decision: string;
   application_date: string;
-  cover_letter?: string;
+  cover_letter?: string | null;
   cv_url?: string;
   region_id?: string;
 }
@@ -179,6 +181,159 @@ function AddApplicantModal({ showAddModal, onClose, isSuperAdmin, userRegion, re
   );
 }
 
+interface EditApplicantModalProps {
+  applicant: Applicant | null;
+  onClose: () => void;
+  onSave: (id: string, updatedFields: any) => Promise<void>;
+}
+
+// A genuine, standalone component for the exact same reason
+// AddApplicantModal (above) is one, not a closure invoked as a plain
+// function -- see that component's own header comment for the React
+// error #310 class of bug this file already hit once from that pattern.
+// Deliberately has NO region field at all (for anyone, admin included):
+// editing an applicant's personal/application details is a distinct
+// concern from reassigning their region, which this form was never asked
+// to support -- and non-admin edits are additionally blocked from ever
+// changing region_id by trg_guard_applicant_region_assignment
+// (20260817000001_functional_roles_direct_region_tables.sql) regardless,
+// so omitting the field here can never silently attempt something RLS
+// would reject anyway.
+function EditApplicantModal({ applicant, onClose, onSave }: EditApplicantModalProps) {
+  const [formData, setFormData] = useState({
+    name: '',
+    position: '',
+    qualification: '',
+    phone: '',
+    email: '',
+    experience: '',
+    coverLetter: '',
+  });
+
+  // Re-seeds local form state from whichever applicant is currently being
+  // edited -- this modal is a single long-lived component instance (not
+  // remounted per row), so its own state must be explicitly refreshed
+  // every time `applicant` changes to a different row, or a second edit
+  // would open pre-filled with the FIRST applicant's stale values.
+  useEffect(() => {
+    if (applicant) {
+      setFormData({
+        name: applicant.name || '',
+        position: applicant.position || '',
+        qualification: applicant.qualification || '',
+        phone: applicant.phone || '',
+        email: applicant.email || '',
+        experience: applicant.experience || '',
+        coverLetter: applicant.cover_letter || '',
+      });
+    }
+  }, [applicant]);
+
+  return (
+    <Modal open={!!applicant} onClose={onClose} title="Edit Applicant" size="lg">
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="editApplicantName" className="block text-sm font-medium text-slate-700 mb-1.5">Full Name *</label>
+            <input
+              id="editApplicantName"
+              name="editApplicantName"
+              type="text"
+              value={formData.name}
+              onChange={(e: any) => setFormData({ ...formData, name: e.target.value })}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+              required
+            />
+          </div>
+          <div>
+            <label htmlFor="editApplicantPosition" className="block text-sm font-medium text-slate-700 mb-1.5">Position Applied *</label>
+            <input
+              id="editApplicantPosition"
+              name="editApplicantPosition"
+              type="text"
+              value={formData.position}
+              onChange={(e: any) => setFormData({ ...formData, position: e.target.value })}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+              required
+            />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="editApplicantQualification" className="block text-sm font-medium text-slate-700 mb-1.5">Qualification</label>
+            <input
+              id="editApplicantQualification"
+              name="editApplicantQualification"
+              type="text"
+              value={formData.qualification}
+              onChange={(e: any) => setFormData({ ...formData, qualification: e.target.value })}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+          <div>
+            <label htmlFor="editApplicantExperience" className="block text-sm font-medium text-slate-700 mb-1.5">Years of Experience</label>
+            <input
+              id="editApplicantExperience"
+              name="editApplicantExperience"
+              type="text"
+              value={formData.experience}
+              onChange={(e: any) => setFormData({ ...formData, experience: e.target.value })}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="editApplicantPhone" className="block text-sm font-medium text-slate-700 mb-1.5">Phone Number</label>
+            <input
+              id="editApplicantPhone"
+              name="editApplicantPhone"
+              type="tel"
+              value={formData.phone}
+              onChange={(e: any) => setFormData({ ...formData, phone: e.target.value })}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+          <div>
+            <label htmlFor="editApplicantEmail" className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
+            <input
+              id="editApplicantEmail"
+              name="editApplicantEmail"
+              type="email"
+              value={formData.email}
+              onChange={(e: any) => setFormData({ ...formData, email: e.target.value })}
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+            />
+          </div>
+        </div>
+        <div>
+          <label htmlFor="editApplicantCoverLetter" className="block text-sm font-medium text-slate-700 mb-1.5">Cover Letter</label>
+          <textarea
+            id="editApplicantCoverLetter"
+            name="editApplicantCoverLetter"
+            rows={3}
+            value={formData.coverLetter}
+            onChange={(e: any) => setFormData({ ...formData, coverLetter: e.target.value })}
+            placeholder="Write a cover letter or notes about this applicant..."
+            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
+          />
+        </div>
+      </div>
+      <div className="flex justify-end gap-2 mt-6">
+        <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium hover:bg-slate-50">Cancel</button>
+        <button
+          type="button"
+          onClick={() => applicant && onSave(applicant.id, formData)}
+          disabled={!formData.name || !formData.position}
+          className="px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] disabled:opacity-50"
+        >
+          Save Changes
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 export function RecruitmentPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [applicants, setApplicants] = useState<Applicant[]>([]);
@@ -187,8 +342,13 @@ export function RecruitmentPage() {
   const [filter, setFilter] = useState('all');
   const [view, setView] = useState<Applicant | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [editingApplicant, setEditingApplicant] = useState<Applicant | null>(null);
   const [userProfile, setUserProfile] = useState<any>(null);
   const [regions, setRegions] = useState<any[]>([]);
+  // Gates the Edit action ONLY -- never a hardcoded role check. Fail-
+  // closed (false) until resolved, same convention as every other page's
+  // canX permission flags in this app.
+  const [canEditApplicant, setCanEditApplicant] = useState(false);
 
   // ===== PAGINATION STATES =====
   const [recruitmentPage, setRecruitmentPage] = useState(1);
@@ -230,6 +390,8 @@ export function RecruitmentPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
+    const isLegacy = (profile?.role_level ?? null) !== null;
+    setCanEditApplicant(await canAccess(isLegacy, PERMISSIONS.RECRUITMENT_EDIT));
   }, []);
 
   // Only needed for a super admin to pick which region a new applicant
@@ -379,6 +541,56 @@ export function RecruitmentPage() {
     }
   }, [applicants, userProfile]);
 
+  // ===== EDIT APPLICANT DETAILS =====
+  // Deliberately separate from `update()` above: this only ever writes
+  // name/position/qualification/phone/email/experience/cover_letter --
+  // interview_status, decision, and region_id are never included in the
+  // payload, so an edit can never accidentally reset a pipeline status or
+  // move an applicant to a different region. RLS's own UPDATE policy
+  // (recruitment.edit) and trg_guard_applicant_region_assignment enforce
+  // the same tenant/region boundary server-side regardless.
+  const updateApplicantDetails = useCallback(async (id: string, updatedFields: any) => {
+    const applicant = applicants.find(a => a.id === id);
+    if (!applicant) return;
+
+    if (!userProfile?.is_super_admin && applicant.region_id && applicant.region_id !== userProfile?.region_id) {
+      showNotification('You can only edit applicants from your region', 'error');
+      return;
+    }
+
+    const patch = buildApplicantUpdatePatch(updatedFields);
+
+    const { error } = await supabase
+      .from('applicants')
+      .update(patch)
+      .eq('id', id);
+
+    if (error) {
+      showNotification('Error updating applicant: ' + error.message, 'error');
+    } else {
+      setApplicants(applicants.map(a => a.id === id ? { ...a, ...patch } : a));
+
+      await logAudit({
+        action: 'UPDATE',
+        entity_type: 'applicant',
+        entity_id: id,
+        old_data: {
+          name: applicant.name,
+          position: applicant.position,
+          qualification: applicant.qualification,
+          phone: applicant.phone,
+          email: applicant.email,
+          experience: applicant.experience,
+        },
+        new_data: patch,
+        region_id: userProfile?.region_id
+      });
+
+      showNotification('Applicant details updated', 'success');
+      setEditingApplicant(null);
+    }
+  }, [applicants, userProfile]);
+
   // ===== VIEW APPLICANT =====
   const handleViewApplicant = useCallback(async (applicant: Applicant) => {
     setView(applicant);
@@ -514,16 +726,26 @@ export function RecruitmentPage() {
                   <TD className="hidden lg:table-cell"><Badge color={app.decision === 'Hire' ? 'green' : app.decision === 'Reject' ? 'red' : 'gray'}>{app.decision}</Badge></TD>
                   <TD className="text-right">
                     <div className="flex items-center justify-end gap-1">
-                      <button 
+                      <button
                         type="button"
-                        onClick={() => handleViewApplicant(app)} 
+                        onClick={() => handleViewApplicant(app)}
                         className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"
                       >
                         <Eye size={14} />
                       </button>
-                      <button 
+                      {canEditApplicant && (
+                        <button
+                          type="button"
+                          onClick={() => setEditingApplicant(app)}
+                          className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"
+                          title="Edit applicant details"
+                        >
+                          <Edit2 size={14} />
+                        </button>
+                      )}
+                      <button
                         type="button"
-                        onClick={() => update(app.id, 'Shortlisted')} 
+                        onClick={() => update(app.id, 'Shortlisted')}
                         disabled={app.interview_status === 'Shortlisted'} 
                         className="px-2 py-1 text-xs rounded-md bg-blue-50 text-blue-700 hover:bg-blue-100 disabled:opacity-50"
                       >
@@ -617,6 +839,12 @@ export function RecruitmentPage() {
         userRegion={userRegion}
         regions={regions}
         addApplicant={addApplicant}
+      />
+
+      <EditApplicantModal
+        applicant={editingApplicant}
+        onClose={() => setEditingApplicant(null)}
+        onSave={updateApplicantDetails}
       />
     </div>
   );

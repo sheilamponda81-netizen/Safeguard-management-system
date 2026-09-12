@@ -3,9 +3,10 @@ import { Search, Download, DollarSign, CheckCircle, XCircle, Clock, Banknote, Sm
 
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { supabase } from '../lib/supabase';
-import { getCurrentProfile } from '../utils/currentProfile';
+import { getCurrentProfile, UserProfile, UserProfileRegion } from '../utils/currentProfile';
 import { formatKwacha } from '../data';
 import { showNotification } from '../utils/clickHandlers';
+import { toCsvRow } from '../utils/csvExport';
 import { logAudit } from '../utils/auditLogger';
 import {
   getSystemCurrentMonth,
@@ -21,9 +22,30 @@ import { getPayrollRates } from '../utils/payrollSettings';
 import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
 import { getDefaultPageSize } from '../utils/uiSettings';
 
+// Shape of each row in the `payments` list -- built in fetchPaymentData below
+// by merging employees, live/approved payroll, and payment_status rows.
+interface PaymentRecord {
+  id: string;
+  employee_id: string;
+  full_name: string;
+  employee_number: string;
+  phone: string | null;
+  region_id: string | null;
+  company: string | null;
+  workstation: string | null;
+  pay_point: string | null;
+  account_number: string;
+  net_pay: number;
+  net_pay_is_estimate: boolean;
+  status: string;
+  payment_date: string;
+  transaction_id: string;
+  notes: string;
+}
+
 export function PaymentsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
-  const [payments, setPayments] = useState<any[]>([]);
+  const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [selectedMonth, setSelectedMonth] = useState('');
@@ -34,11 +56,11 @@ export function PaymentsPage() {
   const [filterCompany, setFilterCompany] = useState('');
   const [filterWorkstation, setFilterWorkstation] = useState('');
   const [filterPayPoint, setFilterPayPoint] = useState('all');
-  const [userProfile, setUserProfile] = useState<any>(null);
-  const [regions, setRegions] = useState<any[]>([]);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [regions, setRegions] = useState<UserProfileRegion[]>([]);
   const [companies, setCompanies] = useState<string[]>([]);
   const [workstations, setWorkstations] = useState<string[]>([]);
-  const [editingPayment, setEditingPayment] = useState<any>(null);
+  const [editingPayment, setEditingPayment] = useState<PaymentRecord | null>(null);
   const [showEditModal, setShowEditModal] = useState(false);
   const [selectedEmployees, setSelectedEmployees] = useState<string[]>([]);
   const [processingBulk, setProcessingBulk] = useState(false);
@@ -80,7 +102,7 @@ export function PaymentsPage() {
   // fast -- especially in bulkUpdateStatus, which previously did one such
   // scan per selected employee (O(selected x payments)).
   const paymentsByEmployee = useMemo(() => {
-    const map = new Map<string, any>();
+    const map = new Map<string, PaymentRecord>();
     payments.forEach(p => map.set(p.employee_id, p));
     return map;
   }, [payments]);
@@ -112,8 +134,12 @@ export function PaymentsPage() {
   const fetchPaymentData = useCallback(async () => {
     setLoading(true);
     try {
+      // employees_general: non-sensitive employee read surface (Design B2) --
+      // Payments never needs guard/security-only fields, and this keeps
+      // those columns out of reach even if the base employees table's own
+      // grants are ever tightened (Phase C).
       let employeesQuery = supabase
-        .from('employees')
+        .from('employees_general')
         .select('*')
         .eq('is_deleted', false); // <-- CRITICAL: Exclude deleted employees
       
@@ -347,11 +373,11 @@ export function PaymentsPage() {
       const employeeName = existing?.full_name || 'Unknown';
       const employeeNumber = existing?.employee_number || 'N/A';
       
-      const updateData: any = {
+      const updateData: { status: string; updated_at: string; payment_date?: string } = {
         status: newStatus,
         updated_at: new Date().toISOString()
       };
-      
+
       if (newStatus === 'paid' && existing?.status !== 'paid') {
         updateData.payment_date = new Date().toISOString().split('T')[0];
       }
@@ -416,10 +442,10 @@ export function PaymentsPage() {
       console.error('Error updating status:', err);
       showNotification('Failed to update status', 'error');
     }
-  }, [canEdit, payments, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== UPDATE PAYMENT DETAILS =====
-  const updatePaymentDetails = useCallback(async (payment: any) => {
+  const updatePaymentDetails = useCallback(async (payment: PaymentRecord) => {
     if (!canEdit) {
       showNotification('Payments can only be edited for the current month.', 'error');
       return;
@@ -485,7 +511,7 @@ export function PaymentsPage() {
       console.error('Error updating:', err);
       showNotification('Failed to update payment details', 'error');
     }
-  }, [canEdit, payments, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== BULK UPDATE STATUS =====
   const bulkUpdateStatus = useCallback(async (newStatus: string) => {
@@ -501,7 +527,7 @@ export function PaymentsPage() {
     
     setProcessingBulk(true);
     let successCount = 0;
-    const updatedEmployees: any[] = [];
+    const updatedEmployees: { employee_id: string; employee_name: string; employee_number: string; old_status: string; new_status: string }[] = [];
     
     for (const employeeId of selectedEmployees) {
       const payment = paymentsByEmployee.get(employeeId);
@@ -510,7 +536,7 @@ export function PaymentsPage() {
       const employeeNumber = payment?.employee_number || 'N/A';
       
       try {
-        const updateData: any = { status: newStatus, updated_at: new Date().toISOString() };
+        const updateData: { status: string; updated_at: string; payment_date?: string } = { status: newStatus, updated_at: new Date().toISOString() };
         if (newStatus === 'paid' && payment?.status !== 'paid') {
           updateData.payment_date = new Date().toISOString().split('T')[0];
         }
@@ -563,7 +589,7 @@ export function PaymentsPage() {
     setSelectedEmployees([]);
     fetchPaymentData();
     setProcessingBulk(false);
-  }, [canEdit, selectedEmployees, payments, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, selectedEmployees, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== EXPORT PAYMENTS =====
   const exportPayments = useCallback(() => {
@@ -583,7 +609,7 @@ export function PaymentsPage() {
         p.payment_date || '',
         p.notes || ''
       ])
-    ].map(row => row.join(',')).join('\n');
+    ].map(toCsvRow).join('\n');
     
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
@@ -611,7 +637,7 @@ export function PaymentsPage() {
     });
     
     showNotification('Payments exported successfully', 'success');
-  }, [payments, regions, selectedMonth, userProfile]);
+  }, [payments, regions, selectedMonth, userProfile, filterStatus, filterRegion, filterCompany, filterWorkstation, filterPayPoint]);
 
   // ===== TOGGLE SELECT =====
   const toggleSelectAll = useCallback(() => {
@@ -660,7 +686,7 @@ export function PaymentsPage() {
     );
   }, []);
 
-  const getPaymentMethodIcon = useCallback((method: string) => {
+  const getPaymentMethodIcon = useCallback((method: string | null) => {
     if (!method) return <Wallet size={14} className="text-gray-400" />;
     if (method.includes('bank')) return <Banknote size={14} className="text-blue-500" />;
     if (method.includes('money')) return <Smartphone size={14} className="text-green-500" />;

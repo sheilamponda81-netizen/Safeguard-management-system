@@ -8,7 +8,10 @@ export const generatePerformanceReport = () => {
   console.log('');
 
   // Navigation Timing
-  const nav = performance.getEntriesByType('navigation')[0];
+  // getEntriesByType('navigation') always returns PerformanceNavigationTiming
+  // entries at runtime; the DOM lib's overload just doesn't narrow past the
+  // base PerformanceEntry from the string literal alone.
+  const nav = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
   if (nav) {
     console.log('🔹 Navigation Timing:');
     console.log(`   DNS Lookup: ${Math.round(nav.domainLookupEnd - nav.domainLookupStart)}ms`);
@@ -30,7 +33,8 @@ export const generatePerformanceReport = () => {
   console.log('');
 
   // Resource Summary
-  const resources = performance.getEntriesByType('resource');
+  // Same as above: 'resource' entries are always PerformanceResourceTiming.
+  const resources = performance.getEntriesByType('resource') as PerformanceResourceTiming[];
   const byType = {
     script: 0,
     style: 0,

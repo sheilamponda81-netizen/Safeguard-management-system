@@ -11,8 +11,20 @@ import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
+import { toCsvRow } from '../utils/csvExport';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
+
+// 'payroll' is financial. 'recruitment' is its OWN category, deliberately
+// NOT grouped with the other operational tabs -- Operations Manager has
+// reports.operational.view but is explicitly denied Recruitment
+// everywhere else in the app (no recruitment.view), so the Recruitment
+// report must not become a side door into a module Operations Manager
+// cannot otherwise reach. Every remaining tab (employee/company/
+// workstation/attendance/department) is operational.
+export const FINANCIAL_REPORT_IDS: ReportType[] = ['payroll'];
+export const RECRUITMENT_REPORT_IDS: ReportType[] = ['recruitment'];
 
 interface Employee {
   id: string;
@@ -70,6 +82,13 @@ interface WorkstationStats {
   payrollTotal: number;
 }
 
+// Accumulator shape used while building company stats -- workstations are
+// keyed by name here for O(1) lookup per employee, then converted to the
+// CompanyStats[] array shape (WorkstationStats[]) once accumulation is done.
+interface CompanyStatsAccumulator extends Omit<CompanyStats, 'workstations'> {
+  workstations: Record<string, WorkstationStats>;
+}
+
 export function ReportsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [activeReport, setActiveReport] = useState<ReportType>('company');
@@ -82,6 +101,27 @@ export function ReportsPage() {
   const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [hasData, setHasData] = useState(true);
   const [userProfile, setUserProfile] = useState<any>(null);
+  // Financial (payroll) vs operational (everything else) report access --
+  // legacy accounts (role_level set) keep their existing unrestricted
+  // access to every tab, unchanged. A new functional-role account is
+  // gated: Accountant gets both financial and operational (view + export),
+  // Operations Manager gets operational VIEW ONLY (no export, no
+  // financial), HR Manager gets neither (denied Reports entirely -- never
+  // reaches this page per Sidebar/App.tsx's NAV_PERMISSIONS, which has no
+  // 'reports' entry for recruitment.view).
+  const [canViewFinancial, setCanViewFinancial] = useState(true);
+  const [canExportFinancial, setCanExportFinancial] = useState(true);
+  // Recruitment is its OWN category, deliberately NOT part of
+  // "operational" -- Operations Manager has reports.operational.view but
+  // is explicitly denied Recruitment everywhere else in the app (no
+  // recruitment.view), so the Recruitment report must not become a side
+  // door into a module Operations Manager cannot otherwise reach. Only
+  // Accountant (of the 3 non-admin functional roles) is seeded with
+  // reports.recruitment.view/export -- see 20260817000006.
+  const [canViewRecruitment, setCanViewRecruitment] = useState(true);
+  const [canExportRecruitment, setCanExportRecruitment] = useState(true);
+  const [canViewOperational, setCanViewOperational] = useState(true);
+  const [canExportOperational, setCanExportOperational] = useState(true);
   // Same shared rates/gates Payroll.tsx and Payments.tsx use, so a report for
   // an unprocessed month shows the same live-calculated figures those pages
   // show -- not a naive "basic salary as net pay" guess.
@@ -172,7 +212,7 @@ export function ReportsPage() {
 
   // ===== COMPANY DATA - Using companies table and assignment_type =====
   const companyData = useMemo(() => {
-    const companyMap: Record<string, CompanyStats> = {};
+    const companyMap: Record<string, CompanyStatsAccumulator> = {};
     
     activeEmployees.forEach(emp => {
       // Determine the entity name based on assignment type
@@ -318,14 +358,24 @@ export function ReportsPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
+
+    const isLegacy = (profile?.role_level ?? null) !== null;
+    setCanViewFinancial(await canAccess(isLegacy, PERMISSIONS.REPORTS_FINANCIAL_VIEW));
+    setCanExportFinancial(await canAccess(isLegacy, PERMISSIONS.REPORTS_FINANCIAL_EXPORT));
+    setCanViewRecruitment(await canAccess(isLegacy, PERMISSIONS.REPORTS_RECRUITMENT_VIEW));
+    setCanExportRecruitment(await canAccess(isLegacy, PERMISSIONS.REPORTS_RECRUITMENT_EXPORT));
+    setCanViewOperational(await canAccess(isLegacy, PERMISSIONS.REPORTS_OPERATIONAL_VIEW));
+    setCanExportOperational(await canAccess(isLegacy, PERMISSIONS.REPORTS_OPERATIONAL_EXPORT));
   }, []);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
       // CRITICAL: Exclude deleted employees
+      // employees_general: non-sensitive employee read surface (Design B2) --
+      // confirmed no report tab references any guard/security-only column.
       let employeesQuery = supabase
-        .from('employees')
+        .from('employees_general')
         .select('*')
         .eq('is_deleted', false);
       
@@ -365,24 +415,22 @@ export function ReportsPage() {
       );
 
       const employeeIds = (employeesData || []).map(e => e.id);
-      const [yearStr, monthStr] = selectedMonth.split('-');
-      const year = parseInt(yearStr, 10);
-      const monthNum = parseInt(monthStr, 10);
-      const monthStart = `${selectedMonth}-01`;
-      const lastDay = new Date(year, monthNum, 0).getDate();
-      const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
 
       const deductionCounts = new Map<string, AttendanceCount>();
       const rateStats = new Map<string, { present: number; total: number }>();
       if (employeeIds.length > 0) {
+        // Report-scoped RPC (see 20260817000006) -- gated by
+        // reports.operational.view, NOT attendance.view, so this cannot be
+        // used to browse the live Attendance module/grid; it only returns
+        // employee_id/status for the region-allowed subset of the
+        // requested employee ids and month.
         const { data: attendanceData } = await supabase
-          .from('attendance')
-          .select('employee_id, status')
-          .gte('date', monthStart)
-          .lte('date', monthEnd)
-          .in('employee_id', employeeIds);
+          .rpc('get_report_attendance_summary', { p_employee_ids: employeeIds, p_month: selectedMonth });
 
-        (attendanceData || []).forEach(record => {
+        // No generated Supabase types exist in this project -- cast
+        // explicitly to the shape get_report_attendance_summary() actually
+        // returns, matching the pattern used for get_applicant_dashboard_counts().
+        ((attendanceData || []) as { employee_id: string; status: string }[]).forEach(record => {
           const dc = deductionCounts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
           if (record.status === 'A') dc.absentDays += 1;
           if (record.status === 'L') dc.lateDays += 1;
@@ -405,10 +453,12 @@ export function ReportsPage() {
         .eq('month', selectedMonth);
       setDeductionsByEmployee(new Map((deductionsData || []).map(d => [d.employee_id, d])));
 
+      // Report-scoped RPC (see 20260817000006) -- gated by
+      // reports.recruitment.view, NOT recruitment.view, so this cannot be
+      // used to browse the live Recruitment pipeline; it returns only the
+      // 6 columns this report actually renders, region-scoped server-side.
       const { data: applicantsData, error: appError } = await supabase
-        .from('applicants')
-        .select('*')
-        .order('created_at', { ascending: false });
+        .rpc('get_report_recruitment_data');
       if (appError) throw appError;
       setApplicants(applicantsData || []);
 
@@ -578,7 +628,12 @@ export function ReportsPage() {
           ])
         };
       case 'company':
-        return {
+        // Total Payroll is PAYROLL data (money) baked into what is
+        // otherwise an operational report -- a caller without
+        // reports.financial.view (e.g. Operations Manager) must not see it
+        // here either, or this "operational" tab becomes a side door into
+        // the denied Payroll report.
+        return canViewFinancial ? {
           title: 'Company & Resident Report',
           headers: ['Name', 'Type', 'Total Employees', 'Active', 'Total Payroll', 'Workstations/Sites'],
           rows: companyData.map(company => [
@@ -589,9 +644,19 @@ export function ReportsPage() {
             formatKwacha(company.totalPayroll),
             company.workstations.map(w => `${sanitizeInput(w.name)}: ${w.employeeCount}`).join(' | ')
           ])
+        } : {
+          title: 'Company & Resident Report',
+          headers: ['Name', 'Type', 'Total Employees', 'Active', 'Workstations/Sites'],
+          rows: companyData.map(company => [
+            sanitizeInput(company.name),
+            company.type === 'resident' ? '🏠 Resident' : '🏢 Company',
+            company.totalEmployees,
+            company.activeEmployees,
+            company.workstations.map(w => `${sanitizeInput(w.name)}: ${w.employeeCount}`).join(' | ')
+          ])
         };
       case 'workstation':
-        return {
+        return canViewFinancial ? {
           title: 'Workstation Analysis Report',
           headers: ['Workstation/Site', 'Total Employees', 'Active', 'Total Payroll', 'Companies/Residents'],
           rows: workstationData.map(ws => [
@@ -603,9 +668,20 @@ export function ReportsPage() {
               `${entity.type === 'resident' ? '🏠' : '🏢'} ${sanitizeInput(entity.name)}: ${entity.count}`
             ).join(' | ')
           ])
+        } : {
+          title: 'Workstation Analysis Report',
+          headers: ['Workstation/Site', 'Total Employees', 'Active', 'Companies/Residents'],
+          rows: workstationData.map(ws => [
+            sanitizeInput(ws.name),
+            ws.totalEmployees,
+            ws.activeEmployees,
+            Object.values(ws.entities).map(entity =>
+              `${entity.type === 'resident' ? '🏠' : '🏢'} ${sanitizeInput(entity.name)}: ${entity.count}`
+            ).join(' | ')
+          ])
         };
       default:
-        return {
+        return canViewFinancial ? {
           title: 'Department Report',
           headers: ['Department', 'Employees', 'Total Payroll', 'Average Salary', 'Attendance'],
           rows: departmentData.map(dept => [
@@ -615,9 +691,17 @@ export function ReportsPage() {
             formatKwacha(dept.average),
             `${dept.attendance}%`
           ])
+        } : {
+          title: 'Department Report',
+          headers: ['Department', 'Employees', 'Attendance'],
+          rows: departmentData.map(dept => [
+            sanitizeInput(dept.name),
+            `${dept.employees} employees`,
+            `${dept.attendance}%`
+          ])
         };
     }
-  }, [activeReport, activeEmployees, applicants, companyData, workstationData, departmentData, getEmployeeFigures, getEmployeeAttendanceRate]);
+  }, [activeReport, activeEmployees, applicants, companyData, workstationData, departmentData, getEmployeeFigures, getEmployeeAttendanceRate, canViewFinancial]);
 
   // ===== EXPORT REPORT =====
   const exportReport = useCallback(async () => {
@@ -627,19 +711,28 @@ export function ReportsPage() {
     
     let csvContent = `${reportData.title}\nGenerated: ${new Date().toLocaleString()}\n\n${reportData.headers.join(',')}\n`;
     reportData.rows.forEach(row => {
-      csvContent += row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',') + '\n';
+      csvContent += toCsvRow(row) + '\n';
     });
     if (activeReport === 'payroll') {
       csvContent += `\n\nSUMMARY\nTotal Gross Pay,${formatKwacha(payrollSummary.totalGross)}\nTotal Net Pay,${formatKwacha(payrollSummary.totalNet)}\n`;
     }
+    // Total Payroll summary lines are financial data -- omitted for a
+    // caller without reports.financial.view, same reasoning as the column
+    // redaction in `currentData` above.
     if (activeReport === 'department') {
-      csvContent += `\n\nSUMMARY\nTotal Departments,${departmentData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
+      csvContent += canViewFinancial
+        ? `\n\nSUMMARY\nTotal Departments,${departmentData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`
+        : `\n\nSUMMARY\nTotal Departments,${departmentData.length}\nTotal Employees,${activeEmployees.length}\n`;
     }
     if (activeReport === 'company') {
-      csvContent += `\n\nSUMMARY\nTotal Companies/Residents,${companyData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
+      csvContent += canViewFinancial
+        ? `\n\nSUMMARY\nTotal Companies/Residents,${companyData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`
+        : `\n\nSUMMARY\nTotal Companies/Residents,${companyData.length}\nTotal Employees,${activeEmployees.length}\n`;
     }
     if (activeReport === 'workstation') {
-      csvContent += `\n\nSUMMARY\nTotal Workstations/Sites,${workstationData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`;
+      csvContent += canViewFinancial
+        ? `\n\nSUMMARY\nTotal Workstations/Sites,${workstationData.length}\nTotal Employees,${activeEmployees.length}\nTotal Payroll,${formatKwacha(payrollSummary.totalNet)}\n`
+        : `\n\nSUMMARY\nTotal Workstations/Sites,${workstationData.length}\nTotal Employees,${activeEmployees.length}\n`;
     }
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -674,7 +767,19 @@ export function ReportsPage() {
     { id: 'attendance', label: 'Attendance', icon: Calendar },
     { id: 'recruitment', label: 'Recruitment', icon: UserCheck },
     { id: 'department', label: 'Departments', icon: PieChart }
-  ], []);
+  ].filter((tab) => {
+    if (FINANCIAL_REPORT_IDS.includes(tab.id as ReportType)) return canViewFinancial;
+    if (RECRUITMENT_REPORT_IDS.includes(tab.id as ReportType)) return canViewRecruitment;
+    return canViewOperational;
+  }), [canViewFinancial, canViewRecruitment, canViewOperational]);
+
+  const isActiveReportFinancial = FINANCIAL_REPORT_IDS.includes(activeReport);
+  const isActiveReportRecruitment = RECRUITMENT_REPORT_IDS.includes(activeReport);
+  const canExportActiveReport = isActiveReportFinancial
+    ? canExportFinancial
+    : isActiveReportRecruitment
+    ? canExportRecruitment
+    : canExportOperational;
 
   // ===== RENDER =====
   if (loading) {
@@ -733,12 +838,16 @@ export function ReportsPage() {
               </button>
             )}
 
-            <Button variant="outline" onClick={exportReport}>
-              <FileDown size={14} className="mr-1" /> Export
-            </Button>
-            <Button variant="secondary" onClick={exportReport}>
-              <FileSpreadsheet size={14} className="mr-1" /> CSV
-            </Button>
+            {canExportActiveReport && (
+              <>
+                <Button variant="outline" onClick={exportReport}>
+                  <FileDown size={14} className="mr-1" /> Export
+                </Button>
+                <Button variant="secondary" onClick={exportReport}>
+                  <FileSpreadsheet size={14} className="mr-1" /> CSV
+                </Button>
+              </>
+            )}
           </div>
         }
       />
@@ -855,10 +964,12 @@ export function ReportsPage() {
                   <span className="text-slate-500">Active:</span>
                   <span className="font-semibold">{company.activeEmployees}/{company.totalEmployees}</span>
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Monthly Payroll:</span>
-                  <span className="font-semibold text-[#D4A017]">{formatKwacha(company.totalPayroll)}</span>
-                </div>
+                {canViewFinancial && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Monthly Payroll:</span>
+                    <span className="font-semibold text-[#D4A017]">{formatKwacha(company.totalPayroll)}</span>
+                  </div>
+                )}
                 <div className="border-t pt-2 mt-2">
                   <p className="text-xs text-slate-500 mb-2">Workstations/Sites:</p>
                   <div className="space-y-1">
@@ -898,10 +1009,12 @@ export function ReportsPage() {
                   <span className="text-slate-500">Active Employees:</span>
                   <span className="font-semibold">{ws.activeEmployees}/{ws.totalEmployees}</span>
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Monthly Payroll:</span>
-                  <span className="font-semibold text-[#D4A017]">{formatKwacha(ws.totalPayroll)}</span>
-                </div>
+                {canViewFinancial && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Monthly Payroll:</span>
+                    <span className="font-semibold text-[#D4A017]">{formatKwacha(ws.totalPayroll)}</span>
+                  </div>
+                )}
                 <div className="border-t pt-2 mt-2">
                   <p className="text-xs text-slate-500 mb-2">Companies/Residents at this site:</p>
                   <div className="flex flex-wrap gap-1">

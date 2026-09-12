@@ -5,6 +5,7 @@ import { checkRateLimit } from '../utils/rateLimiter';
 // ===== Import audit logger =====
 import { logAudit } from '../utils/auditLogger';
 import { getCompanySettings } from '../utils/companySettings';
+import { getErrorMessage } from '../utils/errorHandler';
 
 export function LoginPage({ onLogin }: { onLogin: () => void }) {
   const [username, setUsername] = useState('');
@@ -107,12 +108,12 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
       }
 
       if (data?.user) {
-        const { data: profile, error: profileError } = await supabase
+        const { data: rawProfile, error: profileError } = await supabase
           .from("profiles")
           .select(`
-            role_level, 
-            full_name, 
-            is_super_admin, 
+            role_level,
+            full_name,
+            is_super_admin,
             region_id,
             regions:region_id (
               name
@@ -124,6 +125,19 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
         if (profileError) {
           console.error("Error fetching profile:", profileError);
         }
+
+        // Without generated Supabase types, the client can't infer that
+        // `region_id` is a many-to-one foreign key, so it types the embedded
+        // `regions` resource as an array; at runtime (and per the actual FK
+        // cardinality) PostgREST returns a single object here, never an array.
+        interface ProfileWithRegion {
+          role_level: number;
+          full_name: string;
+          is_super_admin: boolean;
+          region_id: string | null;
+          regions: { name: string } | null;
+        }
+        const profile = rawProfile as unknown as ProfileWithRegion | null;
 
         // Get region name
         const regionName = profile?.regions?.name || null;
@@ -150,14 +164,14 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
             region_name: regionName,
             timestamp: new Date().toISOString()
           },
-          region_id: profile?.region_id
+          region_id: profile?.region_id ?? undefined
         });
 
         onLogin();
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('Login error:', err);
-      
+
       // ===== Log login error =====
       await logAudit({
         action: 'LOGIN',
@@ -165,7 +179,7 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
         new_data: {
           success: false,
           email: username.trim(),
-          error: err.message || 'Unexpected error',
+          error: getErrorMessage(err),
           timestamp: new Date().toISOString()
         }
       });
@@ -245,11 +259,13 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
 
           <form onSubmit={submit} className="space-y-5">
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
+              <label htmlFor="loginEmail" className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
               <div className="relative">
                 <User size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                 <input
+                  id="loginEmail"
                   type="email"
+                  autoComplete="username"
                   value={username}
                   onChange={e => setUsername(e.target.value)}
                   placeholder="admin@safeguard.mw"
@@ -259,17 +275,19 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
+              <label htmlFor="loginPassword" className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
               <div className="relative">
                 <Lock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                 <input
+                  id="loginPassword"
                   type={show ? 'text' : 'password'}
+                  autoComplete="current-password"
                   value={password}
                   onChange={e => setPassword(e.target.value)}
                   placeholder="••••••••"
                   className="w-full pl-10 pr-10 py-3 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent outline-none"
                 />
-                <button type="button" onClick={() => setShow(!show)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700">
+                <button type="button" onClick={() => setShow(!show)} aria-label={show ? 'Hide password' : 'Show password'} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700">
                   {show ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>

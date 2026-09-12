@@ -1,7 +1,5 @@
 // src/utils/errorHandler.ts
 
-import { showNotification } from './clickHandlers';
-
 export class AppError extends Error {
   constructor(
     public message: string,
@@ -49,65 +47,70 @@ export class ValidationError extends AppError {
   }
 }
 
-export const handleError = (error: any): string => {
-  console.error('Error occurred:', error);
-  
+// Shape of a Supabase/PostgREST error object -- these always carry a `code`
+// (a Postgres SQLSTATE like '23505', or a PostgREST-specific code like
+// 'PGRST116'), which is what lets the checks below distinguish "a raw
+// database/driver failure" (never safe to show verbatim -- may contain
+// table/column/constraint names, or in principle row data) from "a plain
+// Error our own code threw on purpose" (safe, since we authored the text).
+interface PostgrestLikeError {
+  code: string;
+  message?: string;
+  details?: string;
+  hint?: string;
+}
+
+function isPostgrestLikeError(error: unknown): error is PostgrestLikeError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof (error as { code: unknown }).code === 'string'
+  );
+}
+
+// Every Postgrest/Postgres error code this app has actually observed or
+// deliberately guards against (see AUDIT_REPORT.md / migration files for
+// where each constraint/RLS policy comes from). Codes not listed fall
+// through to the generic message -- deliberately never echoing the raw
+// `error.message`/`error.details`/`error.hint`, since those can contain
+// table names, constraint names, or (for some Postgres errors) fragments
+// of the offending row's data.
+const POSTGREST_CODE_MESSAGES: Record<string, string> = {
+  PGRST116: 'Record not found. Please refresh and try again.',
+  '23505': 'This record already exists. Please check your data.',
+  '23503': 'This operation could not be completed due to related records.',
+  '42P01': 'System error. Please try again later.',
+  '42501': 'You do not have permission to perform this action.',
+  '22001': 'Input is too long. Please shorten your text.',
+};
+
+// The ONE safe error-normalization helper for this app: accepts whatever a
+// `catch (error)` block actually receives (typed `unknown`, never `any`) and
+// returns a string that is always safe to render directly to a user --
+// never a raw SQL/Postgrest message, stack trace, token, or row of
+// employee/payroll data. Every `catch (error: any) { ...error.message }`
+// pattern in this codebase should route through this function instead.
+export const getErrorMessage = (error: unknown): string => {
   if (error instanceof AppError) {
     return error.userMessage;
   }
-  
-  if (error?.code) {
-    switch (error.code) {
-      case 'PGRST116':
-        return 'Record not found. Please refresh and try again.';
-      case '23505':
-        return 'This record already exists. Please check your data.';
-      case '23503':
-        return 'This operation could not be completed due to related records.';
-      case '42P01':
-        return 'System error. Please try again later.';
-      case '42501':
-        return 'You do not have permission to perform this action.';
-      case '22001':
-        return 'Input is too long. Please shorten your text.';
-      default:
-        return 'Something went wrong. Please try again later.';
-    }
-  }
-  
-  if (error?.message?.includes('Failed to fetch') || 
-      error?.message?.includes('NetworkError') ||
-      error?.message?.includes('network')) {
-    return 'Network error. Please check your internet connection and try again.';
-  }
-  
-  if (error?.message?.includes('invalid_credentials')) {
-    return 'Invalid email or password. Please try again.';
-  }
-  
-  if (error?.message?.includes('session_expired')) {
-    return 'Your session has expired. Please log in again.';
-  }
-  
-  return 'Something went wrong. We are looking into it. Try refreshing or contact support if the problem persists.';
-};
 
-export const withErrorHandling = async <T>(
-  fn: () => Promise<T>,
-  fallbackValue?: T,
-  showUserMessage: boolean = true
-): Promise<T | undefined> => {
-  try {
-    return await fn();
-  } catch (error) {
-    const userMessage = handleError(error);
-    
-    if (showUserMessage) {
-      showNotification(userMessage, 'error');
-    }
-    
-    console.error('Function execution failed:', error);
-    
-    return fallbackValue;
+  if (isPostgrestLikeError(error)) {
+    return POSTGREST_CODE_MESSAGES[error.code] || 'Something went wrong. Please try again later.';
   }
+
+  // A plain Error/string with no `code` was thrown by this app's own code
+  // (Postgrest/Postgres errors always carry `code` -- see above), so its
+  // message is application-authored text, not raw driver/database output,
+  // and is safe to surface verbatim.
+  if (error instanceof Error) {
+    if (/failed to fetch|networkerror|network/i.test(error.message)) {
+      return 'Network error. Please check your internet connection and try again.';
+    }
+    return error.message;
+  }
+  if (typeof error === 'string') return error;
+
+  return 'Something went wrong. Please try again later.';
 };

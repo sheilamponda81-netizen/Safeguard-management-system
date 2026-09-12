@@ -1,11 +1,14 @@
 // src/utils/auditHelpers.ts
 
 /**
- * Extract only the relevant fields from an employee object for audit logging
+ * Extract only the relevant fields from an employee object for audit logging.
+ * Accepts either the app's camelCase `Employee` shape or a raw snake_case
+ * Supabase row -- callers pass both across this codebase -- so this reads
+ * via a loosely-typed record rather than a single named interface.
  */
-export const getEmployeeAuditData = (employee: any) => {
+export const getEmployeeAuditData = (employee: Record<string, unknown> | null | undefined) => {
   if (!employee) return null;
-  
+
   return {
     full_name: employee.fullName || employee.full_name,
     employee_number: employee.employeeNumber || employee.employee_number,
@@ -26,17 +29,23 @@ export const getEmployeeAuditData = (employee: any) => {
 };
 
 /**
- * Get changes between old and new data
+ * Get changes between old and new data -- a generic shallow-diff over
+ * whatever plain object the audit payload actually is (see
+ * getEmployeeAuditData above for why this stays loosely typed rather than
+ * a single named interface).
  */
-export const getChanges = (oldData: any, newData: any): { changed: string[]; old: any; new: any } => {
+export const getChanges = (
+  oldData: Record<string, unknown> | null | undefined,
+  newData: Record<string, unknown> | null | undefined
+): { changed: string[]; old: typeof oldData; new: typeof newData } => {
   const changed: string[] = [];
-  
+
   if (!oldData || !newData) {
     return { changed: ['Data created or deleted'], old: oldData, new: newData };
   }
-  
+
   const allKeys = new Set([...Object.keys(oldData), ...Object.keys(newData)]);
-  
+
   allKeys.forEach(key => {
     const oldVal = JSON.stringify(oldData[key]);
     const newVal = JSON.stringify(newData[key]);
@@ -44,6 +53,6 @@ export const getChanges = (oldData: any, newData: any): { changed: string[]; old
       changed.push(key);
     }
   });
-  
+
   return { changed, old: oldData, new: newData };
 };

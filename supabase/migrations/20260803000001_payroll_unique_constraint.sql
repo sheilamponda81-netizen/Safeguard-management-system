@@ -1,0 +1,99 @@
+-- ============================================================
+-- MIGRATION: Prevent duplicate payroll rows per employee/month
+-- Date: 2026-08-03
+-- ============================================================
+--
+-- `attendance` has UNIQUE (employee_id, date) and `payment_status` has
+-- UNIQUE (employee_id, month) -- both closing exactly this class of
+-- duplicate-row risk -- but `payroll` itself has no equivalent
+-- constraint, despite being the highest-stakes financial table in this
+-- schema. Nothing in the database stops two payroll rows existing for
+-- the same employee in the same month.
+--
+-- src/pages/Payroll.tsx's processPayroll() AND copyFromPreviousMonth()
+-- both work around this today with the same client-side delete-then-
+-- insert dance (delete existing rows for the month/employees, then
+-- insert fresh ones) rather than a real upsert. processPayroll's
+-- "Process/Reprocess Payroll" button is also disabled while a previous
+-- run is still in flight or once the month is approved -- but all of
+-- that is client-side-only protection, and neither flow is atomic: if
+-- the insert half fails after the delete half already succeeded (a
+-- dropped connection, a constraint violation on one row, the tab
+-- closing), that month's payroll for the affected employees is left
+-- fully deleted with nothing re-inserted in its place.
+--
+-- Adding this constraint is safe to attempt but NOT guaranteed to
+-- succeed blind: if production already has duplicate (employee_id,
+-- month) rows for any employee -- entirely possible given the gap this
+-- migration closes -- this ALTER TABLE will fail outright with a clear
+-- Postgres error identifying the constraint, rather than silently
+-- corrupting or deleting anything. That failure is the correct signal
+-- to go find and manually resolve those duplicates (e.g. keep the most
+-- recently approved/processed row per employee/month) BEFORE re-running
+-- this migration -- not something to guess at or automate here.
+--
+-- Deliberately NOT changed here: Payroll.tsx's own delete+insert logic
+-- (switching it to a true .upsert(..., { onConflict: 'employee_id,month'
+-- }) once this constraint exists would be the more robust long-term fix,
+-- and would also close the non-atomic delete-then-insert data-loss
+-- window documented in SECURITY_REVIEW.md/DATA_INTEGRITY_REVIEW.md --
+-- but that changes the actual code path that writes real salary data in
+-- production, and needs to be tested against a staging database before
+-- touching it, not applied blind alongside a schema migration.
+-- ============================================================
+
+ALTER TABLE payroll ADD CONSTRAINT payroll_employee_month_unique UNIQUE (employee_id, month);
+
+-- ============================================================
+-- MIGRATION SAFETY NOTES (added after this audit's migration-safety review)
+-- ============================================================
+--
+-- RUN ONCE, SUCCESSFULLY: yes, assuming no pre-existing duplicates (see
+-- PREFLIGHT SQL below) -- a single ALTER TABLE ADD CONSTRAINT statement,
+-- no loop, no conditional logic to get wrong.
+--
+-- RUN TWICE, ACCIDENTALLY: the second run FAILS LOUDLY --
+-- `ERROR: constraint "payroll_employee_month_unique" for relation
+-- "payroll" already exists` -- not a silent no-op, but also not
+-- destructive; the correct response is simply "already applied, no
+-- action needed," not a rollback-and-retry.
+--
+-- LOCKS TAKEN / PRODUCTION TRAFFIC IMPACT: `ALTER TABLE ... ADD
+-- CONSTRAINT ... UNIQUE` takes an ACCESS EXCLUSIVE lock on `payroll` for
+-- the duration of the constraint's validation scan (Postgres must read
+-- the whole table once to confirm no existing violation before the
+-- constraint can be created). ACCESS EXCLUSIVE blocks ALL reads and
+-- writes on `payroll` for every other session, including the app itself,
+-- until the scan completes. On a small-to-medium `payroll` table (a
+-- single HR/payroll system's monthly records, not a high-volume
+-- transactional table) this is expected to be sub-second to a few
+-- seconds; it should still be applied during a low-traffic window, never
+-- during active payroll processing.
+-- ============================================================
+
+-- ============================================================
+-- PREFLIGHT SQL (run against production BEFORE applying this migration)
+-- ============================================================
+-- SELECT employee_id, month, COUNT(*) FROM payroll
+--   GROUP BY employee_id, month HAVING COUNT(*) > 1;
+-- Expected: 0 rows. Any row returned identifies a real, pre-existing
+-- duplicate that must be manually resolved (keep the most recently
+-- approved/processed row per employee/month, per this file's own header
+-- comment) BEFORE this migration will apply successfully.
+
+-- ============================================================
+-- VERIFICATION SQL (run immediately after applying)
+-- ============================================================
+-- SELECT conname FROM pg_constraint WHERE conname = 'payroll_employee_month_unique';
+-- Expected: 1 row.
+
+-- ============================================================
+-- ROLLBACK SQL (safe at any time -- drops only the constraint just
+-- added; no data is touched or lost, though rolling back re-opens the
+-- duplicate-row risk this migration exists to close)
+-- ============================================================
+-- ALTER TABLE payroll DROP CONSTRAINT IF EXISTS payroll_employee_month_unique;
+
+-- ============================================================
+-- END OF PAYROLL UNIQUE CONSTRAINT MIGRATION
+-- ============================================================

@@ -1,5 +1,4 @@
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { Button } from './ui';
 
 interface PaginationProps {
   currentPage: number;

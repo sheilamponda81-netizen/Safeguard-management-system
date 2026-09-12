@@ -1,13 +1,21 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Calculator, Search, CheckCircle, Wallet, Eye, Edit2, Save, ChevronDown } from '../utils/icons';
+import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
+import { hasExplicitPermission, PERMISSIONS } from '../utils/permissions';
+import { getVisibleTerminalDueActions, shouldShowReturnedForCorrectionBanner, TerminalDueStatus } from '../utils/terminalDueRowActions';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { calculateTerminalDues as calculateTerminalDuesPure } from '../utils/terminalDuesCalculations';
+import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
+import { formatAuditTimestamp, formatAuditValue } from '../utils/terminalDuesAudit';
+import { buildOpenDueStatusMap, getOpenDueLabel, isOpenDueUniqueViolation, DUPLICATE_OPEN_DUE_MESSAGE } from '../utils/terminalDuesDuplicates';
+import { getErrorMessage } from '../utils/errorHandler';
+import { UserProfile } from '../utils/currentProfile';
 
 interface Employee {
   id: string;
@@ -22,7 +30,27 @@ interface Employee {
   email: string;
   status: string;
   is_deleted?: boolean;
-  uniform_deduction?: number;
+  uniform_deduction?: number | null;
+}
+
+// Raw `employees` row shape (query below is `select('*')`) -- only the
+// columns this file actually reads. No generated Supabase types exist in
+// this project yet (see AUDIT_REPORT.md's "Supabase generated types"
+// section).
+interface EmployeeRow {
+  id: string;
+  employee_number: string | null;
+  full_name: string | null;
+  position: string | null;
+  department: string | null;
+  basic_salary: number | null;
+  hire_date: string | null;
+  region_id: string | null;
+  phone: string | null;
+  email: string | null;
+  status: string | null;
+  is_deleted: boolean | null;
+  uniform_deduction: number | null;
 }
 
 interface TerminalDue {
@@ -46,6 +74,26 @@ interface TerminalDue {
   status: 'pending' | 'approved' | 'paid';
   termination_type: string;
   created_at: string;
+  approved_by: string | null;
+  approved_at: string | null;
+  paid_by: string | null;
+  paid_at: string | null;
+  payment_date: string | null;
+  payment_method: string | null;
+  payment_reference: string | null;
+  payment_notes: string | null;
+  // Populated only while a Pending row is CURRENTLY awaiting correction
+  // (set by return_terminal_due_for_correction(), cleared by
+  // approve_terminal_due() on re-approval -- 20260907000000). All four are
+  // NULL for an ordinary Pending record that was never returned.
+  // returned_by_name is a server-resolved snapshot, not a live profiles
+  // join -- HR cannot read the returning Admin's own profiles row under
+  // profiles' own RLS (non-admin, self-only SELECT), so the name is
+  // captured once at return time by the SECURITY DEFINER RPC instead.
+  returned_by: string | null;
+  returned_by_name: string | null;
+  returned_at: string | null;
+  return_reason: string | null;
 }
 
 const terminationReasons = [
@@ -95,8 +143,30 @@ export function TerminalDuesPage() {
   const [showDetailModal, setShowDetailModal] = useState<TerminalDue | null>(null);
   const [showEditModal, setShowEditModal] = useState(false);
   const [editingCalculation, setEditingCalculation] = useState<TerminalDue | null>(null);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [filterStatus, setFilterStatus] = useState('all');
+  // Permission-driven action gating. HR Manager: create/edit a Pending
+  // calculation, never approve/pay. Functional Admin: approve a Pending
+  // calculation (and return an Approved one for correction), never
+  // create/edit/pay. Accountant: record payment for an Approved
+  // calculation only, never create/edit/approve. ALL FOUR of
+  // canCreateTerminalDue/canEditTerminalDue/canApproveTerminalDue/
+  // canPayTerminalDue deliberately use hasExplicitPermission() (see
+  // permissions.ts), NOT canAccess()/hasPermission() -- every one of
+  // create/edit/approve/pay must come from an explicit
+  // terminal_dues.create/.edit/.approve/.pay grant (or true super admin),
+  // never a legacy role_level bypass or the usual is_business_admin()
+  // "Admin gets everything" shortcut (separation-of-duties migration,
+  // 20260905000000). Real staging testing caught canCreateTerminalDue/
+  // canEditTerminalDue still using the broad canAccess()/hasPermission()
+  // path here, which let a functional Admin see Edit "for free" via
+  // hasPermission()'s business-admin shortcut despite the database
+  // boundary already denying it. All four default to false (fail-closed):
+  // never true before fetchUserProfile() actually resolves.
+  const [canCreateTerminalDue, setCanCreateTerminalDue] = useState(false);
+  const [canEditTerminalDue, setCanEditTerminalDue] = useState(false);
+  const [canApproveTerminalDue, setCanApproveTerminalDue] = useState(false);
+  const [canPayTerminalDue, setCanPayTerminalDue] = useState(false);
   
   // ===== PAGINATION STATES =====
   const [duesPage, setDuesPage] = useState(1);
@@ -116,9 +186,22 @@ export function TerminalDuesPage() {
   // Preview calculation state
   const [previewCalculation, setPreviewCalculation] = useState<TerminalDue | null>(null);
 
+  // In-flight guard for saveCalculation() -- closes the same-session
+  // double-click race that (alongside the missing DB constraint) let HR
+  // create two open Terminal Dues for one employee in real staging
+  // testing. This is a UX backstop only; the database's partial unique
+  // index (idx_terminal_dues_one_open_per_employee) is the real authority.
+  const [isSavingCalculation, setIsSavingCalculation] = useState(false);
+
   // ===== MEMOIZED VALUES =====
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
   const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
+
+  // employee_id -> its open (pending/approved) status, from the currently
+  // loaded terminal_dues rows. Drives the employee-selector disabling
+  // below and the pre-flight duplicate check in saveCalculation() -- a
+  // Paid-only employee is absent from this map and remains selectable.
+  const openDueByEmployeeId = useMemo(() => buildOpenDueStatusMap(calculations), [calculations]);
 
   const displayedCalculations = useMemo(() => {
     let result = calculations;
@@ -155,13 +238,19 @@ export function TerminalDuesPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
+    setCanCreateTerminalDue(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_CREATE));
+    setCanEditTerminalDue(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_EDIT));
+    setCanApproveTerminalDue(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_APPROVE));
+    setCanPayTerminalDue(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_PAY));
   }, []);
 
   const fetchEmployees = useCallback(async () => {
     try {
       // CRITICAL: Exclude deleted employees
+      // employees_general: non-sensitive employee read surface (Design B2) --
+      // confirmed no Terminal Dues calculation references any guard column.
       let query = supabase
-        .from('employees')
+        .from('employees_general')
         .select('*')
         .eq('status', 'Active')
         .eq('is_deleted', false);
@@ -173,14 +262,14 @@ export function TerminalDuesPage() {
       const { data, error } = await query.order('full_name');
       if (error) throw error;
       
-      const mappedEmployees = (data || []).map((emp: any) => ({
+      const mappedEmployees = (data || []).map((emp: EmployeeRow) => ({
         id: emp.id,
         employeeNumber: emp.employee_number || '',
         fullName: emp.full_name || '',
         position: emp.position || '',
         department: emp.department || '',
         basicSalary: emp.basic_salary || 0,
-        hire_date: emp.hire_date || emp.dateHired || new Date().toISOString().split('T')[0],
+        hire_date: emp.hire_date || new Date().toISOString().split('T')[0],
         region_id: emp.region_id || '',
         phone: emp.phone || '',
         email: emp.email || '',
@@ -199,11 +288,6 @@ export function TerminalDuesPage() {
   const fetchCalculations = useCallback(async () => {
     setLoading(true);
     try {
-      let query = supabase
-        .from('terminal_dues')
-        .select('*')
-        .order('created_at', { ascending: false });
-
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         const { data: regionEmployees } = await supabase
           .from('employees')
@@ -219,12 +303,31 @@ export function TerminalDuesPage() {
           setLoading(false);
           return;
         }
-        query = query.in('employee_id', employeeIds);
+
+        // Large regions can hold far more employees than fit in one PostgREST
+        // URL's `.in('employee_id', [...])` filter -- batch the id list instead
+        // of building a single unbounded request (see employeeBatchFetch.ts).
+        const rows = await fetchInEmployeeIdBatches<TerminalDue>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('terminal_dues')
+              .select('*', withCount ? { count: 'exact' } : undefined)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        const deduped = dedupeById(rows);
+        deduped.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+        setCalculations(deduped);
+        return;
       }
 
-      const { data, error } = await query;
+      const { data, error } = await supabase
+        .from('terminal_dues')
+        .select('*')
+        .order('created_at', { ascending: false });
       if (error) throw error;
-      
+
       setCalculations(data || []);
     } catch (err) {
       console.error('Error fetching calculations:', err);
@@ -302,29 +405,19 @@ export function TerminalDuesPage() {
       return null;
     }
 
-    const dateJoined = new Date(selectedEmployee.hire_date);
-    const dateLeft = new Date(formData.date_left);
+    const result = calculateTerminalDuesPure({
+      hireDate: selectedEmployee.hire_date,
+      dateLeft: formData.date_left,
+      basicSalary: selectedEmployee.basicSalary,
+      uniformRefund: formData.uniform_refund,
+      otherBenefits: formData.other_benefits,
+      deductions: formData.deductions,
+    });
 
-    let monthsDiff = (dateLeft.getFullYear() - dateJoined.getFullYear()) * 12 +
-                     (dateLeft.getMonth() - dateJoined.getMonth());
-
-    if (monthsDiff <= 0) {
+    if (!result) {
       showNotification('Date Left must be after the employee\'s Date Joined', 'error');
       return null;
     }
-
-    const periodMonths = monthsDiff;
-
-    const basicSalary = selectedEmployee.basicSalary ?? 150000;
-
-    const gratuity = Math.round((periodMonths * basicSalary * 10) / 100);
-    // Annual leave payout is a flat one month's basic salary.
-    const annualLeave = basicSalary;
-    const uniformRefund = Number(formData.uniform_refund) || 0;
-    const otherBenefits = Number(formData.other_benefits) || 0;
-    const subtotal = gratuity + annualLeave + uniformRefund + otherBenefits;
-    const deductions = Number(formData.deductions) || 0;
-    const totalPayable = subtotal - deductions;
 
     const calculation: TerminalDue = {
       id: '',
@@ -335,18 +428,30 @@ export function TerminalDuesPage() {
       date_joined: selectedEmployee.hire_date,
       date_left: formData.date_left,
       reason_for_termination: formData.reason,
-      period_months: periodMonths,
-      basic_salary: basicSalary,
-      gratuity: gratuity,
-      annual_leave: annualLeave,
-      uniform_refund: uniformRefund,
-      other_benefits: otherBenefits,
-      subtotal: subtotal,
-      deductions: deductions,
-      total_payable: totalPayable,
+      period_months: result.periodMonths,
+      basic_salary: result.basicSalary,
+      gratuity: result.gratuity,
+      annual_leave: result.annualLeave,
+      uniform_refund: result.uniformRefund,
+      other_benefits: result.otherBenefits,
+      subtotal: result.subtotal,
+      deductions: result.deductions,
+      total_payable: result.totalPayable,
       status: 'pending',
       termination_type: formData.termination_type,
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
+      approved_by: null,
+      approved_at: null,
+      paid_by: null,
+      paid_at: null,
+      payment_date: null,
+      payment_method: null,
+      payment_reference: null,
+      payment_notes: null,
+      returned_by: null,
+      returned_by_name: null,
+      returned_at: null,
+      return_reason: null
     };
 
     setPreviewCalculation(calculation);
@@ -360,91 +465,161 @@ export function TerminalDuesPage() {
       return;
     }
 
-    const calculation = calculateTerminalDues();
-    if (!calculation) return;
-
-    const { id, ...calculationToSave } = calculation;
-
-    const { data, error } = await supabase
-      .from('terminal_dues')
-      .insert([calculationToSave])
-      .select();
-
-    if (error) {
-      showNotification('Error saving calculation: ' + error.message, 'error');
-      console.error('Error:', error);
-    } else {
-      await logAudit({
-        action: 'CREATE',
-        entity_type: 'terminal_due',
-        entity_id: data?.[0]?.id || 'new',
-        new_data: {
-          employee_name: calculation.employee_name,
-          employee_number: calculation.employee_number,
-          position: calculation.position,
-          total_payable: calculation.total_payable,
-          gratuity: calculation.gratuity,
-          annual_leave: calculation.annual_leave,
-          uniform_refund: calculation.uniform_refund,
-          deductions: calculation.deductions,
-          termination_type: calculation.termination_type,
-          reason: calculation.reason_for_termination,
-          period_months: calculation.period_months
-        },
-        region_id: userProfile?.region_id
-      });
-
-      showNotification('Terminal dues calculated successfully', 'success');
-      setPreviewCalculation(null);
-      setShowCalculateModal(false);
-      setEmployeeSearch('');
-      setSelectedEmployee(null);
-      setFormData(getInitialFormData());
-      await fetchCalculations();
-    }
-  }, [selectedEmployee, calculateTerminalDues, userProfile, fetchCalculations]);
-
-  // ===== UPDATE STATUS =====
-  const updateStatus = useCallback(async (id: string, status: string) => {
-    const existingCalc = calculations.find(c => c.id === id);
-    if (!existingCalc) {
-      showNotification('Calculation not found', 'error');
+    // Defensive, non-authoritative pre-check -- the database's partial
+    // unique index (idx_terminal_dues_one_open_per_employee) is what
+    // actually prevents a duplicate open due; this only avoids a round
+    // trip for the common case (e.g. stale `calculations` from before a
+    // refresh) and always has a race window, which is why the 23505
+    // handling below exists regardless of this check.
+    if (openDueByEmployeeId.has(selectedEmployee.id)) {
+      showNotification(DUPLICATE_OPEN_DUE_MESSAGE, 'error');
       return;
     }
 
-    const oldStatus = existingCalc.status;
+    const calculation = calculateTerminalDues();
+    if (!calculation) return;
 
-    const { error } = await supabase
-      .from('terminal_dues')
-      .update({ status, updated_at: new Date().toISOString() })
-      .eq('id', id);
+    // `id` is destructured out only to exclude it from the insert payload below.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { id, ...calculationToSave } = calculation;
+
+    setIsSavingCalculation(true);
+    try {
+      const { data, error } = await supabase
+        .from('terminal_dues')
+        .insert([calculationToSave])
+        .select();
+
+      if (error) {
+        if (isOpenDueUniqueViolation(error)) {
+          showNotification(DUPLICATE_OPEN_DUE_MESSAGE, 'error');
+        } else {
+          showNotification('Error saving calculation: ' + getErrorMessage(error), 'error');
+        }
+        console.error('Error:', error);
+      } else {
+        await logAudit({
+          action: 'CREATE',
+          entity_type: 'terminal_due',
+          entity_id: data?.[0]?.id || 'new',
+          new_data: {
+            employee_name: calculation.employee_name,
+            employee_number: calculation.employee_number,
+            position: calculation.position,
+            total_payable: calculation.total_payable,
+            gratuity: calculation.gratuity,
+            annual_leave: calculation.annual_leave,
+            uniform_refund: calculation.uniform_refund,
+            deductions: calculation.deductions,
+            termination_type: calculation.termination_type,
+            reason: calculation.reason_for_termination,
+            period_months: calculation.period_months
+          },
+          region_id: userProfile?.region_id
+        });
+
+        showNotification('Terminal dues calculated successfully', 'success');
+        setPreviewCalculation(null);
+        setShowCalculateModal(false);
+        setEmployeeSearch('');
+        setSelectedEmployee(null);
+        setFormData(getInitialFormData());
+        await fetchCalculations();
+      }
+    } finally {
+      setIsSavingCalculation(false);
+    }
+  }, [selectedEmployee, calculateTerminalDues, userProfile, fetchCalculations, openDueByEmployeeId]);
+
+  // ===== APPROVE (Pending -> Approved) =====
+  // Status transitions go through narrow SECURITY DEFINER RPCs, never a
+  // direct client UPDATE -- RLS itself now rejects any client attempt to
+  // change `status` on this table (see migration 20260905000000). The RPC
+  // performs its own audit_logs insert, so no separate logAudit() call is
+  // needed here.
+  const approveTerminalDue = useCallback(async (id: string) => {
+    const { error } = await supabase.rpc('approve_terminal_due', { p_terminal_due_id: id });
+    if (error) {
+      showNotification('Error approving terminal due: ' + error.message, 'error');
+      return;
+    }
+    showNotification('Terminal due approved', 'success');
+    await fetchCalculations();
+  }, [fetchCalculations]);
+
+  // ===== RECORD PAYMENT (Approved -> Paid) =====
+  const [showPaymentModal, setShowPaymentModal] = useState<TerminalDue | null>(null);
+  const [paymentForm, setPaymentForm] = useState({
+    payment_date: new Date().toISOString().split('T')[0],
+    payment_method: '',
+    payment_reference: '',
+    payment_notes: ''
+  });
+
+  const openPaymentModal = useCallback((calc: TerminalDue) => {
+    setPaymentForm({
+      payment_date: new Date().toISOString().split('T')[0],
+      payment_method: '',
+      payment_reference: '',
+      payment_notes: ''
+    });
+    setShowPaymentModal(calc);
+  }, []);
+
+  const submitPayment = useCallback(async () => {
+    if (!showPaymentModal) return;
+    if (!paymentForm.payment_method.trim() || !paymentForm.payment_reference.trim()) {
+      showNotification('Payment method and reference are required', 'error');
+      return;
+    }
+
+    const { error } = await supabase.rpc('record_terminal_due_payment', {
+      p_terminal_due_id: showPaymentModal.id,
+      p_payment_date: paymentForm.payment_date,
+      p_payment_method: paymentForm.payment_method.trim(),
+      p_payment_reference: paymentForm.payment_reference.trim(),
+      p_notes: paymentForm.payment_notes.trim() || null
+    });
 
     if (error) {
-      showNotification('Error updating status', 'error');
-    } else {
-      await logAudit({
-        action: 'UPDATE',
-        entity_type: 'terminal_due',
-        entity_id: id,
-        old_data: {
-          employee_name: existingCalc.employee_name,
-          employee_number: existingCalc.employee_number,
-          status: oldStatus,
-          total_payable: existingCalc.total_payable
-        },
-        new_data: {
-          employee_name: existingCalc.employee_name,
-          employee_number: existingCalc.employee_number,
-          status: status,
-          total_payable: existingCalc.total_payable
-        },
-        region_id: userProfile?.region_id
-      });
-
-      showNotification(`Status updated to ${status}`, 'success');
-      fetchCalculations();
+      showNotification('Error recording payment: ' + error.message, 'error');
+      return;
     }
-  }, [calculations, userProfile, fetchCalculations]);
+    showNotification('Payment recorded', 'success');
+    setShowPaymentModal(null);
+    await fetchCalculations();
+  }, [showPaymentModal, paymentForm, fetchCalculations]);
+
+  // ===== RETURN FOR CORRECTION (Approved -> Pending) =====
+  const [showReturnModal, setShowReturnModal] = useState<TerminalDue | null>(null);
+  const [returnReason, setReturnReason] = useState('');
+
+  const openReturnModal = useCallback((calc: TerminalDue) => {
+    setReturnReason('');
+    setShowReturnModal(calc);
+  }, []);
+
+  const submitReturn = useCallback(async () => {
+    if (!showReturnModal) return;
+    if (!returnReason.trim()) {
+      showNotification('A reason is required to return for correction', 'error');
+      return;
+    }
+
+    const { error } = await supabase.rpc('return_terminal_due_for_correction', {
+      p_terminal_due_id: showReturnModal.id,
+      p_reason: returnReason.trim()
+    });
+
+    if (error) {
+      showNotification('Error returning for correction: ' + error.message, 'error');
+      return;
+    }
+    showNotification('Returned to Pending for correction', 'success');
+    setShowReturnModal(null);
+    setReturnReason('');
+    await fetchCalculations();
+  }, [showReturnModal, returnReason, fetchCalculations]);
 
   // ===== UPDATE CALCULATION =====
   const updateCalculation = useCallback(async () => {
@@ -456,6 +631,10 @@ export function TerminalDuesPage() {
                      editingCalculation.uniform_refund + editingCalculation.other_benefits;
     const totalPayable = subtotal - editingCalculation.deductions;
 
+    // Deliberately does NOT send `status` -- RLS now requires the row to
+    // stay 'pending' across a direct client UPDATE (see migration
+    // 20260905000000), so this edit path only ever touches a Pending
+    // calculation's financial fields, never its status.
     const { error } = await supabase
       .from('terminal_dues')
       .update({
@@ -464,7 +643,6 @@ export function TerminalDuesPage() {
         other_benefits: editingCalculation.other_benefits,
         reason_for_termination: editingCalculation.reason_for_termination,
         termination_type: editingCalculation.termination_type,
-        status: editingCalculation.status,
         subtotal: subtotal,
         total_payable: totalPayable,
         updated_at: new Date().toISOString()
@@ -562,9 +740,11 @@ export function TerminalDuesPage() {
         title="Terminal Dues Calculator"
         subtitle="Calculate and manage employee termination benefits"
         actions={
-          <Button variant="secondary" onClick={() => setShowCalculateModal(true)}>
-            <Calculator size={16} className="mr-1" /> New Calculation
-          </Button>
+          canCreateTerminalDue ? (
+            <Button variant="secondary" onClick={() => setShowCalculateModal(true)}>
+              <Calculator size={16} className="mr-1" /> New Calculation
+            </Button>
+          ) : undefined
         }
       />
 
@@ -669,7 +849,14 @@ export function TerminalDuesPage() {
                   </TD>
                 </TR>
               ) : (
-                paginatedDues.map((calc) => (
+                paginatedDues.map((calc) => {
+                  const rowActions = getVisibleTerminalDueActions(calc.status as TerminalDueStatus, {
+                    canCreate: canCreateTerminalDue,
+                    canEdit: canEditTerminalDue,
+                    canApprove: canApproveTerminalDue,
+                    canPay: canPayTerminalDue,
+                  });
+                  return (
                   <TR key={calc.id} className="hover:bg-slate-50">
                     <TD>
                       <div>
@@ -701,39 +888,45 @@ export function TerminalDuesPage() {
                         >
                           <Eye size={14} />
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setEditingCalculation(calc);
-                            setShowEditModal(true);
-                          }}
-                          className="w-7 h-7 rounded-lg hover:bg-slate-100 text-amber-600"
-                        >
-                          <Edit2 size={14} />
-                        </button>
-                        {calc.status === 'pending' && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => updateStatus(calc.id, 'approved')}
-                              className="w-7 h-7 rounded-lg hover:bg-emerald-100 text-emerald-600"
-                            >
-                              <CheckCircle size={14} />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => updateStatus(calc.id, 'paid')}
-                              className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
-                            >
-                              <Wallet size={14} />
-                            </button>
-                          </>
-                        )}
-                        {calc.status === 'approved' && (
+                        {rowActions.showEdit && (
                           <button
                             type="button"
-                            onClick={() => updateStatus(calc.id, 'paid')}
+                            onClick={() => {
+                              setEditingCalculation(calc);
+                              setShowEditModal(true);
+                            }}
+                            className="w-7 h-7 rounded-lg hover:bg-slate-100 text-amber-600"
+                            title="Edit"
+                          >
+                            <Edit2 size={14} />
+                          </button>
+                        )}
+                        {rowActions.showApprove && (
+                          <button
+                            type="button"
+                            onClick={() => approveTerminalDue(calc.id)}
+                            className="w-7 h-7 rounded-lg hover:bg-emerald-100 text-emerald-600"
+                            title="Approve"
+                          >
+                            <CheckCircle size={14} />
+                          </button>
+                        )}
+                        {rowActions.showReturnForCorrection && (
+                          <button
+                            type="button"
+                            onClick={() => openReturnModal(calc)}
+                            className="w-7 h-7 rounded-lg hover:bg-amber-100 text-amber-600"
+                            title="Return for Correction"
+                          >
+                            <RotateCcw size={14} />
+                          </button>
+                        )}
+                        {rowActions.showRecordPayment && (
+                          <button
+                            type="button"
+                            onClick={() => openPaymentModal(calc)}
                             className="w-7 h-7 rounded-lg hover:bg-blue-100 text-blue-600"
+                            title="Record Payment"
                           >
                             <Wallet size={14} />
                           </button>
@@ -741,7 +934,8 @@ export function TerminalDuesPage() {
                       </div>
                     </TD>
                   </TR>
-                ))
+                  );
+                })
               )}
             </TBody>
           </table>
@@ -811,29 +1005,42 @@ export function TerminalDuesPage() {
                       No active employees found matching "{employeeSearch}"
                     </div>
                   ) : (
-                    filteredEmployees.map((emp) => (
-                      <button
-                        key={emp.id}
-                        type="button"
-                        onClick={() => selectEmployee(emp)}
-                        className="w-full text-left px-4 py-2.5 hover:bg-slate-50 border-b border-slate-100 last:border-0 transition-colors flex items-center gap-3"
-                      >
-                        <div className="w-8 h-8 rounded-full bg-[#081C3A] text-white text-xs font-bold flex items-center justify-center flex-shrink-0">
-                          {((emp.fullName || 'U').split(' ').map(n => n[0]).join('').slice(0, 2)).toUpperCase()}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium text-slate-800 truncate">{emp.fullName || 'Unknown'}</p>
-                          <div className="flex items-center gap-2 text-xs text-slate-500">
-                            <span>{emp.employeeNumber || 'N/A'}</span>
-                            <span className="w-1 h-1 rounded-full bg-slate-300" />
-                            <span>{emp.position || 'N/A'}</span>
+                    filteredEmployees.map((emp) => {
+                      const openLabel = getOpenDueLabel(openDueByEmployeeId.get(emp.id));
+                      return (
+                        <button
+                          key={emp.id}
+                          type="button"
+                          disabled={!!openLabel}
+                          onClick={() => selectEmployee(emp)}
+                          title={openLabel ?? undefined}
+                          className={`w-full text-left px-4 py-2.5 border-b border-slate-100 last:border-0 transition-colors flex items-center gap-3 ${
+                            openLabel ? 'opacity-50 cursor-not-allowed bg-slate-50' : 'hover:bg-slate-50'
+                          }`}
+                        >
+                          <div className="w-8 h-8 rounded-full bg-[#081C3A] text-white text-xs font-bold flex items-center justify-center flex-shrink-0">
+                            {((emp.fullName || 'U').split(' ').map(n => n[0]).join('').slice(0, 2)).toUpperCase()}
                           </div>
-                        </div>
-                        <div className="text-xs font-medium text-[#D4A017]">
-                          {formatKwacha(emp.basicSalary || 0)}
-                        </div>
-                      </button>
-                    ))
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium text-slate-800 truncate">{emp.fullName || 'Unknown'}</p>
+                            <div className="flex items-center gap-2 text-xs text-slate-500">
+                              <span>{emp.employeeNumber || 'N/A'}</span>
+                              <span className="w-1 h-1 rounded-full bg-slate-300" />
+                              <span>{emp.position || 'N/A'}</span>
+                            </div>
+                          </div>
+                          {openLabel ? (
+                            <div className="text-xs font-medium text-amber-700">
+                              {openLabel}
+                            </div>
+                          ) : (
+                            <div className="text-xs font-medium text-[#D4A017]">
+                              {formatKwacha(emp.basicSalary || 0)}
+                            </div>
+                          )}
+                        </button>
+                      );
+                    })
                   )}
                 </div>
               )}
@@ -995,8 +1202,8 @@ export function TerminalDuesPage() {
               setSelectedEmployee(null);
               setFormData(getInitialFormData());
             }}>Cancel</Button>
-            <Button variant="secondary" onClick={saveCalculation} disabled={!selectedEmployee}>
-              <Save size={14} className="mr-1" /> Save Calculation
+            <Button variant="secondary" onClick={saveCalculation} disabled={!selectedEmployee || isSavingCalculation}>
+              <Save size={14} className="mr-1" /> {isSavingCalculation ? 'Saving...' : 'Save Calculation'}
             </Button>
           </div>
         </div>
@@ -1059,20 +1266,54 @@ export function TerminalDuesPage() {
               <p className="text-xs text-slate-500">Date Left: {new Date(showDetailModal.date_left).toLocaleDateString()}</p>
             </div>
 
+            {/* Only while a Pending row is CURRENTLY awaiting correction --
+                return_reason is cleared on re-approval (approve_terminal_due(),
+                20260907000000), so an ordinary Pending record that was never
+                returned (return_reason NULL) never shows this, matching
+                required behavior exactly. */}
+            {shouldShowReturnedForCorrectionBanner(showDetailModal.status, showDetailModal.return_reason) && (
+              <div className="border-t pt-4">
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-1">
+                  <p className="text-sm font-semibold text-amber-800">RETURNED FOR CORRECTION</p>
+                  <p className="text-xs text-amber-700"><span className="font-medium">Reason:</span> {showDetailModal.return_reason}</p>
+                  <p className="text-xs text-amber-700"><span className="font-medium">Returned by:</span> {showDetailModal.returned_by_name || 'Unknown'}</p>
+                  <p className="text-xs text-amber-700"><span className="font-medium">Returned on:</span> {formatAuditTimestamp(showDetailModal.returned_at)}</p>
+                </div>
+              </div>
+            )}
+
+            {(showDetailModal.status === 'approved' || showDetailModal.status === 'paid') && (
+              <div className="border-t pt-4 space-y-1">
+                <h4 className="font-semibold text-slate-800 mb-2 text-sm">Approval &amp; Payment</h4>
+                <p className="text-xs text-slate-500">Approved: {formatAuditTimestamp(showDetailModal.approved_at)}</p>
+                {showDetailModal.status === 'paid' && (
+                  <>
+                    <p className="text-xs text-slate-500">Paid: {formatAuditTimestamp(showDetailModal.paid_at)}</p>
+                    <p className="text-xs text-slate-500">Payment Date: {formatAuditValue(showDetailModal.payment_date)}</p>
+                    <p className="text-xs text-slate-500">Payment Method: {formatAuditValue(showDetailModal.payment_method)}</p>
+                    <p className="text-xs text-slate-500">Payment Reference: {formatAuditValue(showDetailModal.payment_reference)}</p>
+                    {showDetailModal.payment_notes && (
+                      <p className="text-xs text-slate-500">Notes: {showDetailModal.payment_notes}</p>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
             <div className="flex justify-end gap-2 pt-4 border-t">
-              {showDetailModal.status === 'pending' && (
-                <>
-                  <Button variant="secondary" onClick={() => { updateStatus(showDetailModal.id, 'approved'); setShowDetailModal(null); }}>
-                    <CheckCircle size={14} className="mr-1" /> Approve
-                  </Button>
-                  <Button variant="secondary" onClick={() => { updateStatus(showDetailModal.id, 'paid'); setShowDetailModal(null); }}>
-                    <Wallet size={14} className="mr-1" /> Mark Paid
-                  </Button>
-                </>
+              {showDetailModal.status === 'pending' && canApproveTerminalDue && (
+                <Button variant="secondary" onClick={() => { approveTerminalDue(showDetailModal.id); setShowDetailModal(null); }}>
+                  <CheckCircle size={14} className="mr-1" /> Approve
+                </Button>
               )}
-              {showDetailModal.status === 'approved' && (
-                <Button variant="secondary" onClick={() => { updateStatus(showDetailModal.id, 'paid'); setShowDetailModal(null); }}>
-                  <Wallet size={14} className="mr-1" /> Mark Paid
+              {showDetailModal.status === 'approved' && canApproveTerminalDue && (
+                <Button variant="secondary" onClick={() => { openReturnModal(showDetailModal); setShowDetailModal(null); }}>
+                  <RotateCcw size={14} className="mr-1" /> Return for Correction
+                </Button>
+              )}
+              {showDetailModal.status === 'approved' && canPayTerminalDue && (
+                <Button variant="secondary" onClick={() => { openPaymentModal(showDetailModal); setShowDetailModal(null); }}>
+                  <Wallet size={14} className="mr-1" /> Record Payment
                 </Button>
               )}
               <Button variant="outline" onClick={() => setShowDetailModal(null)}>Close</Button>
@@ -1089,19 +1330,7 @@ export function TerminalDuesPage() {
               <div><p className="text-slate-500">Employee</p><p className="font-semibold">{editingCalculation.employee_name}</p></div>
               <div><p className="text-slate-500">Employee #</p><p className="font-semibold">{editingCalculation.employee_number}</p></div>
               <div><p className="text-slate-500">Position</p><p className="font-semibold">{editingCalculation.position}</p></div>
-              <div><p className="text-slate-500">Status</p>
-                <select
-                  id="editStatus"
-                  name="editStatus"
-                  value={editingCalculation.status}
-                  onChange={(e) => setEditingCalculation({ ...editingCalculation, status: e.target.value as any })}
-                  className="w-full px-2 py-1 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
-                >
-                  <option value="pending">Pending</option>
-                  <option value="approved">Approved</option>
-                  <option value="paid">Paid</option>
-                </select>
-              </div>
+              <div><p className="text-slate-500">Status</p><Badge color={getStatusColor(editingCalculation.status)}>{editingCalculation.status.toUpperCase()}</Badge></div>
             </div>
 
             <div className="border-t pt-4">
@@ -1171,6 +1400,111 @@ export function TerminalDuesPage() {
               <Button variant="outline" onClick={() => { setShowEditModal(false); setEditingCalculation(null); }}>Cancel</Button>
               <Button variant="secondary" onClick={updateCalculation}>
                 <Save size={14} className="mr-1" /> Save Changes
+              </Button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Record Payment Modal -- Accountant only, Approved rows only. Never
+          a one-click "mark Paid": payment evidence (method + reference) is
+          mandatory, enforced both here and server-side by
+          record_terminal_due_payment(). */}
+      <Modal open={!!showPaymentModal} onClose={() => setShowPaymentModal(null)} title="Record Payment">
+        {showPaymentModal && (
+          <div className="space-y-4">
+            <div className="text-sm">
+              <p className="text-slate-500">Employee</p>
+              <p className="font-semibold">{showPaymentModal.employee_name} ({showPaymentModal.employee_number})</p>
+              <p className="text-slate-500 mt-2">Amount</p>
+              <p className="font-bold text-lg text-[#D4A017]">{formatKwacha(showPaymentModal.total_payable)}</p>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Payment Date *</label>
+              <input
+                id="paymentDate"
+                name="paymentDate"
+                type="date"
+                value={paymentForm.payment_date}
+                onChange={(e) => setPaymentForm({ ...paymentForm, payment_date: e.target.value })}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Payment Method *</label>
+              <input
+                id="paymentMethod"
+                name="paymentMethod"
+                type="text"
+                placeholder="e.g. Bank Transfer, Cash, Mobile Money"
+                value={paymentForm.payment_method}
+                onChange={(e) => setPaymentForm({ ...paymentForm, payment_method: e.target.value })}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Payment Reference *</label>
+              <input
+                id="paymentReference"
+                name="paymentReference"
+                type="text"
+                placeholder="Receipt / voucher / transaction reference number"
+                value={paymentForm.payment_reference}
+                onChange={(e) => setPaymentForm({ ...paymentForm, payment_reference: e.target.value })}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Notes</label>
+              <textarea
+                id="paymentNotes"
+                name="paymentNotes"
+                rows={2}
+                value={paymentForm.payment_notes}
+                onChange={(e) => setPaymentForm({ ...paymentForm, payment_notes: e.target.value })}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              />
+            </div>
+
+            <div className="flex justify-end gap-2 pt-4 border-t">
+              <Button variant="outline" onClick={() => setShowPaymentModal(null)}>Cancel</Button>
+              <Button variant="secondary" onClick={submitPayment}>
+                <Wallet size={14} className="mr-1" /> Record Payment
+              </Button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Return for Correction Modal -- Admin only, Approved rows only. A
+          mandatory, nonblank reason is required both here and server-side
+          by return_terminal_due_for_correction() -- an approved amount is
+          never silently changed; it goes back to Pending for HR to
+          recalculate. */}
+      <Modal open={!!showReturnModal} onClose={() => setShowReturnModal(null)} title="Return for Correction">
+        {showReturnModal && (
+          <div className="space-y-4">
+            <div className="text-sm">
+              <p className="text-slate-500">Employee</p>
+              <p className="font-semibold">{showReturnModal.employee_name} ({showReturnModal.employee_number})</p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Reason *</label>
+              <textarea
+                id="returnReason"
+                name="returnReason"
+                rows={3}
+                placeholder="Why is this calculation being returned to Pending?"
+                value={returnReason}
+                onChange={(e) => setReturnReason(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-4 border-t">
+              <Button variant="outline" onClick={() => setShowReturnModal(null)}>Cancel</Button>
+              <Button variant="secondary" onClick={submitReturn}>
+                <RotateCcw size={14} className="mr-1" /> Return for Correction
               </Button>
             </div>
           </div>

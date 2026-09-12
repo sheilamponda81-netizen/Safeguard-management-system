@@ -6,9 +6,14 @@ export interface AuditLogEntry {
   action: 'CREATE' | 'UPDATE' | 'DELETE' | 'LOGIN' | 'LOGOUT' | 'EXPORT' | 'VIEW' | 'APPROVE' | 'REJECT';
   entity_type: string;
   entity_id?: string;
-  old_data?: any;
-  new_data?: any;
-  region_id?: string;
+  // Audit payloads vary per entity_type (payroll records, employee records,
+  // position config, etc.) and are only ever serialized/stored here, never
+  // read back -- `unknown` keeps that genuinely-variable shape without
+  // falling back to `any` (callers can pass any concrete object; nothing
+  // in this file reads through it without narrowing first).
+  old_data?: unknown;
+  new_data?: unknown;
+  region_id?: string | null;
 }
 
 export const logAudit = async (entry: AuditLogEntry) => {

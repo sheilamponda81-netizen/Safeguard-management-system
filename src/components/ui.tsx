@@ -37,8 +37,8 @@ export function StatCard({ title, value, icon: Icon, change, accent, sub }:
   );
 }
 
-export function Button({ children, onClick, variant = 'primary', className = '', type = 'button', disabled }:
-  { children: React.ReactNode; onClick?: () => void; variant?: 'primary' | 'secondary' | 'ghost' | 'danger' | 'outline' | 'success'; className?: string; type?: 'button' | 'submit'; disabled?: boolean }) {
+export function Button({ children, onClick, variant = 'primary', size = 'md', className = '', type = 'button', disabled, title }:
+  { children: React.ReactNode; onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void; variant?: 'primary' | 'secondary' | 'ghost' | 'danger' | 'outline' | 'success'; size?: 'sm' | 'md'; className?: string; type?: 'button' | 'submit'; disabled?: boolean; title?: string }) {
   const variants = {
     primary: 'bg-[#081C3A] text-white hover:bg-[#1a2f5c] shadow-sm',
     secondary: 'bg-[#D4A017] text-white hover:bg-[#e8b82e] shadow-sm',
@@ -47,19 +47,24 @@ export function Button({ children, onClick, variant = 'primary', className = '',
     danger: 'bg-red-600 text-white hover:bg-red-700',
     success: 'bg-emerald-600 text-white hover:bg-emerald-700'
   };
+  const sizes = {
+    sm: 'px-3 py-1.5 text-xs',
+    md: 'px-4 py-2 text-sm'
+  };
   return (
     <button
       type={type}
       onClick={onClick}
       disabled={disabled}
-      className={cn('inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed', variants[variant], className)}
+      title={title}
+      className={cn('inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed', variants[variant], sizes[size], className)}
     >
       {children}
     </button>
   );
 }
 
-export function Badge({ children, color = 'navy' }: { children: React.ReactNode; color?: 'navy' | 'gold' | 'green' | 'red' | 'blue' | 'gray' | 'yellow' }) {
+export function Badge({ children, color = 'navy', className = '' }: { children: React.ReactNode; color?: 'navy' | 'gold' | 'green' | 'red' | 'blue' | 'gray' | 'yellow' | 'orange' | 'purple' | 'teal' | 'emerald' | 'cyan'; className?: string }) {
   const map: Record<string, string> = {
     navy: 'bg-[#081C3A] text-white',
     gold: 'bg-[#FFF1CC] text-[#8B6F0F]',
@@ -67,9 +72,14 @@ export function Badge({ children, color = 'navy' }: { children: React.ReactNode;
     red: 'bg-[#FEE2E2] text-[#991B1B]',
     blue: 'bg-[#DBEAFE] text-[#1E40AF]',
     gray: 'bg-slate-100 text-slate-700',
-    yellow: 'bg-[#FEF3C7] text-[#854D0E]'
+    yellow: 'bg-[#FEF3C7] text-[#854D0E]',
+    orange: 'bg-orange-100 text-orange-800',
+    purple: 'bg-purple-100 text-purple-800',
+    teal: 'bg-teal-100 text-teal-800',
+    emerald: 'bg-emerald-100 text-emerald-800',
+    cyan: 'bg-cyan-100 text-cyan-800'
   };
-  return <span className={cn('inline-flex items-center px-2 py-1 text-xs font-medium rounded-md', map[color])}>{children}</span>;
+  return <span className={cn('inline-flex items-center px-2 py-1 text-xs font-medium rounded-md', map[color], className)}>{children}</span>;
 }
 
 export function Input({ label, type = 'text', value, defaultValue, onChange, placeholder, className = '', required, icon: Icon, id, name }:
@@ -159,8 +169,8 @@ export function TH({ children, className = '' }: { children: React.ReactNode; cl
   return <th className={cn('px-4 py-3 font-semibold whitespace-nowrap', className)}>{children}</th>;
 }
 
-export function TD({ children, className = '' }: { children: React.ReactNode; className?: string }) {
-  return <td className={cn('px-4 py-3 text-slate-700 whitespace-nowrap', className)}>{children}</td>;
+export function TD({ children, className = '', colSpan }: { children: React.ReactNode; className?: string; colSpan?: number }) {
+  return <td colSpan={colSpan} className={cn('px-4 py-3 text-slate-700 whitespace-nowrap', className)}>{children}</td>;
 }
 
 // ===== UPDATED: Modal with top positioning =====

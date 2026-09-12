@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar, Shield, AlertTriangle } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, Modal, Tabs, Input } from '../components/ui';
 import { formatKwacha } from '../data';
@@ -14,6 +14,22 @@ import { getCompanySettings, setCompanySettings, uploadCompanyLogo, DEFAULT_COMP
 import { getDefaultPageSize, setDefaultPageSize } from '../utils/uiSettings';
 import { normalizeForDedup } from '../utils/textNormalize';
 import { showNotification } from '../utils/clickHandlers';
+import { getErrorMessage } from '../utils/errorHandler';
+
+// Matches the `positions` table -- default_salary/requires_uniform feed
+// payroll's uniform-deduction and default-salary calculations directly
+// (see payrollCalculations.ts), so this state is payroll-affecting even
+// though this page's other settings tabs are general admin UI.
+interface Position {
+  id: string;
+  name: string;
+  category: string;
+  default_salary: number;
+  is_active: boolean;
+  requires_uniform: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
 
 interface DuplicateGroup {
   normalizedKey: string;
@@ -101,9 +117,9 @@ export function SettingsPage() {
   });
   
   // Positions state
-  const [positions, setPositions] = useState<any[]>([]);
+  const [positions, setPositions] = useState<Position[]>([]);
   const [showPositionModal, setShowPositionModal] = useState(false);
-  const [editingPosition, setEditingPosition] = useState<any>(null);
+  const [editingPosition, setEditingPosition] = useState<Position | null>(null);
   const [positionForm, setPositionForm] = useState({
     name: '',
     category: 'security',
@@ -316,19 +332,22 @@ const handleSavePosition = async () => {
     setShowPositionModal(false);
     setEditingPosition(null);
     setPositionForm({ name: '', category: 'security', default_salary: 150000, is_active: true, requires_uniform: true });
-  } catch (error: any) {
+  } catch (error) {
     console.error('Error saving position:', error);
     // Fallback for the same duplicate-name case if another admin added it
     // concurrently, after this page's own positions list was last loaded.
-    const message = error.code === '23505'
+    const isDuplicateNameError =
+      typeof error === 'object' && error !== null && 'code' in error &&
+      (error as { code: unknown }).code === '23505';
+    const message = isDuplicateNameError
       ? `A position named "${trimmedName}" already exists.`
-      : `Failed to save position: ${error.message || 'Unknown error'}`;
+      : `Failed to save position: ${getErrorMessage(error)}`;
     showNotification(message, 'error');
   }
 };
 
   // ===== UPDATED: handleDeletePosition =====
-const handleDeletePosition = async (position: any) => {
+const handleDeletePosition = async (position: Position) => {
   if (confirm(`Are you sure you want to delete "${position.name}"? This may affect existing employees.`)) {
     try {
       const { error } = await supabase
@@ -352,15 +371,15 @@ const handleDeletePosition = async (position: any) => {
       
       await loadPositions();
       showNotification('Position deleted successfully', 'success');
-    } catch (error: any) {
+    } catch (error) {
       console.error('Error deleting position:', error);
-      showNotification(`Failed to delete position: ${error.message || 'Unknown error'}`, 'error');
+      showNotification(`Failed to delete position: ${getErrorMessage(error)}`, 'error');
     }
   }
 };
 
   // Edit position
-  const handleEditPosition = (position: any) => {
+  const handleEditPosition = (position: Position) => {
     setEditingPosition(position);
     setPositionForm({
       name: position.name,
@@ -418,7 +437,7 @@ const handleDeletePosition = async (position: any) => {
     return groups.sort((a, b) => b.totalEmployees - a.totalEmployees);
   };
 
-  const loadDuplicates = async () => {
+  const loadDuplicates = useCallback(async () => {
     setLoadingDuplicates(true);
     try {
       const { data, error } = await supabase
@@ -453,7 +472,7 @@ const handleDeletePosition = async (position: any) => {
     } finally {
       setLoadingDuplicates(false);
     }
-  };
+  }, []);
 
   const handleMergeGroup = async (field: 'company' | 'workstation', group: DuplicateGroup) => {
     const canonical = canonicalChoice[group.normalizedKey] || group.spellings[0].value;
@@ -1021,7 +1040,7 @@ const handleDeletePosition = async (position: any) => {
     if (tab === 'data-cleanup') {
       loadDuplicates();
     }
-  }, [tab]);
+  }, [tab, loadDuplicates]);
 
   const RoleModal = () => (
     <Modal open={showRoleModal} onClose={() => setShowRoleModal(false)} title={editingRole ? 'Edit Role' : 'Create New Role'} size="lg">

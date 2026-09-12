@@ -1,7 +1,7 @@
-﻿import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
-import { Search, FileText, Download, Printer, Eye, Shield, FileDown, User, Building2, Calendar, Clock, CheckCircle, XCircle, AlertCircle, ChevronLeft, ChevronRight, Settings, Upload, Save, RefreshCw, Archive, FileArchive } from '../utils/icons';
+﻿import { useState, useMemo, useEffect, useCallback } from 'react';
+import { Search, FileText, Download, Printer, Shield, Calendar, ChevronLeft, ChevronRight, Settings, Save } from '../utils/icons';
 import { Archive as ArchiveIcon, FileArchive as FileArchiveIcon } from 'lucide-react';
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
+import { Card, Button, Badge, PageHeader, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
@@ -17,8 +17,9 @@ import {
   getAvailableMonthsFromSystem
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
-import JSZip from 'jszip';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { UserProfile } from '../utils/currentProfile';
+import { getErrorMessage } from '../utils/errorHandler';
 
 // ===== PERFORMANCE: Lazy load PDF libraries only when needed =====
 const loadPDFLibraries = async () => {
@@ -42,7 +43,7 @@ interface Employee {
   status: string;
   payPoint?: string;
   contractType?: string;
-  region_id?: string;
+  region_id?: string | null;
   uniform_deduction?: number;
 }
 
@@ -82,6 +83,48 @@ interface ExtendedPayrollRecord extends PayrollRecord {
   uniform_amount?: number;
 }
 
+// Raw Supabase row shapes -- match the exact columns each query below
+// selects (no generated Supabase types exist in this project yet; see
+// AUDIT_REPORT.md's "Supabase generated types" section).
+interface EmployeeRow {
+  id: string;
+  employee_number: string;
+  full_name: string;
+  position: string;
+  department: string | null;
+  basic_salary: number | null;
+  status: string | null;
+  pay_point: string | null;
+  contract_type: string | null;
+  region_id: string | null;
+  uniform_deduction: number | null;
+}
+
+interface PayrollRow {
+  id: string;
+  employee_id: string;
+  month: string;
+  basic_salary: number;
+  allowances: number | null;
+  overtime: number | null;
+  bonus: number | null;
+  gross_pay: number;
+  paye: number | null;
+  pension: number | null;
+  uniform_deduction: number | null;
+  net_pay: number;
+  processed_at: string;
+  approval_status: string | null;
+}
+
+interface DeductionRow {
+  employee_id: string;
+  absent_days: number | null;
+  late_days: number | null;
+  lecture_deduction: number | null;
+  appearance_deduction: number | null;
+}
+
 interface PayslipTemplate {
   companyName: string;
   companyAddress: string;
@@ -118,13 +161,10 @@ const defaultTemplate: PayslipTemplate = {
 
 export function PayslipsPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
-  const [employees, setEmployees] = useState<Employee[]>([]);
-  const [payrollRecords, setPayrollRecords] = useState<ExtendedPayrollRecord[]>([]);
-  const [employeeDeductions, setEmployeeDeductions] = useState<any[]>([]);
   const [payslips, setPayslips] = useState<PayslipData[]>([]);
   const [search, setSearch] = useState('');
   const [view, setView] = useState<PayslipData | null>(null);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [selectedMonth, setSelectedMonth] = useState('');
   const [selectedYear, setSelectedYear] = useState('');
   const [systemMonth, setSystemMonth] = useState('');
@@ -219,22 +259,45 @@ export function PayslipsPage() {
     setLoading(true);
     try {
       const monthYear = `${selectedYear}-${String(months.indexOf(selectedMonth) + 1).padStart(2, '0')}`;
-      
-      // CRITICAL: Exclude deleted employees and include uniform_deduction
-      let employeesQuery = supabase
-        .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id, uniform_deduction')
-        .eq('status', 'Active')
-        .eq('is_deleted', false);
 
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+      // Fetch payroll records for the selected month FIRST, directly --
+      // NOT gated by today's Active/is_deleted/region employee roster. A
+      // payslip must reflect exactly what was STORED for that payroll
+      // period: gating this query (or the employee join below) by today's
+      // roster would silently drop a legitimate historical payslip for
+      // anyone since deactivated, soft-deleted, or moved to another
+      // region, even though their processed payroll row is untouched.
+      // RLS already scopes this read to the caller's own tenant.
+      const { data: rawPayrollData, error: payError } = await supabase
+        .from('payroll')
+        .select('*')
+        .eq('month', monthYear);
+      if (payError) throw payError;
+
+      // A rejected payroll run isn't valid pay data -- it's flagged for
+      // rework and its figures may still change, so no payslip should be
+      // generated from it. Pending and approved runs both produce payslips;
+      // only the badge differs (see render below).
+      const payrollData = (rawPayrollData || []).filter((r: PayrollRow) => r.approval_status !== 'rejected');
+      const payrollEmployeeIds = [...new Set(payrollData.map((r: PayrollRow) => r.employee_id))];
+
+      // Employee DISPLAY fields (name, number, position, pay point,
+      // contract type, region, uniform deduction) as they exist TODAY --
+      // fetched by id, with no Active/is_deleted/region filter, so a
+      // since-changed employee record still has details to show on their
+      // historical payslip. This never gates which payslips are produced;
+      // `payrollData` above already determined that.
+      let employeesData: EmployeeRow[] = [];
+      if (payrollEmployeeIds.length > 0) {
+        const { data, error: empError } = await supabase
+          .from('employees')
+          .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id, uniform_deduction')
+          .in('id', payrollEmployeeIds);
+        if (empError) throw empError;
+        employeesData = data || [];
       }
 
-      const { data: employeesData, error: empError } = await employeesQuery;
-      if (empError) throw empError;
-
-      const mappedEmployees = (employeesData || []).map((emp: any) => ({
+      const mappedEmployees = employeesData.map((emp: EmployeeRow) => ({
         id: emp.id,
         employeeNumber: emp.employee_number,
         fullName: emp.full_name,
@@ -248,8 +311,19 @@ export function PayslipsPage() {
         uniform_deduction: emp.uniform_deduction ?? payrollRates.uniformDeduction
       }));
 
-      setEmployees(mappedEmployees);
       const employeesById = new Map(mappedEmployees.map(e => [e.id, e]));
+
+      // Region scoping for a non-super-admin: applied here against the
+      // payroll rows (using each employee's CURRENT region_id), rather
+      // than as a pre-filter on the employees query, for the same
+      // historical-snapshot reason as above -- an employee's region at
+      // the time a past payroll run happened isn't separately tracked by
+      // this schema, so this is necessarily "is this employee in my
+      // region today," the same limitation the rest of this app's region
+      // scoping already has.
+      const authorizedPayrollData = (!userProfile?.is_super_admin && userProfile?.region_id)
+        ? payrollData.filter((r: PayrollRow) => employeesById.get(r.employee_id)?.region_id === userProfile.region_id)
+        : payrollData;
 
       // Positions eligible for a uniform deduction -- same flag Payroll.tsx
       // gates on, so a senior/office position never shows a fabricated
@@ -261,28 +335,6 @@ export function PayslipsPage() {
       if (posError) throw posError;
       const positionMap = new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]));
 
-      // Fetch payroll records
-      let payrollQuery = supabase
-        .from('payroll')
-        .select('*')
-        .eq('month', monthYear);
-
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        const employeeIds = mappedEmployees.map(e => e.id);
-        if (employeeIds.length > 0) {
-          payrollQuery = payrollQuery.in('employee_id', employeeIds);
-        }
-      }
-
-      const { data: rawPayrollData, error: payError } = await payrollQuery;
-      if (payError) throw payError;
-
-      // A rejected payroll run isn't valid pay data -- it's flagged for
-      // rework and its figures may still change, so no payslip should be
-      // generated from it. Pending and approved runs both produce payslips;
-      // only the badge differs (see render below).
-      const payrollData = (rawPayrollData || []).filter((r: any) => r.approval_status !== 'rejected');
-
       // Fetch employee deductions for the month
       const { data: deductionsData, error: dedError } = await supabase
         .from('employee_deductions')
@@ -290,16 +342,13 @@ export function PayslipsPage() {
         .eq('month', monthYear);
 
       if (dedError) throw dedError;
-      setEmployeeDeductions(deductionsData || []);
-
-      setPayrollRecords(payrollData);
 
       const payslipData: PayslipData[] = [];
 
-      if (payrollData.length > 0) {
-        payrollData.forEach((payroll: any) => {
+      if (authorizedPayrollData.length > 0) {
+        authorizedPayrollData.forEach((payroll: PayrollRow) => {
           const employee = employeesById.get(payroll.employee_id);
-          const deduction = deductionsData?.find((d: any) => d.employee_id === payroll.employee_id);
+          const deduction = deductionsData?.find((d: DeductionRow) => d.employee_id === payroll.employee_id);
 
           if (employee) {
             // Calculate deduction breakdown
@@ -345,7 +394,7 @@ export function PayslipsPage() {
       }
 
       setPayslips(payslipData);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error fetching payslip data:', err);
       showNotification('Failed to load payslips', 'error');
     } finally {
@@ -654,9 +703,9 @@ export function PayslipsPage() {
       pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
       
       return pdf.output('blob');
-    } catch (error: any) {
+    } catch (error) {
       console.error('PDF Generation Error:', error);
-      showNotification('Failed to generate PDF: ' + error.message, 'error');
+      showNotification('Failed to generate PDF: ' + getErrorMessage(error), 'error');
       return null;
     }
   }, [selectedMonth, selectedYear, template, payrollRates]);
@@ -693,9 +742,9 @@ export function PayslipsPage() {
 
         showNotification(`Payslip for ${employee.fullName} downloaded successfully`, 'success');
       }
-    } catch (error: any) {
+    } catch (error) {
       console.error('PDF Download Error:', error);
-      showNotification(`Failed to generate payslip: ${error.message || 'Unknown error'}`, 'error');
+      showNotification(`Failed to generate payslip: ${getErrorMessage(error)}`, 'error');
     }
   }, [selectedMonth, selectedYear, userProfile, generatePDF]);
 
@@ -708,6 +757,11 @@ export function PayslipsPage() {
 
     setDownloading(true);
     try {
+      // Lazy-loaded, same as the PDF libraries above (loadPDFLibraries) --
+      // this was previously a static top-level import, pulling JSZip into
+      // every visitor's Payslips bundle even though only the bulk-ZIP
+      // download path (this function) ever uses it.
+      const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
       const folder = zip.folder(`Payslips_${selectedMonth}_${selectedYear}`);
       
@@ -751,9 +805,9 @@ export function PayslipsPage() {
       });
 
       showNotification(`Downloaded ${successCount} payslips as ZIP`, 'success');
-    } catch (error: any) {
+    } catch (error) {
       console.error('Bulk Download Error:', error);
-      showNotification('Failed to download payslips: ' + error.message, 'error');
+      showNotification('Failed to download payslips: ' + getErrorMessage(error), 'error');
     } finally {
       setDownloading(false);
     }
@@ -765,6 +819,8 @@ export function PayslipsPage() {
   // longer independently editable from this modal, so there's nothing of
   // theirs to persist locally.
   const saveTemplate = useCallback(() => {
+    // Destructured only to exclude these fields from `presentation` below (see comment above).
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { companyName, companyAddress, companyPhone, companyEmail, logoUrl, ...presentation } = template;
     localStorage.setItem('payslipTemplate', JSON.stringify(presentation));
     showNotification('Payslip template saved successfully!', 'success');
@@ -800,7 +856,7 @@ export function PayslipsPage() {
       printWindow.document.close();
       printWindow.focus();
       setTimeout(() => printWindow.print(), 500);
-    } catch (error: any) {
+    } catch (error) {
       console.error('Print error:', error);
       showNotification('Failed to print payslip', 'error');
     }

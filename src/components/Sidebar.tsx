@@ -1,16 +1,21 @@
-import { 
-  LayoutDashboard, Users, UserCheck, Calendar, DollarSign, 
-  FileText, CreditCard, Receipt, FileBarChart, Settings, 
-  Shield, Sparkles, History, LogOut, Menu, X, ChevronDown, 
-  Building2, MapPin, User, Briefcase, Wallet, Clock, 
-  CheckCircle, AlertCircle, Calculator, ClipboardList, 
-  CalendarCheck, BarChart3, BookOpen
+import {
+  LayoutDashboard, Users, DollarSign,
+  FileText, Settings,
+  Shield, History, LogOut, Menu, X,
+  Wallet,
+  Calculator, ClipboardList,
+  CalendarCheck, BarChart3, BookOpen,
+  Banknote
 } from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
-import { getCurrentProfile } from "../utils/currentProfile";
+import { getCurrentProfile, UserProfile } from "../utils/currentProfile";
 import { getCompanySettings } from "../utils/companySettings";
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  PERMISSIONS, PermissionKey, isBusinessAdmin, getMyPermissions,
+  ROLE_DISPLAY_NAMES, FunctionalRole,
+} from "../utils/permissions";
+import { useState, useEffect, useCallback } from "react";
 import { ChevronRight } from 'lucide-react';
 
 export type NavKey =
@@ -22,6 +27,7 @@ export type NavKey =
   | "payslips"
   | "payments"
   | "terminal-dues"
+  | "salary-advances"
   | "reports"
   | "settings"
   | "security"
@@ -30,10 +36,11 @@ export type NavKey =
   | "user-manual";
 
 // ===== ALL NAV ITEMS =====
-export const allNavItems: { id: NavKey; label: string; icon: any }[] = [
+const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "employees", label: "Employees", icon: Users },
   { id: "terminal-dues", label: "Terminal Dues", icon: Calculator },
+  { id: "salary-advances", label: "Salary Advances", icon: Banknote },
   { id: "recruitment", label: "Recruitment", icon: ClipboardList },
   { id: "attendance", label: "Attendance", icon: CalendarCheck },
   { id: "payroll", label: "Payroll", icon: Wallet },
@@ -56,6 +63,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "payslips",
     "payments",
     "terminal-dues",
+    "salary-advances",
     "reports",
     "settings",
     "security",
@@ -70,13 +78,83 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "attendance",
     "payments",
     "terminal-dues",
+    "salary-advances",
     "reports",
     "security",
     "user-manual",
   ],
   3: ["dashboard", "attendance", "security", "user-manual"],
-  4: ["dashboard", "payslips", "user-manual"],
+  // "payslips" deliberately removed for role_level 4 (Legacy Staff) -- see
+  // App.tsx's matching rolePages[4] comment and migration
+  // 20260908000000_employees_attendance_payroll_legacy_role_hardening.sql:
+  // profiles has no employee_id link, so payroll RLS cannot express "only
+  // this account's own payslip," and Staff payroll SELECT is now disabled
+  // at the database level as a temporary restriction.
+  4: ["dashboard", "user-manual"],
 };
+
+// "security" and "features" are rendered separately (the "Special"
+// section below, not the generic allNavItems loop), so they're not rows
+// in allNavItems -- but a business admin (the ALL_NAV_KEYS branch in
+// resolveAllowedPages() below) must still resolve as having them, so a
+// FUNCTIONAL admin (role='admin', role_level=null -- not just a legacy
+// role_level=1 account, which already gets both via roleMenuItems[1]
+// above) sees the same Special-section items a legacy Admin always has.
+// Appended explicitly here rather than added to allNavItems, so the
+// generic visibleNavItems loop never renders them a second time.
+const ALL_NAV_KEYS: NavKey[] = [...allNavItems.map((item) => item.id), "security", "features"];
+
+// Governing permission(s) for each nav item, for a NEW functional-role
+// account (role_level = NULL). A page is reachable if the account holds
+// ANY ONE of the listed permissions -- e.g. "reports" is reachable with
+// EITHER the financial OR the operational view permission (the deeper
+// financial-vs-operational content split happens inside Reports.tsx
+// itself). "settings" and "auditlogs" are deliberately absent -- both stay
+// Admin-only (is_business_admin()), not permission-table-backed (see
+// 20260817000004's PART 2 header and 20260817000001's PART 4
+// respectively) -- a business admin reaches them via the ALL_NAV_KEYS
+// branch in resolveAllowedPages() below, not through this map.
+export const NAV_PERMISSIONS: Partial<Record<NavKey, PermissionKey[]>> = {
+  dashboard: [PERMISSIONS.DASHBOARD_VIEW],
+  employees: [PERMISSIONS.EMPLOYEES_VIEW],
+  recruitment: [PERMISSIONS.RECRUITMENT_VIEW],
+  attendance: [PERMISSIONS.ATTENDANCE_VIEW],
+  payroll: [PERMISSIONS.PAYROLL_VIEW],
+  payslips: [PERMISSIONS.PAYSLIPS_VIEW],
+  payments: [PERMISSIONS.PAYMENTS_VIEW],
+  "terminal-dues": [PERMISSIONS.TERMINAL_DUES_VIEW],
+  "salary-advances": [PERMISSIONS.SALARY_ADVANCES_VIEW],
+  reports: [PERMISSIONS.REPORTS_FINANCIAL_VIEW, PERMISSIONS.REPORTS_OPERATIONAL_VIEW],
+  security: [PERMISSIONS.SECURITY_PERSONNEL_VIEW],
+  features: [PERMISSIONS.FUTURE_FEATURES_VIEW],
+  "user-manual": [PERMISSIONS.USER_MANUAL_VIEW],
+};
+
+// Shared derivation used by BOTH Sidebar (nav rendering) and App.tsx
+// (routing guard) so the two can never drift apart. A LEGACY account
+// (role_level IS NOT NULL) uses the EXACT SAME role_level -> page-list map
+// it always has -- zero behavior change for any existing account. A
+// functional-role account (role_level === null, by design -- see
+// 20260817000000's header) is resolved from its permission set instead; a
+// business admin (legacy role_level = 1 OR the new role = 'admin') always
+// gets every page, matching Admin's existing full access.
+export function resolveAllowedPages(
+  profile: UserProfile | null,
+  permissions: Set<string>,
+  legacyMap: Record<number, NavKey[]>,
+): NavKey[] {
+  const roleLevel = profile?.role_level ?? null;
+  if (roleLevel !== null) {
+    return legacyMap[roleLevel] || legacyMap[4];
+  }
+  if (isBusinessAdmin(profile)) {
+    return ALL_NAV_KEYS;
+  }
+  const pages = (Object.keys(NAV_PERMISSIONS) as NavKey[]).filter((key) =>
+    NAV_PERMISSIONS[key]!.some((perm) => permissions.has(perm)),
+  );
+  return pages.length > 0 ? pages : (["dashboard", "user-manual"] as NavKey[]);
+}
 
 export function Sidebar({
   active,
@@ -91,10 +169,11 @@ export function Sidebar({
   onClose: () => void;
   onPreload?: (key: NavKey) => void;
 }) {
-  const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
+  const [userRoleLevel, setUserRoleLevel] = useState<number | null>(4);
+  const [userRole, setUserRole] = useState<string | null>(null);
+  const [allowedMenuIds, setAllowedMenuIds] = useState<NavKey[]>(roleMenuItems[4]);
   const [loading, setLoading] = useState(true);
   const [userName, setUserName] = useState<string>("User");
-  const [userEmail, setUserEmail] = useState<string>("");
   const [isMobile, setIsMobile] = useState(false);
   const [logoUrl, setLogoUrl] = useState('');
 
@@ -155,7 +234,6 @@ export function Sidebar({
           data: { user },
         } = await supabase.auth.getUser();
         if (user) {
-          setUserEmail(user.email || "");
           let profile: any = null;
           let error: any = null;
           try {
@@ -168,11 +246,23 @@ export function Sidebar({
             console.error("Error fetching profile:", error);
             setUserName(user.email?.split("@")[0] || "User");
             setUserRoleLevel(4);
+            setAllowedMenuIds(roleMenuItems[4]);
           } else {
             setUserName(
               profile?.full_name || user.email?.split("@")[0] || "User",
             );
-            setUserRoleLevel(profile?.role_level || 4);
+            const roleLevel = profile?.role_level ?? null;
+            setUserRoleLevel(roleLevel);
+            setUserRole(profile?.role ?? null);
+            const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
+
+            let permissions = new Set<string>();
+            if (roleLevel === null && !businessAdmin) {
+              permissions = await getMyPermissions();
+            }
+            setAllowedMenuIds(
+              resolveAllowedPages(profile as UserProfile | null, permissions, roleMenuItems),
+            );
           }
         }
       } catch (err) {
@@ -184,7 +274,6 @@ export function Sidebar({
     getUserInfo();
   }, []);
 
-  const allowedMenuIds = roleMenuItems[userRoleLevel] || roleMenuItems[4];
   const visibleNavItems = allNavItems.filter((item) =>
     allowedMenuIds.includes(item.id),
   );
@@ -198,7 +287,15 @@ export function Sidebar({
     if (userRoleLevel === 1) return "Administrator";
     if (userRoleLevel === 2) return "Manager";
     if (userRoleLevel === 3) return "Supervisor";
-    return "Staff";
+    if (userRoleLevel === 4) return "Staff";
+    // Functional-role account (role_level === null) -- display its real
+    // role name instead of falling through to "Staff", which would
+    // misrepresent a new hr_manager/accountant/operations_manager/admin
+    // account as the legacy lowest-privilege role.
+    if (userRole && userRole in ROLE_DISPLAY_NAMES) {
+      return ROLE_DISPLAY_NAMES[userRole as FunctionalRole];
+    }
+    return "User";
   };
 
   // ===== PERFORMANCE: Memoize NavLink component =====
@@ -279,70 +376,86 @@ export function Sidebar({
           <div className="px-3 py-2 text-sm text-slate-500">Loading...</div>
         )}
 
-        {!loading && userRoleLevel === 1 && (
+        {/* Permission-aware, not role-name-gated -- each item renders iff
+            allowedMenuIds (the same resolveAllowedPages() result the route
+            guard in App.tsx uses) actually contains it, so this section can
+            never show a button the route guard would then deny, and never
+            hide one the route guard already permits (see this file's own
+            ALL_NAV_KEYS comment for how a business admin -- legacy or
+            functional -- ends up with both). Previously gated on
+            `userRoleLevel === 1 || userIsBusinessAdmin` alone, which ignored
+            allowedMenuIds entirely and hid both items from every functional
+            non-admin role (hr_manager/accountant/operations_manager) even
+            though role_permissions already granted them
+            future_features.view/security_personnel.view. */}
+        {!loading && (allowedMenuIds.includes("security") || allowedMenuIds.includes("features")) && (
           <>
             <p className="px-3 py-2 mt-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
               Special
             </p>
-            <button
-              onClick={() => {
-                onNavigate("security");
-                if (isMobile) {
-                  onClose();
-                }
-              }}
-              onMouseEnter={() => {
-                if (onPreload) {
-                  onPreload("security");
-                }
-              }}
-              onTouchStart={() => {
-                if (onPreload) {
-                  onPreload("security");
-                }
-              }}
-              className={cn(
-                "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
-                active === "security"
-                  ? "bg-[#081C3A] text-white shadow-sm"
-                  : "text-slate-600 hover:bg-slate-100",
-              )}
-            >
-              <Shield
-                size={18}
-                className={active === "security" ? "text-[#D4A017]" : ""}
-              />
-              <span>Security Personnel</span>
-            </button>
-            <button
-              onClick={() => {
-                onNavigate("features");
-                if (isMobile) {
-                  onClose();
-                }
-              }}
-              onMouseEnter={() => {
-                if (onPreload) {
-                  onPreload("features");
-                }
-              }}
-              onTouchStart={() => {
-                if (onPreload) {
-                  onPreload("features");
-                }
-              }}
-              className={cn(
-                "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
-                active === "features"
-                  ? "bg-[#081C3A] text-white shadow-sm"
-                  : "text-slate-600 hover:bg-slate-100",
-              )}
-            >
-              <span className="w-[18px] h-[18px] rounded bg-[#D4A017] text-white text-[10px] flex items-center justify-center font-bold">
-                ★
-              </span>
-              <span>Future Features</span>
-            </button>
+            {allowedMenuIds.includes("security") && (
+              <button
+                onClick={() => {
+                  onNavigate("security");
+                  if (isMobile) {
+                    onClose();
+                  }
+                }}
+                onMouseEnter={() => {
+                  if (onPreload) {
+                    onPreload("security");
+                  }
+                }}
+                onTouchStart={() => {
+                  if (onPreload) {
+                    onPreload("security");
+                  }
+                }}
+                className={cn(
+                  "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
+                  active === "security"
+                    ? "bg-[#081C3A] text-white shadow-sm"
+                    : "text-slate-600 hover:bg-slate-100",
+                )}
+              >
+                <Shield
+                  size={18}
+                  className={active === "security" ? "text-[#D4A017]" : ""}
+                />
+                <span>Security Personnel</span>
+              </button>
+            )}
+            {allowedMenuIds.includes("features") && (
+              <button
+                onClick={() => {
+                  onNavigate("features");
+                  if (isMobile) {
+                    onClose();
+                  }
+                }}
+                onMouseEnter={() => {
+                  if (onPreload) {
+                    onPreload("features");
+                  }
+                }}
+                onTouchStart={() => {
+                  if (onPreload) {
+                    onPreload("features");
+                  }
+                }}
+                className={cn(
+                  "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all",
+                  active === "features"
+                    ? "bg-[#081C3A] text-white shadow-sm"
+                    : "text-slate-600 hover:bg-slate-100",
+                )}
+              >
+                <span className="w-[18px] h-[18px] rounded bg-[#D4A017] text-white text-[10px] flex items-center justify-center font-bold">
+                  ★
+                </span>
+                <span>Future Features</span>
+              </button>
+            )}
           </>
         )}
       </div>
@@ -407,8 +520,18 @@ export function BottomNav({
   active: NavKey;
   onNavigate: (k: NavKey) => void;
 }) {
-  const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
+  const [allowedBottomMenus, setAllowedBottomMenus] = useState<NavKey[]>(["dashboard", "employees", "payments", "payslips", "reports", "user-manual"]);
   const [loading, setLoading] = useState(true);
+
+  const roleBottomItems: Record<number, NavKey[]> = {
+    1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings", "auditlogs", "user-manual"],
+    2: ["dashboard", "employees", "terminal-dues", "attendance", "reports", "user-manual"],
+    3: ["dashboard", "employees", "attendance","terminal-dues", "reports", "user-manual"],
+    // "payslips" removed for role_level 4 -- see roleMenuItems[4]'s comment
+    // above and App.tsx's matching rolePages[4] -- Staff payroll SELECT is
+    // now disabled at the database level (20260908000000).
+    4: ["dashboard", "employees", "payments", "reports", "user-manual"],
+  };
 
   useEffect(() => {
     const getUserRole = async () => {
@@ -418,7 +541,20 @@ export function BottomNav({
         } = await supabase.auth.getUser();
         if (user) {
           const profile = await getCurrentProfile();
-          setUserRoleLevel(profile?.role_level || 4);
+          const roleLevel = profile?.role_level ?? null;
+          const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
+          let permissions = new Set<string>();
+          if (roleLevel === null && !businessAdmin) {
+            permissions = await getMyPermissions();
+          }
+          // resolveAllowedPages() returns the FULL page set for the
+          // caller; `allItems` below (a hand-curated subset for the
+          // limited mobile bottom bar) is what actually narrows it --
+          // same intersection pattern this bar already used for legacy
+          // accounts via `roleBottomItems`.
+          setAllowedBottomMenus(
+            resolveAllowedPages(profile as UserProfile | null, permissions, roleBottomItems),
+          );
         }
       } catch (err) {
         console.error("Failed to get role:", err);
@@ -428,16 +564,6 @@ export function BottomNav({
     };
     getUserRole();
   }, []);
-
-  const roleBottomItems: Record<number, NavKey[]> = {
-    1: ["dashboard", "employees", "payroll", "payments", "terminal-dues", "attendance", "settings", "auditlogs", "user-manual"],
-    2: ["dashboard", "employees", "terminal-dues", "attendance", "reports", "user-manual"],
-    3: ["dashboard", "employees", "attendance","terminal-dues", "reports", "user-manual"],
-    4: ["dashboard", "employees", "payments", "payslips", "reports", "user-manual"],
-  };
-
-  const allowedBottomMenus =
-    roleBottomItems[userRoleLevel] || roleBottomItems[4];
 
   const allItems = [
     { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },

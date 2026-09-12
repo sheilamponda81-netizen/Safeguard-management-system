@@ -1,9 +1,10 @@
-import { useState, useEffect, lazy, Suspense, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, lazy, Suspense, useCallback, useMemo } from "react";
 import { Toaster } from "sonner";
 import { LoginPage } from "./pages/Login";
-import { Sidebar, TopBar, BottomNav, NavKey } from "./components/Sidebar";
+import { Sidebar, TopBar, BottomNav, NavKey, resolveAllowedPages } from "./components/Sidebar";
 import { supabase } from "./lib/supabase";
-import { getCurrentProfile } from "./utils/currentProfile";
+import { getCurrentProfile, UserProfile } from "./utils/currentProfile";
+import { isBusinessAdmin, getMyPermissions } from "./utils/permissions";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { startMonitoring } from "./utils/alerts";
 import { logger } from "./utils/logger";
@@ -11,25 +12,27 @@ import { PageLoader } from "./components/PageLoader";
 import { measurePerformance } from "./utils/performance";
 
 // ===== PERFORMANCE: NO PRELOADING - Only load when needed =====
-const safeLazy = (importFn: () => Promise<any>) => {
+// Generic over each page module's own default-export type so `pageComponents`
+// below reflects what these dynamic imports actually resolve to, instead of
+// collapsing every page to `any`.
+const safeLazy = <P extends object>(importFn: () => Promise<{ default: React.ComponentType<P> }>) => {
   return lazy(() =>
     importFn().catch((error) => {
       console.error('Failed to load component:', error);
-      return {
-        default: () => (
-          <div className="p-8 text-center">
-            <div className="text-red-600 text-4xl mb-4">⚠️</div>
-            <p className="text-red-600 font-semibold">Failed to load component</p>
-            <p className="text-sm text-slate-500 mt-2">Please refresh the page</p>
-            <button
-              onClick={() => window.location.reload()}
-              className="mt-4 px-4 py-2 bg-[#081C3A] text-white rounded-lg hover:bg-[#1a2f5c]"
-            >
-              Refresh Page
-            </button>
-          </div>
-        )
-      };
+      const LoadFailed: React.ComponentType<P> = () => (
+        <div className="p-8 text-center">
+          <div className="text-red-600 text-4xl mb-4">⚠️</div>
+          <p className="text-red-600 font-semibold">Failed to load component</p>
+          <p className="text-sm text-slate-500 mt-2">Please refresh the page</p>
+          <button
+            onClick={() => window.location.reload()}
+            className="mt-4 px-4 py-2 bg-[#081C3A] text-white rounded-lg hover:bg-[#1a2f5c]"
+          >
+            Refresh Page
+          </button>
+        </div>
+      );
+      return { default: LoadFailed };
     })
   );
 };
@@ -47,11 +50,12 @@ const SecurityPage = safeLazy(() => import("./pages/Security"));
 const SettingsPage = safeLazy(() => import("./pages/Misc"));
 const AuditLogsPage = safeLazy(() => import("./pages/AuditLogs"));
 const TerminalDuesPage = safeLazy(() => import("./pages/TerminalDues"));
+const SalaryAdvancesPage = safeLazy(() => import("./pages/SalaryAdvances"));
 const FeaturesPage = safeLazy(() => import("./pages/Features"));
 const UserManualPage = safeLazy(() => import("./pages/UserManual"));
 
 // ===== PAGE COMPONENTS MAP =====
-const pageComponents: Record<NavKey, React.LazyExoticComponent<() => JSX.Element>> = {
+const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentType<object>>> = {
   dashboard: Dashboard,
   employees: EmployeesPage,
   recruitment: RecruitmentPage,
@@ -60,6 +64,7 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<() => JSX.Element
   payslips: PayslipsPage,
   payments: PaymentsPage,
   "terminal-dues": TerminalDuesPage,
+  "salary-advances": SalaryAdvancesPage,
   reports: ReportsPage,
   settings: SettingsPage,
   security: SecurityPage,
@@ -72,17 +77,25 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<() => JSX.Element
 const rolePages: Record<number, NavKey[]> = {
   1: [
     "dashboard", "employees", "recruitment", "attendance",
-    "payroll", "payslips", "payments", "terminal-dues",
+    "payroll", "payslips", "payments", "terminal-dues", "salary-advances",
     "reports", "settings", "security", "features", "auditlogs",
     "user-manual",
   ],
   2: [
     "dashboard", "employees", "recruitment", "attendance",
-    "payments", "terminal-dues", "reports", "security",
+    "payments", "terminal-dues", "salary-advances", "reports", "security",
     "user-manual",
   ],
   3: ["dashboard", "attendance", "security", "user-manual"],
-  4: ["dashboard", "payslips", "user-manual"],
+  // "payslips" deliberately removed for role_level 4 (Legacy Staff):
+  // profiles has no employee_id link, so payroll RLS cannot express "only
+  // this Staff account's own payslip" -- 20260908000000 disables Staff
+  // payroll SELECT at the database level as a temporary security
+  // restriction (see that migration's header), and this route-guard entry
+  // is the matching frontend half so the page is unreachable rather than
+  // rendering with zero/blocked data. Restore only once a real profile<->
+  // employee identity link exists and can back a genuinely self-scoped policy.
+  4: ["dashboard", "user-manual"],
 };
 
 // ===== TITLES CONFIGURATION =====
@@ -95,6 +108,7 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   payslips: { title: "Payslips", breadcrumb: "Payslips" },
   payments: { title: "Payment Management", breadcrumb: "Payments" },
   "terminal-dues": { title: "Terminal Dues Calculator", breadcrumb: "Terminal Dues" },
+  "salary-advances": { title: "Salary Advances", breadcrumb: "Salary Advances" },
   reports: { title: "Reports & Analytics", breadcrumb: "Reports" },
   settings: { title: "System Settings", breadcrumb: "Settings" },
   security: { title: "Security Personnel", breadcrumb: "Security" },
@@ -108,8 +122,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [nav, setNav] = useState<NavKey>("dashboard");
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [userRoleLevel, setUserRoleLevel] = useState<number>(4);
-  const [sessionChecked, setSessionChecked] = useState(false);
+  const [allowedPages, setAllowedPages] = useState<NavKey[]>(rolePages[4]);
   const [preloaded, setPreloaded] = useState<Set<NavKey>>(new Set());
 
   // ===== OPTIMIZED: Use useCallback for navigation =====
@@ -125,17 +138,8 @@ export default function App() {
   // ===== PERFORMANCE: Only preload on hover =====
   const handlePreload = useCallback((key: NavKey) => {
     if (preloaded.has(key)) return;
-    
-    const component = pageComponents[key];
-    if (component) {
-      setPreloaded(prev => new Set(prev).add(key));
-    }
+    setPreloaded(prev => new Set(prev).add(key));
   }, [preloaded]);
-
-  // ===== OPTIMIZED: Use useMemo for allowed pages =====
-  const allowedPages = useMemo(() => {
-    return rolePages[userRoleLevel] || rolePages[4];
-  }, [userRoleLevel]);
 
   // ===== OPTIMIZED: Use useMemo for titles =====
   const currentTitle = useMemo(() => {
@@ -180,15 +184,30 @@ export default function App() {
 
     const checkSession = async () => {
       try {
+        // This effect runs once on mount (see its own empty dependency
+        // array below), so `sessionChecked` here would always read its
+        // initial `false` value regardless of the several setSessionChecked(true)
+        // calls below -- it was never a meaningful condition, just dead
+        // code left over from an earlier version of this check. Removed
+        // rather than added to this effect's deps (which would instead
+        // introduce a real bug: re-running this whole effect -- including
+        // re-subscribing to onAuthStateChange -- every time sessionChecked
+        // flips, which happens multiple times within this same call).
+        // The cached-session fast path only short-circuits for a LEGACY
+        // account (a real cached role_level number) -- its allowedPages
+        // are a pure function of that number, so rolePages[roleLevel] is
+        // safe to use instantly without a network round trip. A
+        // functional-role account (role_level null/absent from the cache)
+        // needs a permissions fetch to know its allowedPages, so it always
+        // falls through to the full check below instead.
         const cachedSession = sessionStorage.getItem('sb-session-cache');
-        if (cachedSession && !sessionChecked) {
+        if (cachedSession) {
           try {
             const parsed = JSON.parse(cachedSession);
-            if (parsed && parsed.user) {
+            if (parsed && parsed.user && typeof parsed.role_level === 'number') {
               setLoggedIn(true);
-              setUserRoleLevel(parsed.role_level || 4);
+              setAllowedPages(rolePages[parsed.role_level] || rolePages[4]);
               setLoading(false);
-              setSessionChecked(true);
               return;
             }
           } catch (e) {
@@ -202,7 +221,6 @@ export default function App() {
           console.error('Session error:', error);
           setLoggedIn(false);
           setLoading(false);
-          setSessionChecked(true);
           return;
         }
 
@@ -210,15 +228,25 @@ export default function App() {
           if (session) {
             setLoggedIn(true);
             localStorage.setItem('sb-session', JSON.stringify(session));
-            
-            const profile = await getCurrentProfile();
 
-            const roleLevel = profile?.role_level || 4;
-            setUserRoleLevel(roleLevel);
-            
+            const profile = await getCurrentProfile();
+            const roleLevel = profile?.role_level ?? null;
+
+            const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
+            let permissions = new Set<string>();
+            if (roleLevel === null && !businessAdmin) {
+              permissions = await getMyPermissions();
+            }
+            const pages = resolveAllowedPages(profile as UserProfile | null, permissions, rolePages);
+            if (isMounted) setAllowedPages(pages);
+
+            // Only cache a real (legacy) role_level number for the fast
+            // path above -- caching `null` would need the permissions set
+            // cached alongside it to be useful, which this deliberately
+            // does not do (see the fast-path comment above).
             sessionStorage.setItem('sb-session-cache', JSON.stringify({
               user: session.user,
-              role_level: roleLevel
+              ...(roleLevel !== null ? { role_level: roleLevel } : {})
             }));
           } else {
             setLoggedIn(false);
@@ -226,13 +254,11 @@ export default function App() {
             sessionStorage.removeItem('sb-session-cache');
           }
           setLoading(false);
-          setSessionChecked(true);
         }
-      } catch (err: any) {
+      } catch (err) {
         console.error('Session check failed:', err);
         setLoggedIn(false);
         setLoading(false);
-        setSessionChecked(true);
       }
     };
 
@@ -244,24 +270,30 @@ export default function App() {
       if (event === 'SIGNED_IN' && session) {
         setLoggedIn(true);
         localStorage.setItem('sb-session', JSON.stringify(session));
-        
-        const profile = await getCurrentProfile();
 
-        const roleLevel = profile?.role_level || 4;
-        setUserRoleLevel(roleLevel);
+        const profile = await getCurrentProfile();
+        const roleLevel = profile?.role_level ?? null;
+
+        const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
+        let permissions = new Set<string>();
+        if (roleLevel === null && !businessAdmin) {
+          permissions = await getMyPermissions();
+        }
+        if (isMounted) {
+          setAllowedPages(resolveAllowedPages(profile as UserProfile | null, permissions, rolePages));
+        }
+
         sessionStorage.setItem('sb-session-cache', JSON.stringify({
           user: session.user,
-          role_level: roleLevel
+          ...(roleLevel !== null ? { role_level: roleLevel } : {})
         }));
         setLoading(false);
-        setSessionChecked(true);
-      } else if (event === 'SIGNED_OUT' || event === 'USER_DELETED') {
+      } else if (event === 'SIGNED_OUT') {
         setLoggedIn(false);
-        setUserRoleLevel(4);
+        setAllowedPages(rolePages[4]);
         localStorage.removeItem('sb-session');
         sessionStorage.removeItem('sb-session-cache');
         setLoading(false);
-        setSessionChecked(true);
       }
     });
 
@@ -277,15 +309,14 @@ export default function App() {
       if (loading) {
         console.warn('Loading forced to complete after 15 seconds');
         setLoading(false);
-        setSessionChecked(true);
         
         const cachedSession = sessionStorage.getItem('sb-session-cache');
         if (cachedSession) {
           try {
             const parsed = JSON.parse(cachedSession);
-            if (parsed && parsed.user) {
+            if (parsed && parsed.user && typeof parsed.role_level === 'number') {
               setLoggedIn(true);
-              setUserRoleLevel(parsed.role_level || 4);
+              setAllowedPages(rolePages[parsed.role_level] || rolePages[4]);
               return;
             }
           } catch (e) {

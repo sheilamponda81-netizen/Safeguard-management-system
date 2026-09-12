@@ -157,9 +157,7 @@ class AlertManager {
     }
   }
 
-  private checkThresholds(severity: AlertSeverity, alert: Alert) {
-    const now = Date.now();
-    
+  private checkThresholds(severity: AlertSeverity, _alert: Alert) {
     switch (severity) {
       case AlertSeverity.ERROR:
         this.errorCount++;

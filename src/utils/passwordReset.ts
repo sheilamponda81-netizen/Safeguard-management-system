@@ -1,8 +1,6 @@
 // src/utils/passwordReset.ts
 
 import { supabase } from '../lib/supabase';
-import { showNotification } from './clickHandlers';
-import { useState } from 'react';
 
 export const validatePasswordStrength = (password: string): { valid: boolean; errors: string[] } => {
   const errors: string[] = [];
@@ -52,7 +50,7 @@ export const requestPasswordReset = async (email: string): Promise<{ success: bo
       };
     }
     
-    const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
       redirectTo: `${window.location.origin}/reset-password`,
     });
     
@@ -63,13 +61,11 @@ export const requestPasswordReset = async (email: string): Promise<{ success: bo
       };
     }
     
-    console.log(`Password reset requested for email: ${email}`);
-    
     return {
       success: true,
       message: 'Password reset link sent to your email. It will expire in 1 hour.'
     };
-  } catch (error: any) {
+  } catch (error) {
     console.error('Password reset error:', error);
     return {
       success: false,
@@ -98,7 +94,7 @@ export const updatePassword = async (
       };
     }
     
-    const { data, error } = await supabase.auth.updateUser({
+    const { error } = await supabase.auth.updateUser({
       password: newPassword
     });
     
@@ -115,13 +111,11 @@ export const updatePassword = async (
       };
     }
     
-    console.log(`Password updated for user: ${data?.user?.email}`);
-    
     return {
       success: true,
       message: 'Password updated successfully! Redirecting to login...'
     };
-  } catch (error: any) {
+  } catch (error) {
     console.error('Password update error:', error);
     return {
       success: false,

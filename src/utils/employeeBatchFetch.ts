@@ -153,7 +153,7 @@ export async function fetchInEmployeeIdBatches<T>(
   let nextIndex = 0;
 
   async function worker() {
-    while (true) {
+    for (;;) {
       const i = nextIndex++;
       if (i >= batches.length) return;
       results[i] = await fetchOneBatch(batches[i], buildQuery, pageSize);

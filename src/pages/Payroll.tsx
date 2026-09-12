@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, Wallet, Calculator, Check, FileText, CheckCircle2, ChevronRight, Save, TrendingUp, Users, DollarSign, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon, UserCheck, Clock, XCircle } from 'lucide-react';
+import { Search, Wallet, Calculator, Check, CheckCircle2, ChevronRight, Save, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon, UserCheck, Clock, XCircle, FileText } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -12,10 +12,23 @@ import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll } from '../utils/payrollCalculations';
+import { calculatePooledAllocation } from '../utils/salaryAdvanceCalculations';
+import { processPayrollBatch, describeProcessPayrollBatchError } from '../utils/payrollProcessing';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { UserProfile } from '../utils/currentProfile';
+import { getErrorMessage } from '../utils/errorHandler';
+import {
+  canProcessPayroll as canProcessPayrollFor,
+  canEditPayroll as canEditPayrollFor,
+  canViewPayroll as canViewPayrollFor,
+  canApprovePayroll as canApprovePayrollFor,
+  isPendingApproval as computeIsPendingApproval,
+} from '../utils/payrollPermissions';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
-import { handleError } from '../utils/errorHandler';
 import { approvePayrollRun } from '../utils/payrollApproval';
+import { buildPayrollReportCsv } from '../utils/payrollExport';
+import { AttendanceCount, deriveAttendanceCountsState, isPreviewBlocked, hasAnyBlockedPreview } from '../utils/payrollAttendanceCounts';
 
 interface Employee {
   id: string;
@@ -27,12 +40,22 @@ interface Employee {
   status: string;
   is_deleted?: boolean;
   uniform_deduction?: number;
+  region_id?: string | null;
+  company?: string | null;
+  workstation?: string | null;
 }
 
-interface AttendanceCount {
-  absentDays: number;
-  lateDays: number;
+interface PayrollRegion {
+  id: string;
+  name: string;
 }
+
+// AttendanceCount and deriveAttendanceCountsState (which decides the
+// counts map + fail-closed attendanceCountsUnavailable flag from either
+// the historical employee_deductions rows or the current/future
+// get_payroll_attendance_counts() RPC result) live in
+// src/utils/payrollAttendanceCounts.ts -- extracted so they're
+// independently unit-testable; see that file's own header for details.
 
 interface PayrollRecord {
   id: string;
@@ -46,12 +69,28 @@ interface PayrollRecord {
   paye: number;
   pension: number;
   uniform_deduction: number;
+  // Populated authoritatively by process_payroll_batch() at processing
+  // time (see supabase/migrations/20260813000001_payroll_salary_advance_integration.sql)
+  // -- for an already-processed record this is simply read back from the
+  // stored row. For a not-yet-processed preview, calculatePayroll below
+  // computes the SAME projected figure client-side (using the identical
+  // LEAST(configured, remaining) formula the RPC applies) purely for
+  // display -- the RPC remains the sole authority for what actually gets
+  // written.
+  salary_advance_deduction: number;
   net_pay: number;
   processed_at: string;
   approval_status?: string;
-  approved_by?: string;
-  approved_at?: string;
-  approval_notes?: string;
+  approved_by?: string | null;
+  approved_at?: string | null;
+  approval_notes?: string | null;
+}
+
+interface ActiveSalaryAdvance {
+  id: string;
+  remainingBalance: number;
+  applicationDate: string;
+  createdAt: string;
 }
 
 interface EmployeeDeduction {
@@ -85,8 +124,13 @@ export function PayrollPage() {
   const [editingValues, setEditingValues] = useState<Record<string, Partial<PayrollRecord>>>({});
   const [showCopyModal, setShowCopyModal] = useState(false);
   const [hasData, setHasData] = useState(false);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [copySourceMonths, setCopySourceMonths] = useState<string[]>([]);
+  // Region id -> name, for the Export Report's "Region" column and for
+  // scoping a historical (already-processed) month's payroll rows to a
+  // regular Admin's own region -- fetched once, same pattern as
+  // Payments.tsx's own `regions` state.
+  const [regions, setRegions] = useState<PayrollRegion[]>([]);
   const [processedMonths, setProcessedMonths] = useState<string[]>([]);
   const [processingStatus, setProcessingStatus] = useState('');
   const [canProcessPayroll, setCanProcessPayroll] = useState(false);
@@ -94,16 +138,39 @@ export function PayrollPage() {
   const [canViewPayroll, setCanViewPayroll] = useState(false);
   const [canApprovePayroll, setCanApprovePayroll] = useState(false);
   const [approvalNotes, setApprovalNotes] = useState('');
-  const [approvalStatus, setApprovalStatus] = useState<'approved' | 'rejected' | null>(null);
   const [isApproved, setIsApproved] = useState(false);
   const [approverName, setApproverName] = useState('');
   // Live attendance-derived absent/late counts for the selected month, keyed by
   // employee_id -- payroll deductions now always reflect real attendance directly,
   // with no separate manual "save deductions" step required.
   const [attendanceCounts, setAttendanceCounts] = useState<Map<string, AttendanceCount>>(new Map());
+  // Set true whenever the CURRENT/FUTURE-month live attendance-count RPC
+  // (get_payroll_attendance_counts) fails for any reason -- fail-closed
+  // guard: attendanceCounts is never trusted as "zero deductions" while
+  // this is true. See the blocking banner in the render below and the
+  // guard clauses in processPayroll()/copyFromPreviousMonth(). Always
+  // false for a historical month, which never calls this RPC (its counts
+  // come from the stored employee_deductions rows instead).
+  const [attendanceCountsUnavailable, setAttendanceCountsUnavailable] = useState(false);
   // Position name -> whether that position's employees should get the uniform
   // deduction at all (Settings -> Positions -> "Requires Uniform").
   const [positionsRequiringUniform, setPositionsRequiringUniform] = useState<Map<string, boolean>>(new Map());
+  // Employee id -> their OPEN (up to 2, per the max-2-open-advances
+  // business rule) active salary advances' remaining balances BEFORE this
+  // month's own deduction -- used only to PREVIEW the projected combined,
+  // oldest-advance-first pooled deduction for a not-yet-processed employee
+  // (see PayrollRecord's own doc comment and calculatePooledAllocation()).
+  // Never written back; the actual applied amounts are always computed
+  // and stored server-side by process_payroll_batch(), which applies the
+  // identical pooled formula.
+  const [salaryAdvanceByEmployee, setSalaryAdvanceByEmployee] = useState<Map<string, ActiveSalaryAdvance[]>>(new Map());
+  // Employee id -> their ONE current combined_monthly_deduction from
+  // salary_advance_repayment_plans -- the single pool figure
+  // calculatePooledAllocation() allocates across the advances above.
+  // Corrected from an earlier draft that summed each advance's own
+  // independently-configured rate -- see 20260813000000's "COMBINED PLAN"
+  // design. Absent (0) for an employee with no current plan.
+  const [combinedPlanByEmployee, setCombinedPlanByEmployee] = useState<Map<string, number>>(new Map());
   const [payrollRates, setPayrollRatesState] = useState<PayrollRates>(DEFAULT_RATES);
 
   // ===== PAGINATION STATES =====
@@ -116,15 +183,7 @@ export function PayrollPage() {
   const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
   const isMonthProcessed = useMemo(() => processedMonths.includes(selectedMonth), [processedMonths, selectedMonth]);
 
-  const isMonthApproved = useMemo(() => {
-    if (payrollRecords.length === 0) return false;
-    return payrollRecords.every(record => record.approval_status === 'approved');
-  }, [payrollRecords]);
-
-  const isPendingApproval = useMemo(() => {
-    if (payrollRecords.length === 0) return false;
-    return !isMonthApproved && payrollRecords.some(record => record.approval_status !== 'approved');
-  }, [payrollRecords, isMonthApproved]);
+  const isPendingApproval = useMemo(() => computeIsPendingApproval(payrollRecords), [payrollRecords]);
 
   // ===== FILTER EMPLOYEES =====
   const filteredEmployees = useMemo(() => {
@@ -149,23 +208,24 @@ export function PayrollPage() {
 
   // ===== FETCH APPROVER NAME =====
   useEffect(() => {
-    if (isApproved && payrollRecords.length > 0 && payrollRecords[0]?.approved_by) {
-      const fetchApproverName = async () => {
+    const approvedBy = payrollRecords[0]?.approved_by;
+    if (isApproved && approvedBy) {
+      const fetchApproverName = async (approvedById: string) => {
         try {
           const { data, error } = await supabase
             .from('profiles')
             .select('full_name')
-            .eq('id', payrollRecords[0].approved_by)
+            .eq('id', approvedById)
             .maybeSingle();
-          
+
           if (error) throw error;
-          setApproverName(data?.full_name || payrollRecords[0].approved_by.slice(0, 8) + '...');
+          setApproverName(data?.full_name || approvedById.slice(0, 8) + '...');
         } catch (err) {
           console.error('Error fetching approver name:', err);
-          setApproverName(payrollRecords[0].approved_by.slice(0, 8) + '...');
+          setApproverName(approvedById.slice(0, 8) + '...');
         }
       };
-      fetchApproverName();
+      fetchApproverName(approvedBy);
     } else {
       setApproverName('');
     }
@@ -184,11 +244,17 @@ export function PayrollPage() {
       
       const isSuperAdmin = profile?.is_super_admin || false;
       const roleLevel = profile?.role_level || 4;
-      
-      setCanProcessPayroll(isSuperAdmin || roleLevel === 1);
-      setCanEditPayroll(isSuperAdmin || roleLevel <= 2);
-      setCanViewPayroll(isSuperAdmin || roleLevel <= 3);
-      setCanApprovePayroll(isSuperAdmin || roleLevel === 1);
+      const roleContext = { isSuperAdmin, roleLevel };
+
+      // OR'd with has_permission() for the new functional roles -- a
+      // legacy-only check would wall out an accountant (payroll.view/
+      // process/approve, role_level = NULL by design) entirely. canEdit
+      // maps to payroll.process (there is no separate "edit" permission in
+      // the seeded matrix -- editing draft entries is part of processing).
+      setCanProcessPayroll(await canAccess(canProcessPayrollFor(roleContext), PERMISSIONS.PAYROLL_PROCESS));
+      setCanEditPayroll(await canAccess(canEditPayrollFor(roleContext), PERMISSIONS.PAYROLL_PROCESS));
+      setCanViewPayroll(await canAccess(canViewPayrollFor(roleContext), PERMISSIONS.PAYROLL_VIEW));
+      setCanApprovePayroll(await canAccess(canApprovePayrollFor(roleContext), PERMISSIONS.PAYROLL_APPROVE));
     }
   }, []);
 
@@ -248,34 +314,107 @@ export function PayrollPage() {
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      let employeesQuery = supabase
-        .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id')
-        .eq('is_deleted', false)
-        .eq('status', 'Active');
+      // BROWSING an existing processed historical payroll run is a
+      // fundamentally different operation from PREPARING/PREVIEWING a
+      // current or future one, and must not share the same "start from
+      // today's roster" semantics -- see the two branches below.
+      const isHistoricalMonth = selectedMonth < systemMonth;
 
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+      let employeesData: Employee[];
+      // Set only for a historical month, where the payroll rows
+      // themselves (fetched below) are what determine `employeeIds` --
+      // resolved into the same Promise.all as the current/future branch's
+      // fresh payroll fetch, so both branches share one code path from
+      // here on.
+      let historicalPayrollPromise: Promise<PayrollRecord[]> | null = null;
+
+      if (isHistoricalMonth) {
+        // ===== A: BROWSING AN EXISTING PROCESSED HISTORICAL PAYROLL RUN =====
+        // Must show exactly what was STORED for that payroll period --
+        // never reconstructed from today's employee roster. If this
+        // branch instead started from "today's Active, region-scoped
+        // employees" (as branch B below correctly does for PREPARING a
+        // new run), a legitimate stored payroll record for someone since
+        // deactivated, soft-deleted, or moved to another region would
+        // silently disappear from view the moment their CURRENT employee
+        // record changed, even though the record itself is untouched in
+        // the database. This entire branch is read-only -- no UPDATE/
+        // INSERT/DELETE happens anywhere on this path -- so viewing a past
+        // month can never reprocess, recalculate, or mutate it.
+        const { data: rawHistoricalPayroll, error: payrollError } = await supabase
+          .from('payroll')
+          .select('*')
+          .eq('month', selectedMonth);
+        if (payrollError) throw payrollError;
+
+        const allHistoricalPayroll = dedupeById(rawHistoricalPayroll || []);
+        const historicalEmployeeIds = [...new Set(allHistoricalPayroll.map(r => r.employee_id))];
+
+        // Employee DISPLAY fields (name, number, position, region, company,
+        // workstation) as they exist TODAY -- fetched by id, with NO
+        // Active/is_deleted/region filter, so a since-changed employee
+        // record still has details to show next to their historical
+        // payroll row. This never gates which payroll rows are shown; the
+        // fetch above already determined that.
+        const historicalEmployees = historicalEmployeeIds.length > 0
+          ? await fetchInEmployeeIdBatches<Employee>(
+              historicalEmployeeIds,
+              (batch, from, to, withCount) =>
+                supabase
+                  .from('employees')
+                  .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id, company, workstation', withCount ? { count: 'exact' } : undefined)
+                  .in('id', batch)
+                  .range(from, to)
+            )
+          : [];
+        const historicalEmployeesById = new Map(historicalEmployees.map(e => [e.id, e]));
+
+        // Region scoping for a non-super-admin: payroll has no region_id
+        // column of its own, so -- same as branch B below -- this is
+        // enforced through each employee's region_id. Necessarily their
+        // CURRENT region, since this schema doesn't separately track an
+        // employee's region at the time a past payroll run happened; a
+        // regional Admin viewing history therefore sees "is this employee
+        // in my region today", the same limitation branch B already has
+        // for the current month.
+        const authorizedPayroll = (!userProfile?.is_super_admin && userProfile?.region_id)
+          ? allHistoricalPayroll.filter(r => historicalEmployeesById.get(r.employee_id)?.region_id === userProfile.region_id)
+          : allHistoricalPayroll;
+
+        const authorizedIds = new Set(authorizedPayroll.map(r => r.employee_id));
+        employeesData = historicalEmployees.filter(e => authorizedIds.has(e.id));
+        historicalPayrollPromise = Promise.resolve(authorizedPayroll);
+      } else {
+        // ===== B: PREPARING / PREVIEWING A CURRENT OR FUTURE PAYROLL RUN =====
+        // Unchanged from before: driven by today's live, Active, region-
+        // scoped roster, since this is the population payroll can actually
+        // be prepared/processed against -- there is no "stored snapshot"
+        // to browse yet for a month that hasn't been (fully) processed.
+        let employeesQuery = supabase
+          .from('employees')
+          .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id, company, workstation')
+          .eq('is_deleted', false)
+          .eq('status', 'Active');
+
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
+        }
+
+        const { data: rosterData, error: empError } = await employeesQuery;
+        if (empError) throw empError;
+        employeesData = rosterData || [];
       }
 
-      const { data: employeesData, error: empError } = await employeesQuery;
-      if (empError) throw empError;
-      setEmployees(employeesData || []);
+      setEmployees(employeesData);
 
       // payroll/employee_deductions/attendance have no region_id column of
       // their own, so region scoping for a non-super-admin has to go through
       // this (already region-scoped) employee id list -- otherwise a regional
       // payroll manager would see, and could overwrite, every other region's
-      // payroll too.
-      const employeeIds = (employeesData || []).map(e => e.id);
-
-      // ===== Live attendance-derived absent/late counts for this month =====
-      const [yearStr, monthStr] = selectedMonth.split('-');
-      const year = parseInt(yearStr, 10);
-      const monthNum = parseInt(monthStr, 10);
-      const monthStart = `${selectedMonth}-01`;
-      const lastDay = new Date(year, monthNum, 0).getDate();
-      const monthEnd = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
+      // payroll too. For a historical month this is the set of employees who
+      // actually have a stored payroll row for that month (branch A above),
+      // not today's roster.
+      const employeeIds = employeesData.map(e => e.id);
 
       // PERFORMANCE CORRECTION: these four reads (payroll records, employee
       // deductions, attendance counts, positions) don't depend on each
@@ -291,9 +430,41 @@ export function PayrollPage() {
       // genuinely fails, Promise.all rejects before any state is set, so no
       // partial/stale data is ever displayed -- same fail-fast guarantee as
       // the previous sequential version, just evaluated together instead of
-      // one at a time.
-      const [payrollDataRaw, deductionsDataRaw, attendanceCountRows, positionsRequiringUniformMap] = await Promise.all([
-        fetchInEmployeeIdBatches<PayrollRecord>(
+      // one at a time. For a historical month the "payroll records" leg is
+      // already resolved (`historicalPayrollPromise`, from branch A above --
+      // it's what determined `employeeIds` in the first place); for a
+      // current/future month it's fetched fresh here, batched exactly as
+      // before.
+      //
+      // The raw `attendance` table is NEVER read client-side, for either
+      // branch (Finding A23/A24 -- see AUDIT_REPORT.md). For a historical
+      // month, absent/late DAY COUNTS come from the stored
+      // `employee_deductions.absent_days`/`late_days` rows (fetched
+      // unconditionally just below, for both branches) -- the figure
+      // `process_payroll_batch()` actually used when that payroll ran, not
+      // "whatever attendance looks like today." For a current/future
+      // month, they come from `get_payroll_attendance_counts()` (see
+      // supabase/migrations/20260901000000_payroll_attendance_aggregate_rpc.sql),
+      // a narrow SECURITY DEFINER RPC that returns only
+      // {employee_id, absent_days, late_days} -- never a raw attendance
+      // row -- gated by the same payroll.view/legacy-role_level rule as
+      // the `payroll` table's own RLS, not by attendance.view. This is
+      // what closes the gap the two approaches above both had: `attendance`
+      // itself is RLS-gated on `current_user_role_level() IS NOT NULL OR
+      // has_permission('attendance.view')`, which a functional-role
+      // Accountant (role_level = NULL, no attendance.view grant in the
+      // seeded matrix) fails -- previously RLS would silently return ZERO
+      // rows (no error), so the live preview silently understated
+      // attendance-derived deductions with nothing in the UI indicating
+      // anything was wrong. The RPC leg below fails LOUD instead: any
+      // error is captured (not swallowed) and surfaces as
+      // `attendanceCountsUnavailable`, which blocks Process Payroll /
+      // Copy From Previous Month and shows a blocking banner -- see the
+      // guard clauses in processPayroll()/copyFromPreviousMonth() and the
+      // render section below. A historical month never calls this RPC at
+      // all (employeeIds there come from what's already stored).
+      const [payrollDataRaw, deductionsDataRaw, attendanceRpcResult, positionsRequiringUniformMap] = await Promise.all([
+        historicalPayrollPromise ?? fetchInEmployeeIdBatches<PayrollRecord>(
           employeeIds,
           (batch, from, to, withCount) =>
             supabase
@@ -313,17 +484,29 @@ export function PayrollPage() {
               .in('employee_id', batch)
               .range(from, to)
         ),
-        fetchInEmployeeIdBatches<{ employee_id: string; status: string }>(
-          employeeIds,
-          (batch, from, to, withCount) =>
-            supabase
-              .from('attendance')
-              .select('employee_id, status', withCount ? { count: 'exact' } : undefined)
-              .gte('date', monthStart)
-              .lte('date', monthEnd)
-              .in('employee_id', batch)
-              .range(from, to)
-        ),
+        // Isolated in its own try/catch, same pattern as the positions leg
+        // below: a failure here must never reject the whole Promise.all
+        // and take down payroll/deductions/positions loading too -- it's
+        // captured as `failed: true` instead, so fetchData can render its
+        // OWN dedicated fail-closed state (banner + disabled processing)
+        // rather than a generic "failed to load payroll data" toast that
+        // doesn't actually stop an Accountant from clicking Process
+        // Payroll against silently-zeroed attendance data.
+        (isHistoricalMonth || employeeIds.length === 0)
+          ? Promise.resolve({ rows: [] as { employee_id: string; absent_days: number; late_days: number }[], failed: false })
+          : (async () => {
+              try {
+                const { data, error } = await supabase.rpc('get_payroll_attendance_counts', {
+                  p_employee_ids: employeeIds,
+                  p_month: selectedMonth,
+                });
+                if (error) throw error;
+                return { rows: (data || []) as { employee_id: string; absent_days: number; late_days: number }[], failed: false };
+              } catch (attendanceRpcErr) {
+                console.error('Error fetching payroll attendance totals:', attendanceRpcErr);
+                return { rows: [] as { employee_id: string; absent_days: number; late_days: number }[], failed: true };
+              }
+            })(),
         // ===== Positions (for the "Requires Uniform" gate) =====
         // Isolated from the rest of this fetch: `requires_uniform` was added
         // by supabase/migrations/20260728000000_position_uniform_flag.sql,
@@ -361,26 +544,116 @@ export function PayrollPage() {
       const deductionsData = dedupeById(deductionsDataRaw);
       setEmployeeDeductions(deductionsData);
 
-      const counts = new Map<string, AttendanceCount>();
-      attendanceCountRows.forEach(record => {
-        const existing = counts.get(record.employee_id) || { absentDays: 0, lateDays: 0 };
-        if (record.status === 'A') existing.absentDays += 1;
-        if (record.status === 'L') existing.lateDays += 1;
-        counts.set(record.employee_id, existing);
-      });
-      setAttendanceCounts(counts);
+      // See deriveAttendanceCountsState's own header comment
+      // (src/utils/payrollAttendanceCounts.ts) for the exact fail-closed
+      // decision this makes -- extracted so it's independently
+      // unit-testable without rendering this page.
+      const attendanceState = deriveAttendanceCountsState(isHistoricalMonth, deductionsData, attendanceRpcResult);
+      setAttendanceCounts(attendanceState.counts);
+      setAttendanceCountsUnavailable(attendanceState.unavailable);
 
       setPositionsRequiringUniform(positionsRequiringUniformMap);
 
+      // ===== Active salary advances + each employee's ONE combined
+      // repayment plan (for the payroll preview only -- the actual
+      // deduction is always computed/applied server-side by
+      // process_payroll_batch(), see PayrollRecord's own doc comment).
+      // An employee may have up to 2 simultaneously open advances (the
+      // max-2-open-advances business rule), so this collects a LIST per
+      // employee, not a single value; the combined monthly figure they
+      // share comes from salary_advance_repayment_plans, NOT from summing
+      // each advance's own originally-applied-for rate (corrected from an
+      // earlier draft -- see 20260813000000's "COMBINED PLAN" design). =====
+      const advanceMap = new Map<string, ActiveSalaryAdvance[]>();
+      const planMap = new Map<string, number>();
+      if (employeeIds.length > 0) {
+        // Batched the same way payroll/employee_deductions above already
+        // are: a plain `.in('employee_id', employeeIds)` here reintroduces
+        // the exact oversized-request pattern that already broke production
+        // once at ~500+ employees (see employeeBatchFetch.ts's own header).
+        // `activeAdvancesRaw` genuinely can contain more than one row per
+        // employee (max-2-open-advances business rule), so dedupeById is
+        // real insurance here, not just convention-following, exactly like
+        // `payrollData`/`deductionsData` above.
+        const activeAdvancesRaw = await fetchInEmployeeIdBatches<{
+          id: string; employee_id: string; advance_amount: number; application_date: string; created_at: string;
+        }>(
+          employeeIds,
+          (batch, from, to, withCount) =>
+            supabase
+              .from('salary_advances')
+              .select('id, employee_id, advance_amount, application_date, created_at', withCount ? { count: 'exact' } : undefined)
+              .eq('status', 'active')
+              .lte('deduction_start_month', selectedMonth)
+              .in('employee_id', batch)
+              .range(from, to)
+        );
+        const activeAdvances = dedupeById(activeAdvancesRaw);
+
+        if (activeAdvances.length > 0) {
+          const advanceIds = activeAdvances.map(a => a.id);
+          // Batched on advance_id (disjoint across batches by construction,
+          // same reasoning as employeeBatchFetch.ts's own note on why a
+          // dedupe step isn't needed for a sum computed from disjoint
+          // batches) -- advanceIds can also grow past a safe single-request
+          // URL size for a large enough tenant, independent of employeeIds.
+          const ledgerRows = await fetchInEmployeeIdBatches<{ salary_advance_id: string; deduction_amount: number }>(
+            advanceIds,
+            (batch, from, to, withCount) =>
+              supabase
+                .from('salary_advance_deductions')
+                .select('salary_advance_id, deduction_amount', withCount ? { count: 'exact' } : undefined)
+                .in('salary_advance_id', batch)
+                .range(from, to)
+          );
+
+          const repaidByAdvance = new Map<string, number>();
+          ledgerRows.forEach(row => {
+            repaidByAdvance.set(row.salary_advance_id, (repaidByAdvance.get(row.salary_advance_id) || 0) + row.deduction_amount);
+          });
+
+          activeAdvances.forEach(advance => {
+            const repaid = repaidByAdvance.get(advance.id) || 0;
+            const entry: ActiveSalaryAdvance = {
+              id: advance.id,
+              remainingBalance: Math.max(0, advance.advance_amount - repaid),
+              applicationDate: advance.application_date,
+              createdAt: advance.created_at,
+            };
+            const existing = advanceMap.get(advance.employee_id) || [];
+            existing.push(entry);
+            advanceMap.set(advance.employee_id, existing);
+          });
+
+          // Batched on the (deduped, already-bounded-by-active-advances)
+          // employee ids with an active advance -- a subset of employeeIds,
+          // but still unbounded in principle for a large enough tenant.
+          const plans = await fetchInEmployeeIdBatches<{ employee_id: string; combined_monthly_deduction: number }>(
+            Array.from(advanceMap.keys()),
+            (batch, from, to, withCount) =>
+              supabase
+                .from('salary_advance_repayment_plans')
+                .select('employee_id, combined_monthly_deduction', withCount ? { count: 'exact' } : undefined)
+                .in('employee_id', batch)
+                .range(from, to)
+          );
+          plans.forEach(plan => {
+            planMap.set(plan.employee_id, plan.combined_monthly_deduction);
+          });
+        }
+      }
+      setSalaryAdvanceByEmployee(advanceMap);
+      setCombinedPlanByEmployee(planMap);
+
       setHasData((payrollData?.length || 0) > 0);
 
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error fetching data:', err);
-      showNotification('Failed to load payroll data: ' + err.message, 'error');
+      showNotification('Failed to load payroll data: ' + getErrorMessage(err), 'error');
     } finally {
       setLoading(false);
     }
-  }, [selectedMonth, userProfile]);
+  }, [selectedMonth, systemMonth, userProfile]);
 
   // ===== Shared payroll rates (PAYE rate/threshold, pension rate) from Settings =====
   useEffect(() => {
@@ -446,7 +719,28 @@ export function PayrollPage() {
 
     const paye = customValues?.paye ?? live.paye;
     const pension = customValues?.pension ?? live.pension;
-    const netPay = live.grossPay - paye - pension - live.uniformDeduction;
+    const netPayBeforeAdvance = live.grossPay - paye - pension - live.uniformDeduction;
+
+    // Preview only -- identical oldest-advance-first pooled allocation the
+    // process_payroll_batch() RPC itself applies (see
+    // 20260813000001_payroll_salary_advance_integration.sql and
+    // calculatePooledAllocation()'s own header), computed here purely so
+    // this page's own display matches what processing will actually do
+    // for an employee with up to 2 simultaneously open advances. The RPC
+    // recomputes this independently at processing time and is the only
+    // thing that actually writes it.
+    const openAdvances = salaryAdvanceByEmployee.get(employee.id) || [];
+    const combinedMonthlyDeduction = combinedPlanByEmployee.get(employee.id) || 0;
+    const salaryAdvanceDeduction = customValues?.salary_advance_deduction ?? calculatePooledAllocation(
+      combinedMonthlyDeduction,
+      openAdvances.map(a => ({
+        id: a.id,
+        remainingBalance: a.remainingBalance,
+        applicationDate: a.applicationDate,
+        createdAt: a.createdAt,
+      }))
+    ).total;
+    const netPay = netPayBeforeAdvance - salaryAdvanceDeduction;
 
     return {
       id: '',
@@ -460,6 +754,7 @@ export function PayrollPage() {
       paye,
       pension,
       uniform_deduction: live.uniformDeduction,
+      salary_advance_deduction: salaryAdvanceDeduction,
       net_pay: netPay,
       processed_at: new Date().toISOString(),
       approval_status: 'pending',
@@ -467,7 +762,7 @@ export function PayrollPage() {
       approved_at: null,
       approval_notes: null
     };
-  }, [selectedMonth, getEmployeeDeduction, attendanceCounts, positionsRequiringUniform, payrollRates]);
+  }, [selectedMonth, getEmployeeDeduction, attendanceCounts, positionsRequiringUniform, payrollRates, salaryAdvanceByEmployee, combinedPlanByEmployee]);
 
   const getDisplayPayroll = useCallback((employee: Employee): PayrollRecord => {
     const existing = getPayrollForEmployee(employee.id);
@@ -478,7 +773,7 @@ export function PayrollPage() {
 
   // ===== GET TOTALS =====
   const totals = useMemo(() => {
-    let gross = 0, net = 0, paye = 0, pension = 0, uniformDeductions = 0;
+    let gross = 0, net = 0, paye = 0, pension = 0, uniformDeductions = 0, salaryAdvanceDeductions = 0;
     employees.forEach(emp => {
       const p = getDisplayPayroll(emp);
       gross += p.gross_pay;
@@ -486,8 +781,9 @@ export function PayrollPage() {
       paye += p.paye;
       pension += p.pension;
       uniformDeductions += p.uniform_deduction || 0;
+      salaryAdvanceDeductions += p.salary_advance_deduction || 0;
     });
-    return { gross, net, paye, pension, uniformDeductions };
+    return { gross, net, paye, pension, uniformDeductions, salaryAdvanceDeductions };
   }, [employees, getDisplayPayroll]);
 
   const employeesWithDeductions = useMemo(() => {
@@ -496,6 +792,26 @@ export function PayrollPage() {
     // re-deriving it separately here and risking the two disagreeing.
     return employees.filter(emp => getDisplayPayroll(emp).uniform_deduction > 0);
   }, [employees, getDisplayPayroll]);
+
+  // True only when at least one CURRENTLY DISPLAYED figure is actually a
+  // live calculation built on a failed/unavailable attendance-count fetch
+  // -- i.e. attendanceCountsUnavailable AND at least one employee has no
+  // stored payroll row yet (getDisplayPayroll falls through to
+  // calculatePayroll() for them, which silently treats a missing
+  // attendanceCounts entry as zero). Deliberately false for an
+  // already-fully-processed month even if attendanceCountsUnavailable
+  // happens to be true (every displayed figure there comes from the
+  // stored, already-authoritative payroll row, untouched by this fetch) --
+  // and always false for a historical month, which never sets
+  // attendanceCountsUnavailable at all. Gates the deduction/net-pay
+  // DISPLAY only (see the render section below) -- it does not change
+  // what getDisplayPayroll/calculatePayroll compute, so Process Payroll
+  // (already disabled via attendanceCountsUnavailable directly) is
+  // unaffected.
+  const hasBlockedPreview = useMemo(
+    () => hasAnyBlockedPreview(attendanceCountsUnavailable, employees.map(e => e.id), new Set(payrollByEmployee.keys())),
+    [attendanceCountsUnavailable, employees, payrollByEmployee]
+  );
 
   // ===== UPDATE FIELD =====
   const updateField = useCallback((employeeId: string, field: keyof PayrollRecord, value: number) => {
@@ -537,10 +853,13 @@ export function PayrollPage() {
       const pastMonths = months.filter(m => m < month);
       setCopySourceMonths(pastMonths);
 
+      const { data: regionsData } = await supabase.from('regions').select('id, name');
+      setRegions(regionsData || []);
+
       await fetchUserProfile();
     };
     init();
-  }, []);
+  }, [fetchUserProfile]);
 
   useEffect(() => {
     if (userProfile && selectedMonth) {
@@ -586,7 +905,16 @@ export function PayrollPage() {
       showNotification('You do not have permission to copy payroll data.', 'error');
       return;
     }
-    
+
+    // Same fail-closed guard as processPayroll() -- calculatePayroll()
+    // below is called per employee to compute the target month's uniform/
+    // attendance deductions, which must never proceed on a known-missing
+    // attendance-count fetch.
+    if (attendanceCountsUnavailable) {
+      showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
+      return;
+    }
+
     setProcessingStatus('Copying data from ' + getMonthLabel(sourceMonth) + '...');
 
     try {
@@ -596,21 +924,15 @@ export function PayrollPage() {
         return;
       }
 
-      // Scoped to this admin's own employee set (their region, or the whole
-      // company for a super admin) -- the payroll table has no region_id
-      // column of its own, so an unscoped delete/read here would touch (or
-      // silently overwrite) every other region's payroll too.
-      const { error: deleteError } = await supabase
-        .from('payroll')
-        .delete()
-        .eq('month', selectedMonth)
-        .in('employee_id', employeeIds);
-
-      if (deleteError) {
-        console.error('Error deleting existing data:', deleteError);
-      }
-
-      // Same oversized-IN-list risk/fix as the main fetchData payroll query.
+      // The target month's existing rows are no longer deleted here up
+      // front -- process_payroll_batch() (called below, once newRecords is
+      // built) does the delete and insert atomically in one transaction,
+      // scoped to exactly `employeeIds` as before. (A separate manual
+      // pre-delete would race with that atomic RPC step and isn't needed.)
+      //
+      // Same oversized-IN-list risk/fix as the main fetchData payroll query
+      // -- batched via employeeBatchFetch instead of one request built from
+      // the entire employee population.
       let sourceData: PayrollRecord[];
       try {
         const sourceDataRaw = await fetchInEmployeeIdBatches<PayrollRecord>(
@@ -667,7 +989,13 @@ export function PayrollPage() {
             paye: payroll.paye,
             pension: payroll.pension,
             uniform_deduction: payroll.uniform_deduction,
-            net_pay: payroll.net_pay,
+            // payroll.net_pay is the FINAL (post-advance) figure used for
+            // display/totals throughout this page -- process_payroll_batch()
+            // subtracts its OWN server-computed salary advance deduction
+            // from whatever net_pay it receives, so the value sent here
+            // must be added back to the PRE-advance figure or the RPC
+            // would subtract the same deduction a second time.
+            net_pay: payroll.net_pay + payroll.salary_advance_deduction,
             processed_at: new Date().toISOString(),
             approval_status: 'pending',
             approved_by: null,
@@ -682,41 +1010,31 @@ export function PayrollPage() {
         return;
       }
 
-      const { data: inserted, error: insertError } = await supabase
-        .from('payroll')
-        .insert(newRecords)
-        .select();
+      const result = await processPayrollBatch(selectedMonth, newRecords, {
+        sourceMonth,
+        targetMonth: selectedMonth,
+      });
 
-      if (insertError) {
-        console.error('Error inserting records:', insertError);
-        showNotification('Failed to copy data: ' + insertError.message, 'error');
+      if (!result.success) {
+        console.error('Error copying data:', result.error);
+        const message = result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error;
+        showNotification('Failed to copy data: ' + message, 'error');
         return;
       }
-      
-      await logAudit({
-        action: 'CREATE',
-        entity_type: 'payroll',
-        new_data: {
-          sourceMonth: sourceMonth,
-          targetMonth: selectedMonth,
-          recordsCopied: inserted?.length || 0
-        },
-        region_id: userProfile?.region_id
-      });
-      
+
       await fetchData();
       await fetchProcessedMonths();
       setHasData(true);
       setIsApproved(false);
       setShowCopyModal(false);
-      showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${inserted?.length || 0} records copied.`, 'success');
-    } catch (err: any) {
+      showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${result.insertedCount ?? newRecords.length} records copied.`, 'success');
+    } catch (err) {
       console.error('Error copying data:', err);
-      showNotification('Failed to copy data: ' + err.message, 'error');
+      showNotification('Failed to copy data: ' + getErrorMessage(err), 'error');
     } finally {
       setProcessingStatus('');
     }
-  }, [canProcessPayroll, selectedMonth, userProfile, employees, calculatePayroll, fetchData, fetchProcessedMonths]);
+  }, [canProcessPayroll, attendanceCountsUnavailable, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths]);
 
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
@@ -797,18 +1115,52 @@ export function PayrollPage() {
 
       setShowApprovalModal(false);
       setApprovalNotes('');
-      setApprovalStatus(null);
       await fetchData();
       await fetchProcessedMonths();
 
     } catch (err) {
       console.error('Error approving payroll:', err);
-      showNotification('Failed to approve payroll: ' + handleError(err), 'error');
+      showNotification('Failed to approve payroll: ' + getErrorMessage(err), 'error');
     } finally {
       setProcessing(false);
       setProcessingStatus('');
     }
   }, [canApprovePayroll, payrollRecords, selectedMonth, userProfile, approvalNotes, fetchData, fetchProcessedMonths]);
+
+  // ===== EXPORT PAYROLL REPORT =====
+  // Always exports whatever is CURRENTLY LOADED for `selectedMonth` --
+  // the month actually being viewed, never silently the live current
+  // month -- and only what fetchData() already fetched for this caller's
+  // authorized tenant/region scope (see fetchData's branch A/B above), so
+  // this can never leak another tenant's or another region's payroll.
+  // Uses the stored `payrollRecords` directly (not a live/unprocessed
+  // preview via getDisplayPayroll), since this is a report for the
+  // Accountant/Managing Director -- only figures that were actually
+  // processed and stored belong in it.
+  const exportPayrollReport = useCallback(() => {
+    const regionsById = new Map(regions.map(r => [r.id, r]));
+    const csv = buildPayrollReportCsv(selectedMonth, payrollRecords, employeesById, regionsById, deductionsByEmployee);
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `payroll_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    logAudit({
+      action: 'EXPORT',
+      entity_type: 'payroll',
+      new_data: {
+        month: selectedMonth,
+        employeeCount: payrollRecords.length,
+      },
+      region_id: userProfile?.region_id,
+    });
+
+    showNotification('Payroll report exported!', 'success');
+  }, [payrollRecords, employeesById, regions, deductionsByEmployee, selectedMonth, userProfile]);
 
   // ===== PROCESS PAYROLL =====
   const processPayroll = useCallback(async () => {
@@ -825,7 +1177,17 @@ export function PayrollPage() {
       showNotification('You do not have permission to process payroll. Only Super Admins can process payroll.', 'error');
       return;
     }
-    
+
+    // Fail-closed, defense in depth: the Process Payroll button is already
+    // disabled while this is true (see the render section), but this
+    // function must never proceed on its own even if somehow invoked
+    // anyway -- calculatePayroll() below would otherwise silently treat
+    // every employee's attendance as zero absent/late days.
+    if (attendanceCountsUnavailable) {
+      showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
+      return;
+    }
+
     setProcessing(true);
     setProcessingStatus('Preparing payroll data...');
     
@@ -848,8 +1210,8 @@ export function PayrollPage() {
 
         totalGross += payroll.gross_pay;
         totalNet += payroll.net_pay;
-        totalDeductions += (payroll.paye + payroll.pension + payroll.uniform_deduction);
-        
+        totalDeductions += (payroll.paye + payroll.pension + payroll.uniform_deduction + payroll.salary_advance_deduction);
+
         payrollToSave.push({
           employee_id: employee.id,
           month: selectedMonth,
@@ -861,7 +1223,11 @@ export function PayrollPage() {
           paye: payroll.paye,
           pension: payroll.pension,
           uniform_deduction: payroll.uniform_deduction,
-          net_pay: payroll.net_pay,
+          // See the identical comment in copyFromPreviousMonth() above --
+          // payroll.net_pay here is already post-advance; add the
+          // deduction back so process_payroll_batch() (which subtracts
+          // its own server-computed copy) doesn't subtract it twice.
+          net_pay: payroll.net_pay + payroll.salary_advance_deduction,
           processed_at: new Date().toISOString(),
           approval_status: 'pending',
           approved_by: null,
@@ -870,71 +1236,50 @@ export function PayrollPage() {
         });
       }
       
-      setProcessingStatus('Clearing existing data...');
-      // Scoped to exactly the employees being (re)processed in this run --
-      // for a non-super-admin that's their own region only. An unscoped
-      // delete-by-month here would also wipe every OTHER region's payroll
-      // for this month, since the payroll table has no region_id column of
-      // its own to protect it.
-      const { error: deleteError } = await supabase
-        .from('payroll')
-        .delete()
-        .eq('month', selectedMonth)
-        .in('employee_id', employees.map(e => e.id));
-
-      if (deleteError) {
-        console.error('Error deleting existing records:', deleteError);
-      }
-      
       setProcessingStatus(`Saving ${payrollToSave.length} records...`);
-      const { data: insertedData, error: insertError } = await supabase
-        .from('payroll')
-        .insert(payrollToSave)
-        .select();
-      
-      if (insertError) {
-        console.error('❌ Error inserting records:', insertError);
-        showNotification('Failed to save payroll: ' + insertError.message, 'error');
+      // Atomic, server-side: validates (role, approved-month protection),
+      // deletes, and inserts all inside one transaction, serialized against
+      // any concurrent processing attempt for the same tenant+month -- see
+      // supabase/migrations/20260803000002_payroll_atomic_process_rpc.sql.
+      // Replaces the previous separate client-side DELETE then INSERT,
+      // which could leave a month's payroll fully deleted with nothing
+      // re-inserted if the INSERT failed after the DELETE had already
+      // succeeded (Finding A8).
+      const result = await processPayrollBatch(selectedMonth, payrollToSave, {
+        totalGross,
+        totalNet,
+        totalDeductions,
+      });
+
+      if (!result.success) {
+        console.error('❌ Error processing payroll:', result.error);
+        const message = result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error;
+        showNotification('Failed to save payroll: ' + message, 'error');
         setProcessing(false);
         setProcessingStatus('');
         return;
       }
-      
-      await logAudit({
-        action: 'CREATE',
-        entity_type: 'payroll',
-        new_data: {
-          month: selectedMonth,
-          employeeCount: employees.length,
-          totalGross: totalGross,
-          totalNet: totalNet,
-          totalDeductions: totalDeductions,
-          recordsSaved: insertedData?.length || 0,
-          status: 'pending_approval'
-        },
-        region_id: userProfile?.region_id
-      });
-      
+
       await fetchData();
       await fetchProcessedMonths();
-      
+
       setProcessed(true);
       setShowConfirmModal(false);
       setEditingValues({});
       setIsApproved(false);
-      
+
       setTimeout(() => setProcessed(false), 5000);
-      
-      showNotification(`Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${insertedData?.length || 0} employees processed. The payroll is now pending approval by a manager or admin.`, 'success');
-      
-    } catch (err: any) {
+
+      showNotification(`Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${result.insertedCount ?? payrollToSave.length} employees processed. The payroll is now pending approval by a manager or admin.`, 'success');
+
+    } catch (err) {
       console.error('❌ Error processing payroll:', err);
-      showNotification('Failed to process payroll: ' + err.message, 'error');
+      showNotification('Failed to process payroll: ' + getErrorMessage(err), 'error');
     } finally {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, employees, editingValues, calculatePayroll, selectedMonth, userProfile, fetchData, fetchProcessedMonths]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -1004,12 +1349,19 @@ export function PayrollPage() {
               </button>
             )}
 
+            <Button
+              variant="secondary"
+              onClick={exportPayrollReport}
+              disabled={payrollRecords.length === 0}
+            >
+              <FileText size={16} /> Export Report
+            </Button>
+
             {canApprovePayroll && isMonthProcessed && !isApproved && isCurrentMonth && (
               <Button 
                 variant="secondary" 
                 onClick={() => {
-                  setApprovalStatus(null);
-                  setApprovalNotes('');
+                              setApprovalNotes('');
                   setShowApprovalModal(true);
                 }}
                 disabled={processing || payrollRecords.length === 0}
@@ -1032,10 +1384,10 @@ export function PayrollPage() {
             )}
 
             {canProcessPayroll && isCurrentMonth && (
-              <Button 
-                variant={isMonthProcessed ? "outline" : "secondary"} 
+              <Button
+                variant={isMonthProcessed ? "outline" : "secondary"}
                 onClick={() => setShowConfirmModal(true)}
-                disabled={processing || isApproved}
+                disabled={processing || isApproved || attendanceCountsUnavailable}
               >
                 {processing ? (
                   <span className="flex items-center gap-2">
@@ -1109,8 +1461,7 @@ export function PayrollPage() {
                 {canApprovePayroll && (
                   <button 
                     onClick={() => {
-                      setApprovalStatus(null);
-                      setApprovalNotes('');
+                                      setApprovalNotes('');
                       setShowApprovalModal(true);
                     }}
                     className="ml-2 text-[#D4A017] hover:underline font-medium"
@@ -1154,6 +1505,29 @@ export function PayrollPage() {
         </Card>
       )}
 
+      {attendanceCountsUnavailable && (
+        <Card className="p-4 bg-red-50 border-red-300 border">
+          <div className="flex items-start gap-3">
+            <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-semibold text-red-800">
+                Unable to load attendance totals required for payroll. Please refresh and try again.
+              </p>
+              <p className="text-sm text-red-700 mt-1">
+                Processing and copy-forward are disabled until this loads successfully, so payroll is
+                never calculated or saved with missing attendance data.
+              </p>
+              <button
+                onClick={() => fetchData()}
+                className="mt-2 text-sm font-medium text-red-800 hover:underline"
+              >
+                Retry
+              </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {processedMonths.length > 0 && (
         <Card className="p-3 bg-emerald-50 border-emerald-200 border">
           <div className="flex items-center gap-4 flex-wrap">
@@ -1186,7 +1560,10 @@ export function PayrollPage() {
         </Card>
       )}
 
-      {employeesWithDeductions.length > 0 && (
+      {/* Suppressed while hasBlockedPreview -- this list is itself built
+          from the same live calculation that's currently unreliable, and
+          the blocking banner above already explains why. */}
+      {!hasBlockedPreview && employeesWithDeductions.length > 0 && (
         <Card className="p-4 bg-red-50 border-red-200 border">
           <div className="flex items-start gap-3">
             <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />
@@ -1195,7 +1572,7 @@ export function PayrollPage() {
                 Attendance & Uniform Deductions Applied
               </p>
               <p className="text-sm text-red-700">
-                {employeesWithDeductions.length} employee(s) have uniform and/or attendance deductions for this month. 
+                {employeesWithDeductions.length} employee(s) have uniform and/or attendance deductions for this month.
                 These will be automatically included in the payroll calculation.
               </p>
               <div className="mt-2 text-xs text-red-600 space-y-1">
@@ -1229,10 +1606,22 @@ export function PayrollPage() {
           <div className="flex items-start justify-between">
             <div>
               <p className="text-xs text-slate-500">Total Deductions</p>
-              <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(totals.paye + totals.pension + totals.uniformDeductions)}</p>
-              <p className="text-xs text-slate-500 mt-1">PAYE: {formatKwacha(totals.paye)}</p>
-              <p className="text-xs text-slate-500 mt-1">Pension: {formatKwacha(totals.pension)}</p>
-              <p className="text-xs text-red-500 mt-1">Uniform/Attendance: {formatKwacha(totals.uniformDeductions)}</p>
+              {hasBlockedPreview ? (
+                <>
+                  <p className="text-xl font-bold text-slate-400 mt-1">—</p>
+                  <p className="text-xs text-red-500 mt-1">Attendance totals unavailable</p>
+                </>
+              ) : (
+                <>
+                  <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(totals.paye + totals.pension + totals.uniformDeductions + totals.salaryAdvanceDeductions)}</p>
+                  <p className="text-xs text-slate-500 mt-1">PAYE: {formatKwacha(totals.paye)}</p>
+                  <p className="text-xs text-slate-500 mt-1">Pension: {formatKwacha(totals.pension)}</p>
+                  <p className="text-xs text-red-500 mt-1">Uniform/Attendance: {formatKwacha(totals.uniformDeductions)}</p>
+                  {totals.salaryAdvanceDeductions > 0 && (
+                    <p className="text-xs text-purple-600 mt-1">Salary Advances: {formatKwacha(totals.salaryAdvanceDeductions)}</p>
+                  )}
+                </>
+              )}
             </div>
             <div className="w-10 h-10 rounded-lg bg-red-100 text-red-600 flex items-center justify-center">
               <Calculator size={18} />
@@ -1243,8 +1632,17 @@ export function PayrollPage() {
           <div className="flex items-start justify-between">
             <div>
               <p className="text-xs text-[#8B6F0F]">Net Pay</p>
-              <p className="text-2xl font-bold text-[#081C3A] mt-1">{formatKwacha(totals.net)}</p>
-              <p className="text-xs text-[#8B6F0F] mt-1">Total Disbursement</p>
+              {hasBlockedPreview ? (
+                <>
+                  <p className="text-2xl font-bold text-slate-400 mt-1">—</p>
+                  <p className="text-xs text-red-500 mt-1">Attendance totals unavailable</p>
+                </>
+              ) : (
+                <>
+                  <p className="text-2xl font-bold text-[#081C3A] mt-1">{formatKwacha(totals.net)}</p>
+                  <p className="text-xs text-[#8B6F0F] mt-1">Total Disbursement</p>
+                </>
+              )}
             </div>
             <div className="w-10 h-10 rounded-lg bg-[#081C3A] text-[#D4A017] flex items-center justify-center">
               <ChevronRight size={18} />
@@ -1255,8 +1653,17 @@ export function PayrollPage() {
           <div className="flex items-start justify-between">
             <div>
               <p className="text-xs text-red-600">Uniform/Attendance</p>
-              <p className="text-xl font-bold text-red-600 mt-1">{formatKwacha(totals.uniformDeductions)}</p>
-              <p className="text-xs text-red-500 mt-1">{employeesWithDeductions.length} employees</p>
+              {hasBlockedPreview ? (
+                <>
+                  <p className="text-xl font-bold text-slate-400 mt-1">—</p>
+                  <p className="text-xs text-red-500 mt-1">Attendance totals unavailable</p>
+                </>
+              ) : (
+                <>
+                  <p className="text-xl font-bold text-red-600 mt-1">{formatKwacha(totals.uniformDeductions)}</p>
+                  <p className="text-xs text-red-500 mt-1">{employeesWithDeductions.length} employees</p>
+                </>
+              )}
             </div>
             <div className="w-10 h-10 rounded-lg bg-red-200 text-red-700 flex items-center justify-center">
               <AlertCircle size={18} />
@@ -1280,7 +1687,7 @@ export function PayrollPage() {
               a stale "PAYE (30%)" label here would contradict whatever an
               admin has actually configured. */}
           <p className="text-sm text-slate-600">
-            = Gross Pay - PAYE ({(payrollRates.payeRate * 100).toFixed(0)}% above {formatKwacha(payrollRates.payeThreshold)}) - Pension ({(payrollRates.pensionEmployeeRate * 100).toFixed(0)}%) - Uniform Deduction - Attendance Deductions
+            = Gross Pay - PAYE ({(payrollRates.payeRate * 100).toFixed(0)}% above {formatKwacha(payrollRates.payeThreshold)}) - Pension ({(payrollRates.pensionEmployeeRate * 100).toFixed(0)}%) - Uniform Deduction - Attendance Deductions - Salary Advance Deduction (if any)
           </p>
           <p className="text-xs text-slate-500 mt-2">Attendance Deductions: Absent (MK4,200/day) + Late (MK4,200/day) + Lecture + Appearance</p>
         </Card>
@@ -1304,7 +1711,7 @@ export function PayrollPage() {
           <Badge color="gray" className="text-xs">🔒 Read Only</Badge>
         )}
         {!isCurrentMonth && (
-          <Badge color={isFutureMonthSelected ? 'blue' : 'amber'} className="text-xs">
+          <Badge color={isFutureMonthSelected ? 'blue' : 'yellow'} className="text-xs">
             {isFutureMonthSelected ? '🔮 Future' : '📅 Past'}
           </Badge>
         )}
@@ -1324,6 +1731,10 @@ export function PayrollPage() {
           onAction={() => {
             if (copySourceMonths.length === 0) {
               showNotification('No previous months available to copy from.', 'error');
+              return;
+            }
+            if (attendanceCountsUnavailable) {
+              showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
               return;
             }
             setShowCopyModal(true);
@@ -1355,8 +1766,15 @@ export function PayrollPage() {
                 const positionRequiresUniform = positionsRequiringUniform.get(emp.position) ?? true;
                 const uniformAmount = positionRequiresUniform ? (emp.uniform_deduction ?? payrollRates.uniformDeduction) : 0;
                 const hasUniform = uniformAmount > 0;
-                const hasAnyDeduction = p.uniform_deduction > 0;
                 const existingRecord = payrollByEmployee.get(emp.id);
+                // This employee's own uniform/attendance and net-pay figures
+                // are a live calculation built on attendanceCounts, and that
+                // fetch failed -- never render them as if valid (see
+                // hasBlockedPreview's own comment above). Never true for an
+                // already-processed employee (existingRecord), whose figures
+                // come from the stored, unaffected payroll row instead.
+                const previewBlocked = isPreviewBlocked(attendanceCountsUnavailable, !!existingRecord);
+                const hasAnyDeduction = !previewBlocked && p.uniform_deduction > 0;
                 const isEditable = canEditPayroll && !existingRecord && isCurrentMonth && !isMonthProcessed && !isApproved;
 
                 return (
@@ -1442,19 +1860,27 @@ export function PayrollPage() {
                       {formatKwacha(p.gross_pay)}
                     </TD>
                     <TD className={`text-right font-mono font-semibold ${hasAnyDeduction ? 'text-red-600' : 'text-slate-500'} bg-red-50/50`}>
-                      {formatKwacha(p.uniform_deduction || 0)}
-                      {hasAnyDeduction && (
-                        <div className="text-[10px] text-red-400 space-y-0.5">
-                          {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
-                          {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × MK4,200</div>}
-                          {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × MK4,200</div>}
-                          {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
-                          {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
-                        </div>
+                      {previewBlocked ? (
+                        <span className="text-slate-400" title="Unable to load attendance totals for this employee">—</span>
+                      ) : (
+                        <>
+                          {formatKwacha(p.uniform_deduction || 0)}
+                          {hasAnyDeduction && (
+                            <div className="text-[10px] text-red-400 space-y-0.5">
+                              {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
+                              {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × MK4,200</div>}
+                              {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × MK4,200</div>}
+                              {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
+                              {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
+                            </div>
+                          )}
+                        </>
                       )}
                     </TD>
                     <TD className="text-right font-mono font-bold text-[#081C3A] bg-slate-100">
-                      {formatKwacha(p.net_pay)}
+                      {previewBlocked
+                        ? <span className="text-slate-400" title="Unable to load attendance totals for this employee">—</span>
+                        : formatKwacha(p.net_pay)}
                     </TD>
                   </TR>
                 );

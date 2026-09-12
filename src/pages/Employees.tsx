@@ -1,9 +1,10 @@
-﻿import { useState, useMemo, useEffect, useCallback } from 'react';
-import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, User, Phone, MapPin, Heart, ChevronLeft, ChevronRight, Archive, RotateCcw, Calendar, Clock, AlertCircle, Building2, Home, Loader2 } from 'lucide-react';
+﻿import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import { Search, Plus, Eye, Edit2, Trash2, Filter, Download, UserPlus, Heart, Archive, RotateCcw, Calendar, AlertCircle, Building2, Home, Loader2 } from 'lucide-react';
 import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
+import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
@@ -11,6 +12,10 @@ import { getEmployeeAuditData, getChanges } from '../utils/auditHelpers';
 import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { getDefaultPageSize } from '../utils/uiSettings';
+import { toCsvRow } from '../utils/csvExport';
+import { generateEmployeeNumberServerSide, shouldGenerateEmployeeNumber } from '../utils/employeeNumberGeneration';
+import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
+import { getErrorMessage } from '../utils/errorHandler';
 import { checkEmployeeIdentifierConflicts, formatIdentifierConflictMessage, identifierColumnFromUniqueViolation } from '../utils/employeeConflicts';
 
 interface Employee {
@@ -26,32 +31,110 @@ interface Employee {
   status: string;
   email: string;
   dateHired: string;
-  dob?: string;
-  nationalId?: string;
-  address?: string;
-  qualification?: string;
-  contractType?: string;
-  payPoint?: string;
-  region_id?: string;
-  company?: string;
-  workstation?: string;
-  pay_point?: string;
-  account_number?: string;
+  dob?: string | null;
+  nationalId?: string | null;
+  address?: string | null;
+  qualification?: string | null;
+  contractType?: string | null;
+  payPoint?: string | null;
+  region_id?: string | null;
+  company?: string | null;
+  workstation?: string | null;
+  pay_point?: string | null;
+  account_number?: string | null;
   uniform_deduction?: number;
   next_of_kin_name?: string;
   next_of_kin_relationship?: string;
   next_of_kin_phone?: string;
   next_of_kin_address?: string;
   is_deleted?: boolean;
-  deleted_at?: string;
-  deleted_reason?: string;
-  deleted_by?: string;
+  deleted_at?: string | null;
+  deleted_reason?: string | null;
+  deleted_by?: string | null;
   deleted_by_name?: string;
-  created_at?: string;
+  created_at?: string | null;
   assignment_type?: string;
   resident_name?: string;
   resident_contact?: string;
-  company_id?: string;
+  company_id?: string | null;
+}
+
+// Shape of AddEmployeeForm/EditEmployeeForm's own form state -- every field
+// is always initialized (see each form's useState below), so unlike
+// `Employee` (which models a persisted row, where several fields are
+// legitimately optional) none of these are optional here.
+interface EmployeeFormData {
+  employeeNumber: string;
+  fullName: string;
+  dob: string;
+  gender: string;
+  nationalId: string;
+  phone: string;
+  address: string;
+  position: string;
+  department: string;
+  qualification: string;
+  dateHired: string;
+  basicSalary: number;
+  contractType: string;
+  status: string;
+  email: string;
+  region_id: string;
+  assignment_type: string;
+  company: string;
+  workstation: string;
+  resident_name: string;
+  resident_contact: string;
+  pay_point: string;
+  account_number: string;
+  uniform_deduction: number;
+  next_of_kin_name: string;
+  next_of_kin_relationship: string;
+  next_of_kin_phone: string;
+  next_of_kin_address: string;
+}
+
+// Raw `employees` row shape -- only the columns this file actually reads
+// (query below is `select('*')`). No generated Supabase types exist in
+// this project yet (see AUDIT_REPORT.md's "Supabase generated types"
+// section).
+interface EmployeeRow {
+  id: string;
+  employee_number: string;
+  full_name: string;
+  gender: string | null;
+  age: number | null;
+  phone: string | null;
+  position: string;
+  department: string | null;
+  basic_salary: number;
+  status: string | null;
+  email: string | null;
+  hire_date: string | null;
+  dob: string | null;
+  national_id: string | null;
+  address: string | null;
+  qualification: string | null;
+  contract_type: string | null;
+  pay_point: string | null;
+  region_id: string | null;
+  company: string | null;
+  workstation: string | null;
+  account_number: string | null;
+  uniform_deduction: number | null;
+  next_of_kin_name: string | null;
+  next_of_kin_relationship: string | null;
+  next_of_kin_phone: string | null;
+  next_of_kin_address: string | null;
+  is_deleted: boolean | null;
+  deleted_at: string | null;
+  deleted_reason: string | null;
+  deleted_by: string | null;
+  created_at: string | null;
+  assignment_type: string | null;
+  resident_name: string | null;
+  resident_contact: string | null;
+  company_id: string | null;
 }
 
 const departmentOptions = [
@@ -228,7 +311,7 @@ function DateFieldDMY({ value, onChange, required, disabled }: {
 // never drift out of sync on what's required. Returns the label of the first
 // missing/invalid field so the caller can show a notification naming it, or
 // null when the form is valid.
-const REQUIRED_EMPLOYEE_FIELDS: { key: string; label: string }[] = [
+const REQUIRED_EMPLOYEE_FIELDS: { key: keyof Employee; label: string }[] = [
   { key: 'fullName', label: 'Full Name' },
   { key: 'dob', label: 'Date of Birth' },
   { key: 'gender', label: 'Gender' },
@@ -246,9 +329,13 @@ const REQUIRED_EMPLOYEE_FIELDS: { key: string; label: string }[] = [
   { key: 'next_of_kin_phone', label: 'Next of Kin Phone Number' },
 ];
 
-const validateEmployeeForm = (form: any, isSuperAdmin?: boolean): string | null => {
+const validateEmployeeForm = (form: Partial<Employee>, isSuperAdmin?: boolean): string | null => {
   if (!form.employeeNumber || String(form.employeeNumber).trim() === '') {
-    return 'Employee Number (select a Region first so it can be generated)';
+    // Deliberately not "select a Region first" -- a non-super-admin's
+    // region is pre-assigned, not manually selected, so that phrasing
+    // describes an action they can't take. Covers both: a region not yet
+    // resolved at all, and generation still in flight or having failed.
+    return 'Employee Number (still generating -- wait for it to complete, or select/confirm a Region)';
   }
 
   for (const { key, label } of REQUIRED_EMPLOYEE_FIELDS) {
@@ -289,7 +376,7 @@ export function EmployeesPage() {
   const [showEdit, setShowEdit] = useState(false);
   const [selected, setSelected] = useState<Employee | null>(null);
   const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
-  const [regions, setRegions] = useState<any[]>([]);
+  const [regions, setRegions] = useState<UserProfileRegion[]>([]);
   const [filterRegionId, setFilterRegionId] = useState<string>('');
   const [filterCompany, setFilterCompany] = useState<string>('');
   const [filterWorkstation, setFilterWorkstation] = useState<string>('');
@@ -297,8 +384,18 @@ export function EmployeesPage() {
   // Debounced so typing doesn't refetch the whole employees table per keystroke.
   const debouncedFilterCompany = useDebouncedValue(filterCompany, 300);
   const debouncedFilterWorkstation = useDebouncedValue(filterWorkstation, 300);
-  const [userProfile, setUserProfile] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [userLoading, setUserLoading] = useState(true);
+  // Permission-driven action gating (correction round 2, item 6) --
+  // legacy accounts (role_level set) keep unrestricted create/edit/delete,
+  // exactly as before this rollout (no legacy account was ever gated
+  // here). A new functional-role account is gated: HR Manager gets all
+  // three (employees.create/edit/delete); Accountant/Operations Manager
+  // (employees.view only) get none -- Employees becomes read-only for
+  // them, matching "Accountant on Employees: no Add, no Edit, no Delete".
+  const [canCreateEmployee, setCanCreateEmployee] = useState(true);
+  const [canEditEmployee, setCanEditEmployee] = useState(true);
+  const [canDeleteEmployee, setCanDeleteEmployee] = useState(true);
   const [showDeletedModal, setShowDeletedModal] = useState(false);
   const [selectedDeletedEmployee, setSelectedDeletedEmployee] = useState<Employee | null>(null);
   
@@ -327,7 +424,7 @@ export function EmployeesPage() {
     }
     
     // Otherwise show ONLY active employees with optional status filter
-    let data = activeEmployees;
+    const data = activeEmployees;
     
     return data.filter(e => {
       const matchesSearch = e.fullName.toLowerCase().includes(search.toLowerCase()) || 
@@ -360,13 +457,20 @@ export function EmployeesPage() {
   const fetchUserProfile = useCallback(async () => {
     const profile = await getCurrentProfile();
     setUserProfile(profile);
+    const isLegacy = (profile?.role_level ?? null) !== null;
+    setCanCreateEmployee(await canAccess(isLegacy, PERMISSIONS.EMPLOYEES_CREATE));
+    setCanEditEmployee(await canAccess(isLegacy, PERMISSIONS.EMPLOYEES_EDIT));
+    setCanDeleteEmployee(await canAccess(isLegacy, PERMISSIONS.EMPLOYEES_DELETE));
     setUserLoading(false);
   }, []);
 
   const fetchEmployees = useCallback(async () => {
     setLoading(true);
     try {
-      let query = supabase.from('employees').select('*');
+      // employees_general: non-sensitive employee read surface (Design B2) --
+      // confirmed the Employees module never references any guard/security-
+      // only column.
+      let query = supabase.from('employees_general').select('*');
       
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
         query = query.eq('region_id', userProfile.region_id);
@@ -382,7 +486,7 @@ export function EmployeesPage() {
       const { data, error } = await query.order('full_name');
       if (error) throw error;
       
-      const mappedEmployees = (data || []).map((emp: any) => ({
+      const mappedEmployees = (data || []).map((emp: EmployeeRow) => ({
         id: emp.id,
         employeeNumber: emp.employee_number,
         fullName: emp.full_name,
@@ -422,7 +526,7 @@ export function EmployeesPage() {
         company_id: emp.company_id || null,
       }));
       setEmployees(mappedEmployees);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error fetching employees:', err);
       showNotification('Failed to load employees', 'error');
     } finally {
@@ -435,29 +539,12 @@ export function EmployeesPage() {
   // addEmployee can call it again, with a fresh read, whenever the number it
   // was handed collides with one someone else just took.
   const getNextEmployeeNumberForRegion = useCallback(async (regionId: string): Promise<string> => {
-    const region = regions.find((r) => r.id === regionId);
-    const regionLetter = (region?.code?.trim() || region?.name?.trim() || 'X').charAt(0).toUpperCase();
-    const prefix = `SFG-${regionLetter}-`;
-
-    const { data } = await supabase
-      .from('employees')
-      .select('employee_number')
-      .ilike('employee_number', `${prefix}%`)
-      .order('employee_number', { ascending: false })
-      .limit(1);
-
-    let nextNumber = 1;
-    if (data && data.length > 0) {
-      const match = data[0].employee_number.match(/\d+$/);
-      if (match) {
-        nextNumber = parseInt(match[0]) + 1;
-      }
-    }
-    return `${prefix}${nextNumber.toString().padStart(3, '0')}`;
+    const region = regions.find((r) => r.id === regionId) || {};
+    return generateEmployeeNumberServerSide(regionId, region);
   }, [regions]);
 
   // ===== ADD EMPLOYEE =====
-  const addEmployee = useCallback(async (emp: any) => {
+  const addEmployee = useCallback(async (emp: EmployeeFormData) => {
     const safeEmp = {
       ...emp,
       fullName: sanitizeInput(emp.fullName),
@@ -477,7 +564,7 @@ export function EmployeesPage() {
       next_of_kin_address: sanitizeInput(emp.next_of_kin_address),
     };
     
-    let assignedRegionId = safeEmp.region_id;
+    let assignedRegionId: string | null | undefined = safeEmp.region_id;
     if (!userProfile?.is_super_admin) {
       assignedRegionId = userProfile?.region_id;
     }
@@ -504,7 +591,7 @@ export function EmployeesPage() {
     const formattedResidentName = safeEmp.assignment_type === 'resident' ? formatText(safeEmp.resident_name) : null;
     const formattedResidentContact = safeEmp.assignment_type === 'resident' ? sanitizeInput(safeEmp.resident_contact) : null;
     
-    const uniformDeduction = parseInt(safeEmp.uniform_deduction) || 0;
+    const uniformDeduction = safeEmp.uniform_deduction || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
 
     const buildInsertRow = (employeeNumber: string) => ({
@@ -515,7 +602,7 @@ export function EmployeesPage() {
       phone: safeEmp.phone,
       position: safeEmp.position,
       department: safeEmp.department,
-      basic_salary: parseFloat(safeEmp.basicSalary),
+      basic_salary: safeEmp.basicSalary,
       status: safeEmp.status || 'Active',
       email: safeEmp.email,
       hire_date: safeEmp.dateHired && safeEmp.dateHired !== '' ? safeEmp.dateHired : new Date().toISOString().split('T')[0],
@@ -555,8 +642,11 @@ export function EmployeesPage() {
     // adding several employees in a row makes a transient blip more likely
     // to land mid-request.
     let employeeNumberToUse = safeEmp.employeeNumber;
-    let data: any = null;
-    let error: any = null;
+    // Narrowed RETURNING -- just `id`, not the full row (no `RETURNING *`
+    // against the base table). The complete row the UI needs is fetched
+    // separately from `employees_general` once the insert succeeds.
+    let insertedId: string | null = null;
+    let error: { message: string; code?: string; isNetworkError?: boolean } | null = null;
     const MAX_INSERT_ATTEMPTS = 5;
 
     for (let attempt = 1; attempt <= MAX_INSERT_ATTEMPTS; attempt++) {
@@ -565,11 +655,12 @@ export function EmployeesPage() {
         const result = await supabase
           .from('employees')
           .insert([buildInsertRow(employeeNumberToUse)])
-          .select();
-        data = result.data;
+          .select('id')
+          .single();
+        insertedId = result.data?.id ?? null;
         error = result.error;
-      } catch (networkErr: any) {
-        error = { message: networkErr?.message || 'Network error', isNetworkError: true };
+      } catch (networkErr) {
+        error = { message: getErrorMessage(networkErr), isNetworkError: true };
       }
 
       if (!error) break;
@@ -578,7 +669,7 @@ export function EmployeesPage() {
       const isLastAttempt = attempt === MAX_INSERT_ATTEMPTS;
 
       if (isNumberCollision && !isLastAttempt) {
-        employeeNumberToUse = await getNextEmployeeNumberForRegion(assignedRegionId);
+        employeeNumberToUse = await getNextEmployeeNumberForRegion(assignedRegionId ?? '');
         continue;
       }
 
@@ -597,7 +688,7 @@ export function EmployeesPage() {
       // rarely their fault to begin with.
       let message = error.isNetworkError
         ? 'Network error while adding employee. Please check your connection and try again.'
-        : 'Error adding employee: ' + error.message;
+        : 'Error adding employee: ' + getErrorMessage(error);
 
       // Defensive, forward-compatible handling for a genuine DB-level
       // unique violation on national_id/phone/account_number -- see
@@ -621,47 +712,60 @@ export function EmployeesPage() {
 
       showNotification(message, 'error');
       return;
-    } else if (data && data[0]) {
+    } else if (insertedId) {
+      // Fetch the complete non-sensitive row through employees_general --
+      // the base-table insert above only returned `id` (no `RETURNING *`).
+      const { data: fullRow, error: fetchError } = await supabase
+        .from('employees_general')
+        .select('*')
+        .eq('id', insertedId)
+        .single();
+
+      if (fetchError || !fullRow) {
+        showNotification('Employee added, but failed to load the new record: ' + getErrorMessage(fetchError), 'error');
+        return;
+      }
+
       const newEmployee = {
-        id: data[0].id,
-        employeeNumber: data[0].employee_number,
-        fullName: data[0].full_name,
-        gender: data[0].gender || '',
-        age: data[0].age || 0,
-        phone: data[0].phone || '',
-        position: data[0].position,
-        department: data[0].department,
-        basicSalary: data[0].basic_salary,
-        status: data[0].status,
-        email: data[0].email || '',
-        dateHired: data[0].hire_date || new Date().toISOString().split('T')[0],
-        dob: data[0].dob,
-        nationalId: data[0].national_id,
-        address: data[0].address,
-        qualification: data[0].qualification,
-        contractType: data[0].contract_type,
-        region_id: data[0].region_id,
-        company: data[0].company,
-        workstation: data[0].workstation,
-        pay_point: data[0].pay_point,
-        account_number: data[0].account_number,
-        uniform_deduction: data[0].uniform_deduction || 0,
-        next_of_kin_name: data[0].next_of_kin_name || '',
-        next_of_kin_relationship: data[0].next_of_kin_relationship || '',
-        next_of_kin_phone: data[0].next_of_kin_phone || '',
-        next_of_kin_address: data[0].next_of_kin_address || '',
-        is_deleted: data[0].is_deleted || false,
-        deleted_at: data[0].deleted_at || null,
-        deleted_reason: data[0].deleted_reason || null,
-        deleted_by: data[0].deleted_by || null,
-        created_at: data[0].created_at || null,
-        assignment_type: data[0].assignment_type || 'company',
-        resident_name: data[0].resident_name || '',
-        resident_contact: data[0].resident_contact || '',
-        company_id: data[0].company_id || null,
+        id: fullRow.id,
+        employeeNumber: fullRow.employee_number,
+        fullName: fullRow.full_name,
+        gender: fullRow.gender || '',
+        age: fullRow.age || 0,
+        phone: fullRow.phone || '',
+        position: fullRow.position,
+        department: fullRow.department || 'Operations',
+        basicSalary: fullRow.basic_salary,
+        status: fullRow.status || 'Active',
+        email: fullRow.email || '',
+        dateHired: fullRow.hire_date || new Date().toISOString().split('T')[0],
+        dob: fullRow.dob,
+        nationalId: fullRow.national_id,
+        address: fullRow.address,
+        qualification: fullRow.qualification,
+        contractType: fullRow.contract_type,
+        region_id: fullRow.region_id,
+        company: fullRow.company,
+        workstation: fullRow.workstation,
+        pay_point: fullRow.pay_point,
+        account_number: fullRow.account_number,
+        uniform_deduction: fullRow.uniform_deduction || 0,
+        next_of_kin_name: fullRow.next_of_kin_name || '',
+        next_of_kin_relationship: fullRow.next_of_kin_relationship || '',
+        next_of_kin_phone: fullRow.next_of_kin_phone || '',
+        next_of_kin_address: fullRow.next_of_kin_address || '',
+        is_deleted: fullRow.is_deleted || false,
+        deleted_at: fullRow.deleted_at || null,
+        deleted_reason: fullRow.deleted_reason || null,
+        deleted_by: fullRow.deleted_by || null,
+        created_at: fullRow.created_at || null,
+        assignment_type: fullRow.assignment_type || 'company',
+        resident_name: fullRow.resident_name || '',
+        resident_contact: fullRow.resident_contact || '',
+        company_id: fullRow.company_id || null,
       };
       setEmployees([newEmployee, ...employees]);
-      
+
       await logAudit({
         action: 'CREATE',
         entity_type: 'employee',
@@ -676,7 +780,7 @@ export function EmployeesPage() {
   }, [userProfile, employees, getNextEmployeeNumberForRegion]);
 
   // ===== UPDATE EMPLOYEE =====
-  const updateEmployee = useCallback(async (emp: any) => {
+  const updateEmployee = useCallback(async (emp: EmployeeFormData) => {
     if (!editingEmployee) return;
     
     const oldEmployeeData = { ...editingEmployee };
@@ -719,10 +823,13 @@ export function EmployeesPage() {
     const formattedResidentName = safeEmp.assignment_type === 'resident' ? formatText(safeEmp.resident_name) : null;
     const formattedResidentContact = safeEmp.assignment_type === 'resident' ? sanitizeInput(safeEmp.resident_contact) : null;
 
-    const uniformDeduction = parseInt(safeEmp.uniform_deduction) || 0;
+    const uniformDeduction = safeEmp.uniform_deduction || 0;
     const calculatedAge = safeEmp.dob ? calculateAge(safeEmp.dob) : 0;
 
-    const { data, error } = await supabase
+    // Narrowed RETURNING -- just `id`, not the full row (no `RETURNING *`
+    // against the base table). The complete row the UI needs is fetched
+    // separately from `employees_general` once the update succeeds.
+    const { data: updateResult, error } = await supabase
       .from('employees')
       .update({
         employee_number: safeEmp.employeeNumber,
@@ -732,7 +839,7 @@ export function EmployeesPage() {
         phone: safeEmp.phone,
         position: safeEmp.position,
         department: safeEmp.department,
-        basic_salary: parseFloat(safeEmp.basicSalary),
+        basic_salary: safeEmp.basicSalary,
         status: safeEmp.status,
         email: safeEmp.email,
         hire_date: safeEmp.dateHired && safeEmp.dateHired !== '' ? safeEmp.dateHired : null,
@@ -756,11 +863,11 @@ export function EmployeesPage() {
         // company_id will be updated by trigger
       })
       .eq('id', editingEmployee.id)
-      .select();
-    
+      .select('id');
+
     if (error) {
       // Leave the modal open on failure so the admin's edits aren't discarded.
-      let message = 'Error updating employee: ' + error.message;
+      let message = 'Error updating employee: ' + getErrorMessage(error);
 
       // Defensive, forward-compatible handling -- see the matching comment
       // in addEmployee() and identifierColumnFromUniqueViolation() for why
@@ -782,38 +889,51 @@ export function EmployeesPage() {
 
       showNotification(message, 'error');
       return;
-    } else if (data && data[0]) {
+    } else if (updateResult && updateResult[0]) {
+      // Fetch the complete non-sensitive row through employees_general --
+      // the base-table update above only returned `id` (no `RETURNING *`).
+      const { data: fullRow, error: fetchError } = await supabase
+        .from('employees_general')
+        .select('*')
+        .eq('id', updateResult[0].id)
+        .single();
+
+      if (fetchError || !fullRow) {
+        showNotification('Employee updated, but failed to reload the record: ' + getErrorMessage(fetchError), 'error');
+        return;
+      }
+
       const updatedEmployee = {
         ...editingEmployee,
-        employeeNumber: data[0].employee_number,
-        fullName: data[0].full_name,
-        gender: data[0].gender || '',
-        age: data[0].age || 0,
-        phone: data[0].phone || '',
-        position: data[0].position,
-        department: data[0].department,
-        basicSalary: data[0].basic_salary,
-        status: data[0].status,
-        email: data[0].email || '',
-        dateHired: data[0].hire_date || new Date().toISOString().split('T')[0],
-        dob: data[0].dob,
-        nationalId: data[0].national_id,
-        address: data[0].address,
-        qualification: data[0].qualification,
-        contractType: data[0].contract_type,
-        company: data[0].company,
-        workstation: data[0].workstation,
-        pay_point: data[0].pay_point,
-        account_number: data[0].account_number,
-        uniform_deduction: data[0].uniform_deduction || 0,
-        next_of_kin_name: data[0].next_of_kin_name || '',
-        next_of_kin_relationship: data[0].next_of_kin_relationship || '',
-        next_of_kin_phone: data[0].next_of_kin_phone || '',
-        next_of_kin_address: data[0].next_of_kin_address || '',
-        assignment_type: data[0].assignment_type || 'company',
-        resident_name: data[0].resident_name || '',
-        resident_contact: data[0].resident_contact || '',
-        company_id: data[0].company_id || null,
+        employeeNumber: fullRow.employee_number,
+        fullName: fullRow.full_name,
+        gender: fullRow.gender || '',
+        age: fullRow.age || 0,
+        phone: fullRow.phone || '',
+        position: fullRow.position,
+        department: fullRow.department || 'Operations',
+        basicSalary: fullRow.basic_salary,
+        status: fullRow.status || 'Active',
+        email: fullRow.email || '',
+        dateHired: fullRow.hire_date || new Date().toISOString().split('T')[0],
+        dob: fullRow.dob,
+        nationalId: fullRow.national_id,
+        address: fullRow.address,
+        qualification: fullRow.qualification,
+        contractType: fullRow.contract_type,
+        company: fullRow.company,
+        workstation: fullRow.workstation,
+        pay_point: fullRow.pay_point,
+        account_number: fullRow.account_number,
+        uniform_deduction: fullRow.uniform_deduction || 0,
+        next_of_kin_name: fullRow.next_of_kin_name || '',
+        next_of_kin_relationship: fullRow.next_of_kin_relationship || '',
+        next_of_kin_phone: fullRow.next_of_kin_phone || '',
+        next_of_kin_address: fullRow.next_of_kin_address || '',
+        assignment_type: fullRow.assignment_type || 'company',
+        resident_name: fullRow.resident_name || '',
+        resident_contact: fullRow.resident_contact || '',
+        company_id: fullRow.company_id || null,
       };
       setEmployees(employees.map(e => e.id === updatedEmployee.id ? updatedEmployee : e));
       
@@ -984,7 +1104,7 @@ export function EmployeesPage() {
         e.resident_name || '',
         e.resident_contact || ''
       ])
-    ].map(row => row.join(',')).join('\n');
+    ].map(toCsvRow).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1053,7 +1173,9 @@ export function EmployeesPage() {
           <>
             <Button variant="outline" className="hidden md:inline-flex"><Filter size={16} /> Filter</Button>
             <Button variant="outline" className="hidden md:inline-flex" onClick={handleExport}><Download size={16} /> Export</Button>
-            <Button variant="secondary" onClick={() => setShowAdd(true)}><Plus size={16} /> Add Employee</Button>
+            {canCreateEmployee && (
+              <Button variant="secondary" onClick={() => setShowAdd(true)}><Plus size={16} /> Add Employee</Button>
+            )}
           </>
         }
       />
@@ -1265,19 +1387,25 @@ export function EmployeesPage() {
                           >
                             <Eye size={14} />
                           </button>
-                          <button 
-                            onClick={() => restoreEmployee(emp)} 
-                            className="w-8 h-8 rounded-lg hover:bg-emerald-50 text-emerald-600 flex items-center justify-center"
-                            title="Restore Employee"
-                          >
-                            <RotateCcw size={14} />
-                          </button>
+                          {canEditEmployee && (
+                            <button
+                              onClick={() => restoreEmployee(emp)}
+                              className="w-8 h-8 rounded-lg hover:bg-emerald-50 text-emerald-600 flex items-center justify-center"
+                              title="Restore Employee"
+                            >
+                              <RotateCcw size={14} />
+                            </button>
+                          )}
                         </>
                       ) : (
                         <>
                           <button onClick={() => setSelected(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-600 flex items-center justify-center"><Eye size={14} /></button>
-                          <button onClick={() => handleEdit(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-amber-600 flex items-center justify-center"><Edit2 size={14} /></button>
-                          <button onClick={() => handleDelete(emp)} className="w-8 h-8 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"><Trash2 size={14} /></button>
+                          {canEditEmployee && (
+                            <button onClick={() => handleEdit(emp)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-amber-600 flex items-center justify-center"><Edit2 size={14} /></button>
+                          )}
+                          {canDeleteEmployee && (
+                            <button onClick={() => handleDelete(emp)} className="w-8 h-8 rounded-lg hover:bg-red-50 text-red-500 flex items-center justify-center"><Trash2 size={14} /></button>
+                          )}
                         </>
                       )}
                     </div>
@@ -1401,8 +1529,7 @@ export function EmployeesPage() {
             employee={editingEmployee}
             onSubmit={updateEmployee} 
             onCancel={() => { setShowEdit(false); setEditingEmployee(null); }} 
-            departments={departmentOptions} 
-            regions={regions}
+            departments={departmentOptions}
             isSuperAdmin={isSuperAdmin}
             relationshipOptions={relationshipOptions}
           />
@@ -1423,16 +1550,16 @@ function AddEmployeeForm({
   userRegionName,
   relationshipOptions,
 }: {
-  onSubmit: (e: any) => void;
+  onSubmit: (e: EmployeeFormData) => void;
   onCancel: () => void;
   departments: string[];
-  regions: any[];
-  userRegionId?: string;
+  regions: UserProfileRegion[];
+  userRegionId?: string | null;
   isSuperAdmin?: boolean;
   userRegionName?: string;
   relationshipOptions: string[];
 }) {
-  const [form, setForm] = useState<any>({
+  const [form, setForm] = useState<EmployeeFormData>({
     employeeNumber: "",
     fullName: "",
     dob: "",
@@ -1463,20 +1590,25 @@ function AddEmployeeForm({
     next_of_kin_address: "",
   });
 
-  const [positions, setPositions] = useState<any[]>([]);
+  const [positions, setPositions] = useState<{ name: string }[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [showResidentFields, setShowResidentFields] = useState(false);
+  // Tracks which region_id the employee number was last generated (or is
+  // being generated) for, so the auto-generation effect below can tell "a
+  // NEW region just became current, generate for it" apart from "form
+  // re-rendered for an unrelated reason, region_id is unchanged, don't
+  // regenerate" -- a plain "regenerate whenever employeeNumber is blank"
+  // check can't make that distinction (employeeNumber starts blank too).
+  const lastGeneratedForRegion = useRef<string | null>(null);
   const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
   const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
   const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
   const [showResidentSuggestions, setShowResidentSuggestions] = useState(false);
-  const [suggestionLoading, setSuggestionLoading] = useState(false);
-  
+
   // ===== NEW: Loading state for submit button =====
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const update = (k: string, v: any) => {
-    setForm((prev: any) => ({ ...prev, [k]: v }));
+  const update = <K extends keyof EmployeeFormData>(k: K, v: EmployeeFormData[K]) => {
+    setForm((prev) => ({ ...prev, [k]: v }));
   };
 
   const formatNumberWithCommas = (value: number) => {
@@ -1502,7 +1634,6 @@ function AddEmployeeForm({
       return;
     }
     
-    setSuggestionLoading(true);
     try {
       const normalized = normalizeText(input);
       const { data } = await supabase
@@ -1516,8 +1647,6 @@ function AddEmployeeForm({
       setShowCompanySuggestions(true);
     } catch (err) {
       console.error('Error fetching company suggestions:', err);
-    } finally {
-      setSuggestionLoading(false);
     }
   }, []);
 
@@ -1528,7 +1657,6 @@ function AddEmployeeForm({
       return;
     }
     
-    setSuggestionLoading(true);
     try {
       const normalized = normalizeText(input);
       const { data } = await supabase
@@ -1543,15 +1671,12 @@ function AddEmployeeForm({
       setShowResidentSuggestions(true);
     } catch (err) {
       console.error('Error fetching resident suggestions:', err);
-    } finally {
-      setSuggestionLoading(false);
     }
   }, []);
 
   // Handle assignment type change
   const handleAssignmentTypeChange = (type: string) => {
     update("assignment_type", type);
-    setShowResidentFields(type === 'resident');
     if (type === 'company') {
       update("resident_name", "");
       update("resident_contact", "");
@@ -1568,41 +1693,59 @@ function AddEmployeeForm({
     setIsGenerating(true);
     try {
       const region = regions.find((r) => r.id === regionId);
-      if (!region) return;
-
-      // Region letter comes from the region's own `code` (set in Settings ->
-      // Regions) if there is one, otherwise falls back to the first letter
-      // of the region's name -- so "Northern Region" still gets "N" even if
-      // nobody has set an explicit one-letter code yet.
-      const regionLetter = (region.code?.trim() || region.name?.trim() || "X").charAt(0).toUpperCase();
-      const prefix = `SFG-${regionLetter}-`;
-
-      const { data } = await supabase
-        .from("employees")
-        .select("employee_number")
-        .ilike("employee_number", `${prefix}%`)
-        .order("employee_number", { ascending: false })
-        .limit(1);
-
-      let nextNumber = 1;
-      if (data && data.length > 0) {
-        const match = data[0].employee_number.match(/\d+$/);
-        if (match) {
-          const lastNumber = parseInt(match[0]);
-          nextNumber = lastNumber + 1;
-        }
+      if (!region) {
+        console.error("Error generating employee number: region", regionId, "not found in the loaded regions list");
+        showNotification("Could not generate Employee Number: region not found. Please try again.", "error");
+        return;
       }
 
-      const formattedNumber = `${prefix}${nextNumber.toString().padStart(3, "0")}`;
+      const formattedNumber = await generateEmployeeNumberServerSide(regionId, region);
       setTimeout(() => {
         update("employeeNumber", formattedNumber);
       }, 10);
     } catch (err) {
+      // Leaves form.employeeNumber blank -- validateEmployeeForm() already
+      // refuses to submit with a blank Employee Number, so this never
+      // results in an employee being created with a blank or guessed
+      // number; this notification just makes the failure visible instead
+      // of only reaching the browser console.
       console.error("Error generating employee number:", err);
+      showNotification("Failed to generate Employee Number. Please try again.", "error");
     } finally {
       setIsGenerating(false);
     }
   };
+
+  // ===== AUTO-GENERATE EMPLOYEE NUMBER WHENEVER THE FORM'S REGION
+  // RESOLVES TO A NEW VALUE -- covers BOTH ways a region reaches this
+  // form: a non-super-admin's region is preset directly into useState's
+  // initial value (see `region_id: userRegionId || ""` above) and the
+  // region field then renders as a locked, disabled <input> with no
+  // onChange of its own -- so a handler living only inside the region
+  // <select>'s onChange (the old approach) could never fire for that
+  // case, leaving Employee Number permanently blank and the form
+  // permanently unsubmittable. A super admin's own region <select> still
+  // works too: its onChange sets form.region_id, which is exactly this
+  // effect's dependency, so ONE code path now generates for both cases
+  // instead of two.
+  //
+  // `lastGeneratedForRegion` (not "is employeeNumber blank") is the guard
+  // against double-generating: employeeNumber is legitimately blank both
+  // before the FIRST generation for a region AND right after a super
+  // admin switches to a DIFFERENT region (see the onChange handler below,
+  // which clears it) -- a blank-check alone can't tell "never generated
+  // yet" apart from "already generated, still on the same region" once a
+  // super admin has switched back and forth. Comparing against the exact
+  // region_id last generated for makes a genuine region change always
+  // regenerate, while a re-render that leaves region_id untouched never
+  // does.
+  useEffect(() => {
+    const regionId = form.region_id;
+    if (!shouldGenerateEmployeeNumber(regionId, lastGeneratedForRegion.current)) return;
+    lastGeneratedForRegion.current = regionId;
+    generateEmployeeNumber(regionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.region_id]);
 
   useEffect(() => {
     const fetchPositions = async () => {
@@ -1657,8 +1800,11 @@ function AddEmployeeForm({
   };
 
   // ===== FIELD HELPER =====
+  // Only ever called with the string-valued fields -- basicSalary/
+  // uniform_deduction have their own dedicated inputs (handleSalaryChange/
+  // handleUniformDeductionChange below) and never go through this helper.
   const field = (
-    k: string,
+    k: Exclude<keyof EmployeeFormData, 'basicSalary' | 'uniform_deduction'>,
     label: string,
     type = "text",
     required = false,
@@ -1687,15 +1833,6 @@ function AddEmployeeForm({
               </option>
             ))}
           </select>
-        ) : type === "salary" ? (
-          <input
-            type="text"
-            value={formatNumberWithCommas(form[k] || 0)}
-            onChange={handleSalaryChange}
-            className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] text-right"
-            required={required}
-            disabled={isSubmitting}
-          />
         ) : type === "date" ? (
           <DateFieldDMY
             value={form[k] || ""}
@@ -1741,11 +1878,16 @@ function AddEmployeeForm({
             <label className="block text-sm font-medium text-slate-700 mb-1.5">Employee Number</label>
             <input
               type="text"
-              value={form.employeeNumber}
+              value={isGenerating ? '' : form.employeeNumber}
+              placeholder={isGenerating ? 'Generating employee number...' : ''}
               disabled
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg bg-slate-50 font-mono"
+              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg bg-slate-50 font-mono placeholder:font-sans placeholder:italic placeholder:text-slate-400"
             />
-            <p className="text-xs text-slate-400 mt-1">Auto-generated after selecting region</p>
+            <p className="text-xs text-slate-400 mt-1">
+              {isGenerating
+                ? 'Generating employee number...'
+                : 'System-generated for the assigned region -- not editable'}
+            </p>
           </div>
           {field("fullName", "Full Name", "text", true)}
           {field("dob", "Date of Birth", "date", true)}
@@ -2152,12 +2294,15 @@ function AddEmployeeForm({
                 value={form.region_id || ""}
                 onChange={(e) => {
                   const selectedId = e.target.value;
-                  setForm((prev: any) => ({ ...prev, region_id: selectedId }));
-                  if (selectedId) {
-                    generateEmployeeNumber(selectedId);
-                  } else {
-                    setForm((prev: any) => ({ ...prev, employeeNumber: "" }));
-                  }
+                  // Clears employeeNumber unconditionally (not just when
+                  // cleared to "") and resets the generation-tracking ref
+                  // so the auto-generation effect above always treats this
+                  // as a fresh region and regenerates -- the effect itself
+                  // (triggered by this same region_id change) is now the
+                  // ONLY place that calls generateEmployeeNumber, so there
+                  // is no risk of it firing twice for one selection.
+                  setForm((prev) => ({ ...prev, region_id: selectedId, employeeNumber: "" }));
+                  lastGeneratedForRegion.current = null;
                 }}
                 disabled={isSubmitting}
                 className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
@@ -2190,17 +2335,22 @@ function AddEmployeeForm({
         >
           Cancel
         </button>
-        <button 
-          type="submit" 
-          disabled={isSubmitting}
+        <button
+          type="submit"
+          disabled={isSubmitting || isGenerating}
           className={`px-5 py-2 rounded-lg bg-[#D4A017] text-white text-sm font-semibold hover:bg-[#e8b82e] transition-all flex items-center gap-2 ${
-            isSubmitting ? 'opacity-70 cursor-not-allowed' : ''
+            (isSubmitting || isGenerating) ? 'opacity-70 cursor-not-allowed' : ''
           }`}
         >
           {isSubmitting ? (
             <>
               <Loader2 size={16} className="animate-spin" />
               Adding Employee...
+            </>
+          ) : isGenerating ? (
+            <>
+              <Loader2 size={16} className="animate-spin" />
+              Generating Employee Number...
             </>
           ) : (
             <>
@@ -2215,16 +2365,15 @@ function AddEmployeeForm({
 }
 
 // ===== EditEmployeeForm =====
-function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, isSuperAdmin, relationshipOptions }: { 
+function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAdmin, relationshipOptions }: {
   employee: Employee;
-  onSubmit: (e: any) => void; 
-  onCancel: () => void; 
-  departments: string[]; 
-  regions: any[];
+  onSubmit: (e: EmployeeFormData) => void;
+  onCancel: () => void;
+  departments: string[];
   isSuperAdmin?: boolean;
   relationshipOptions: string[];
 }) {
-  const [form, setForm] = useState<any>({
+  const [form, setForm] = useState<EmployeeFormData>({
     employeeNumber: employee.employeeNumber,
     fullName: employee.fullName,
     dob: employee.dob || '',
@@ -2255,13 +2404,12 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
     next_of_kin_address: employee.next_of_kin_address || '',
   });
   
-  const [positions, setPositions] = useState<any[]>([]);
-  const [showResidentFields, setShowResidentFields] = useState(form.assignment_type === 'resident');
+  const [positions, setPositions] = useState<{ name: string }[]>([]);
   const [companySuggestions, setCompanySuggestions] = useState<string[]>([]);
   const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
   const [residentSuggestions, setResidentSuggestions] = useState<string[]>([]);
   const [showResidentSuggestions, setShowResidentSuggestions] = useState(false);
-  
+
   // ===== NEW: Loading state for edit submit button =====
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -2273,8 +2421,8 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
   // change instead of building on it. That's why switching Company <-> Resident
   // looked like it did nothing: the assignment_type update was overwritten by
   // the very next line clearing the other field.
-  const update = (k: string, v: any) => {
-    setForm((prev: any) => ({ ...prev, [k]: v }));
+  const update = <K extends keyof EmployeeFormData>(k: K, v: EmployeeFormData[K]) => {
+    setForm((prev) => ({ ...prev, [k]: v }));
   };
 
   const formatNumberWithCommas = (value: string) => {
@@ -2297,7 +2445,6 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
 
   const handleAssignmentTypeChange = (type: string) => {
     update("assignment_type", type);
-    setShowResidentFields(type === 'resident');
     if (type === 'company') {
       update("resident_name", "");
       update("resident_contact", "");
@@ -2408,7 +2555,10 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, regions, 
   };
 
   // ===== FIELD HELPER =====
-  const field = (k: string, label: string, type = 'text', required = false, options?: { label: string; value: string }[], maxLength?: number) => {
+  // Only ever called with the string-valued fields -- basicSalary/
+  // uniform_deduction have their own dedicated inputs (handleSalaryChange/
+  // handleUniformDeductionChange above) and never go through this helper.
+  const field = (k: Exclude<keyof EmployeeFormData, 'basicSalary' | 'uniform_deduction'>, label: string, type = 'text', required = false, options?: { label: string; value: string }[], maxLength?: number) => {
     const fieldId = `edit-field-${k}`;
 
     return (

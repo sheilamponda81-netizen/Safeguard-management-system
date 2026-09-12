@@ -1,0 +1,146 @@
+-- ============================================================
+-- MIGRATION: One open Terminal Due per employee (race-safe)
+-- Date: 2026-09-06
+-- ============================================================
+--
+-- WHY THIS MIGRATION EXISTS
+-- -----------------------------------------------------------
+-- Real staging HR testing produced two Pending terminal_dues rows for the
+-- same employee (Andrew Simakweli, SFG-S-428) with two different
+-- total_payable amounts, both visible on the Terminal Dues page at once.
+-- Root cause, confirmed by tracing the exact code path: saveCalculation()
+-- (src/pages/TerminalDues.tsx) does a plain client-side
+-- `supabase.from('terminal_dues').insert(...)` with NO pre-check against
+-- existing open rows, NO in-flight/disabled-while-saving guard on the
+-- Save button, and NO employee-selector filtering by existing open-due
+-- status -- and, until this migration, terminal_dues had no uniqueness
+-- constraint of ANY kind (only 4 plain, non-unique indexes: tenant_id,
+-- employee_id, status, created_at). Duplicate protection existed nowhere
+-- -- not in the UI, not in the database -- so two concurrent requests (or
+-- even a single double-click, since there was no disabled-while-saving
+-- state) could always produce two open rows for one employee.
+--
+-- The one staging duplicate this exposed
+-- (2d744129-5dd1-470c-b165-0604060c917d, the newer Pending row,
+-- total_payable MK 214,200) was manually deleted from STAGING ONLY before
+-- this migration was written, confirmed via:
+--   SELECT employee_id, COUNT(*) FROM terminal_dues
+--   WHERE status IN ('pending','approved') GROUP BY employee_id HAVING COUNT(*) > 1;
+--   -- returned 0 rows immediately before this migration was applied.
+-- This migration does not touch, delete, or backfill any data itself --
+-- see PREFLIGHT below for why it would have failed outright if any
+-- duplicate had still been present.
+--
+-- BUSINESS RULE
+-- -----------------------------------------------------------
+-- Exactly one OPEN (status IN ('pending','approved')) terminal_dues row
+-- per employee, at any time. A Paid row is historical and must NOT block
+-- a future calculation for the same employee (e.g. a theoretical rehire)
+-- -- the current `employees` table has no employment-spell/rehire model
+-- at all (one row per person, one hire_date, one status column), which
+-- this migration does not attempt to solve; it only needs Paid to never
+-- count as "open," which the partial index below already guarantees by
+-- construction.
+--
+-- WHY A PARTIAL UNIQUE INDEX (not a CHECK constraint, not an app-level
+-- SELECT-before-INSERT check)
+-- -----------------------------------------------------------
+-- A CHECK constraint cannot reference OTHER ROWS in the same table, so it
+-- cannot express "no other open row for this employee_id" at all. A
+-- client-side SELECT-before-INSERT is exactly what already existed here
+-- as "no protection" -- it has a check-then-write race window between the
+-- SELECT and the INSERT that two concurrent requests can both pass
+-- through, which is EXACTLY how the real staging duplicate was produced.
+-- A unique index is enforced by Postgres atomically at commit time,
+-- independent of any client-side timing -- two concurrent transactions
+-- attempting to INSERT (or UPDATE into) an open row for the same
+-- employee_id will have exactly one succeed; the other receives a 23505
+-- unique_violation and rolls back, with no window for both to succeed.
+--
+-- WHY employee_id ALONE (no tenant_id in the index)
+-- -----------------------------------------------------------
+-- terminal_dues.employee_id is `NOT NULL REFERENCES employees(id) ON
+-- DELETE CASCADE`, and every `employees` row belongs to exactly one fixed
+-- tenant_id for its whole lifetime -- there is no mechanism anywhere in
+-- this schema for the same employee_id to belong to two different
+-- tenants. employee_id therefore already uniquely determines the tenant;
+-- adding tenant_id to this index would be redundant, not incorrect, but
+-- unnecessary -- confirmed by inspecting the employees table definition
+-- (20260727000000_reconstructed_base_schema.sql) before choosing this
+-- index shape, per instruction.
+-- ============================================================
+
+-- ============================================================
+-- PREFLIGHT (run this BEFORE applying, on STAGING, to confirm it is safe):
+-- ============================================================
+--   SELECT employee_id, COUNT(*) AS open_count,
+--          array_agg(id ORDER BY created_at) AS terminal_due_ids,
+--          array_agg(status ORDER BY created_at) AS statuses
+--   FROM terminal_dues
+--   WHERE status IN ('pending', 'approved')
+--   GROUP BY employee_id
+--   HAVING COUNT(*) > 1;
+--   -- MUST return 0 rows. If it returns any row, CREATE UNIQUE INDEX
+--   -- below will fail outright with "could not create unique index --
+--   -- key ... is duplicated" -- resolve every duplicate first (see the
+--   -- design report's cleanup guidance), never let this migration attempt
+--   -- to silently resolve them itself.
+-- ============================================================
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_dues_one_open_per_employee
+ON terminal_dues (employee_id)
+WHERE status IN ('pending', 'approved');
+
+-- ============================================================
+-- MIGRATION SAFETY NOTES
+-- ============================================================
+--
+-- RUN ONCE / RUN TWICE: idempotent -- CREATE UNIQUE INDEX IF NOT EXISTS.
+-- A second run is a no-op if the index already exists in the same shape;
+-- if attempted after the underlying data has since grown a duplicate
+-- (which should be structurally impossible once this index exists), it
+-- would fail the same way a first run against dirty data would, per
+-- PREFLIGHT above.
+--
+-- PREFLIGHT: see above -- the duplicate-detection query MUST return 0
+-- rows before applying. This was confirmed against STAGING immediately
+-- before this migration was written.
+--
+-- LOCKING / PRODUCTION TRAFFIC IMPACT: CREATE UNIQUE INDEX (without
+-- CONCURRENTLY) takes a lock that blocks concurrent writes to
+-- terminal_dues for the duration of the index build. terminal_dues is a
+-- small table (bounded by employee count, not a high-volume transactional
+-- table), so this is expected to be fast; CONCURRENTLY was deliberately
+-- NOT used here because it cannot run inside the same transaction as the
+-- rest of a migration batch and this project's existing migrations do not
+-- use it elsewhere for comparable indexes -- if staging's terminal_dues
+-- table is unexpectedly large by the time this is applied, confirm the
+-- lock window is acceptable first.
+--
+-- BEHAVIOR CHANGE FOR EXISTING CALLERS: any INSERT or UPDATE that would
+-- leave a SECOND open (pending/approved) row for the same employee_id now
+-- fails with a 23505 unique_violation instead of silently succeeding.
+-- This affects the client-side INSERT path in saveCalculation()
+-- (src/pages/TerminalDues.tsx, same pass -- now handled with a friendly
+-- message instead of a raw database error) and, in principle, the
+-- return_terminal_due_for_correction() RPC (20260905000000), which moves
+-- an Approved row back to Pending -- that UPDATE is an in-place status
+-- change on the SAME row (not a second row for the employee), so it does
+-- not conflict with this index; it was already, and remains, unaffected.
+--
+-- VERIFICATION SQL (run immediately after applying):
+--   SELECT indexname, indexdef FROM pg_indexes
+--     WHERE tablename = 'terminal_dues' AND indexname = 'idx_terminal_dues_one_open_per_employee';
+--   -- expected: 1 row, indexdef containing
+--   -- "WHERE ((status = 'pending'::text) OR (status = 'approved'::text))"
+--   SELECT employee_id, COUNT(*) FROM terminal_dues
+--     WHERE status IN ('pending','approved') GROUP BY employee_id HAVING COUNT(*) > 1;
+--   -- expected: 0 rows (this is now enforced by the database itself, not
+--   -- just by this query -- but re-running it after applying is a cheap
+--   -- sanity check that nothing else concurrently reintroduced a
+--   -- duplicate in the gap between the preflight check and this
+--   -- migration's application).
+--
+-- ROLLBACK SQL:
+--   DROP INDEX IF EXISTS idx_terminal_dues_one_open_per_employee;
+-- ============================================================

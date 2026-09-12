@@ -6,9 +6,7 @@ import compression from 'vite-plugin-compression';
 
 export default defineConfig({
   plugins: [
-    react({
-      fastRefresh: true,
-    }),
+    react(),
     compression({
       algorithm: 'gzip',
       ext: '.gz',
@@ -86,10 +84,6 @@ export default defineConfig({
       },
     },
     cssCodeSplit: true,
-    treeshake: {
-      moduleSideEffects: false,
-      propertyReadSideEffects: false,
-    },
   },
   optimizeDeps: {
     include: [
