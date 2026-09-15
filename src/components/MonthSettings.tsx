@@ -11,6 +11,7 @@ import {
   getNextMonth
 } from '../utils/currentMonth';
 import { showNotification } from '../utils/clickHandlers';
+import { canChangeCurrentPayrollMonth } from '../utils/permissions';
 
 interface MonthSettingsProps {
   onMonthChange?: (month: string) => void;
@@ -97,8 +98,13 @@ export function MonthSettings({ onMonthChange }: MonthSettingsProps) {
         return;
       }
       
-      if (!userProfile?.is_super_admin && userProfile?.role_level !== 1) {
-        showNotification('You do not have permission to change the current month', 'error');
+      // Friendly, non-authoritative pre-check (delegates to the shared
+      // canChangeCurrentPayrollMonth, also used by canChangeMonth below,
+      // so the two can never drift) -- the real boundary is the key-aware
+      // system_settings RLS policy, which independently rejects a
+      // non-super-admin's UPDATE regardless of this check.
+      if (!canChangeCurrentPayrollMonth(userProfile)) {
+        showNotification('Only a Super Administrator can change the current month', 'error');
         setSaving(false);
         return;
       }
@@ -146,7 +152,7 @@ export function MonthSettings({ onMonthChange }: MonthSettingsProps) {
     }
   };
 
-  const canChangeMonth = userProfile?.is_super_admin || userProfile?.role_level === 1;
+  const canChangeMonth = canChangeCurrentPayrollMonth(userProfile);
 
   if (loading) {
     return (

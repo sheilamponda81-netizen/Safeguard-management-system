@@ -20,6 +20,7 @@ import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { UserProfile } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
+import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load PDF libraries only when needed =====
 const loadPDFLibraries = async () => {
@@ -159,7 +160,17 @@ const defaultTemplate: PayslipTemplate = {
   secondaryColor: '#D4A017'
 };
 
-export function PayslipsPage() {
+interface PayslipsPageProps {
+  // HOTFIX: this SPA has no URL router/rewrite -- a hard `window.location.
+  // href` navigation to any path other than `/` 404s against Vercel's
+  // static host (confirmed root cause of the "Go to Payroll" 404). App.tsx
+  // threads its own internal in-memory nav callback down to every page for
+  // exactly this case; optional because every other current caller of this
+  // component renders it with no props.
+  onNavigate?: (key: 'payroll') => void;
+}
+
+export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [payslips, setPayslips] = useState<PayslipData[]>([]);
   const [search, setSearch] = useState('');
@@ -287,15 +298,29 @@ export function PayslipsPage() {
       // since-changed employee record still has details to show on their
       // historical payslip. This never gates which payslips are produced;
       // `payrollData` above already determined that.
-      let employeesData: EmployeeRow[] = [];
-      if (payrollEmployeeIds.length > 0) {
-        const { data, error: empError } = await supabase
-          .from('employees')
-          .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id, uniform_deduction')
-          .in('id', payrollEmployeeIds);
-        if (empError) throw empError;
-        employeesData = data || [];
-      }
+      // HOTFIX: production evidence showed a single `.in('id', ...)` built
+      // from an entire month's payroll population (hundreds of employee
+      // ids) produces a PostgREST request URL long enough to be rejected
+      // outright with 400 Bad Request ("Failed to load payslips"). Batched
+      // via the same fetchInEmployeeIdBatches helper Payroll.tsx already
+      // uses for this exact class of query (see src/utils/
+      // employeeBatchFetch.ts) -- payrollEmployeeIds above is already
+      // deduplicated via `[...new Set(...)]`, every batch is fetched (none
+      // skipped), and a failed batch throws (propagating out of this
+      // try/catch to the existing error handling below) rather than
+      // silently returning a partial employee list for some payslips. The
+      // exact column selection is unchanged.
+      const employeesData: EmployeeRow[] = payrollEmployeeIds.length > 0
+        ? await fetchInEmployeeIdBatches<EmployeeRow>(
+            payrollEmployeeIds,
+            (batch, from, to, withCount) =>
+              supabase
+                .from('employees')
+                .select('id, employee_number, full_name, position, department, basic_salary, status, pay_point, contract_type, region_id, uniform_deduction', withCount ? { count: 'exact' } : undefined)
+                .in('id', batch)
+                .range(from, to)
+          )
+        : [];
 
       const mappedEmployees = employeesData.map((emp: EmployeeRow) => ({
         id: emp.id,
@@ -982,8 +1007,8 @@ export function PayslipsPage() {
               ? ' Payroll needs to be processed for this month first.'
               : ' Payroll was not processed for this month.'}
           </p>
-          {isCurrentMonth && (
-            <Button variant="secondary" className="mt-4" onClick={() => window.location.href = '/payroll'}>
+          {isCurrentMonth && onNavigate && (
+            <Button variant="secondary" className="mt-4" onClick={() => onNavigate('payroll')}>
               Go to Payroll
             </Button>
           )}

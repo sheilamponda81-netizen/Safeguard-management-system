@@ -23,11 +23,17 @@
 // 20260817000000_functional_role_permissions_foundation.sql's definitions).
 //
 // WHAT THIS FUNCTION DELIBERATELY NEVER DOES:
-//   - Never accepts or grants is_super_admin from the request body -- the
-//     new profile's is_super_admin is unconditionally `false`. There is no
-//     way to create a super-admin account through this function, by design
-//     -- that account type is provisioned outside the normal Create User
-//     UI/flow entirely.
+//   - Never TRUSTS a client-supplied is_super_admin flag on its own. The
+//     request body MAY include `is_super_admin: true` (HOTFIX: formal
+//     Super Administrator model -- see UserManagement.tsx's Add User
+//     modal), but it is only honored when the CALLER (re-derived from
+//     their own verified JWT/profile row, exactly like callerIsSuperAdmin
+//     below -- never from anything in the request body) is themselves a
+//     genuine super admin. Any other caller sending
+//     `is_super_admin: true` is rejected outright (403), not silently
+//     downgraded to false -- a silent downgrade could let a caller believe
+//     a super-admin account was created when an ordinary one was, which is
+//     a worse failure mode than a loud rejection.
 //   - Never accepts a client-supplied tenant_id -- the new profile's
 //     tenant_id is always the CALLER's own tenant_id, resolved server-side.
 //   - Never accepts a client-supplied role_level -- every new account gets
@@ -45,7 +51,7 @@
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { AllowedRole, validateCreateUserInput } from './validation.ts';
+import { AllowedRole, validateCreateUserInput, canGrantSuperAdmin } from './validation.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -115,6 +121,17 @@ serve(async (req) => {
     const department = typeof body.department === 'string' && body.department.trim() ? body.department.trim() : null;
     const role = body.role as AllowedRole;
     const regionId = typeof body.region_id === 'string' && body.region_id ? body.region_id : null;
+    const requestedSuperAdmin = body.is_super_admin === true;
+
+    // HOTFIX: Super Administrator creation authorization -- extracted to
+    // ./validation.ts (canGrantSuperAdmin) so this exact decision has its
+    // own ordinary unit test. Rejected loudly (never silently downgraded)
+    // so a non-super caller never mistakenly believes this succeeded as
+    // requested.
+    const superAdminCheck = canGrantSuperAdmin(requestedSuperAdmin, callerIsSuperAdmin, role);
+    if (!superAdminCheck.valid) {
+      return json({ error: superAdminCheck.error }, requestedSuperAdmin && !callerIsSuperAdmin ? 403 : 400);
+    }
 
     // Extracted to ./validation.ts (pure, dependency-free) so this exact
     // validation sequence has an ordinary unit-test covering it -- see
@@ -158,7 +175,10 @@ serve(async (req) => {
       role,
       role_level: null, // deliberate -- see this file's header
       department,
-      is_super_admin: false, // never settable through this function
+      // Server-verified only -- requestedSuperAdmin was already rejected
+      // above (403) unless callerIsSuperAdmin, so ANDing here is defense
+      // in depth, not the primary gate.
+      is_super_admin: requestedSuperAdmin && callerIsSuperAdmin,
       is_active: true,
       region_id: role === 'admin' ? null : regionId,
     });
@@ -179,7 +199,7 @@ serve(async (req) => {
       entity_type: 'profiles',
       entity_id: newUserId,
       old_data: null,
-      new_data: { email, full_name: fullName, role, region_id: role === 'admin' ? null : regionId, department },
+      new_data: { email, full_name: fullName, role, region_id: role === 'admin' ? null : regionId, department, is_super_admin: requestedSuperAdmin && callerIsSuperAdmin },
     });
 
     return json({ success: true, id: newUserId });

@@ -3,7 +3,10 @@ import { supabase } from '../lib/supabase';
 import { Button, Input, Modal, Badge } from './ui';
 import { Plus, UserX, Edit2 } from 'lucide-react';
 import { getErrorMessage } from '../utils/errorHandler';
-import { FUNCTIONAL_ROLES, FunctionalRole, ROLE_DISPLAY_NAMES } from '../utils/permissions';
+import {
+  FUNCTIONAL_ROLES, FunctionalRole, ROLE_DISPLAY_NAMES, getRoleDisplayLabel,
+  AddUserRoleOption, getAddUserRoleOptions, resolveAddUserRoleSelection,
+} from '../utils/permissions';
 
 interface Profile {
   id: string;
@@ -70,14 +73,38 @@ export function UserManagement() {
     password: '',
     full_name: '',
     department: '',
-    role: 'hr_manager' as FunctionalRole,
+    role: 'hr_manager' as AddUserRoleOption,
     region_id: '',
   });
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [currentUserIsSuperAdmin, setCurrentUserIsSuperAdmin] = useState(false);
 
   useEffect(() => {
     fetchUsers();
     fetchRegions();
+    fetchCurrentUser();
   }, []);
+
+  // Caller's own is_super_admin status -- gates whether "Super
+  // Administrator" appears at all in the Add User role selector and
+  // whether the Promote/Demote Super Administrator action is shown per
+  // row below. This is a UI convenience only; the real authorization
+  // boundaries are create-user/index.ts (server-verified caller check)
+  // and the set_super_admin_status() RPC (its own independent
+  // is_super_admin() check) -- neither trusts this state.
+  const fetchCurrentUser = async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+    setCurrentUserId(user.id);
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('is_super_admin')
+      .eq('id', user.id)
+      .single();
+    if (!error && profile) {
+      setCurrentUserIsSuperAdmin(profile.is_super_admin === true);
+    }
+  };
 
   const fetchUsers = async () => {
     setLoading(true);
@@ -119,10 +146,18 @@ export function UserManagement() {
       showFormAlert('Email, password, and full name are required');
       return;
     }
-    if (formData.role !== 'admin' && !formData.region_id) {
+    if (formData.role !== 'admin' && formData.role !== 'super_admin' && !formData.region_id) {
       showFormAlert('Region is required for this role');
       return;
     }
+
+    // 'super_admin' is a UI-only selection -- translated here (via the
+    // shared resolveAddUserRoleSelection, also used by its own unit test)
+    // into the real persisted values (role='admin', is_super_admin=true)
+    // before ever reaching the network. create-user/index.ts independently
+    // re-verifies the caller is a genuine super admin before honoring
+    // is_super_admin regardless of what this client sends.
+    const { role: effectiveRole, requestSuperAdmin } = resolveAddUserRoleSelection(formData.role);
 
     setSubmitting(true);
     try {
@@ -132,8 +167,9 @@ export function UserManagement() {
           password: formData.password,
           full_name: formData.full_name,
           department: formData.department || undefined,
-          role: formData.role,
-          region_id: formData.role === 'admin' ? null : formData.region_id,
+          role: effectiveRole,
+          region_id: effectiveRole === 'admin' ? null : formData.region_id,
+          ...(requestSuperAdmin ? { is_super_admin: true } : {}),
         },
       });
 
@@ -281,9 +317,46 @@ export function UserManagement() {
     }
   };
 
+  // ===== PROMOTE / DEMOTE SUPER ADMINISTRATOR =====
+  // Its own explicit, clearly-labeled action -- never a side effect of the
+  // ordinary role editors above (see updateLegacyUserRole's own header for
+  // why that distinction matters). Delegates entirely to the
+  // set_super_admin_status() SECURITY DEFINER RPC (see the hotfix
+  // migration), called directly via supabase.rpc(...) using the CALLER's
+  // own JWT -- no Edge Function needed, since a direct RPC call is already
+  // issued with the real caller's JWT, so the RPC's own is_super_admin()
+  // check (and its last-active-Super-Administrator lockout guard) is a
+  // real, independent authorization boundary, not just this button being
+  // hidden in the UI for a non-super-admin viewer.
+  const setSuperAdminStatus = async (user: Profile, grant: boolean) => {
+    const verb = grant ? 'Promote' : 'Demote';
+    const prep = grant ? 'to' : 'from';
+    if (!confirm(`${verb} ${user.email} ${prep} Super Administrator?`)) {
+      return;
+    }
+    try {
+      const { error } = await supabase.rpc('set_super_admin_status', {
+        p_target_id: user.id,
+        p_is_super_admin: grant,
+      });
+      if (error) throw error;
+      alert(`${user.email} ${grant ? 'promoted to' : 'demoted from'} Super Administrator`);
+      fetchUsers();
+    } catch (error) {
+      alert('Error updating Super Administrator status: ' + getErrorMessage(error));
+    }
+  };
+
   const isLegacyUser = (user: Profile) => user.role_level !== null && user.role_level !== undefined;
 
   const getRoleBadge = (user: Profile): { label: string; color: BadgeColor } => {
+    // Delegates the label (not the color) to the shared getRoleDisplayLabel
+    // (utils/permissions.ts) so this badge can never drift from Sidebar's
+    // own getRoleDisplay -- see that function's own comment for why
+    // is_super_admin must take precedence over role_level/role.
+    if (user.is_super_admin) {
+      return { label: getRoleDisplayLabel(user), color: 'gold' };
+    }
     if (isLegacyUser(user)) {
       const role = legacyRoleLevels.find(r => r.level === user.role_level);
       return { label: role?.name || 'Unknown', color: role?.color || 'gray' };
@@ -356,6 +429,25 @@ export function UserManagement() {
                       </td>
                       <td className="px-4 py-3 text-right">
                         <div className="flex items-center justify-end gap-2">
+                          {currentUserIsSuperAdmin && user.id !== currentUserId && (user.role === 'admin' || user.role_level === 1) && (
+                            user.is_super_admin ? (
+                              <button
+                                onClick={() => setSuperAdminStatus(user, false)}
+                                className="px-2 py-1 rounded-lg hover:bg-amber-50 text-amber-700 text-xs font-medium"
+                                title="Demote from Super Administrator"
+                              >
+                                Demote
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => setSuperAdminStatus(user, true)}
+                                className="px-2 py-1 rounded-lg hover:bg-amber-50 text-amber-700 text-xs font-medium"
+                                title="Promote to Super Administrator"
+                              >
+                                Promote
+                              </button>
+                            )
+                          )}
                           {legacy ? (
                             <button
                               onClick={() => { setSelectedUser(user); setShowEditModal(true); }}
@@ -422,15 +514,25 @@ export function UserManagement() {
             <select
               className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg"
               value={formData.role}
-              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setFormData({...formData, role: e.target.value as FunctionalRole})}
+              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setFormData({...formData, role: e.target.value as AddUserRoleOption})}
             >
-              {FUNCTIONAL_ROLES.map(role => (
-                <option key={role} value={role}>{ROLE_DISPLAY_NAMES[role]}</option>
+              {/* getAddUserRoleOptions (utils/permissions.ts) is the single
+                  source of truth for this list -- "Super Administrator"
+                  only ever appears for a caller who is already
+                  is_super_admin=true; for every other caller it must not
+                  appear at all, not just be disabled/hidden by CSS. Its
+                  own unit test pins exactly this contract. */}
+              {getAddUserRoleOptions(currentUserIsSuperAdmin).map(role => (
+                <option key={role} value={role}>{role === 'super_admin' ? 'Super Administrator' : ROLE_DISPLAY_NAMES[role]}</option>
               ))}
             </select>
-            <p className="text-xs text-slate-500 mt-1">{functionalRoleInfo[formData.role].desc}</p>
+            <p className="text-xs text-slate-500 mt-1">
+              {formData.role === 'super_admin'
+                ? 'Full cross-tenant platform access. Stored internally as Admin + Super Administrator status.'
+                : functionalRoleInfo[formData.role].desc}
+            </p>
           </div>
-          {formData.role !== 'admin' && (
+          {formData.role !== 'admin' && formData.role !== 'super_admin' && (
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1.5">Region</label>
               <select

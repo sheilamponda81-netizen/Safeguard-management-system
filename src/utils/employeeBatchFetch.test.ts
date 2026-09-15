@@ -161,6 +161,54 @@ describe('fetchInEmployeeIdBatches', () => {
       'simulated failure'
     );
   });
+
+  // ============================================================
+  // HOTFIX: Payslips.tsx regression coverage -- test items 13 and 14 from
+  // the hotfix's required 15-item test list. Production evidence showed
+  // Payslips' `employees` fetch (id, employee_number, full_name, position,
+  // department, basic_salary, status, pay_point, contract_type, region_id,
+  // uniform_deduction) failing with 400 Bad Request once a month's payroll
+  // population produced hundreds of ids in a single `.in(...)` request URL
+  // -- fixed by routing that fetch through fetchInEmployeeIdBatches (see
+  // src/pages/Payslips.tsx's fetchPayslipData). These tests exercise the
+  // shared helper with a payrollEmployeeIds-shaped id list at a size well
+  // past both the original production failure and 1,000, per the
+  // instruction to size the test for Central Region being added on top of
+  // the existing population.
+  // ============================================================
+  it('test item 13: a 1,247-id payroll population (well past 1,000) is fetched with no single request carrying the full id list, and every employee is returned exactly once', async () => {
+    const ids = makeIds(1247);
+    const seenBatchSizes: number[] = [];
+    const buildQuery: BatchQueryBuilder<{ id: string }> = async (batch) => {
+      seenBatchSizes.push(batch.length);
+      return { data: batch.map(id => ({ id })), error: null, count: batch.length };
+    };
+    const result = await fetchInEmployeeIdBatches(ids, buildQuery);
+    // No batch ever carries the whole population -- this is the exact
+    // failure mode production hit (one `.in()` request built from the
+    // entire month's employee id list).
+    expect(Math.max(...seenBatchSizes)).toBeLessThan(1247);
+    expect(seenBatchSizes.length).toBeGreaterThan(1);
+    expect(dedupeById(result)).toHaveLength(1247);
+  });
+
+  it('test item 14: a single failed batch out of many fails the ENTIRE Payslips employee load, never a partial employee list silently missing some payslips', async () => {
+    const ids = makeIds(1247);
+    let callCount = 0;
+    const buildQuery: BatchQueryBuilder<{ id: string }> = async (batch) => {
+      callCount += 1;
+      // Fail a batch in the middle of the run, after some have already
+      // succeeded -- proves a late failure still aborts the whole load
+      // rather than returning whatever succeeded so far.
+      if (callCount === 5) {
+        return { data: null as { id: string }[] | null, error: new Error('simulated PostgREST failure'), count: null };
+      }
+      return { data: batch.map(id => ({ id })), error: null, count: batch.length };
+    };
+    await expect(fetchInEmployeeIdBatches(ids, buildQuery, { concurrency: 1 })).rejects.toThrow(
+      'simulated PostgREST failure'
+    );
+  });
 });
 
 describe('dedupeById', () => {

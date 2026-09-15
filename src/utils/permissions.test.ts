@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { isBusinessAdmin, isLegacyAccount, PERMISSIONS, FUNCTIONAL_ROLES, ROLE_DISPLAY_NAMES } from './permissions';
+import {
+  isBusinessAdmin, isLegacyAccount, PERMISSIONS, FUNCTIONAL_ROLES, ROLE_DISPLAY_NAMES,
+  getRoleDisplayLabel, getAddUserRoleOptions, resolveAddUserRoleSelection, canChangeCurrentPayrollMonth,
+} from './permissions';
 import type { UserProfile } from './currentProfile';
 import { resolveAllowedPages, NAV_PERMISSIONS } from '../components/Sidebar';
 
@@ -189,5 +192,77 @@ describe('NAV_PERMISSIONS shape', () => {
     expect(NAV_PERMISSIONS.reports).toEqual(
       expect.arrayContaining([PERMISSIONS.REPORTS_FINANCIAL_VIEW, PERMISSIONS.REPORTS_OPERATIONAL_VIEW])
     );
+  });
+});
+
+// ============================================================
+// HOTFIX: formal Super Administrator model -- regression tests 1-3 and 9
+// from the hotfix's required 15-item test list. Items 4-8/10-12 (create-
+// user Edge Function authorization, the set_super_admin_status RPC, and
+// the system_settings/terminal_dues database enforcement) are SQL/RPC/RLS
+// behavior -- exercised empirically in a disposable local PostgreSQL
+// instance per the hotfix's own testing instructions, not here (this repo
+// has no integration harness reaching a real Postgres from vitest). Items
+// 4/5's pure request-shape decision (canGrantSuperAdmin) IS unit-tested,
+// in src/utils/createUserValidation.test.ts.
+// ============================================================
+describe('getRoleDisplayLabel (HOTFIX: Super Administrator label)', () => {
+  it('is_super_admin=true displays "Super Administrator" regardless of role/role_level', () => {
+    expect(getRoleDisplayLabel({ is_super_admin: true, role: 'admin', role_level: null })).toBe('Super Administrator');
+    expect(getRoleDisplayLabel({ is_super_admin: true, role: null, role_level: 1 })).toBe('Super Administrator');
+  });
+
+  it('an ordinary functional Admin (is_super_admin=false) displays "Admin", never "Super Administrator"', () => {
+    expect(getRoleDisplayLabel({ is_super_admin: false, role: 'admin', role_level: null })).toBe('Admin');
+  });
+
+  it('an ordinary legacy Admin (role_level=1, is_super_admin=false) displays "Administrator", never "Super Administrator"', () => {
+    expect(getRoleDisplayLabel({ is_super_admin: false, role: null, role_level: 1 })).toBe('Administrator');
+  });
+
+  it('is_super_admin takes precedence even for a legacy role_level=1 account', () => {
+    expect(getRoleDisplayLabel({ is_super_admin: true, role: null, role_level: 1 })).toBe('Super Administrator');
+  });
+});
+
+describe('getAddUserRoleOptions (HOTFIX: Add User role selector visibility)', () => {
+  it('a normal Admin caller (is_super_admin=false) never sees "super_admin" as an option', () => {
+    const options = getAddUserRoleOptions(false);
+    expect(options).not.toContain('super_admin');
+    expect(options).toEqual([...FUNCTIONAL_ROLES]);
+  });
+
+  it('a genuine Super Administrator caller sees "super_admin" as the first option, plus all 4 functional roles', () => {
+    const options = getAddUserRoleOptions(true);
+    expect(options[0]).toBe('super_admin');
+    expect(options).toEqual(['super_admin', ...FUNCTIONAL_ROLES]);
+  });
+});
+
+describe('resolveAddUserRoleSelection (HOTFIX: Add User submit-time translation)', () => {
+  it('selecting "super_admin" translates to role=admin + requestSuperAdmin=true -- never persists a literal "super_admin" role string', () => {
+    const result = resolveAddUserRoleSelection('super_admin');
+    expect(result).toEqual({ role: 'admin', requestSuperAdmin: true });
+  });
+
+  it('selecting an ordinary functional role passes it through unchanged with requestSuperAdmin=false', () => {
+    expect(resolveAddUserRoleSelection('hr_manager')).toEqual({ role: 'hr_manager', requestSuperAdmin: false });
+    expect(resolveAddUserRoleSelection('admin')).toEqual({ role: 'admin', requestSuperAdmin: false });
+  });
+});
+
+describe('canChangeCurrentPayrollMonth (HOTFIX: test item 9 -- month change unavailable to normal Admin)', () => {
+  it('a normal Admin (is_super_admin=false, even role_level=1) cannot change the month', () => {
+    expect(canChangeCurrentPayrollMonth({ is_super_admin: false })).toBe(false);
+    expect(canChangeCurrentPayrollMonth({ is_super_admin: undefined })).toBe(false);
+  });
+
+  it('a genuine Super Administrator can change the month', () => {
+    expect(canChangeCurrentPayrollMonth({ is_super_admin: true })).toBe(true);
+  });
+
+  it('a null/undefined profile (not yet loaded) cannot change the month -- fails closed, never defaults to true', () => {
+    expect(canChangeCurrentPayrollMonth(null)).toBe(false);
+    expect(canChangeCurrentPayrollMonth(undefined)).toBe(false);
   });
 });

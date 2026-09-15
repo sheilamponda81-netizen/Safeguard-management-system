@@ -34,6 +34,35 @@ export function isRegionRequired(role: AllowedRole): boolean {
   return role !== 'admin';
 }
 
+// HOTFIX: the exact authorization decision create-user/index.ts applies to
+// a request that includes `is_super_admin: true` -- extracted so it has
+// its own ordinary vitest unit test (see
+// src/utils/createUserValidation.test.ts), same rationale as
+// validateCreateUserInput above. Two independent rules, both must hold:
+//   1. Only a caller who is ALREADY a genuine super admin may request it
+//      (never trust the request body alone -- callerIsSuperAdmin is
+//      re-derived server-side from the caller's own profile row).
+//   2. The target role must be 'admin' -- the documented internal model is
+//      "Super Administrator = role='admin' AND is_super_admin=true"; there
+//      is no such thing as a super-admin hr_manager/accountant/
+//      operations_manager account.
+export function canGrantSuperAdmin(
+  requestedSuperAdmin: boolean,
+  callerIsSuperAdmin: boolean,
+  role: string
+): ValidationResult {
+  if (!requestedSuperAdmin) {
+    return { valid: true };
+  }
+  if (!callerIsSuperAdmin) {
+    return { valid: false, error: 'Only a Super Administrator may create another Super Administrator' };
+  }
+  if (role !== 'admin') {
+    return { valid: false, error: 'Super Administrator status requires role=admin' };
+  }
+  return { valid: true };
+}
+
 export interface CreateUserInput {
   email: string;
   password: string;
