@@ -2,17 +2,40 @@
 -- MIGRATION (HOTFIX): Formal Super Administrator model +
 -- Terminal Dues separation-of-duties correction
 -- Date: 2026-09-15
+-- Revised: 2026-09-15 (release-review blocker fix, same day, before this
+-- migration was ever applied to any real database -- see PART 1b)
 -- ============================================================
 --
 -- This is a targeted production hotfix. It does NOT touch payroll/
 -- attendance batching, guard-ID cleanup, or any other item explicitly
--- deferred to the later performance/scaling PR. It contains exactly three
+-- deferred to the later performance/scaling PR. It contains four
 -- independent, narrowly-scoped changes:
 --
 --   PART 1 -- set_super_admin_status() RPC: the smallest secure mechanism
 --            letting ONLY a genuine Super Administrator promote/demote
 --            another profile's is_super_admin flag, with a last-active-
 --            Super-Administrator lockout guard and audit logging.
+--
+--   PART 1b -- RELEASE-REVIEW BLOCKER FIX: a release review of PART 1
+--            found that disable-user (a pre-existing Edge Function this
+--            hotfix never originally touched) could disable an
+--            is_super_admin=true profile with zero awareness of the
+--            global "at least one active Super Admin" invariant PART 1
+--            established for the is_super_admin flag itself -- and that
+--            an ordinary Admin could disable a Super Administrator's
+--            account at all, since profiles' own UPDATE RLS lets any
+--            business-admin-class caller update a same-tenant row's
+--            is_active regardless of that row's is_super_admin flag,
+--            independent of whatever disable-user's own JS logic checked.
+--            Adds a shared assert_not_last_active_super_admin() helper
+--            (also used to refactor, not weaken, PART 1's own guard),
+--            extends the EXISTING prevent_profile_privilege_escalation()
+--            trigger (unconditional, RLS-independent) to block this
+--            transition, and adds a new disable_user_profile() RPC that
+--            becomes disable-user/index.ts's actual mutating call,
+--            invoked with the caller's own JWT (never the service-role
+--            client) so auth.uid() resolves correctly for a genuine
+--            Super Admin caller. See PART 1b's own header for full detail.
 --
 --   PART 2 -- system_settings key-aware RLS: current_payroll_month becomes
 --            Super-Admin-only to change, at the database layer, without
@@ -87,6 +110,51 @@
 -- refuses outright rather than relying solely on the last-Super-Admin
 -- count check to catch it after the fact.
 --
+-- ============================================================
+-- SHARED HELPER: assert_not_last_active_super_admin()
+-- ============================================================
+-- Added by PART 1b (release-review blocker fix) so the SAME global-
+-- invariant check (advisory lock + count) is used by every code path that
+-- can take a Super Administrator out of the "active" set -- originally
+-- only set_super_admin_status() had this logic inline; it is now shared
+-- with prevent_profile_privilege_escalation()'s new guard and
+-- disable_user_profile() (both added below in PART 1b), so the three
+-- can never independently drift. Internal-only -- REVOKE ALL below,
+-- callable only from within another SECURITY DEFINER function/trigger
+-- (which runs as this function's OWNER, not the original caller, so no
+-- direct grant to authenticated/anon is needed or given).
+--
+-- p_excluding_id is the profile being acted on -- excluded from its own
+-- "how many would remain" count, exactly as set_super_admin_status's own
+-- inline version already did.
+CREATE OR REPLACE FUNCTION assert_not_last_active_super_admin(p_excluding_id UUID)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_remaining_supers INTEGER;
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('global_super_admin_invariant', 0));
+
+  SELECT count(*) INTO v_remaining_supers
+  FROM profiles
+  WHERE is_super_admin = true
+    AND is_active = true
+    AND deleted_at IS NULL
+    AND id <> p_excluding_id;
+
+  IF v_remaining_supers = 0 THEN
+    RAISE EXCEPTION 'Cannot remove the last active Super Administrator';
+  END IF;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION assert_not_last_active_super_admin(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION assert_not_last_active_super_admin(UUID) FROM anon;
+REVOKE ALL ON FUNCTION assert_not_last_active_super_admin(UUID) FROM authenticated;
+
 CREATE OR REPLACE FUNCTION set_super_admin_status(
   p_target_id UUID,
   p_is_super_admin BOOLEAN
@@ -100,7 +168,6 @@ DECLARE
   v_caller_id UUID;
   v_caller RECORD;
   v_target RECORD;
-  v_remaining_supers INTEGER;
   v_result profiles;
 BEGIN
   IF p_is_super_admin IS NULL THEN
@@ -150,22 +217,14 @@ BEGIN
   END IF;
 
   -- 7. Last-active-Super-Administrator lockout guard, only relevant on a
-  -- genuine demotion (true -> false). A single fixed (non-per-tenant)
-  -- advisory lock serializes concurrent demotions against this same
-  -- global invariant -- see header.
+  -- genuine demotion (true -> false). Delegates to the shared
+  -- assert_not_last_active_super_admin() helper (PART 1b) -- same
+  -- advisory lock, same count predicate, same exception text as before
+  -- this refactor; behavior is unchanged, only de-duplicated so
+  -- disable_user_profile() and the trigger's own new guard (both added by
+  -- PART 1b) use the identical check instead of a second hand-copied one.
   IF COALESCE(v_target.is_super_admin, false) AND NOT p_is_super_admin THEN
-    PERFORM pg_advisory_xact_lock(hashtextextended('global_super_admin_invariant', 0));
-
-    SELECT count(*) INTO v_remaining_supers
-    FROM profiles
-    WHERE is_super_admin = true
-      AND is_active = true
-      AND deleted_at IS NULL
-      AND id <> p_target_id;
-
-    IF v_remaining_supers = 0 THEN
-      RAISE EXCEPTION 'Cannot remove the last active Super Administrator';
-    END IF;
+    PERFORM assert_not_last_active_super_admin(p_target_id);
   END IF;
 
   -- 8. The constrained write -- only is_super_admin is in the SET list.
@@ -215,6 +274,319 @@ $$;
 REVOKE ALL ON FUNCTION set_super_admin_status(UUID, BOOLEAN) FROM PUBLIC;
 REVOKE ALL ON FUNCTION set_super_admin_status(UUID, BOOLEAN) FROM anon;
 GRANT EXECUTE ON FUNCTION set_super_admin_status(UUID, BOOLEAN) TO authenticated;
+
+-- ============================================================
+-- PART 1b: RELEASE-REVIEW BLOCKER FIX -- disable-user could disable an
+-- is_super_admin=true profile without enforcing the global
+-- at-least-one-active-Super-Administrator invariant, and an ordinary
+-- Admin could disable a Super Administrator's account at all.
+-- ============================================================
+--
+-- ROOT CAUSE (two independent gaps, both closed below):
+--
+--   1. profiles' own UPDATE RLS policy (20260817000001) lets ANY
+--      business-admin-class caller update a SAME-TENANT row's is_active,
+--      regardless of that row's is_super_admin flag -- there was no
+--      column-aware/flag-aware carve-out for is_active the way PART 2
+--      below adds one for system_settings.key. disable-user/index.ts's
+--      own JS-side checks (business-admin count, cross-tenant
+--      restriction, self-disable) are therefore NOT the real security
+--      boundary -- they are bypassable by any raw
+--      `supabase.from('profiles').update({is_active:false})` REST call
+--      that skips the Edge Function entirely. Confirmed by direct
+--      repo-wide audit (see this hotfix's own report) that no other
+--      write path currently sets profiles.deleted_at at all, and that
+--      disable-user is the ONLY Edge Function writing profiles.is_active
+--      to false.
+--
+--   2. disable-user/index.ts's actual mutating UPDATE was issued via the
+--      SERVICE-ROLE client (not a caller-JWT-scoped one) -- exactly the
+--      same auth.uid()-is-NULL failure mode update-user/index.ts's own
+--      header already documents and works around. Any NEW is_super_admin-
+--      aware guard added to the profiles UPDATE trigger would therefore
+--      be unable to see the REAL caller's identity through that
+--      connection, and would incorrectly reject even a genuine Super
+--      Admin's legitimate attempt to disable another Super Admin.
+--
+-- FIX (two parts, both required together -- see requirement #6 in the
+-- release review):
+--
+--   A. assert_not_last_active_super_admin() (above) is now ALSO called
+--      from a new guard inside the EXISTING
+--      prevent_profile_privilege_escalation() trigger (20260822000000) --
+--      unconditional, fires on ANY UPDATE to profiles regardless of which
+--      role/client issues it (service-role, caller-JWT-scoped, or a raw
+--      REST call), closing gap 1 for every current and future write path,
+--      not just disable-user. Scoped tightly to the exact transition that
+--      matters: a row that WAS an active Super Admin losing that active
+--      status (is_active -> false, or deleted_at being set) --
+--      promotions, re-enables, and every other write are unaffected, and
+--      the existing tenant-scoped last-Business-Admin invariant later in
+--      the same trigger is untouched.
+--
+--   B. A new disable_user_profile() RPC becomes disable-user/index.ts's
+--      actual mutating call (companion Edge Function change, not part of
+--      this SQL file), invoked via a SEPARATE client scoped to the
+--      CALLER's own JWT -- same pattern update-user/index.ts already
+--      established for update_functional_user_profile() -- so auth.uid()
+--      correctly resolves the real caller for both this RPC's own checks
+--      and the trigger's guard from (A), closing gap 2. The Edge
+--      Function's existing JS-side pre-checks (tenant/business-admin
+--      lookups, friendly early error messages) are preserved unchanged
+--      for UX; they were already non-authoritative (see their own
+--      existing comments) and remain so -- this RPC plus the trigger are
+--      the real boundary.
+--
+-- WHY NOT RE-IMPLEMENT THE TENANT-SCOPED LAST-BUSINESS-ADMIN CHECK HERE:
+-- prevent_profile_privilege_escalation()'s existing v_was_admin/
+-- v_will_be_admin logic ALREADY unconditionally protects that invariant
+-- for every write path, including this new RPC's own UPDATE statement --
+-- duplicating it here would be redundant surface, not extra safety (see
+-- requirement to "keep the surface minimal").
+--
+-- WHY THE AUDIT LOG MOVES INTO THIS RPC (not a behavior loss): disable-
+-- user/index.ts previously inserted its own audit_logs row as a SEPARATE
+-- step, via the service-role client, AFTER the update already succeeded
+-- -- if that insert failed, the disable had already happened with no
+-- audit trail. Folding it into this SECURITY DEFINER RPC, in the SAME
+-- transaction as the UPDATE (exactly like set_super_admin_status's own
+-- audit insert), means a failed audit insert now rolls back the whole
+-- disable instead of silently losing the trail -- a strengthening, not a
+-- change in what gets logged (same fields, same content).
+--
+-- AUTH ADMIN API / profiles-Auth CONSISTENCY: this function -- like
+-- disable-user/index.ts before it -- does NOT call the Supabase Auth
+-- Admin API (no ban, no delete) at all. is_active=false is deliberately
+-- the ONLY effect, exactly matching disable-user's own pre-existing,
+-- documented "soft disable only" design (see that file's own
+-- "HARD-DELETE LIMITATION" footer). Since no Auth-side mutation is
+-- introduced by this fix, there is no multi-step Auth+DB sequence that
+-- needs compensation/rollback here -- profiles and Supabase Auth account
+-- state cannot diverge from a step this function never takes.
+--
+CREATE OR REPLACE FUNCTION prevent_profile_privilege_escalation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_was_admin BOOLEAN;
+  v_will_be_admin BOOLEAN;
+  v_remaining INTEGER;
+  v_was_active_super BOOLEAN;
+  v_will_be_active_super BOOLEAN;
+BEGIN
+  IF NOT is_super_admin() THEN
+    NEW.is_super_admin := OLD.is_super_admin;
+  END IF;
+
+  IF NEW.id = auth.uid() THEN
+    NEW.role_level := OLD.role_level;
+    NEW.role := OLD.role;
+    NEW.region_id := OLD.region_id;
+    NEW.tenant_id := OLD.tenant_id;
+  ELSIF NOT (is_super_admin() OR is_business_admin()) THEN
+    NEW.role_level := OLD.role_level;
+    NEW.role := OLD.role;
+    NEW.region_id := OLD.region_id;
+    NEW.tenant_id := OLD.tenant_id;
+  END IF;
+
+  -- NEW (PART 1b): last-active-Super-Administrator protection, extended
+  -- here to cover DEACTIVATING (is_active -> false) or SOFT-DELETING
+  -- (deleted_at being set) a row that IS a Super Administrator -- the
+  -- release-review finding this closes. Fires ONLY when a row that WAS an
+  -- active Super Admin is losing that active status; promotions,
+  -- re-enables, and every unrelated write pass through untouched. This is
+  -- the unconditional, RLS-independent boundary -- it runs regardless of
+  -- which role/client issues the UPDATE.
+  v_was_active_super := COALESCE(OLD.is_active, false) AND OLD.deleted_at IS NULL AND COALESCE(OLD.is_super_admin, false);
+  v_will_be_active_super := COALESCE(NEW.is_active, false) AND NEW.deleted_at IS NULL AND COALESCE(NEW.is_super_admin, false);
+
+  IF v_was_active_super AND NOT v_will_be_active_super THEN
+    IF NOT is_super_admin() THEN
+      RAISE EXCEPTION 'Only a Super Administrator may disable another Super Administrator';
+    END IF;
+    IF OLD.id = auth.uid() THEN
+      RAISE EXCEPTION 'You cannot disable your own Super Administrator account';
+    END IF;
+    PERFORM assert_not_last_active_super_admin(OLD.id);
+  END IF;
+
+  v_was_admin := COALESCE(OLD.is_active, false) AND OLD.deleted_at IS NULL
+    AND (COALESCE(OLD.role = 'admin', false) OR COALESCE(OLD.role_level = 1, false));
+  v_will_be_admin := COALESCE(NEW.is_active, false) AND NEW.deleted_at IS NULL
+    AND (COALESCE(NEW.role = 'admin', false) OR COALESCE(NEW.role_level = 1, false));
+
+  -- Protects OLD.tenant_id whenever an active Business Admin is LEAVING it --
+  -- either by no longer being admin-class (demoted/disabled) OR by being
+  -- reassigned to a DIFFERENT tenant while remaining admin-class (a genuine
+  -- Super Admin changing NEW.tenant_id -- the only caller who can get a
+  -- changed tenant_id past this function's own restoration logic above and
+  -- past profiles' RLS WITH CHECK, which requires an ordinary Business
+  -- Admin's write to keep NEW.tenant_id equal to their own tenant). Without
+  -- the second condition, a Super Admin moving a tenant's ONLY admin to
+  -- another tenant would leave OLD.tenant_id with zero local admins while
+  -- v_will_be_admin stayed true (role/active unchanged, only tenant_id
+  -- moved) -- the check would never fire. Only OLD.tenant_id is ever
+  -- locked/recounted here -- the DESTINATION tenant gaining an admin is
+  -- never a threat to this invariant and must not be locked for it.
+  IF v_was_admin AND (NOT v_will_be_admin OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id) THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended(OLD.tenant_id::text, 0));
+
+    SELECT count(*) INTO v_remaining FROM profiles
+    WHERE tenant_id = OLD.tenant_id AND id <> OLD.id
+      AND is_active AND deleted_at IS NULL
+      AND (COALESCE(role = 'admin', false) OR COALESCE(role_level = 1, false));
+
+    IF v_remaining = 0 THEN
+      RAISE EXCEPTION 'Cannot remove the last remaining active Admin for this tenant';
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- ACL restated explicitly, matching this function's existing established
+-- pattern (20260822000000) -- trigger-only, no direct client EXECUTE for
+-- any role, including authenticated. Unchanged by this revision.
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM PUBLIC;
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM anon;
+REVOKE ALL ON FUNCTION prevent_profile_privilege_escalation() FROM authenticated;
+
+-- ============================================================
+-- disable_user_profile() -- becomes disable-user/index.ts's actual
+-- mutating call (see this PART's header, gap 2). Reproduces that Edge
+-- Function's existing business rules (caller must be admin-class, target
+-- must exist, cross-tenant blocked unless caller is super admin,
+-- already-disabled is an idempotent no-op, self-disable rejected) plus
+-- the two NEW checks this blocker fix requires. MUST be invoked with the
+-- caller's own JWT forwarded (auth.uid() is NULL under a service-role
+-- connection) -- disable-user/index.ts constructs a second, anon-key +
+-- caller-Authorization-header client specifically for this call, exactly
+-- like update-user/index.ts already does for update_functional_user_profile().
+-- ============================================================
+CREATE OR REPLACE FUNCTION disable_user_profile(p_target_id UUID)
+RETURNS profiles
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_caller_id UUID;
+  v_caller RECORD;
+  v_target RECORD;
+  v_caller_is_business_admin BOOLEAN;
+  v_caller_is_super_admin BOOLEAN;
+  v_result profiles;
+BEGIN
+  -- 1. Caller must be authenticated with a real JWT.
+  v_caller_id := auth.uid();
+  IF v_caller_id IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated';
+  END IF;
+
+  -- 2. Caller profile must exist, be active, not soft-deleted.
+  SELECT * INTO v_caller FROM profiles WHERE id = v_caller_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No profile found for the caller';
+  END IF;
+  IF NOT COALESCE(v_caller.is_active, false) OR v_caller.deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Your account is disabled';
+  END IF;
+
+  v_caller_is_business_admin := COALESCE(v_caller.role = 'admin', false) OR COALESCE(v_caller.role_level = 1, false);
+  v_caller_is_super_admin := COALESCE(v_caller.is_super_admin, false);
+  IF NOT v_caller_is_business_admin AND NOT v_caller_is_super_admin THEN
+    RAISE EXCEPTION 'Only Admins may disable users';
+  END IF;
+
+  -- 3. Self-disable rejected outright, for every caller (mirrors
+  -- disable-user/index.ts's own existing pre-check, restated here as the
+  -- authoritative version).
+  IF p_target_id = v_caller_id THEN
+    RAISE EXCEPTION 'You cannot disable your own account';
+  END IF;
+
+  -- 4. Load and lock the target row for the duration of this transaction.
+  SELECT * INTO v_target FROM profiles WHERE id = p_target_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'User not found';
+  END IF;
+
+  -- 5. Cross-tenant restriction, mirrors update_functional_user_profile()
+  -- and disable-user/index.ts's own existing check: existence masked as
+  -- "User not found" rather than a distinct "wrong tenant" error.
+  IF NOT v_caller_is_super_admin AND v_target.tenant_id IS DISTINCT FROM v_caller.tenant_id THEN
+    RAISE EXCEPTION 'User not found';
+  END IF;
+
+  -- 6. Idempotent no-op for an already-disabled target -- mirrors
+  -- disable-user/index.ts's own existing behavior.
+  IF NOT v_target.is_active THEN
+    RETURN v_target;
+  END IF;
+
+  -- 7. NEW: only a genuine Super Administrator may disable another Super
+  -- Administrator. An ordinary (business-admin-only) caller is rejected
+  -- outright, regardless of the tenant-scoped last-Business-Admin count
+  -- below -- this is the exact gap the release review found.
+  IF COALESCE(v_target.is_super_admin, false) AND NOT v_caller_is_super_admin THEN
+    RAISE EXCEPTION 'Only a Super Administrator may disable a Super Administrator';
+  END IF;
+
+  -- 8. NEW: global last-active-Super-Administrator invariant, same shared
+  -- helper set_super_admin_status() and the trigger's own guard use.
+  -- Redundant with the trigger's own call to the same helper during the
+  -- UPDATE below (step 9) -- deliberate defense-in-depth, matching this
+  -- schema's established "two independent layers" pattern (see
+  -- set_super_admin_status()'s own header) -- the advisory lock is safely
+  -- re-entrant within one transaction/session, so calling it twice here
+  -- is harmless, not a deadlock risk.
+  IF COALESCE(v_target.is_super_admin, false) THEN
+    PERFORM assert_not_last_active_super_admin(p_target_id);
+  END IF;
+
+  -- 9. The write. prevent_profile_privilege_escalation() still fires on
+  -- this UPDATE and independently re-verifies everything in steps 7-8
+  -- (via its own new guard) for the ACTUAL caller (auth.uid(), unaffected
+  -- by this function's own SECURITY DEFINER context) -- this RPC's own
+  -- checks and that trigger are two independent layers, not one
+  -- masquerading as two. The EXISTING tenant-scoped last-Business-Admin
+  -- invariant (unchanged, in that same trigger) also applies here for
+  -- free, with no need to duplicate it in this function.
+  UPDATE profiles SET is_active = false WHERE id = p_target_id RETURNING * INTO v_result;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Update did not apply -- this account may have changed since validation';
+  END IF;
+
+  -- 10. Authoritative audit entry, same transaction as the mutation above
+  -- -- see this PART's header on why this moved out of the Edge Function.
+  -- Identical field shape to disable-user/index.ts's own prior insert.
+  INSERT INTO audit_logs (tenant_id, user_id, user_email, user_role, region_id, action, entity_type, entity_id, old_data, new_data)
+  VALUES (
+    v_target.tenant_id,
+    v_caller_id,
+    v_caller.email,
+    CASE WHEN v_caller_is_super_admin THEN 'super_admin' ELSE 'admin' END,
+    NULL,
+    'UPDATE',
+    'profiles',
+    p_target_id::text,
+    jsonb_build_object('is_active', true),
+    jsonb_build_object('is_active', false)
+  );
+
+  RETURN v_result;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION disable_user_profile(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION disable_user_profile(UUID) FROM anon;
+GRANT EXECUTE ON FUNCTION disable_user_profile(UUID) TO authenticated;
 
 -- ============================================================
 -- PART 2: system_settings key-aware RLS -- current_payroll_month becomes
@@ -339,6 +711,42 @@ WHERE role = 'admin' AND permission = 'terminal_dues.approve';
 --   -- exception 'You cannot change your own super-admin status through
 --   -- this action'
 --   SELECT set_super_admin_status('<self-id>', false);
+--
+-- PART 1b (release-review blocker fix):
+--   -- ordinary Admin attempts to disable a Super Admin via the RPC:
+--   -- expect exception 'Only a Super Administrator may disable a Super
+--   -- Administrator'
+--   SELECT disable_user_profile('<super-admin-id>');
+--
+--   -- ordinary Admin attempts to disable a Super Admin via a RAW UPDATE
+--   -- (simulating a direct REST call that bypasses disable-user/the RPC
+--   -- entirely): expect exception 'Only a Super Administrator may
+--   -- disable another Super Administrator' (raised by the trigger)
+--   UPDATE profiles SET is_active = false WHERE id = '<super-admin-id>';
+--
+--   -- genuine Super Admin attempts to disable THEMSELVES: expect
+--   -- exception 'You cannot disable your own account' (RPC) or 'You
+--   -- cannot disable your own Super Administrator account' (raw UPDATE,
+--   -- caught by the trigger)
+--   SELECT disable_user_profile('<self-id>');
+--
+--   -- genuine Super Admin disables the ONLY other active Super Admin:
+--   -- expect exception 'Cannot remove the last active Super
+--   -- Administrator'
+--   SELECT disable_user_profile('<last-other-super-admin-id>');
+--
+--   -- with 2+ active Super Admins, genuine Super Admin disables another:
+--   -- expect SUCCESS, target row now is_active = false
+--   SELECT disable_user_profile('<other-super-admin-id>');
+--
+--   -- ordinary Admin disabling an ordinary (non-super) user: expect
+--   -- SUCCESS, unaffected by this fix
+--   SELECT disable_user_profile('<ordinary-user-id>');
+--
+--   -- existing tenant-scoped last-Business-Admin protection still
+--   -- fires (unchanged trigger logic): expect exception 'Cannot remove
+--   -- the last remaining active Admin for this tenant'
+--   SELECT disable_user_profile('<tenants-only-remaining-business-admin-id>');
 --
 -- PART 2:
 --   -- ordinary Admin, direct REST-equivalent UPDATE: expect 0 rows
