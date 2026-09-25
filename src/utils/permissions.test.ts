@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   isBusinessAdmin, isLegacyAccount, PERMISSIONS, FUNCTIONAL_ROLES, ROLE_DISPLAY_NAMES,
   getRoleDisplayLabel, getAddUserRoleOptions, resolveAddUserRoleSelection, canChangeCurrentPayrollMonth,
+  canChooseAnyRegion,
 } from './permissions';
 import type { UserProfile } from './currentProfile';
 import { resolveAllowedPages, NAV_PERMISSIONS } from '../components/Sidebar';
@@ -68,6 +69,40 @@ describe('isBusinessAdmin', () => {
 
   it('is false for a null profile', () => {
     expect(isBusinessAdmin(null)).toBe(false);
+  });
+});
+
+// HOTFIX (STAGING blockers 1 & 2): canChooseAnyRegion backs both the
+// Attendance region-edit gate and the Add Employee region field's
+// select-vs-locked-input gate -- see attendancePermissions.test.ts and this
+// engagement's report for the STAGING reproduction this closes.
+describe('canChooseAnyRegion', () => {
+  it('is true for a Super Admin', () => {
+    expect(canChooseAnyRegion(makeProfile({ is_super_admin: true, role: 'hr_manager', region_id: null }))).toBe(true);
+  });
+
+  it('is true for a new-model Business Admin (role="admin", region_id=null) -- the confirmed STAGING persona', () => {
+    expect(canChooseAnyRegion(makeProfile({ role: 'admin', role_level: null, is_super_admin: false, region_id: null }))).toBe(true);
+  });
+
+  it('is true for a legacy Business Admin (role_level=1) regardless of role text', () => {
+    expect(canChooseAnyRegion(makeProfile({ role: null, role_level: 1, is_super_admin: false, region_id: null }))).toBe(true);
+  });
+
+  it('is false for a region-scoped functional role (hr_manager/accountant/operations_manager)', () => {
+    expect(canChooseAnyRegion(makeProfile({ role: 'hr_manager', role_level: null, region_id: 'r1' }))).toBe(false);
+    expect(canChooseAnyRegion(makeProfile({ role: 'accountant', role_level: null, region_id: 'r1' }))).toBe(false);
+    expect(canChooseAnyRegion(makeProfile({ role: 'operations_manager', role_level: null, region_id: 'r1' }))).toBe(false);
+  });
+
+  it('is false for a region-scoped legacy account (Manager/Supervisor/Staff, role_level 2/3/4)', () => {
+    expect(canChooseAnyRegion(makeProfile({ role_level: 2, region_id: 'r1' }))).toBe(false);
+    expect(canChooseAnyRegion(makeProfile({ role_level: 3, region_id: 'r1' }))).toBe(false);
+    expect(canChooseAnyRegion(makeProfile({ role_level: 4, region_id: 'r1' }))).toBe(false);
+  });
+
+  it('is false for a null profile', () => {
+    expect(canChooseAnyRegion(null)).toBe(false);
   });
 });
 

@@ -78,6 +78,23 @@ export function isBusinessAdmin(profile: UserProfile | null): boolean {
   return profile.role === 'admin' || profile.role_level === 1;
 }
 
+// HOTFIX: mirrors region_allowed()'s tenant-wide bypass -- that function
+// returns true unconditionally for is_business_admin() the same way it
+// does for is_super_admin(), so at the database layer a Business Admin
+// already has access to every region in their tenant, not just their own
+// profile's region_id. Frontend region gates (Attendance's edit check,
+// the Add Employee region field) must grant the same bypass instead of
+// checking is_super_admin alone, or a Business Admin with no region_id of
+// their own (the normal case -- Business Admin authority is tenant-wide,
+// not tied to one region) gets incorrectly treated as region-scoped.
+// Genuinely region-scoped roles (a legacy Supervisor/Staff, or a
+// functional HR Manager/Accountant/Operations Manager) are unaffected --
+// they still fall through to false here, same as before.
+export function canChooseAnyRegion(profile: UserProfile | null): boolean {
+  if (!profile) return false;
+  return profile.is_super_admin === true || isBusinessAdmin(profile);
+}
+
 // HOTFIX: single source of truth for "what role label does this profile
 // display", used by both Sidebar.tsx (the account's own label in the nav)
 // and UserManagement.tsx's getRoleBadge (every OTHER user's label in the

@@ -4,7 +4,7 @@ import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs 
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
-import { canAccess, PERMISSIONS } from '../utils/permissions';
+import { canAccess, canChooseAnyRegion as resolveCanChooseAnyRegion, PERMISSIONS } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
@@ -17,6 +17,7 @@ import { generateEmployeeNumberServerSide, shouldGenerateEmployeeNumber } from '
 import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
 import { checkEmployeeIdentifierConflicts, formatIdentifierConflictMessage, identifierColumnFromUniqueViolation } from '../utils/employeeConflicts';
+import { validateEmployeeForm } from '../utils/employeeFormValidation';
 
 interface Employee {
   id: string;
@@ -305,66 +306,10 @@ function DateFieldDMY({ value, onChange, required, disabled }: {
   );
 }
 
-// ===== Shared Add/Edit employee form validation =====
-// Every textbox on the form is mandatory -- this is the single place that
-// list lives, so the Add and Edit forms (which duplicate the same fields)
-// never drift out of sync on what's required. Returns the label of the first
-// missing/invalid field so the caller can show a notification naming it, or
-// null when the form is valid.
-const REQUIRED_EMPLOYEE_FIELDS: { key: keyof Employee; label: string }[] = [
-  { key: 'fullName', label: 'Full Name' },
-  { key: 'dob', label: 'Date of Birth' },
-  { key: 'gender', label: 'Gender' },
-  { key: 'phone', label: 'Phone Number' },
-  { key: 'address', label: 'Residential Address' },
-  { key: 'position', label: 'Position' },
-  { key: 'department', label: 'Department' },
-  { key: 'qualification', label: 'Qualification' },
-  { key: 'dateHired', label: 'Date Hired' },
-  { key: 'contractType', label: 'Contract Type' },
-  { key: 'pay_point', label: 'Pay Point' },
-  { key: 'account_number', label: 'Bank Account / Mobile Money Number' },
-  { key: 'next_of_kin_name', label: 'Next of Kin Full Name' },
-  { key: 'next_of_kin_relationship', label: 'Next of Kin Relationship' },
-  { key: 'next_of_kin_phone', label: 'Next of Kin Phone Number' },
-];
-
-const validateEmployeeForm = (form: Partial<Employee>, isSuperAdmin?: boolean): string | null => {
-  if (!form.employeeNumber || String(form.employeeNumber).trim() === '') {
-    // Deliberately not "select a Region first" -- a non-super-admin's
-    // region is pre-assigned, not manually selected, so that phrasing
-    // describes an action they can't take. Covers both: a region not yet
-    // resolved at all, and generation still in flight or having failed.
-    return 'Employee Number (still generating -- wait for it to complete, or select/confirm a Region)';
-  }
-
-  for (const { key, label } of REQUIRED_EMPLOYEE_FIELDS) {
-    if (!form[key] || String(form[key]).trim() === '') {
-      return label;
-    }
-  }
-
-  if (isSuperAdmin && !form.region_id) return 'Region';
-  if (form.assignment_type === 'company' && !form.company) return 'Company Name';
-  if (form.assignment_type === 'resident') {
-    if (!form.resident_name) return 'Resident Name';
-  }
-
-  // National ID and Next of Kin Address are optional -- not every employee
-  // has one on file yet -- but if a National ID is entered it still needs
-  // to be a real one, not a partial/typo'd value.
-  if (form.nationalId && String(form.nationalId).trim() !== '' && String(form.nationalId).trim().length !== 8) {
-    return 'National ID (must be exactly 8 characters)';
-  }
-  if (String(form.phone).trim().length !== 10) {
-    return 'Phone Number (must be exactly 10 digits)';
-  }
-  if (String(form.next_of_kin_phone).trim().length !== 10) {
-    return 'Next of Kin Phone Number (must be exactly 10 digits)';
-  }
-
-  return null;
-};
+// Shared Add/Edit employee form validation -- extracted to
+// src/utils/employeeFormValidation.ts (HOTFIX, STAGING blocker 2) so it's
+// unit-testable without importing this whole page component; see that
+// file for the full behavior/history comment.
 
 export function EmployeesPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
@@ -406,6 +351,17 @@ export function EmployeesPage() {
 
   // ===== MEMOIZED VALUES =====
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
+  // HOTFIX: employees RLS already grants a Business Admin (role='admin' or
+  // role_level=1) tenant-wide region access the same way it does for a
+  // Super Admin (current_user_role_level() <= 2 OR employees.* permission
+  // -- is_super_admin plays no special role in that policy at all). The Add
+  // Employee form's region field used to gate on isSuperAdmin alone, which
+  // left a Business Admin with no region_id of their own (the normal case)
+  // stuck with a blank, locked field and no way to create an employee. Uses
+  // the shared canChooseAnyRegion() helper (src/utils/permissions.ts) that
+  // Attendance's region-edit gate also uses, so this doesn't duplicate a
+  // second, possibly-drifting definition of "who may act across regions".
+  const canChooseAnyRegion = useMemo(() => resolveCanChooseAnyRegion(userProfile), [userProfile]);
   const userRegion = useMemo(() => regions.find(r => r.id === userProfile?.region_id), [regions, userProfile]);
 
   // Separate active and deleted employees - ONLY ACTIVE EMPLOYEES (is_deleted = false or null)
@@ -1517,7 +1473,7 @@ export function EmployeesPage() {
           departments={departmentOptions} 
           regions={regions}
           userRegionId={userProfile?.region_id}
-          isSuperAdmin={isSuperAdmin}
+          canChooseAnyRegion={canChooseAnyRegion}
           userRegionName={userRegion?.name}
           relationshipOptions={relationshipOptions}
         />
@@ -1546,7 +1502,7 @@ function AddEmployeeForm({
   departments,
   regions,
   userRegionId,
-  isSuperAdmin,
+  canChooseAnyRegion,
   userRegionName,
   relationshipOptions,
 }: {
@@ -1555,7 +1511,7 @@ function AddEmployeeForm({
   departments: string[];
   regions: UserProfileRegion[];
   userRegionId?: string | null;
-  isSuperAdmin?: boolean;
+  canChooseAnyRegion?: boolean;
   userRegionName?: string;
   relationshipOptions: string[];
 }) {
@@ -1776,7 +1732,7 @@ function AddEmployeeForm({
     // Validation -- every field on this form is mandatory; validateEmployeeForm
     // returns the label of the first missing/invalid one so the notification
     // tells the admin exactly which box to fill in.
-    const missingField = validateEmployeeForm(form, isSuperAdmin);
+    const missingField = validateEmployeeForm(form, canChooseAnyRegion);
     if (missingField) {
       showNotification(`Please fill in: ${missingField}`, "error");
       return;
@@ -1863,7 +1819,7 @@ function AddEmployeeForm({
           <strong>Employment Form</strong>
           <br />
           Complete all required fields. Employee will be added to active records.
-          {!isSuperAdmin && userRegionName && (
+          {!canChooseAnyRegion && userRegionName && (
             <span className="block mt-1 text-xs text-[#D4A017]">
               Will be assigned to: {userRegionName}
             </span>
@@ -2289,7 +2245,7 @@ function AddEmployeeForm({
             <label className="block text-sm font-medium text-slate-700 mb-1.5">
               Region <span className="text-red-500">*</span>
             </label>
-            {isSuperAdmin ? (
+            {canChooseAnyRegion ? (
               <select
                 value={form.region_id || ""}
                 onChange={(e) => {
