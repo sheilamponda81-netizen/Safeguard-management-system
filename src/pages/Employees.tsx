@@ -4,7 +4,7 @@ import { Card, Button, Badge, THead, TBody, TR, TH, TD, Modal, PageHeader, Tabs 
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
-import { canAccess, canChooseAnyRegion as resolveCanChooseAnyRegion, PERMISSIONS } from '../utils/permissions';
+import { canAccess, canActOnRegion, canChooseAnyRegion as resolveCanChooseAnyRegion, PERMISSIONS } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
@@ -1079,7 +1079,15 @@ export function EmployeesPage() {
   }, []);
 
   const handleEdit = useCallback((employee: Employee) => {
-    if (!userProfile?.is_super_admin && employee.region_id !== userProfile?.region_id) {
+    // HOTFIX: employees UPDATE RLS already grants a Business Admin
+    // (role='admin' or role_level=1) tenant-wide region access via
+    // region_allowed()'s is_business_admin() bypass, the same as it does
+    // for is_super_admin() -- this gate used to exempt Super Admin only,
+    // blocking a Business Admin with region_id=NULL (the confirmed
+    // STAGING persona) from editing any employee outside their own (null)
+    // region. canActOnRegion() reuses the same canChooseAnyRegion() helper
+    // the Attendance edit gate and Add Employee region field already use.
+    if (!canActOnRegion(userProfile, employee.region_id)) {
       showNotification('You cannot edit employees from other regions', 'error');
       return;
     }

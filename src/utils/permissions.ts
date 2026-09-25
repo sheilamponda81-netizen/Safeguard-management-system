@@ -95,6 +95,23 @@ export function canChooseAnyRegion(profile: UserProfile | null): boolean {
   return profile.is_super_admin === true || isBusinessAdmin(profile);
 }
 
+// HOTFIX: generic "may this caller act on a record belonging to this
+// region" gate -- canChooseAnyRegion() covers the Super Admin/Business
+// Admin bypass, and this adds the one remaining case: a genuinely
+// region-scoped caller acting on a record in their OWN region. Used by
+// Employees.tsx's edit-employee gate (STAGING: "You cannot edit employees
+// from other regions" was blocking a Business Admin with region_id=NULL
+// the same way the Attendance/Add-Employee gates were before them) --
+// intentionally the same shape as attendancePermissions.ts's
+// canEditAttendanceInRegion(), so a future region-scoped gate (e.g.
+// delete/restore employee, which still have the pre-fix is_super_admin-only
+// check as of this commit) can reuse this instead of a third copy.
+export function canActOnRegion(profile: UserProfile | null, recordRegionId: string | null | undefined): boolean {
+  if (!profile) return false;
+  if (canChooseAnyRegion(profile)) return true;
+  return recordRegionId === profile.region_id;
+}
+
 // HOTFIX: single source of truth for "what role label does this profile
 // display", used by both Sidebar.tsx (the account's own label in the nav)
 // and UserManagement.tsx's getRoleBadge (every OTHER user's label in the

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   isBusinessAdmin, isLegacyAccount, PERMISSIONS, FUNCTIONAL_ROLES, ROLE_DISPLAY_NAMES,
   getRoleDisplayLabel, getAddUserRoleOptions, resolveAddUserRoleSelection, canChangeCurrentPayrollMonth,
-  canChooseAnyRegion,
+  canChooseAnyRegion, canActOnRegion,
 } from './permissions';
 import type { UserProfile } from './currentProfile';
 import { resolveAllowedPages, NAV_PERMISSIONS } from '../components/Sidebar';
@@ -103,6 +103,49 @@ describe('canChooseAnyRegion', () => {
 
   it('is false for a null profile', () => {
     expect(canChooseAnyRegion(null)).toBe(false);
+  });
+});
+
+// HOTFIX (STAGING blocker: "You cannot edit employees from other regions"):
+// backs Employees.tsx's edit-employee region gate. Same shape as
+// attendancePermissions.ts's canEditAttendanceInRegion() (region_allowed()
+// at the database layer grants the same tenant-wide bypass for both
+// attendance and employees writes).
+describe('canActOnRegion', () => {
+  it('Super Admin may act on a record in any region', () => {
+    const profile = makeProfile({ is_super_admin: true, role: 'hr_manager', region_id: 'r1' });
+    expect(canActOnRegion(profile, 'r2')).toBe(true);
+    expect(canActOnRegion(profile, null)).toBe(true);
+  });
+
+  it('functional Business Admin (role="admin", region_id=null -- the confirmed STAGING persona) may act on a record in any region', () => {
+    const profile = makeProfile({ role: 'admin', role_level: null, is_super_admin: false, region_id: null });
+    expect(canActOnRegion(profile, 'r1')).toBe(true);
+    expect(canActOnRegion(profile, 'r2')).toBe(true);
+  });
+
+  it('legacy Business Admin (role_level=1) may act on a record in any region, per the current Business Admin model', () => {
+    const profile = makeProfile({ role: null, role_level: 1, is_super_admin: false, region_id: null });
+    expect(canActOnRegion(profile, 'r1')).toBe(true);
+  });
+
+  it('a region-scoped role may act on a record in its own region', () => {
+    const profile = makeProfile({ role: 'hr_manager', role_level: null, region_id: 'r1' });
+    expect(canActOnRegion(profile, 'r1')).toBe(true);
+  });
+
+  it('a region-scoped role may NOT act on a record outside its own region', () => {
+    const profile = makeProfile({ role: 'hr_manager', role_level: null, region_id: 'r1' });
+    expect(canActOnRegion(profile, 'r2')).toBe(false);
+  });
+
+  it('a region-scoped legacy role (role_level=3) may NOT act on a record outside its own region', () => {
+    const profile = makeProfile({ role: null, role_level: 3, region_id: 'r1' });
+    expect(canActOnRegion(profile, 'r2')).toBe(false);
+  });
+
+  it('fails closed for a null profile', () => {
+    expect(canActOnRegion(null, 'r1')).toBe(false);
   });
 });
 
