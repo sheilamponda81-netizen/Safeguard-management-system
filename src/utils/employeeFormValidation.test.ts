@@ -1,5 +1,29 @@
 import { describe, it, expect } from 'vitest';
-import { validateEmployeeForm, EmployeeFormValidationFields } from './employeeFormValidation';
+import {
+  validateEmployeeForm, EmployeeFormValidationFields,
+  resolveEmployeeFormRegionId, resolveEmployeeUpdateRegionId,
+} from './employeeFormValidation';
+import { canChooseAnyRegion } from './permissions';
+import type { UserProfile } from './currentProfile';
+
+function makeProfile(overrides: Partial<UserProfile>): UserProfile {
+  return {
+    id: 'u1',
+    tenant_id: 't1',
+    email: 'u@example.com',
+    full_name: 'Test User',
+    role: null,
+    role_level: null,
+    department: null,
+    is_super_admin: false,
+    is_active: true,
+    region_id: null,
+    deleted_at: null,
+    created_at: '2026-01-01T00:00:00Z',
+    regions: null,
+    ...overrides,
+  };
+}
 
 // A complete, otherwise-valid form -- individual tests below knock out one
 // field at a time (or vary canChooseAnyRegion/region_id) rather than
@@ -97,5 +121,60 @@ describe('validateEmployeeForm', () => {
       const result = validateEmployeeForm(makeValidForm({ next_of_kin_phone: '12345' }));
       expect(result).toMatch(/Next of Kin Phone Number/);
     });
+  });
+});
+
+// HOTFIX (STAGING blocker: Edit Employee had no Region field at all -- see
+// Employees.tsx's EditEmployeeForm). These two functions are the single
+// source of truth for seeding the Edit form's region_id and for what
+// actually reaches the employees UPDATE payload; the round trip between
+// them is what a form-level "can I edit the region" test would otherwise
+// need a full component render to exercise.
+describe('resolveEmployeeFormRegionId (Edit form seeding)', () => {
+  it('pre-populates from the employee\'s current region', () => {
+    expect(resolveEmployeeFormRegionId('region-north')).toBe('region-north');
+  });
+
+  it('falls back to an empty string for a null/undefined region', () => {
+    expect(resolveEmployeeFormRegionId(null)).toBe('');
+    expect(resolveEmployeeFormRegionId(undefined)).toBe('');
+  });
+});
+
+describe('resolveEmployeeUpdateRegionId (Edit form -> UPDATE payload)', () => {
+  it('includes the changed region_id in the update payload', () => {
+    expect(resolveEmployeeUpdateRegionId('region-south')).toBe('region-south');
+  });
+
+  it('fails safely to null (never an empty-string UUID) for a blank/whitespace value', () => {
+    expect(resolveEmployeeUpdateRegionId('')).toBeNull();
+    expect(resolveEmployeeUpdateRegionId('   ')).toBeNull();
+    expect(resolveEmployeeUpdateRegionId(null)).toBeNull();
+    expect(resolveEmployeeUpdateRegionId(undefined)).toBeNull();
+  });
+});
+
+// HOTFIX: who gets EditEmployeeForm's free-choice Region <select> vs. the
+// locked, read-only display -- same canChooseAnyRegion() helper Employees.tsx
+// uses for the render gate (no second authorization definition). Full
+// true/false matrix for canChooseAnyRegion() itself already lives in
+// permissions.test.ts; these confirm the specific personas this STAGING
+// blocker named.
+describe('EditEmployeeForm Region editability (via canChooseAnyRegion)', () => {
+  it('Super Admin can change an employee\'s region', () => {
+    expect(canChooseAnyRegion(makeProfile({ is_super_admin: true, role: 'hr_manager', region_id: 'r1' }))).toBe(true);
+  });
+
+  it('functional Admin (role="admin", region_id=null -- the confirmed STAGING persona) can change an employee\'s region', () => {
+    expect(canChooseAnyRegion(makeProfile({ role: 'admin', role_level: null, is_super_admin: false, region_id: null }))).toBe(true);
+  });
+
+  it('legacy Admin (role_level=1) can change an employee\'s region, per the current Business Admin model', () => {
+    expect(canChooseAnyRegion(makeProfile({ role: null, role_level: 1, is_super_admin: false, region_id: null }))).toBe(true);
+  });
+
+  it('a region-scoped lower role cannot choose another region', () => {
+    expect(canChooseAnyRegion(makeProfile({ role: 'hr_manager', role_level: null, region_id: 'r1' }))).toBe(false);
+    expect(canChooseAnyRegion(makeProfile({ role: null, role_level: 3, region_id: 'r1' }))).toBe(false);
   });
 });

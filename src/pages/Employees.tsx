@@ -17,7 +17,7 @@ import { generateEmployeeNumberServerSide, shouldGenerateEmployeeNumber } from '
 import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
 import { checkEmployeeIdentifierConflicts, formatIdentifierConflictMessage, identifierColumnFromUniqueViolation } from '../utils/employeeConflicts';
-import { validateEmployeeForm } from '../utils/employeeFormValidation';
+import { validateEmployeeForm, resolveEmployeeFormRegionId, resolveEmployeeUpdateRegionId } from '../utils/employeeFormValidation';
 
 interface Employee {
   id: string;
@@ -816,6 +816,13 @@ export function EmployeesPage() {
         assignment_type: safeEmp.assignment_type || 'company',
         resident_name: formattedResidentName,
         resident_contact: formattedResidentContact,
+        // HOTFIX: region_id was missing from this payload entirely -- the
+        // Edit form now lets a Business Admin/Super Admin reassign region
+        // (EditEmployeeForm's new Region field), but without this the
+        // selection was silently discarded on submit, never reaching the
+        // database. See resolveEmployeeUpdateRegionId() for why it's not
+        // just `safeEmp.region_id`.
+        region_id: resolveEmployeeUpdateRegionId(safeEmp.region_id),
         // company_id will be updated by trigger
       })
       .eq('id', editingEmployee.id)
@@ -877,6 +884,12 @@ export function EmployeesPage() {
         address: fullRow.address,
         qualification: fullRow.qualification,
         contractType: fullRow.contract_type,
+        // HOTFIX: previously missing from this refresh -- after a
+        // successful region reassignment, the in-memory employees list (and
+        // the region_id this function then hands to logAudit() below) would
+        // otherwise keep showing the OLD region until a full page reload,
+        // even though the database write itself succeeded.
+        region_id: fullRow.region_id,
         company: fullRow.company,
         workstation: fullRow.workstation,
         pay_point: fullRow.pay_point,
@@ -1489,12 +1502,13 @@ export function EmployeesPage() {
 
       <Modal open={showEdit} onClose={() => { setShowEdit(false); setEditingEmployee(null); }} title="Edit Employee" size="xl">
         {editingEmployee && (
-          <EditEmployeeForm 
+          <EditEmployeeForm
             employee={editingEmployee}
-            onSubmit={updateEmployee} 
-            onCancel={() => { setShowEdit(false); setEditingEmployee(null); }} 
+            onSubmit={updateEmployee}
+            onCancel={() => { setShowEdit(false); setEditingEmployee(null); }}
             departments={departmentOptions}
-            isSuperAdmin={isSuperAdmin}
+            canChooseAnyRegion={canChooseAnyRegion}
+            regions={regions}
             relationshipOptions={relationshipOptions}
           />
         )}
@@ -2329,12 +2343,13 @@ function AddEmployeeForm({
 }
 
 // ===== EditEmployeeForm =====
-function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAdmin, relationshipOptions }: {
+function EditEmployeeForm({ employee, onSubmit, onCancel, departments, canChooseAnyRegion, regions, relationshipOptions }: {
   employee: Employee;
   onSubmit: (e: EmployeeFormData) => void;
   onCancel: () => void;
   departments: string[];
-  isSuperAdmin?: boolean;
+  canChooseAnyRegion?: boolean;
+  regions: UserProfileRegion[];
   relationshipOptions: string[];
 }) {
   const [form, setForm] = useState<EmployeeFormData>({
@@ -2353,7 +2368,7 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAd
     contractType: employee.contractType || 'Permanent',
     status: employee.status,
     email: employee.email || '',
-    region_id: employee.region_id || '',
+    region_id: resolveEmployeeFormRegionId(employee.region_id),
     assignment_type: employee.assignment_type || 'company',
     company: employee.company || '',
     workstation: employee.workstation || '',
@@ -2494,8 +2509,11 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAd
     
     // Validation -- every field on this form is mandatory; validateEmployeeForm
     // returns the label of the first missing/invalid one so the notification
-    // tells the admin exactly which box to fill in.
-    const missingField = validateEmployeeForm(form, isSuperAdmin);
+    // tells the admin exactly which box to fill in. HOTFIX: Region is now a
+    // real field here too (see the render gate below) -- canChooseAnyRegion
+    // (Super Admin OR Business Admin) governs its requiredness the same way
+    // it already does in AddEmployeeForm.
+    const missingField = validateEmployeeForm(form, canChooseAnyRegion);
     if (missingField) {
       showNotification(`Please fill in: ${missingField}`, 'error');
       return;
@@ -2820,6 +2838,52 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, isSuperAd
             </div>
           </div>
         )}
+      </div>
+
+      <div>
+        <h4 className="font-semibold text-slate-800 mb-3 text-sm">Region</h4>
+        <div className="grid grid-cols-1 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">
+              Region <span className="text-red-500">*</span>
+            </label>
+            {/* HOTFIX: employees UPDATE RLS already grants a Business Admin
+                (role='admin' or role_level=1) tenant-wide region access via
+                region_allowed()'s is_business_admin() bypass, same as Super
+                Admin -- this Edit form previously had no Region field at
+                all, so a Business Admin could never reassign an employee's
+                region even though the database already permits it.
+                canChooseAnyRegion mirrors AddEmployeeForm's identical gate;
+                a genuinely region-scoped caller (canChooseAnyRegion=false)
+                only ever reaches this form for an employee already in their
+                own region (handleEdit's canActOnRegion() check above this
+                component enforces that), so the locked display below is
+                never actually cross-region for them -- it just preserves
+                the existing "cannot reassign" restriction. */}
+            {canChooseAnyRegion ? (
+              <select
+                value={form.region_id || ""}
+                onChange={(e) => update('region_id', e.target.value)}
+                disabled={isSubmitting}
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] bg-white"
+              >
+                <option value="">-- Please select a region --</option>
+                {regions.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={regions.find((r) => r.id === form.region_id)?.name || ""}
+                disabled
+                className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg bg-slate-50"
+              />
+            )}
+          </div>
+        </div>
       </div>
 
       <div>

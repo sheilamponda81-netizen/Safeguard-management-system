@@ -55,15 +55,14 @@ export const REQUIRED_EMPLOYEE_FIELDS: { key: keyof EmployeeFormValidationFields
   { key: 'next_of_kin_phone', label: 'Next of Kin Phone Number' },
 ];
 
-// HOTFIX (STAGING blocker 2): second param renamed from "isSuperAdmin" to
-// "canChooseAnyRegion" -- AddEmployeeForm now passes canChooseAnyRegion
+// HOTFIX (STAGING blocker 2, later extended to EditEmployeeForm too):
+// second param renamed from "isSuperAdmin" to "canChooseAnyRegion" -- both
+// AddEmployeeForm and EditEmployeeForm now pass canChooseAnyRegion
 // (src/utils/permissions.ts's canChooseAnyRegion() helper: Super Admin OR
 // Business Admin) here instead of isSuperAdmin alone, since a Business
-// Admin also gets a free-choice region <select> now (Employees.tsx's
-// render gate uses the same flag), so "must have actually picked a Region"
-// needs to apply to that broader caller too. EditEmployeeForm still passes
-// its own isSuperAdmin unchanged -- it has no region <select> at all, so
-// this param has no effect there either way.
+// Admin gets a free-choice region <select> in both forms now, so "must
+// have actually picked a Region" applies to that broader caller in both
+// places.
 export const validateEmployeeForm = (form: EmployeeFormValidationFields, canChooseAnyRegion?: boolean): string | null => {
   if (!form.employeeNumber || String(form.employeeNumber).trim() === '') {
     // Deliberately not "select a Region first" -- a non-super-admin's
@@ -100,3 +99,29 @@ export const validateEmployeeForm = (form: EmployeeFormValidationFields, canChoo
 
   return null;
 };
+
+// HOTFIX (STAGING blocker: Edit Employee had no Region field at all, and
+// separately region_id was missing from the employees UPDATE payload
+// entirely -- a Region change was silently discarded on submit). These two
+// small pure functions are the single source of truth for both ends of
+// that round trip: EditEmployeeForm's useState initializer calls
+// resolveEmployeeFormRegionId() to seed the form from the employee's
+// current region, and updateEmployee() in Employees.tsx calls
+// resolveEmployeeUpdateRegionId() to build the region_id key actually sent
+// to Supabase -- so this is tested once here rather than trusted silently
+// at each call site.
+
+// Form state wants a plain string (never null/undefined -- see
+// EmployeeFormData in Employees.tsx), so a missing region collapses to "".
+export function resolveEmployeeFormRegionId(employeeRegionId: string | null | undefined): string {
+  return employeeRegionId || '';
+}
+
+// The database column is nullable UUID, not text -- an empty string is not
+// a valid UUID, so a blank/whitespace form value must become null, never
+// sent through as "". validateEmployeeForm() already refuses to submit a
+// blank Region for any caller who can choose one, so the null case here is
+// only a defensive fallback, never the normal path for that caller.
+export function resolveEmployeeUpdateRegionId(formRegionId: string | null | undefined): string | null {
+  return formRegionId && formRegionId.trim() !== '' ? formRegionId : null;
+}
