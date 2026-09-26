@@ -78,6 +78,112 @@ export function isBusinessAdmin(profile: UserProfile | null): boolean {
   return profile.role === 'admin' || profile.role_level === 1;
 }
 
+// HOTFIX: mirrors region_allowed()'s tenant-wide bypass -- that function
+// returns true unconditionally for is_business_admin() the same way it
+// does for is_super_admin(), so at the database layer a Business Admin
+// already has access to every region in their tenant, not just their own
+// profile's region_id. Frontend region gates (Attendance's edit check,
+// the Add Employee region field) must grant the same bypass instead of
+// checking is_super_admin alone, or a Business Admin with no region_id of
+// their own (the normal case -- Business Admin authority is tenant-wide,
+// not tied to one region) gets incorrectly treated as region-scoped.
+// Genuinely region-scoped roles (a legacy Supervisor/Staff, or a
+// functional HR Manager/Accountant/Operations Manager) are unaffected --
+// they still fall through to false here, same as before.
+export function canChooseAnyRegion(profile: UserProfile | null): boolean {
+  if (!profile) return false;
+  return profile.is_super_admin === true || isBusinessAdmin(profile);
+}
+
+// HOTFIX: generic "may this caller act on a record belonging to this
+// region" gate -- canChooseAnyRegion() covers the Super Admin/Business
+// Admin bypass, and this adds the one remaining case: a genuinely
+// region-scoped caller acting on a record in their OWN region. Used by
+// Employees.tsx's edit-employee gate (STAGING: "You cannot edit employees
+// from other regions" was blocking a Business Admin with region_id=NULL
+// the same way the Attendance/Add-Employee gates were before them) --
+// intentionally the same shape as attendancePermissions.ts's
+// canEditAttendanceInRegion(), so a future region-scoped gate (e.g.
+// delete/restore employee, which still have the pre-fix is_super_admin-only
+// check as of this commit) can reuse this instead of a third copy.
+export function canActOnRegion(profile: UserProfile | null, recordRegionId: string | null | undefined): boolean {
+  if (!profile) return false;
+  if (canChooseAnyRegion(profile)) return true;
+  return recordRegionId === profile.region_id;
+}
+
+// HOTFIX: single source of truth for "what role label does this profile
+// display", used by both Sidebar.tsx (the account's own label in the nav)
+// and UserManagement.tsx's getRoleBadge (every OTHER user's label in the
+// admin table). Extracted specifically so the two surfaces cannot drift
+// out of sync -- before this hotfix each had its own independent
+// role_level/role branching, and is_super_admin was only ever checked in
+// neither, which was the exact bug this hotfix fixes. is_super_admin is
+// checked with the HIGHEST precedence -- it is an orthogonal axis from
+// role/role_level (a Super Administrator's role_level/role still reads as
+// an ordinary Administrator underneath).
+const LEGACY_ROLE_LEVEL_NAMES: Record<number, string> = {
+  1: 'Administrator',
+  2: 'Manager',
+  3: 'Supervisor',
+  4: 'Staff',
+};
+
+export interface RoleDisplayProfile {
+  is_super_admin?: boolean | null;
+  role_level?: number | null;
+  role?: string | null;
+}
+
+export function getRoleDisplayLabel(profile: RoleDisplayProfile | null | undefined): string {
+  if (!profile) return 'User';
+  if (profile.is_super_admin === true) return 'Super Administrator';
+  if (profile.role_level != null && profile.role_level in LEGACY_ROLE_LEVEL_NAMES) {
+    return LEGACY_ROLE_LEVEL_NAMES[profile.role_level];
+  }
+  if (profile.role && profile.role in ROLE_DISPLAY_NAMES) {
+    return ROLE_DISPLAY_NAMES[profile.role as FunctionalRole];
+  }
+  return 'User';
+}
+
+// HOTFIX: UserManagement.tsx's Add User role selector. 'super_admin' is a
+// UI-only value, never persisted as profiles.role -- see
+// resolveAddUserRoleSelection below for the translation applied at submit
+// time. Extracted as a pure function (rather than left as an inline JSX
+// conditional) so "Super Administrator does not appear at all for a
+// non-super-admin caller" has its own direct unit test, independent of any
+// component-rendering test infrastructure this repo does not have.
+export type AddUserRoleOption = FunctionalRole | 'super_admin';
+
+export function getAddUserRoleOptions(callerIsSuperAdmin: boolean): AddUserRoleOption[] {
+  return callerIsSuperAdmin ? ['super_admin', ...FUNCTIONAL_ROLES] : [...FUNCTIONAL_ROLES];
+}
+
+// The exact translation UserManagement.tsx's addUser() applies before
+// calling create-user/index.ts: the UI-only 'super_admin' selection never
+// reaches the network as a role value -- it becomes role='admin' plus an
+// explicit is_super_admin request flag, which create-user/index.ts's own
+// canGrantSuperAdmin (supabase/functions/create-user/validation.ts)
+// independently re-authorizes server-side.
+export function resolveAddUserRoleSelection(selection: AddUserRoleOption): { role: FunctionalRole; requestSuperAdmin: boolean } {
+  if (selection === 'super_admin') {
+    return { role: 'admin', requestSuperAdmin: true };
+  }
+  return { role: selection, requestSuperAdmin: false };
+}
+
+// HOTFIX: changing current_payroll_month is Super-Admin-only -- an
+// ordinary Administrator (role_level===1 or role==='admin') no longer
+// qualifies, per the formal Super Administrator model. Used by
+// MonthSettings.tsx for both its render-time gate (canChangeMonth) and its
+// handleSaveMonth pre-check, so the two can never independently drift.
+// This is a UI-only convenience; the actual enforcement is the key-aware
+// system_settings RLS policy (see the hotfix migration).
+export function canChangeCurrentPayrollMonth(profile: { is_super_admin?: boolean | null } | null | undefined): boolean {
+  return profile?.is_super_admin === true;
+}
+
 // A LEGACY account is any profile that still carries a real numeric
 // role_level (1-4). Every NEW functional-role account has role_level =
 // NULL by design (see supabase/migrations/20260817000000's header) --

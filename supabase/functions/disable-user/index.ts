@@ -29,9 +29,33 @@
 // separately revoked) can no longer read or write anything through any
 // server-side path. No forced sign-out is required for this to be a
 // complete access revocation.
+//
+// HOTFIX (release-review blocker fix): the actual mutating UPDATE below
+// used to go through the SERVICE-ROLE client above, directly. A release
+// review found this bypassable two ways: (1) profiles' own UPDATE RLS
+// lets any business-admin-class caller update a same-tenant row's
+// is_active regardless of that row's is_super_admin flag -- this
+// function's own JS checks below were never the real security boundary,
+// only a raw `supabase.from('profiles').update({is_active:false})` REST
+// call away from being skipped entirely; (2) even with this function's
+// own checks intact, a service-role connection has no `sub` JWT claim, so
+// auth.uid() is NULL under it -- any is_super_admin-aware database guard
+// could never see the REAL caller's identity through this client. Both
+// gaps are closed by supabase/migrations/20260915000000's PART 1b: the
+// EXISTING prevent_profile_privilege_escalation() trigger now
+// unconditionally blocks deactivating a Super Administrator unless the
+// REAL caller is genuinely super_admin() and the global
+// at-least-one-active-Super-Administrator invariant still holds, and the
+// actual mutating call below now goes through a NEW disable_user_profile()
+// RPC, invoked via a SEPARATE client scoped to the CALLER's own JWT (never
+// the service-role client) -- same pattern update-user/index.ts already
+// established for update_functional_user_profile(). The JS checks below
+// remain as friendly, non-authoritative pre-checks (unchanged); the RPC
+// plus that trigger are the real boundary.
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { canDisableTarget } from './validation.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -116,6 +140,16 @@ serve(async (req) => {
       return json({ success: true, message: 'User is already disabled' });
     }
 
+    // HOTFIX: friendly, non-authoritative pre-check for the common case --
+    // extracted to ./validation.ts so it has its own unit test. The
+    // authoritative version of this check lives in disable_user_profile()
+    // and, independently, in prevent_profile_privilege_escalation() (see
+    // this file's header).
+    const disableCheck = canDisableTarget(callerIsSuperAdmin, target.is_super_admin === true);
+    if (!disableCheck.valid) {
+      return json({ error: disableCheck.error }, 403);
+    }
+
     // Business-continuity guard, preserved from the prior (broken)
     // deleteUser()'s own "cannot delete the last admin" check, generalized
     // to cover both a legacy Admin (role_level = 1) and a new functional
@@ -155,27 +189,30 @@ serve(async (req) => {
       }
     }
 
-    const { error: updateError } = await supabase
-      .from('profiles')
-      .update({ is_active: false })
-      .eq('id', targetUserId);
-
-    if (updateError) {
-      return json({ error: 'Failed to disable user: ' + updateError.message }, 500);
-    }
-
-    await supabase.from('audit_logs').insert({
-      tenant_id: callerProfile.tenant_id,
-      user_id: caller.id,
-      user_email: caller.email,
-      user_role: callerIsSuperAdmin ? 'super_admin' : 'admin',
-      region_id: null,
-      action: 'UPDATE',
-      entity_type: 'profiles',
-      entity_id: targetUserId,
-      old_data: { is_active: true },
-      new_data: { is_active: false },
+    // ===== THE MUTATING CALL =====
+    // A SEPARATE client, scoped to the CALLER's own bearer token (anon key
+    // + the same Authorization header this request arrived with) -- so
+    // auth.uid() inside Postgres resolves to the real caller for this one
+    // call, not NULL. Never the service-role client above. See this file's
+    // header for why. disable_user_profile() re-verifies everything this
+    // function already checked above (it is not trusted as this RPC's only
+    // authorization boundary) plus the new Super-Admin-aware checks, and
+    // performs the audit_logs insert itself, atomically with the update.
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')!;
+    const callerScopedSupabase = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: authHeader } },
     });
+
+    const { data: disabled, error: rpcError } = await callerScopedSupabase.rpc('disable_user_profile', {
+      p_target_id: targetUserId,
+    });
+
+    if (rpcError) {
+      return json({ error: rpcError.message || 'Failed to disable user' }, 400);
+    }
+    if (!disabled) {
+      return json({ error: 'Update did not apply' }, 400);
+    }
 
     return json({ success: true });
   } catch (error: any) {

@@ -18,7 +18,7 @@ import { getErrorMessage } from '../utils/errorHandler';
 import { toCsvRow } from '../utils/csvExport';
 import { calculateAttendanceDeductions } from '../utils/attendanceDeductions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
-import { resolveAttendanceWritePermissions } from '../utils/attendancePermissions';
+import { resolveAttendanceWritePermissions, canEditAttendanceInRegion } from '../utils/attendancePermissions';
 import { filterAttendanceEmployees } from '../utils/attendanceFilters';
 
 const statusColors: Record<string, string> = {
@@ -798,7 +798,7 @@ export function AttendancePage() {
     }
 
     const employee = employees.find(e => e.id === employeeId);
-    if (!userProfile?.is_super_admin && employee?.region_id !== userProfile?.region_id) {
+    if (!canEditAttendanceInRegion(userProfile, employee?.region_id)) {
       showNotification('You can only edit attendance for employees in your region', 'error');
       return;
     }

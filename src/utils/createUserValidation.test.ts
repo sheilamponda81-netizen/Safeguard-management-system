@@ -11,6 +11,7 @@ import {
   isAllowedRole,
   isRegionRequired,
   validateCreateUserInput,
+  canGrantSuperAdmin,
   MIN_PASSWORD_LENGTH,
 } from '../../supabase/functions/create-user/validation';
 
@@ -117,5 +118,39 @@ describe('validateCreateUserInput', () => {
     const result = validateCreateUserInput({ email: '', password: '', full_name: '', role: '', region_id: null });
     expect(result.valid).toBe(false);
     expect(result.error).toMatch(/email/i);
+  });
+});
+
+// HOTFIX: formal Super Administrator model -- regression test items 4 and 5
+// from the hotfix's required 15-item test list ("create-user rejects
+// super-admin creation by normal Admin" / "create-user allows it for
+// genuine Super Admin"). canGrantSuperAdmin is the exact authorization
+// decision create-user/index.ts applies to a request body that includes
+// `is_super_admin: true` -- never trusting that flag alone.
+describe('canGrantSuperAdmin (HOTFIX: create-user super-admin creation authorization)', () => {
+  it('a request with no is_super_admin flag is always valid, regardless of caller', () => {
+    expect(canGrantSuperAdmin(false, false, 'hr_manager')).toEqual({ valid: true });
+    expect(canGrantSuperAdmin(false, true, 'admin')).toEqual({ valid: true });
+  });
+
+  it('test item 4: rejects super-admin creation requested by a normal (non-super-admin) Admin', () => {
+    const result = canGrantSuperAdmin(true, false, 'admin');
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/Super Administrator/);
+  });
+
+  it('test item 5: allows super-admin creation for a genuine Super Admin caller, target role=admin', () => {
+    expect(canGrantSuperAdmin(true, true, 'admin')).toEqual({ valid: true });
+  });
+
+  it('rejects super-admin creation even for a genuine Super Admin caller if the target role is not admin -- there is no super-admin hr_manager/accountant/operations_manager', () => {
+    const result = canGrantSuperAdmin(true, true, 'hr_manager');
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/role=admin/);
+  });
+
+  it('never silently downgrades -- a rejected request always reports valid:false, never valid:true with is_super_admin quietly dropped', () => {
+    expect(canGrantSuperAdmin(true, false, 'admin').valid).toBe(false);
+    expect(canGrantSuperAdmin(true, false, 'hr_manager').valid).toBe(false);
   });
 });

@@ -54,8 +54,17 @@ const SalaryAdvancesPage = safeLazy(() => import("./pages/SalaryAdvances"));
 const FeaturesPage = safeLazy(() => import("./pages/Features"));
 const UserManualPage = safeLazy(() => import("./pages/UserManual"));
 
+// HOTFIX: every page is rendered with this one optional prop (see
+// renderPage below) -- most pages ignore it entirely (an unused prop is
+// harmless), Payslips.tsx is the first to actually use it (its "Go to
+// Payroll" button, replacing a hard `window.location.href` navigation
+// that 404s against this SPA's lack of a router/rewrite).
+interface PageComponentProps {
+  onNavigate?: (key: NavKey) => void;
+}
+
 // ===== PAGE COMPONENTS MAP =====
-const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentType<object>>> = {
+const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentType<PageComponentProps>>> = {
   dashboard: Dashboard,
   employees: EmployeesPage,
   recruitment: RecruitmentPage,
@@ -163,10 +172,16 @@ export default function App() {
 
     return (
       <Suspense fallback={<PageLoader />}>
-        <Component />
+        {/* onNavigate is a HOTFIX addition (Payslips' "Go to Payroll" 404
+            fix -- this SPA has no router/rewrite for a hard `window.
+            location.href` navigation) -- typed loosely as `object` above,
+            so an extra prop here is not an error, and every page that
+            doesn't declare/use it simply ignores it, same as any unused
+            React prop. */}
+        <Component onNavigate={handleNavigate} />
       </Suspense>
     );
-  }, [nav, allowedPages]);
+  }, [nav, allowedPages, handleNavigate]);
 
   // ===== SESSION CHECK =====
   useEffect(() => {

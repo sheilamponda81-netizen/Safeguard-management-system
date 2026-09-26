@@ -13,7 +13,7 @@ import { getCurrentProfile, UserProfile } from "../utils/currentProfile";
 import { getCompanySettings } from "../utils/companySettings";
 import {
   PERMISSIONS, PermissionKey, isBusinessAdmin, getMyPermissions,
-  ROLE_DISPLAY_NAMES, FunctionalRole,
+  getRoleDisplayLabel,
 } from "../utils/permissions";
 import { useState, useEffect, useCallback } from "react";
 import { ChevronRight } from 'lucide-react';
@@ -171,6 +171,7 @@ export function Sidebar({
 }) {
   const [userRoleLevel, setUserRoleLevel] = useState<number | null>(4);
   const [userRole, setUserRole] = useState<string | null>(null);
+  const [userIsSuperAdmin, setUserIsSuperAdmin] = useState<boolean>(false);
   const [allowedMenuIds, setAllowedMenuIds] = useState<NavKey[]>(roleMenuItems[4]);
   const [loading, setLoading] = useState(true);
   const [userName, setUserName] = useState<string>("User");
@@ -254,6 +255,7 @@ export function Sidebar({
             const roleLevel = profile?.role_level ?? null;
             setUserRoleLevel(roleLevel);
             setUserRole(profile?.role ?? null);
+            setUserIsSuperAdmin(profile?.is_super_admin === true);
             const businessAdmin = isBusinessAdmin(profile as UserProfile | null);
 
             let permissions = new Set<string>();
@@ -284,18 +286,11 @@ export function Sidebar({
   };
 
   const getRoleDisplay = () => {
-    if (userRoleLevel === 1) return "Administrator";
-    if (userRoleLevel === 2) return "Manager";
-    if (userRoleLevel === 3) return "Supervisor";
-    if (userRoleLevel === 4) return "Staff";
-    // Functional-role account (role_level === null) -- display its real
-    // role name instead of falling through to "Staff", which would
-    // misrepresent a new hr_manager/accountant/operations_manager/admin
-    // account as the legacy lowest-privilege role.
-    if (userRole && userRole in ROLE_DISPLAY_NAMES) {
-      return ROLE_DISPLAY_NAMES[userRole as FunctionalRole];
-    }
-    return "User";
+    // Delegates to the shared getRoleDisplayLabel (utils/permissions.ts)
+    // so this label can never drift from UserManagement.tsx's own
+    // getRoleBadge -- see that function's own comment for why is_super_admin
+    // must take precedence over role_level/role.
+    return getRoleDisplayLabel({ is_super_admin: userIsSuperAdmin, role_level: userRoleLevel, role: userRole });
   };
 
   // ===== PERFORMANCE: Memoize NavLink component =====
