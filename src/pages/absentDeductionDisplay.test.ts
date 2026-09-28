@@ -11,6 +11,20 @@ import path from 'node:path';
 // reappear, and each display must derive its value from the configured rate.
 // The late-arrival rate is intentionally NOT touched here -- it is a
 // separate configured setting that may legitimately still read "MK 4,200".
+//
+// A second regression is pinned here too: a per-employee/per-payslip absence
+// display (which can render an already-processed HISTORICAL month) must use
+// getHistoricalSafeAbsentRate -- deriving the rate from that record's own
+// frozen employee_deductions amount/days -- rather than the live
+// payrollRates.absentDeduction directly, which reflects only TODAY's
+// system_settings and would relabel a past month's deduction with a rate
+// that didn't apply when it was processed. A page-level/generic explainer
+// that isn't tied to one employee's stored record (e.g. Payroll.tsx's "Net
+// Pay Formula" reference card, or its "Process Payroll" confirmation modal,
+// which only ever describes the CURRENT month about to be processed) is
+// exempt -- it may legitimately keep using the live rate directly. See
+// getHistoricalSafeAbsentRate's own tests in payrollCalculations.test.ts for
+// the historical-vs-live derivation itself.
 const payrollSource = fs.readFileSync(
   path.resolve(__dirname, './Payroll.tsx'),
   'utf-8'
@@ -37,9 +51,23 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(payrollSource).not.toMatch(/Absent:\s*\{attendance!\.absentDays\}\s*×\s*MK4,?200/);
   });
 
-  it('Payroll.tsx: absenteeism labels use formatKwacha(payrollRates.absentDeduction)', () => {
+  it('Payroll.tsx: the generic (non-employee-specific) absenteeism labels use formatKwacha(payrollRates.absentDeduction) -- the Net Pay Formula card, the deduction-summary banner\'s live-month branch, and the Process/Reprocess Payroll modal (which only ever describes the current month)', () => {
     const matches = payrollSource.match(/formatKwacha\(payrollRates\.absentDeduction\)/g) || [];
     expect(matches.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('Payroll.tsx: the per-employee row breakdown derives its absent-day rate via getHistoricalSafeAbsentRate, not the live rate directly, since this row can be an already-processed historical month', () => {
+    expect(payrollSource).toMatch(
+      /Absent:\s*\{attendance!\.absentDays\}\s*×\s*\{formatKwacha\(getHistoricalSafeAbsentRate\(\{\s*frozenAbsentDeduction:\s*deduction\?\.absent_deduction,\s*frozenAbsentDays:\s*deduction\?\.absent_days,\s*liveConfiguredRate:\s*payrollRates\.absentDeduction\s*\}\)\)\}/
+    );
+  });
+
+  it('Payroll.tsx: the deduction-summary banner (which can render for a historical/past month) only shows the live numeric absence rate when the selected month is current/future', () => {
+    expect(payrollSource).toMatch(/Absenteeism:\s*\{\(isCurrentMonth \|\| isFutureMonthSelected\)\s*\?\s*`\$\{formatKwacha\(payrollRates\.absentDeduction\)\} per absent day`/);
+  });
+
+  it('Payroll.tsx: the deduction-summary banner falls back to non-numeric wording for a historical/past month, instead of relabeling it with today\'s rate', () => {
+    expect(payrollSource).toMatch(/rate in effect when each employee.{0,2}s payroll was processed/);
   });
 
   it('Payroll.tsx: the late-arrival rate is left untouched (still MK 4,200)', () => {
@@ -52,9 +80,15 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(payslipsSource).not.toMatch(/Absent\s*\(\$\{absentDays\}\s*×\s*MK4,?200\)/);
   });
 
-  it('Payslips.tsx: absence breakdown uses formatKwacha(payrollRates.absentDeduction)', () => {
-    const matches = payslipsSource.match(/formatKwacha\(payrollRates\.absentDeduction\)/g) || [];
+  it('Payslips.tsx: absence breakdown derives its rate via getHistoricalSafeAbsentRate (never the live rate directly), since a payslip can be for an already-processed historical month', () => {
+    const matches = payslipsSource.match(
+      /formatKwacha\(getHistoricalSafeAbsentRate\(\{\s*frozenAbsentDeduction:\s*p\.absent_deduction,\s*frozenAbsentDays:\s*p\.absent_days,\s*liveConfiguredRate:\s*payrollRates\.absentDeduction\s*\}\)\)/g
+    ) || [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('Payslips.tsx: no absence display uses the live payrollRates.absentDeduction directly', () => {
+    expect(payslipsSource).not.toMatch(/formatKwacha\(payrollRates\.absentDeduction\)/);
   });
 
   it('Payslips.tsx: the late-arrival rate is left untouched (still MK4,200)', () => {

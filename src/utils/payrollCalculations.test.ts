@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { calculateLivePayroll, LivePayrollInputs } from './payrollCalculations';
+import { calculateLivePayroll, LivePayrollInputs, getHistoricalSafeAbsentRate } from './payrollCalculations';
 import { DEFAULT_RATES } from './payrollSettings';
 
 // calculateLivePayroll is the single source of truth Payroll.tsx and
@@ -168,6 +168,78 @@ describe('calculateLivePayroll', () => {
       // decides -- flagged in AUDIT_REPORT.md, not silently "fixed" here.
       const result = calculateLivePayroll(baseInputs({ basicSalary: -5000, position: 'Office Assistant' }));
       expect(result.grossPay).toBe(-5000);
+    });
+  });
+});
+
+// A payslip/payroll row for a month that's already been processed must show
+// the rate that was ACTUALLY applied that month, not whatever
+// system_settings.absent_day_deduction happens to be configured to today --
+// otherwise a rate change (e.g. MWK 4,200 -> 5,200) silently relabels every
+// past absence deduction as if it had always been the new rate. See
+// employee_deductions.absent_deduction/absent_days, which freeze the real
+// per-employee-per-month figures this is derived from.
+describe('getHistoricalSafeAbsentRate', () => {
+  describe('scenario A: current/unprocessed month (no frozen deduction row yet)', () => {
+    it('falls back to the live configured rate when nothing is stored (e.g. 1 absent day should read as the current 5,200 rate)', () => {
+      const rate = getHistoricalSafeAbsentRate({
+        frozenAbsentDeduction: undefined,
+        frozenAbsentDays: undefined,
+        liveConfiguredRate: 5200,
+      });
+      expect(rate).toBe(5200);
+    });
+
+    it('falls back to the live rate when a deduction row exists but has 0 absent days (nothing to divide by)', () => {
+      const rate = getHistoricalSafeAbsentRate({
+        frozenAbsentDeduction: 0,
+        frozenAbsentDays: 0,
+        liveConfiguredRate: 5200,
+      });
+      expect(rate).toBe(5200);
+    });
+
+    it('is consistent with a live 1-day absence at the current rate: 1 x 5,200 displays as 5,200', () => {
+      const liveConfiguredRate = 5200;
+      const rate = getHistoricalSafeAbsentRate({
+        frozenAbsentDeduction: null,
+        frozenAbsentDays: null,
+        liveConfiguredRate,
+      });
+      expect(1 * rate).toBe(5200);
+    });
+  });
+
+  describe('scenario B: historical/processed month (frozen deduction row exists)', () => {
+    it('derives the rate actually charged from the frozen amount/days, ignoring a since-changed live rate', () => {
+      // July: processed when the absent rate was 4,200. September's live
+      // configured rate has since moved to 5,200 -- July's payslip must
+      // keep reading 4,200, never be relabeled to 5,200.
+      const rate = getHistoricalSafeAbsentRate({
+        frozenAbsentDeduction: 4200,
+        frozenAbsentDays: 1,
+        liveConfiguredRate: 5200,
+      });
+      expect(rate).toBe(4200);
+      expect(rate).not.toBe(5200);
+    });
+
+    it('divides the frozen amount by the frozen day count for a multi-day historical absence', () => {
+      const rate = getHistoricalSafeAbsentRate({
+        frozenAbsentDeduction: 12600,
+        frozenAbsentDays: 3,
+        liveConfiguredRate: 5200,
+      });
+      expect(rate).toBe(4200);
+    });
+
+    it('never uses the live rate once a frozen amount/days pair is present, even if it happens to equal the live rate', () => {
+      const rate = getHistoricalSafeAbsentRate({
+        frozenAbsentDeduction: 5200,
+        frozenAbsentDays: 1,
+        liveConfiguredRate: 5200,
+      });
+      expect(rate).toBe(5200);
     });
   });
 });

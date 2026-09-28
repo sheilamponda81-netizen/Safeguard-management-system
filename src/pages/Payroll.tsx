@@ -11,7 +11,7 @@ import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
-import { calculateLivePayroll } from '../utils/payrollCalculations';
+import { calculateLivePayroll, getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
 import { calculatePooledAllocation } from '../utils/salaryAdvanceCalculations';
 import { processPayrollBatch, describeProcessPayrollBatchError } from '../utils/payrollProcessing';
 import { getDefaultPageSize } from '../utils/uiSettings';
@@ -1577,7 +1577,7 @@ export function PayrollPage() {
               </p>
               <div className="mt-2 text-xs text-red-600 space-y-1">
                 <p>• Uniform Deduction: Default MK 10,000 per employee (adjustable in employee profile)</p>
-                <p>• Absenteeism: {formatKwacha(payrollRates.absentDeduction)} per absent day</p>
+                <p>• Absenteeism: {(isCurrentMonth || isFutureMonthSelected) ? `${formatKwacha(payrollRates.absentDeduction)} per absent day` : 'rate in effect when each employee\'s payroll was processed (see breakdown below)'}</p>
                 <p>• Late Arrival: MK 4,200 per late day</p>
               </div>
             </div>
@@ -1868,7 +1868,7 @@ export function PayrollPage() {
                           {hasAnyDeduction && (
                             <div className="text-[10px] text-red-400 space-y-0.5">
                               {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
-                              {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × {formatKwacha(payrollRates.absentDeduction)}</div>}
+                              {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × {formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}</div>}
                               {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × MK4,200</div>}
                               {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
                               {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
