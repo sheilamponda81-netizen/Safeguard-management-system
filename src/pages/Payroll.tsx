@@ -1577,7 +1577,7 @@ export function PayrollPage() {
               </p>
               <div className="mt-2 text-xs text-red-600 space-y-1">
                 <p>• Uniform Deduction: Default MK 10,000 per employee (adjustable in employee profile)</p>
-                <p>• Absenteeism: MK 4,200 per absent day</p>
+                <p>• Absenteeism: {formatKwacha(payrollRates.absentDeduction)} per absent day</p>
                 <p>• Late Arrival: MK 4,200 per late day</p>
               </div>
             </div>
@@ -1689,7 +1689,7 @@ export function PayrollPage() {
           <p className="text-sm text-slate-600">
             = Gross Pay - PAYE ({(payrollRates.payeRate * 100).toFixed(0)}% above {formatKwacha(payrollRates.payeThreshold)}) - Pension ({(payrollRates.pensionEmployeeRate * 100).toFixed(0)}%) - Uniform Deduction - Attendance Deductions - Salary Advance Deduction (if any)
           </p>
-          <p className="text-xs text-slate-500 mt-2">Attendance Deductions: Absent (MK4,200/day) + Late (MK4,200/day) + Lecture + Appearance</p>
+          <p className="text-xs text-slate-500 mt-2">Attendance Deductions: Absent ({formatKwacha(payrollRates.absentDeduction)}/day) + Late (MK4,200/day) + Lecture + Appearance</p>
         </Card>
       </div>
 
@@ -1868,7 +1868,7 @@ export function PayrollPage() {
                           {hasAnyDeduction && (
                             <div className="text-[10px] text-red-400 space-y-0.5">
                               {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
-                              {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × MK4,200</div>}
+                              {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × {formatKwacha(payrollRates.absentDeduction)}</div>}
                               {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × MK4,200</div>}
                               {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
                               {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
@@ -1949,7 +1949,7 @@ export function PayrollPage() {
               </div>
               <div className="mt-2 text-xs text-red-600 border-t border-red-200 pt-2">
                 <p>• Uniform Deduction: MK 10,000 per employee (default, adjustable)</p>
-                <p>• Absenteeism: MK 4,200 per absent day</p>
+                <p>• Absenteeism: {formatKwacha(payrollRates.absentDeduction)} per absent day</p>
                 <p>• Late Arrival: MK 4,200 per late day</p>
               </div>
             </div>

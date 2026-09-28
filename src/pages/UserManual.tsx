@@ -352,7 +352,7 @@ export function UserManualPage() {
                 </div>
                 <div className="flex items-center gap-3 text-slate-600">
                   <div className="w-2 h-2 rounded-full bg-[#D4A017] flex-shrink-0" />
-                  <span><strong>Deductions</strong> — Automatic calculation: MK 4,200 per absent/late day</span>
+                  <span><strong>Deductions</strong> — Automatically calculated using the Absent/Late day rates configured in Settings</span>
                 </div>
                 <div className="flex items-center gap-3 text-slate-600">
                   <div className="w-2 h-2 rounded-full bg-red-500 flex-shrink-0" />
@@ -367,7 +367,7 @@ export function UserManualPage() {
               <h4 className="font-semibold text-slate-800 mb-3 text-sm">Status Colors</h4>
               <div className="space-y-2 text-sm">
                 <div className="flex items-center gap-3"><span className="w-4 h-4 rounded bg-emerald-500" /> Present (P)</div>
-                <div className="flex items-center gap-3"><span className="w-4 h-4 rounded bg-red-500" /> Absent (A) → MK 4,200</div>
+                <div className="flex items-center gap-3"><span className="w-4 h-4 rounded bg-red-500" /> Absent (A) → deducted per the configured Absent rate</div>
                 <div className="flex items-center gap-3"><span className="w-4 h-4 rounded bg-yellow-400" /> Late (L) → MK 4,200</div>
                 <div className="flex items-center gap-3"><span className="w-4 h-4 rounded bg-blue-500" /> Leave (LV)</div>
                 <div className="flex items-center gap-3"><span className="w-4 h-4 rounded bg-purple-500" /> Sick (SL)</div>
@@ -420,7 +420,7 @@ export function UserManualPage() {
                 </div>
                 <div className="p-3 bg-red-50 rounded-lg border border-red-200 text-xs text-red-600">
                   <AlertCircle size={14} className="inline mr-1" />
-                  <strong>Default:</strong> Uniform Deduction = MK 10,000 · Absent/Late = MK 4,200/day
+                  <strong>Default:</strong> Uniform Deduction = MK 10,000 · Absent/Late deductions use the rates configured in Settings
                 </div>
               </div>
             </div>
