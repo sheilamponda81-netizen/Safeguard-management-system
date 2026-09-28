@@ -8,6 +8,7 @@ import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
+import { getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
 import { getCompanySettings } from '../utils/companySettings';
 import {
   getSystemCurrentMonth,
@@ -592,7 +593,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             <div class="row deduction-item" style="border-bottom: none;"><span class="label">Uniform & Attendance</span><span class="amount">-${formatKwacha(totalUniformAtt)}</span></div>
             <div class="deduction-breakdown">
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
-              ${absentDays > 0 ? `<div>Absent (${absentDays} × MK4,200): -${formatKwacha(absentDeduction)}</div>` : ''}
+              ${absentDays > 0 ? `<div>Absent (${absentDays} × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}): -${formatKwacha(absentDeduction)}</div>` : ''}
               ${lateDays > 0 ? `<div>Late (${lateDays} × MK4,200): -${formatKwacha(lateDeduction)}</div>` : ''}
               ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
               ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
@@ -688,7 +689,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5; border-bottom: none;"><span style="color: #555;">Uniform & Attendance</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(totalUniformAtt)}</span></div>
             <div style="font-size: 11px; color: #dc2626; padding-left: 20px; padding-bottom: 6px;">
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
-              ${absentDays > 0 ? `<div>Absent (${absentDays} × MK4,200): -${formatKwacha(absentDeduction)}</div>` : ''}
+              ${absentDays > 0 ? `<div>Absent (${absentDays} × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}): -${formatKwacha(absentDeduction)}</div>` : ''}
               ${lateDays > 0 ? `<div>Late (${lateDays} × MK4,200): -${formatKwacha(lateDeduction)}</div>` : ''}
               ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
               ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
