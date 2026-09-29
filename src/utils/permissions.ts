@@ -49,6 +49,10 @@ export const PERMISSIONS = {
   ATTENDANCE_VIEW: 'attendance.view',
   ATTENDANCE_CREATE: 'attendance.create',
   ATTENDANCE_EDIT: 'attendance.edit',
+  // HikCentral Attendance MVP Phase 1 (20260929000000_hikcentral_attendance_ingestion_foundation.sql)
+  // -- import/preview/mapping only, no "apply attendance" permission yet.
+  ATTENDANCE_IMPORT_HIKCENTRAL: 'attendance.import_hikcentral',
+  ATTENDANCE_MAP_HIKCENTRAL_PERSONS: 'attendance.map_hikcentral_persons',
   USER_MANUAL_VIEW: 'user_manual.view',
   FUTURE_FEATURES_VIEW: 'future_features.view',
 } as const;

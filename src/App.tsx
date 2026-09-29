@@ -42,6 +42,7 @@ const Dashboard = safeLazy(() => import("./pages/Dashboard"));
 const EmployeesPage = safeLazy(() => import("./pages/Employees"));
 const RecruitmentPage = safeLazy(() => import("./pages/Recruitment"));
 const AttendancePage = safeLazy(() => import("./pages/Attendance"));
+const HikCentralImportPage = safeLazy(() => import("./pages/HikCentralImport"));
 const PayrollPage = safeLazy(() => import("./pages/Payroll"));
 const PayslipsPage = safeLazy(() => import("./pages/Payslips"));
 const PaymentsPage = safeLazy(() => import("./pages/Payments"));
@@ -69,6 +70,7 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
   employees: EmployeesPage,
   recruitment: RecruitmentPage,
   attendance: AttendancePage,
+  "hikcentral-import": HikCentralImportPage,
   payroll: PayrollPage,
   payslips: PayslipsPage,
   payments: PaymentsPage,
@@ -85,13 +87,13 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
 // ===== ROLE CONFIGURATION =====
 const rolePages: Record<number, NavKey[]> = {
   1: [
-    "dashboard", "employees", "recruitment", "attendance",
+    "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
     "payroll", "payslips", "payments", "terminal-dues", "salary-advances",
     "reports", "settings", "security", "features", "auditlogs",
     "user-manual",
   ],
   2: [
-    "dashboard", "employees", "recruitment", "attendance",
+    "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
     "payments", "terminal-dues", "salary-advances", "reports", "security",
     "user-manual",
   ],
@@ -113,6 +115,7 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   employees: { title: "Employee Management", breadcrumb: "Employees" },
   recruitment: { title: "Recruitment Pipeline", breadcrumb: "Recruitment" },
   attendance: { title: "Attendance Management", breadcrumb: "Attendance" },
+  "hikcentral-import": { title: "HikCentral Attendance Import", breadcrumb: "HikCentral Import" },
   payroll: { title: "Payroll Management", breadcrumb: "Payroll" },
   payslips: { title: "Payslips", breadcrumb: "Payslips" },
   payments: { title: "Payment Management", breadcrumb: "Payments" },
