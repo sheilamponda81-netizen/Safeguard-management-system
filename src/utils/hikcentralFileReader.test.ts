@@ -2,13 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { raceWithTimeout } from './hikcentralFileReader';
 
 // `parseHikCentralExcelFile` itself is not tested here (it depends on
-// `read-excel-file/browser`, a browser-only build -- see this module's
-// own header comment). `raceWithTimeout` is the pure, directly-testable
-// piece of the fix for the real-file hang observed on PR #44's STAGING
-// Preview (2026-09-29): it's what guarantees `parseHikCentralExcelFile`'s
-// returned promise always settles, so HikCentralImportPage's
-// `finally { setParsing(false) }` is never left waiting forever on a
-// slow/pathological file.
+// the browser's `File.arrayBuffer()` -- see this module's own header
+// comment; the actual XLSX reading it delegates to,
+// hikcentralOoxmlReader.ts, has its own dedicated, directly-testable
+// suite in hikcentralOoxmlReader.test.ts). `raceWithTimeout` is the
+// pure, directly-testable piece of the fix for the real-file hang
+// observed on PR #44's STAGING Preview (2026-09-29): it's what
+// guarantees `parseHikCentralExcelFile`'s returned promise always
+// settles, so HikCentralImportPage's `finally { setParsing(false) }` is
+// never left waiting forever on a slow/pathological file.
 describe('raceWithTimeout', () => {
   it('resolves with the underlying promise\'s value when it settles before the timeout', async () => {
     const result = await raceWithTimeout(

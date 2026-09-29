@@ -2,11 +2,12 @@ import JSZip from 'jszip';
 
 // Test-only .xlsx builder. Not imported by any production page/component --
 // exists purely so the HikCentral parser tests can exercise the real
-// `read-excel-file` library against a genuine, hand-built OOXML file
-// (rather than mocking the library's return value), without checking a
-// binary fixture into git and without depending on an XLSX *writer*
-// library the app has no other use for. An .xlsx is just a zip of XML
-// parts; this assembles the minimal set any real spreadsheet app needs.
+// production reader (hikcentralOoxmlReader.ts) against a genuine,
+// hand-built OOXML file (rather than mocking the reader's return value),
+// without checking a binary fixture into git and without depending on an
+// XLSX *writer* library the app has no other use for. An .xlsx is just a
+// zip of XML parts; this assembles the minimal set any real spreadsheet
+// app needs.
 //
 // Every text cell is written as an inline string (`t="inlineStr"`), which
 // is a genuinely TEXT-typed OOXML cell -- exactly how a value like

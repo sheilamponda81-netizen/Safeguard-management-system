@@ -1,5 +1,6 @@
+// @vitest-environment jsdom
 import { describe, it, expect } from 'vitest';
-import { readSheet } from 'read-excel-file/node';
+import { readHikCentralWorkbookGrid } from './hikcentralOoxmlReader';
 import { buildTestXlsx, XlsxRow } from './testFixtures/buildTestXlsx';
 import {
   parseHikCentralSheet,
@@ -7,7 +8,6 @@ import {
   summarizeHikCentralParseResult,
   isEligibleSuccessfulEvent,
   HikCentralFileError,
-  SheetRow,
 } from './hikcentralExcelParser';
 
 // Mirrors the REAL HikCentral export structure exactly as inspected:
@@ -55,8 +55,8 @@ function dataRow(overrides: Partial<{
 
 async function parseRows(rows: XlsxRow[]) {
   const buffer = await buildTestXlsx(rows);
-  const sheet = await readSheet(buffer, 1);
-  return parseHikCentralSheet(sheet as unknown as SheetRow[]);
+  const sheet = await readHikCentralWorkbookGrid(buffer);
+  return parseHikCentralSheet(sheet);
 }
 
 describe('parseHikCentralSheet', () => {
@@ -130,22 +130,22 @@ describe('parseHikCentralSheet', () => {
   it('rejects the whole file when a required column is missing from the header row', async () => {
     const brokenHeader = HEADER_ROW.filter((h) => h !== 'Authentication Result');
     const buffer = await buildTestXlsx([...METADATA_ROWS, brokenHeader, dataRow({})]);
-    const sheet = await readSheet(buffer, 1);
-    expect(() => parseHikCentralSheet(sheet as unknown as SheetRow[])).toThrow(HikCentralFileError);
-    expect(() => parseHikCentralSheet(sheet as unknown as SheetRow[])).toThrow(/Authentication Result/);
+    const sheet = await readHikCentralWorkbookGrid(buffer);
+    expect(() => parseHikCentralSheet(sheet)).toThrow(HikCentralFileError);
+    expect(() => parseHikCentralSheet(sheet)).toThrow(/Authentication Result/);
   });
 
   // 9. Empty workbook / no data rows
   it('rejects a file with a valid header but zero data rows', async () => {
     const buffer = await buildTestXlsx([...METADATA_ROWS, HEADER_ROW]);
-    const sheet = await readSheet(buffer, 1);
-    expect(() => parseHikCentralSheet(sheet as unknown as SheetRow[])).toThrow(/no data rows/);
+    const sheet = await readHikCentralWorkbookGrid(buffer);
+    expect(() => parseHikCentralSheet(sheet)).toThrow(/no data rows/);
   });
 
   it('rejects a completely empty workbook', async () => {
     const buffer = await buildTestXlsx([]);
-    const sheet = await readSheet(buffer, 1);
-    expect(() => parseHikCentralSheet(sheet as unknown as SheetRow[])).toThrow(HikCentralFileError);
+    const sheet = await readHikCentralWorkbookGrid(buffer);
+    expect(() => parseHikCentralSheet(sheet)).toThrow(HikCentralFileError);
   });
 
   it('reproduces the real sample file\'s exact observed statistics for an equivalent synthetic mix', async () => {
