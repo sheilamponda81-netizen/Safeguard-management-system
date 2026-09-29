@@ -91,13 +91,20 @@ CREATE TABLE IF NOT EXISTS hikcentral_import_batches (
   source TEXT NOT NULL DEFAULT 'excel' CHECK (source IN ('excel', 'api')),
   filename TEXT,
   -- SHA-256 of the uploaded file's bytes, computed client-side before
-  -- parsing. Purely a diagnostic convenience ("this exact file looks
-  -- like it was already uploaded as batch X") -- NOT the mechanism that
-  -- prevents duplicate data; that is event_fingerprint's UNIQUE
-  -- constraint in PART 2, which correctly also dedupes across two
-  -- OVERLAPPING (not byte-identical) exports. Nullable/unconstrained
-  -- deliberately: re-uploading identical bytes must never be blocked at
-  -- the file level, only silently no-op at the per-event level.
+  -- parsing. Two roles: (1) a diagnostic convenience ("this exact file
+  -- looks like it was already uploaded as batch X"), and (2) LOAD-BEARING
+  -- for anonymous (no Person No.) raw events' fingerprint -- see PART 5's
+  -- import_hikcentral_raw_events(), which reads this column back
+  -- server-side (never re-trusting a client-supplied value at import
+  -- time) to scope an anonymous event's identity to this specific file,
+  -- since the visible event fields alone cannot safely distinguish two
+  -- different anonymous people (see PART 5's header comment). For an
+  -- IDENTIFIED event (has a Person No.), this column plays no role --
+  -- event_fingerprint's UNIQUE constraint in PART 2 dedupes those
+  -- correctly across OVERLAPPING (not byte-identical) exports on its
+  -- own. Nullable/unconstrained deliberately: re-uploading identical
+  -- bytes must never be blocked at the file level, only silently no-op
+  -- at the per-event level.
   file_fingerprint TEXT,
   imported_by UUID REFERENCES profiles(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'completed', 'failed')),
@@ -159,11 +166,17 @@ CREATE TABLE IF NOT EXISTS hikcentral_raw_events (
   -- Deterministic dedup key -- see the ingestion RPC (PART 5) for the
   -- canonical algorithm and its documented limits.
   event_fingerprint TEXT NOT NULL,
-  -- Full original row (all 18 export columns, including the two
-  -- "Captured Picture" columns and fields we don't model as first-class
-  -- columns, e.g. Skin-Surface Temperature) -- cheap insurance so
-  -- nothing HikCentral reported is ever unrecoverable without a schema
-  -- change.
+  -- ONLY the known textual/event-metadata columns this table already
+  -- models as first-class fields (Person No., First/Last Name, Time,
+  -- Access Point, Card Reader, Authentication Result, Event Type,
+  -- Attendance Type -- see hikcentralExcelParser.ts's
+  -- REQUIRED_HEADERS/OPTIONAL_KNOWN_HEADERS, which is exactly what
+  -- rawPayload is built from). Deliberately NEVER includes the export's
+  -- two "Captured Picture" columns, "Profile", or any other
+  -- image/binary-bearing column -- this table must not quietly become
+  -- an image-storage table. (An earlier draft of this comment
+  -- inaccurately claimed this held the complete original spreadsheet
+  -- row; corrected here to match what the parser actually captures.)
   raw_payload JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -240,6 +253,25 @@ CREATE INDEX IF NOT EXISTS idx_hikcentral_person_mappings_tenant
 ALTER TABLE hikcentral_import_batches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hikcentral_raw_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hikcentral_person_mappings ENABLE ROW LEVEL SECURITY;
+
+-- FORCE ROW LEVEL SECURITY is DELIBERATELY NOT applied to any of these
+-- three tables -- do not add it. By default, RLS policies do not apply
+-- to a table's OWNER, and a SECURITY DEFINER function executes with the
+-- privileges of ITS OWNER; import_hikcentral_raw_events() (PART 5) is
+-- how every row in hikcentral_raw_events is written, and that table
+-- has NO client-facing INSERT policy at all -- the RPC's insert only
+-- succeeds because it runs as the (table-owning) function owner, which
+-- RLS does not restrict unless FORCE is set. Adding FORCE ROW LEVEL
+-- SECURITY here would apply RLS to the owner too, and since there is no
+-- INSERT policy for ANY role on this table, that would break the
+-- ingestion pipeline entirely (every insert, including the RPC's own,
+-- would be rejected). The same reasoning applies to
+-- hikcentral_import_batches' status/count columns, which only the RPC
+-- ever updates via a table with no client-facing UPDATE policy. This is
+-- the same owner-bypass mechanism every other SECURITY DEFINER
+-- RPC in this schema (e.g. approve_payroll_run, process_payroll_batch)
+-- already relies on -- none of them, and no table they write through,
+-- uses FORCE ROW LEVEL SECURITY either.
 
 -- hikcentral_import_batches / hikcentral_raw_events have no employee_id
 -- of their own (raw events are tenant-wide facts, not yet linked to any
@@ -368,35 +400,112 @@ WITH CHECK (
 -- PART 5: import_hikcentral_raw_events() -- server-authoritative bulk
 -- ingestion RPC
 -- ============================================================
--- CANONICAL EVENT-FINGERPRINT ALGORITHM (shared by Excel ingestion today
--- and any future API/webhook adapter -- both MUST compute it identically
--- for cross-source dedup to work):
+-- CANONICAL EVENT-FINGERPRINT ALGORITHM -- COMPUTED HERE, SERVER-SIDE,
+-- ALWAYS. This function does NOT read an `event_fingerprint` field from
+-- the client payload at all (see the SELECT below -- there is no
+-- `r->>'event_fingerprint'` anywhere in it). A prior version of this
+-- migration accepted a client-computed fingerprint and inserted it
+-- as-is, which meant a caller could submit arbitrary/forged fingerprints
+-- -- e.g. a fresh random value on every row to defeat ON CONFLICT dedup
+-- entirely (every "re-import" would insert fresh duplicate rows), or a
+-- FIXED value across genuinely distinct rows to make ON CONFLICT
+-- silently discard real events. Recomputing it here, from the row's own
+-- normalized fields plus (for the anonymous branch) a value read
+-- server-side off the ALREADY TENANT-VALIDATED hikcentral_import_batches
+-- row (never re-taken from the payload), closes both directions: the
+-- database is now the sole authority over what "the same event" means.
 --
---   sha256(tenant_id || '|' || COALESCE(hikcentral_person_no, '') || '|'
---          || event_time (ISO 8601, UTC) || '|' || COALESCE(access_point, '')
---          || '|' || COALESCE(card_reader, '') || '|' || authentication_result
---          || '|' || event_type)
+-- Two branches, chosen by whether hikcentral_person_no is present:
 --
--- Computed CLIENT-SIDE by the parser (src/utils/hikcentralExcelParser.ts)
--- and passed in on each element of p_events -- NOT recomputed here datab-
--- ase-side, so the exact same TypeScript implementation Stage 2's future
--- API adapter reuses is the one thing that ever defines this value.
+-- 1. IDENTIFIED events (hikcentral_person_no present) -- true
+--    cross-file, cross-upload deduplication, since a real person's
+--    identity is a meaningful key on its own:
 --
--- ACKNOWLEDGED LIMIT: if two genuinely distinct punches by the same
--- person, at the same access point and reader, with the same
--- authentication result and event type, occur within the SAME SECOND
--- (event_time has 1-second resolution in the source export), they
--- produce an IDENTICAL fingerprint and the second insert is silently
--- deduped as if it were a re-imported duplicate. The export provides no
--- finer-grained timestamp and no trusted per-event ID, so this case is
--- structurally indistinguishable from an exact duplicate with the
--- information available -- documented here rather than "solved" with an
--- invented disambiguator. Two scans even 1 second apart (the
+--      sha256('ID|' || tenant_id || '|' || hikcentral_person_no || '|'
+--             || event_time (the exact JSONB text this row carries --
+--                already an ISO 8601 UTC string produced by the parser's
+--                Africa/Blantyre conversion, hashed as literal text, NEVER
+--                re-formatted/re-parsed first, so no whitespace/format
+--                drift between what was hashed and what is stored can
+--                ever creep in) || '|' || COALESCE(access_point, '')
+--             || '|' || COALESCE(card_reader, '') || '|' || authentication_result
+--             || '|' || event_type)
+--
+-- 2. ANONYMOUS events (hikcentral_person_no NULL/blank -- 238 of 970
+--    Authorization rows in the real sample) -- deliberately NOT
+--    fingerprinted from the visible event fields alone. Two different
+--    real people who both scanned with no Person No. at the same
+--    access point/reader in the same second are NOT distinguishable by
+--    their visible fields, and this schema has no trusted per-event ID
+--    to disambiguate them -- hashing only the visible fields would
+--    silently collapse two real people into one stored event. Per the
+--    approved review: "do NOT invent identity for an anonymous event."
+--    Instead the fingerprint is scoped to THIS SPECIFIC FILE, using the
+--    file's own content hash (hikcentral_import_batches.file_fingerprint,
+--    read server-side for p_batch_id -- never re-taken from the payload)
+--    plus the row's stable position within that file
+--    (source_row_ordinal, see hikcentralExcelParser.ts's `rowNumber`,
+--    which the header-detection scan derives deterministically from the
+--    file's own content, so re-parsing byte-identical bytes always
+--    reproduces the same ordinal for the same physical row):
+--
+--      sha256('ANON|' || tenant_id || '|' || file_fingerprint || '|'
+--             || source_row_ordinal || '|' || COALESCE(access_point, '')
+--             || '|' || COALESCE(card_reader, '') || '|' || authentication_result
+--             || '|' || event_type)
+--
+--    What this DOES protect: re-uploading the exact same file is still
+--    correctly deduped (identical bytes -> identical file_fingerprint;
+--    identical row position -> identical ordinal -> identical hash ->
+--    ON CONFLICT DO NOTHING), and two different anonymous people within
+--    the SAME file never collide (different row -> different ordinal).
+--    What this CANNOT do: deduplicate an anonymous event that
+--    legitimately appears in two DIFFERENT (even date-overlapping)
+--    export files -- those get different file_fingerprint values by
+--    construction, so the same real anonymous punch re-exported in a
+--    second file is stored again. This is the honest, documented limit
+--    of what the source data supports, not a bug: the review that
+--    requested this design explicitly accepts it ("overlapping exports
+--    containing anonymous rows may not be safely deduplicatable without
+--    a true HikCentral event ID").
+--
+-- Both branches use a leading 'ID|'/'ANON|' tag so the two branches can
+-- never collide with each other regardless of field contents.
+--
+-- Cross-source note: identified events are safe to dedup across a
+-- future Stage 2 (live API) adapter's rows too, since person_no/
+-- event_time/etc. mean the same thing regardless of source. Anonymous
+-- events from Stage 2 would need their OWN file/batch-scoped identity
+-- (e.g. that adapter's own poll-cycle id + sequence number) -- carrying
+-- the same documented cross-batch limitation, never invented identity.
+--
+-- ACKNOWLEDGED LIMIT (identified branch only): if two genuinely distinct
+-- punches by the SAME identified person, at the same access point and
+-- reader, with the same authentication result and event type, occur
+-- within the SAME SECOND (event_time has 1-second resolution in the
+-- source export), they produce an IDENTICAL fingerprint and the second
+-- insert is silently deduped as if it were a re-imported duplicate. The
+-- export provides no finer-grained timestamp and no trusted per-event ID,
+-- so this case is structurally indistinguishable from an exact duplicate
+-- with the information available. Two scans even 1 second apart (the
 -- observed real-world minimum in the sample data) remain fully
 -- distinguished and both preserved.
 --
 -- This function only INSERTs into hikcentral_raw_events and UPDATEs the
 -- owning hikcentral_import_batches row -- it never touches `attendance`.
+--
+-- SUMMARY COUNTS TRUST MODEL: authorization_count/with_person_no_count/
+-- without_person_no_count/unique_person_no_count are RECOMPUTED here
+-- directly from p_events (the actual submitted array), never taken from
+-- p_summary_counts, since everything needed to verify them is already in
+-- p_events. total_rows/failed_count CANNOT be independently verified
+-- here -- Failed authentication rows are, by design (approved decision
+-- 6), never transmitted to this function at all, so there is nothing
+-- server-side to count them against. Those two fields remain
+-- client-reported (clamped to non-negative) and are exactly that:
+-- self-reported preview metadata for the audit trail, not a
+-- server-verified fact -- documented here rather than silently implied
+-- to be as trustworthy as the other four.
 CREATE OR REPLACE FUNCTION import_hikcentral_raw_events(
   p_batch_id UUID,
   p_events JSONB,
@@ -415,10 +524,15 @@ DECLARE
   v_is_active BOOLEAN;
   v_deleted_at TIMESTAMPTZ;
   v_batch_tenant_id UUID;
+  v_batch_file_fingerprint TEXT;
   v_before_count INTEGER;
   v_after_count INTEGER;
   v_inserted_count INTEGER;
   v_submitted_count INTEGER;
+  v_authorization_count INTEGER;
+  v_with_person_no_count INTEGER;
+  v_without_person_no_count INTEGER;
+  v_unique_person_no_count INTEGER;
 BEGIN
   IF v_caller_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
@@ -461,7 +575,11 @@ BEGIN
   -- is the concrete "do not allow cross-tenant writes" enforcement point:
   -- a batch id from another tenant fails this check and the function
   -- raises before touching hikcentral_raw_events at all.
-  SELECT tenant_id INTO v_batch_tenant_id
+  -- file_fingerprint is read here, server-side, from the already-
+  -- tenant-validated batch row -- NEVER re-taken from the p_events
+  -- payload -- and is what the ANONYMOUS branch of the fingerprint
+  -- computation below uses (see this function's header comment).
+  SELECT tenant_id, file_fingerprint INTO v_batch_tenant_id, v_batch_file_fingerprint
   FROM hikcentral_import_batches
   WHERE id = p_batch_id;
 
@@ -479,6 +597,33 @@ BEGIN
 
   v_submitted_count := jsonb_array_length(p_events);
 
+  -- Recomputed directly from the actual submitted array -- never taken
+  -- from p_summary_counts. See this function's header comment ("SUMMARY
+  -- COUNTS TRUST MODEL") for why total_rows/failed_count cannot be
+  -- verified the same way.
+  SELECT
+    COUNT(*) FILTER (
+      WHERE r->>'authentication_result' = 'Authorization'
+        AND r->>'event_type' = 'Access Granted by Fingerprint'
+    ),
+    COUNT(*) FILTER (
+      WHERE r->>'authentication_result' = 'Authorization'
+        AND r->>'event_type' = 'Access Granted by Fingerprint'
+        AND NULLIF(r->>'hikcentral_person_no', '') IS NOT NULL
+    ),
+    COUNT(*) FILTER (
+      WHERE r->>'authentication_result' = 'Authorization'
+        AND r->>'event_type' = 'Access Granted by Fingerprint'
+        AND NULLIF(r->>'hikcentral_person_no', '') IS NULL
+    ),
+    COUNT(DISTINCT r->>'hikcentral_person_no') FILTER (
+      WHERE r->>'authentication_result' = 'Authorization'
+        AND r->>'event_type' = 'Access Granted by Fingerprint'
+        AND NULLIF(r->>'hikcentral_person_no', '') IS NOT NULL
+    )
+  INTO v_authorization_count, v_with_person_no_count, v_without_person_no_count, v_unique_person_no_count
+  FROM jsonb_array_elements(p_events) AS r;
+
   SELECT COUNT(*) INTO v_before_count
   FROM hikcentral_raw_events
   WHERE tenant_id = v_tenant_id;
@@ -487,8 +632,19 @@ BEGIN
   -- server-side re-validation that every row is actually the successful-
   -- event shape this table is defined to hold (defense in depth -- the
   -- parser/UI should never send anything else, but this function does
-  -- not trust that). ON CONFLICT DO NOTHING on (tenant_id,
-  -- event_fingerprint) is the exact-duplicate-import protection.
+  -- not trust that), and a SERVER-COMPUTED event_fingerprint (see this
+  -- function's header comment) -- the payload's own fields are hashed
+  -- here, never a client-supplied fingerprint value, which is not read
+  -- anywhere in this statement. ON CONFLICT DO NOTHING on (tenant_id,
+  -- event_fingerprint) is the exact-duplicate-import protection, now
+  -- resting on a value this database computed itself.
+  --
+  -- An anonymous row (no hikcentral_person_no) additionally requires a
+  -- source_row_ordinal -- without one there is nothing stable to scope
+  -- its fingerprint to within this file, so such a row is excluded here
+  -- (defense in depth against a malformed payload) rather than hashed
+  -- with a missing/empty ordinal, which could otherwise let two
+  -- different anonymous rows collide again.
   INSERT INTO hikcentral_raw_events (
     tenant_id, import_batch_id, source, hikcentral_person_no, first_name,
     last_name, event_time, access_point, card_reader,
@@ -508,13 +664,33 @@ BEGIN
     r->>'authentication_result',
     r->>'event_type',
     r->>'attendance_type',
-    r->>'event_fingerprint',
+    encode(
+      digest(
+        CASE
+          WHEN NULLIF(r->>'hikcentral_person_no', '') IS NOT NULL THEN
+            'ID|' || v_tenant_id::text || '|' || (r->>'hikcentral_person_no') || '|' ||
+            (r->>'event_time') || '|' || COALESCE(r->>'access_point', '') || '|' ||
+            COALESCE(r->>'card_reader', '') || '|' || (r->>'authentication_result') || '|' ||
+            (r->>'event_type')
+          ELSE
+            'ANON|' || v_tenant_id::text || '|' || COALESCE(v_batch_file_fingerprint, '') || '|' ||
+            (r->>'source_row_ordinal') || '|' || COALESCE(r->>'access_point', '') || '|' ||
+            COALESCE(r->>'card_reader', '') || '|' || (r->>'authentication_result') || '|' ||
+            (r->>'event_type')
+        END,
+        'sha256'
+      ),
+      'hex'
+    ),
     r->'raw_payload'
   FROM jsonb_array_elements(p_events) AS r
   WHERE r->>'authentication_result' = 'Authorization'
     AND r->>'event_type' = 'Access Granted by Fingerprint'
     AND r->>'event_time' IS NOT NULL
-    AND r->>'event_fingerprint' IS NOT NULL
+    AND (
+      NULLIF(r->>'hikcentral_person_no', '') IS NOT NULL
+      OR r->>'source_row_ordinal' IS NOT NULL
+    )
   ON CONFLICT (tenant_id, event_fingerprint) DO NOTHING;
 
   SELECT COUNT(*) INTO v_after_count
@@ -525,12 +701,16 @@ BEGIN
 
   UPDATE hikcentral_import_batches SET
     status = 'completed',
-    total_rows = COALESCE((p_summary_counts->>'total_rows')::INTEGER, v_submitted_count),
-    authorization_count = (p_summary_counts->>'authorization_count')::INTEGER,
-    failed_count = (p_summary_counts->>'failed_count')::INTEGER,
-    with_person_no_count = (p_summary_counts->>'with_person_no_count')::INTEGER,
-    without_person_no_count = (p_summary_counts->>'without_person_no_count')::INTEGER,
-    unique_person_no_count = (p_summary_counts->>'unique_person_no_count')::INTEGER,
+    -- total_rows: the successful portion (v_submitted_count) is
+    -- server-verified; the Failed portion is client-reported (see this
+    -- function's header comment) since Failed rows are never
+    -- transmitted here to count independently. Clamped non-negative.
+    total_rows = v_submitted_count + GREATEST(COALESCE((p_summary_counts->>'failed_count')::INTEGER, 0), 0),
+    authorization_count = v_authorization_count,
+    failed_count = GREATEST(COALESCE((p_summary_counts->>'failed_count')::INTEGER, 0), 0),
+    with_person_no_count = v_with_person_no_count,
+    without_person_no_count = v_without_person_no_count,
+    unique_person_no_count = v_unique_person_no_count,
     raw_events_inserted = v_inserted_count,
     exact_duplicates_ignored = v_submitted_count - v_inserted_count,
     imported_by = COALESCE(imported_by, v_caller_id),

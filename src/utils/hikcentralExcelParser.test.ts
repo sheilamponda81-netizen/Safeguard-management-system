@@ -173,6 +173,65 @@ describe('parseHikCentralSheet', () => {
     expect(summary.uniquePersonNoCount).toBe(2); // 00000174, 00000175
     expect(summary.accessPoints).toEqual(['MTL - CHICHIRI_Door_1']);
   });
+
+  // Pre-STAGING integrity review item 6: reproduce the REAL file's exact
+  // aggregate statistics at full scale (not just proportionally), since
+  // no copy of the real production file exists in this environment (it
+  // was never uploaded/committed here, per the review's explicit
+  // instruction not to). This is the closest available validation: a
+  // synthetic file built to the exact stated real-world counts.
+  it('reproduces the REAL sample file\'s exact aggregate statistics at full scale: 1,276 rows / 970 Authorization / 306 Failed / 732 successful-identified / 238 successful-anonymous / 71 unique identified Person Nos', async () => {
+    const rows: XlsxRow[] = [];
+
+    // 732 successful, identified events across exactly 71 unique Person Nos.
+    for (let i = 0; i < 732; i++) {
+      const personNo = String(174 + (i % 71)).padStart(8, '0');
+      rows.push(dataRow({ personNo }));
+    }
+    // 238 successful events with no Person No.
+    for (let i = 0; i < 238; i++) {
+      rows.push(dataRow({ personNo: null }));
+    }
+    // 306 Failed events (mix of the real export's observed failure types).
+    const failureTypes = ['Fingerprint Does Not Exist', 'Employee ID Does Not Exist', 'Authentication Mode Mismatch'];
+    for (let i = 0; i < 306; i++) {
+      rows.push(dataRow({ authResult: 'Failed', eventType: failureTypes[i % failureTypes.length], personNo: null }));
+    }
+
+    expect(rows).toHaveLength(1276);
+
+    const result = await parseRows([...METADATA_ROWS, HEADER_ROW, ...rows]);
+    const summary = summarizeHikCentralParseResult(result);
+
+    expect(summary.totalRows).toBe(1276);
+    expect(summary.authorizationCount).toBe(970); // 732 + 238
+    expect(summary.failedCount).toBe(306);
+    expect(summary.withPersonNoCount).toBe(732);
+    expect(summary.withoutPersonNoCount).toBe(238);
+    expect(summary.uniquePersonNoCount).toBe(71);
+    expect(summary.rowErrorCount).toBe(0);
+  });
+
+  it('preserves Person No. "00000174" exactly (the real export\'s documented example) even inside a full-scale 1,276-row file', async () => {
+    const rows: XlsxRow[] = [dataRow({ personNo: '00000174', firstName: 'ALEX', lastName: 'SAID', time: '2026-09-28 07:27:44', accessPoint: 'MTL - CHICHIRI_Door_1' })];
+    for (let i = 0; i < 1275; i++) rows.push(dataRow({ personNo: String(175 + i).padStart(8, '0') }));
+    const result = await parseRows([...METADATA_ROWS, HEADER_ROW, ...rows]);
+    expect(result.rows[0].hikcentralPersonNo).toBe('00000174');
+    expect(result.rows[0].eventTimeIso).toBe('2026-09-28T05:27:44.000Z'); // Africa/Blantyre -> UTC
+  });
+
+  it('raw_payload never contains "Captured Picture" or "Profile" -- this table must not quietly become an image-storage table', async () => {
+    const result = await parseRows([...METADATA_ROWS, HEADER_ROW, dataRow({})]);
+    const rawPayload = result.rows[0].rawPayload;
+    expect(rawPayload).not.toHaveProperty('Captured Picture');
+    expect(rawPayload).not.toHaveProperty('Profile');
+    expect(rawPayload).not.toHaveProperty('Skin-Surface Temperature');
+    expect(rawPayload).not.toHaveProperty('Mask Wearing Status');
+    // Only the known textual/event-metadata columns should be present.
+    expect(Object.keys(rawPayload).sort()).toEqual(
+      ['Access Point', 'Attendance Type', 'Authentication Result', 'Card Reader', 'Event Type', 'First Name', 'Last Name', 'Person No.', 'Time'].sort()
+    );
+  });
 });
 
 describe('parseHikCentralTimeToUtcIso', () => {

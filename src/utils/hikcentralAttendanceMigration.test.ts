@@ -148,3 +148,87 @@ describe('HikCentral person-mapping model constraints (test 15)', () => {
     expect(tableBlock).not.toMatch(/processing_status/);
   });
 });
+
+// Pre-STAGING integrity/security review follow-up fixes.
+describe('HikCentral ingestion RPC: server-authoritative event_fingerprint (forged-client-fingerprint fix)', () => {
+  function getRpcBody(): string {
+    const rpcBody = migrationSource.match(/CREATE OR REPLACE FUNCTION import_hikcentral_raw_events[\s\S]*?\$\$;/)?.[0];
+    expect(rpcBody).toBeTruthy();
+    return rpcBody!;
+  }
+
+  it('never reads an event_fingerprint field from the client payload -- there is nothing for a caller to forge', () => {
+    const rpcBody = getRpcBody();
+    expect(rpcBody).not.toMatch(/r->>'event_fingerprint'/);
+  });
+
+  it('computes event_fingerprint itself via pgcrypto digest()/encode(), not a value taken from the payload', () => {
+    const rpcBody = getRpcBody();
+    expect(rpcBody).toMatch(/encode\(\s*digest\(/);
+    expect(rpcBody).toMatch(/'sha256'/);
+  });
+
+  it('branches the fingerprint algorithm on whether hikcentral_person_no is present (identified) or not (anonymous)', () => {
+    const rpcBody = getRpcBody();
+    expect(rpcBody).toMatch(/WHEN NULLIF\(r->>'hikcentral_person_no', ''\) IS NOT NULL THEN/);
+    expect(rpcBody).toMatch(/'ID\|'/);
+    expect(rpcBody).toMatch(/'ANON\|'/);
+  });
+
+  it('the anonymous branch is scoped by the batch\'s own file_fingerprint (read server-side from the tenant-validated batch row) and source_row_ordinal, never inventing an identity for an anonymous person', () => {
+    const rpcBody = getRpcBody();
+    expect(rpcBody).toMatch(/v_batch_file_fingerprint/);
+    expect(rpcBody).toMatch(/r->>'source_row_ordinal'/);
+    // file_fingerprint is looked up FROM hikcentral_import_batches, never
+    // taken as a separate parameter the client could set independently
+    // of the (already tenant-validated) batch row.
+    expect(rpcBody).not.toMatch(/p_file_fingerprint/);
+  });
+
+  it('excludes an anonymous row with no source_row_ordinal from insertion, rather than hashing it with a missing/empty ordinal', () => {
+    const rpcBody = getRpcBody();
+    expect(rpcBody).toMatch(/NULLIF\(r->>'hikcentral_person_no', ''\) IS NOT NULL\s*\n\s*OR r->>'source_row_ordinal' IS NOT NULL/);
+  });
+});
+
+describe('HikCentral ingestion RPC: summary counts recomputed server-side, not blindly trusted', () => {
+  function getRpcBody(): string {
+    const rpcBody = migrationSource.match(/CREATE OR REPLACE FUNCTION import_hikcentral_raw_events[\s\S]*?\$\$;/)?.[0];
+    expect(rpcBody).toBeTruthy();
+    return rpcBody!;
+  }
+
+  it('recomputes authorization_count/with_person_no_count/without_person_no_count/unique_person_no_count from p_events itself, not from p_summary_counts', () => {
+    const rpcBody = getRpcBody();
+    expect(rpcBody).toMatch(/v_authorization_count, v_with_person_no_count, v_without_person_no_count, v_unique_person_no_count/);
+    expect(rpcBody).toMatch(/authorization_count = v_authorization_count/);
+    expect(rpcBody).toMatch(/with_person_no_count = v_with_person_no_count/);
+    expect(rpcBody).toMatch(/without_person_no_count = v_without_person_no_count/);
+    expect(rpcBody).toMatch(/unique_person_no_count = v_unique_person_no_count/);
+    expect(rpcBody).not.toMatch(/authorization_count = \(p_summary_counts/);
+    expect(rpcBody).not.toMatch(/with_person_no_count = \(p_summary_counts/);
+  });
+
+  it('documents that total_rows/failed_count remain client-reported (Failed rows are never transmitted to this function, so they cannot be independently verified here) and clamps them non-negative', () => {
+    const rpcBody = getRpcBody();
+    expect(rpcBody).toMatch(/total_rows = v_submitted_count \+ GREATEST\(COALESCE\(\(p_summary_counts->>'failed_count'\)::INTEGER, 0\), 0\)/);
+    expect(rpcBody).toMatch(/failed_count = GREATEST\(COALESCE\(\(p_summary_counts->>'failed_count'\)::INTEGER, 0\), 0\)/);
+    expect(migrationSource).toMatch(/SUMMARY COUNTS TRUST MODEL/);
+  });
+});
+
+describe('HikCentral ingestion migration: FORCE ROW LEVEL SECURITY decision documented', () => {
+  it('explicitly documents why FORCE ROW LEVEL SECURITY is not applied to any of the three new tables', () => {
+    expect(migrationSource).toMatch(/FORCE ROW LEVEL SECURITY is DELIBERATELY NOT applied/);
+    expect(migrationSource).toMatch(/would break the\s*\n?\s*-- ingestion pipeline entirely/);
+  });
+});
+
+describe('HikCentral ingestion migration: raw_payload column comment accuracy', () => {
+  it('accurately describes raw_payload as containing only known textual columns, never claiming "all 18 columns"', () => {
+    const tableBlock = migrationSource.match(/CREATE TABLE IF NOT EXISTS hikcentral_raw_events[\s\S]*?\n\);/)?.[0];
+    expect(tableBlock).toBeTruthy();
+    expect(tableBlock).not.toMatch(/all 18/);
+    expect(tableBlock).toMatch(/must not quietly become\s*\n?\s*-- an image-storage table/);
+  });
+});

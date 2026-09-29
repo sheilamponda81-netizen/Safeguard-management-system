@@ -54,8 +54,7 @@ function isImportRpcSuccess(data: unknown): data is ImportRpcSuccess {
 export async function importHikCentralRawEvents(
   filename: string,
   fileFingerprint: string | null,
-  parseResult: HikCentralParseResult,
-  tenantId: string
+  parseResult: HikCentralParseResult
 ): Promise<HikCentralImportResult> {
   const { data: batch, error: batchError } = await supabase
     .from('hikcentral_import_batches')
@@ -72,7 +71,7 @@ export async function importHikCentralRawEvents(
   }
 
   const summary = summarizeHikCentralParseResult(parseResult);
-  const events = await buildRawEventInsertPayloads(tenantId, parseResult.rows, 'excel');
+  const events = buildRawEventInsertPayloads(parseResult.rows, 'excel');
 
   try {
     const { data, error } = await supabase.rpc('import_hikcentral_raw_events', {
@@ -126,7 +125,20 @@ export async function importHikCentralRawEvents(
   }
 }
 
-/** SHA-256 of the raw file bytes, hex-encoded -- see hikcentral_import_batches.file_fingerprint's own comment for why this is diagnostic-only, not the real dedup mechanism. */
+/**
+ * SHA-256 of the raw file bytes, hex-encoded. Stored on
+ * hikcentral_import_batches.file_fingerprint and read back SERVER-SIDE
+ * by import_hikcentral_raw_events() -- it is load-bearing for anonymous
+ * (no Person No.) events' fingerprint computation (see the migration's
+ * PART 5 header comment: the ANON branch scopes an event's identity to
+ * this specific file's content, since the visible fields alone cannot
+ * safely distinguish two different anonymous people). For identified
+ * events it is not used at all. This value is computed here,
+ * client-side, but is never trusted as the DEDUP AUTHORITY by itself --
+ * the RPC re-reads it from the already tenant-validated batch row it
+ * looked up server-side, never from any value the client passes at
+ * import time.
+ */
 export async function computeFileFingerprint(file: File): Promise<string> {
   const buffer = await file.arrayBuffer();
   const digest = await crypto.subtle.digest('SHA-256', buffer);

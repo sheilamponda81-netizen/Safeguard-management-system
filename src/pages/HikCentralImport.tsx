@@ -70,7 +70,7 @@ export default function HikCentralImportPage() {
     setImporting(true);
     try {
       const fileFingerprint = await computeFileFingerprint(selectedFile);
-      const result = await importHikCentralRawEvents(selectedFile.name, fileFingerprint, parseResult, userProfile.tenant_id);
+      const result = await importHikCentralRawEvents(selectedFile.name, fileFingerprint, parseResult);
       setImportResult(result);
       if (result.success) {
         showNotification(`Imported ${result.insertedCount} new raw event(s). ${result.duplicatesIgnored} exact duplicate(s) ignored.`, 'success');
