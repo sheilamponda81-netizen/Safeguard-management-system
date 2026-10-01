@@ -20,6 +20,7 @@ import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { getPayrollRates } from '../utils/payrollSettings';
 import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
+import { resolvePaymentNetPay } from '../utils/paymentNetPay';
 import { getDefaultPageSize } from '../utils/uiSettings';
 
 // Shape of each row in the `payments` list -- built in fetchPaymentData below
@@ -266,6 +267,16 @@ export function PaymentsPage() {
       const paymentDataByEmployee = new Map((paymentData || []).map(p => [p.employee_id, p]));
       const merged = employeesWithPay.map(emp => {
         const existing = paymentDataByEmployee.get(emp.id);
+        // Finalized payroll is the single source of truth for payment --
+        // see resolvePaymentNetPay's own header for why this is no longer
+        // `existing?.net_pay ?? emp.net_pay` (that let a stale/older
+        // payment_status row silently override an approved payroll
+        // amount whenever one existed).
+        const resolved = resolvePaymentNetPay({
+          approvedPayrollNetPay: emp.net_pay_is_estimate ? undefined : emp.net_pay,
+          paymentStatusNetPay: existing?.net_pay,
+          liveEstimateNetPay: emp.net_pay,
+        });
         return {
           id: existing?.id || '',
           employee_id: emp.id,
@@ -277,8 +288,8 @@ export function PaymentsPage() {
           workstation: emp.workstation,
           pay_point: emp.pay_point,
           account_number: existing?.account_number || emp.account_number || '',
-          net_pay: existing?.net_pay ?? emp.net_pay,
-          net_pay_is_estimate: existing?.net_pay === undefined && emp.net_pay_is_estimate,
+          net_pay: resolved.netPay,
+          net_pay_is_estimate: resolved.netPayIsEstimate,
           status: existing?.status || 'pending',
           payment_date: existing?.payment_date || '',
           transaction_id: existing?.transaction_id || '',

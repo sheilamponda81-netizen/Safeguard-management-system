@@ -29,6 +29,7 @@ import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetc
 import { approvePayrollRun } from '../utils/payrollApproval';
 import { buildPayrollReportCsv } from '../utils/payrollExport';
 import { AttendanceCount, deriveAttendanceCountsState, isPreviewBlocked, hasAnyBlockedPreview } from '../utils/payrollAttendanceCounts';
+import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
 
 interface Employee {
   id: string;
@@ -386,15 +387,21 @@ export function PayrollPage() {
         historicalPayrollPromise = Promise.resolve(authorizedPayroll);
       } else {
         // ===== B: PREPARING / PREVIEWING A CURRENT OR FUTURE PAYROLL RUN =====
-        // Unchanged from before: driven by today's live, Active, region-
-        // scoped roster, since this is the population payroll can actually
-        // be prepared/processed against -- there is no "stored snapshot"
-        // to browse yet for a month that hasn't been (fully) processed.
+        // Driven by today's live, region-scoped roster, since this is the
+        // population payroll can actually be prepared/processed against --
+        // there is no "stored snapshot" to browse yet for a month that
+        // hasn't been (fully) processed. PAYABLE_EMPLOYEE_STATUSES
+        // (Active + On Leave) is a deliberate WHITELIST, not a loosened
+        // "any status" filter: an employee on APPROVED leave must still
+        // receive their pay (business rule), but this must not silently
+        // start including a future/other non-payable status (e.g.
+        // "Suspended") the moment it's added to the employees table --
+        // see src/utils/employeeStatus.ts.
         let employeesQuery = supabase
           .from('employees')
           .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id, company, workstation')
           .eq('is_deleted', false)
-          .eq('status', 'Active');
+          .in('status', PAYABLE_EMPLOYEE_STATUSES);
 
         if (!userProfile?.is_super_admin && userProfile?.region_id) {
           employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
