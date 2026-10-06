@@ -53,6 +53,22 @@ describe('buildRawEventInsertPayloads', () => {
     expect(payloads[0].authentication_result).toBe('Authorization');
   });
 
+  // Regression (2026-10-06): a genuine HikCentral export uses the literal
+  // "Authorized", not "Authorization" -- see hikcentralExcelParser.test.ts
+  // for the full real-file investigation. Since this function reuses the
+  // same isEligibleSuccessfulEvent the parser's summary uses, it must
+  // include an "Authorized" row too, with the value passed through
+  // verbatim (never rewritten to "Authorization").
+  it('includes an eligible successful event using the genuine "Authorized" literal, passed through verbatim', () => {
+    const rows = [
+      makeRow({ authenticationResult: 'Authorized', eventType: 'Access Granted by Fingerprint' }),
+      makeRow({ authenticationResult: 'Failed', eventType: 'Fingerprint Does Not Exist' }),
+    ];
+    const payloads = buildRawEventInsertPayloads(rows, 'excel');
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0].authentication_result).toBe('Authorized');
+  });
+
   it('tags every payload with the given source', () => {
     const payloads = buildRawEventInsertPayloads([makeRow()], 'excel');
     expect(payloads[0].source).toBe('excel');

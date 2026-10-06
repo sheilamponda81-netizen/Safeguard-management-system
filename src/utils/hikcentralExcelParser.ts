@@ -278,8 +278,16 @@ export interface HikCentralImportSummary {
 
 const SUCCESSFUL_EVENT_TYPE = 'Access Granted by Fingerprint';
 
+// A genuine HikCentral "Person Authentication Record" export (confirmed
+// against the real workbook's raw XML, not assumed) uses the literal
+// value "Authorized" for a successful Authentication Result -- never
+// "Authorization". Both are accepted here: "Authorized" for the real
+// export, "Authorization" kept for compatibility with the pre-existing
+// fixtures/tests this module was originally built and verified against.
+const SUCCESSFUL_AUTHENTICATION_RESULTS = new Set(['Authorized', 'Authorization']);
+
 export function isEligibleSuccessfulEvent(row: ParsedHikCentralRow): boolean {
-  return row.authenticationResult === 'Authorization' && row.eventType === SUCCESSFUL_EVENT_TYPE;
+  return SUCCESSFUL_AUTHENTICATION_RESULTS.has(row.authenticationResult) && row.eventType === SUCCESSFUL_EVENT_TYPE;
 }
 
 export function summarizeHikCentralParseResult(result: HikCentralParseResult): HikCentralImportSummary {

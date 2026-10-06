@@ -232,6 +232,84 @@ describe('parseHikCentralSheet', () => {
       ['Access Point', 'Attendance Type', 'Authentication Result', 'Card Reader', 'Event Type', 'First Name', 'Last Name', 'Person No.', 'Time'].sort()
     );
   });
+
+  // Regression coverage for a real production bug (2026-10-06): a genuine
+  // HikCentral "Person Authentication Record" export's Authentication
+  // Result column literally contains "Authorized", never "Authorization"
+  // -- confirmed against the real workbook's raw XML (every text cell is
+  // an inline string; the value "Authorization" does not appear anywhere
+  // in the sheet). The parser previously checked only for "Authorization",
+  // so every single row in a real export was misclassified as Failed
+  // (0 Authorization, 100% Failed, 0 for every Person-No.-derived stat)
+  // even though the file's own Access Point/Time/row-count columns were
+  // read correctly throughout -- see isEligibleSuccessfulEvent.
+  describe('real-world "Authorized" literal (2026-10-06 regression)', () => {
+    it('classifies a row with the genuine "Authorized" literal (not "Authorization") as eligible/successful', async () => {
+      const result = await parseRows([
+        ...METADATA_ROWS, HEADER_ROW,
+        dataRow({ personNo: '00000104', authResult: 'Authorized', eventType: 'Access Granted by Fingerprint' }),
+      ]);
+      expect(isEligibleSuccessfulEvent(result.rows[0])).toBe(true);
+      const summary = summarizeHikCentralParseResult(result);
+      expect(summary.authorizationCount).toBe(1);
+      expect(summary.failedCount).toBe(0);
+    });
+
+    it('still classifies the previously-assumed "Authorization" literal as eligible/successful (back-compat with pre-existing fixtures/tests)', async () => {
+      const result = await parseRows([...METADATA_ROWS, HEADER_ROW, dataRow({ authResult: 'Authorization' })]);
+      expect(isEligibleSuccessfulEvent(result.rows[0])).toBe(true);
+    });
+
+    it('keeps a "Failed" / "Fingerprint Does Not Exist" row classified as Failed, never matched by the "Authorized" fix', async () => {
+      const result = await parseRows([
+        ...METADATA_ROWS, HEADER_ROW,
+        dataRow({ personNo: null, authResult: 'Failed', eventType: 'Fingerprint Does Not Exist' }),
+      ]);
+      expect(isEligibleSuccessfulEvent(result.rows[0])).toBe(false);
+      const summary = summarizeHikCentralParseResult(result);
+      expect(summary.authorizationCount).toBe(0);
+      expect(summary.failedCount).toBe(1);
+    });
+
+    // Reproduces the real file's exact aggregate statistics at full scale,
+    // confirmed against the genuine uploaded workbook (349 rows; this
+    // test uses only synthetic names/IDs, per this file's existing
+    // no-real-employee-data convention -- see the header comment above).
+    it('reproduces the REAL "Authorized"-literal file\'s exact aggregate statistics: 349 rows / 223 Authorized / 126 Failed / 175 with Person No. (29 unique) among successful events', async () => {
+      const rows: XlsxRow[] = [];
+
+      // 175 successful, identified events across exactly 29 unique Person Nos.
+      for (let i = 0; i < 175; i++) {
+        const personNo = String(1 + (i % 29)).padStart(8, '0');
+        rows.push(dataRow({ personNo, authResult: 'Authorized' }));
+      }
+      // 48 successful events with no Person No. (card-granted access with
+      // no fingerprint-identified person -- the real file's "anonymous
+      // successful" rows).
+      for (let i = 0; i < 48; i++) {
+        rows.push(dataRow({ personNo: null, authResult: 'Authorized' }));
+      }
+      // 126 Failed events, all "Fingerprint Does Not Exist" with no
+      // Person No. -- matches the real file exactly (every Failed row in
+      // the genuine export has a blank Person No.).
+      for (let i = 0; i < 126; i++) {
+        rows.push(dataRow({ personNo: null, authResult: 'Failed', eventType: 'Fingerprint Does Not Exist' }));
+      }
+
+      expect(rows).toHaveLength(349);
+
+      const result = await parseRows([...METADATA_ROWS, HEADER_ROW, ...rows]);
+      const summary = summarizeHikCentralParseResult(result);
+
+      expect(summary.totalRows).toBe(349);
+      expect(summary.authorizationCount).toBe(223); // 175 + 48
+      expect(summary.failedCount).toBe(126);
+      expect(summary.withPersonNoCount).toBe(175);
+      expect(summary.withoutPersonNoCount).toBe(48); // among successful events only -- see hikcentralExcelParser.ts's isEligibleSuccessfulEvent/summarizeHikCentralParseResult
+      expect(summary.uniquePersonNoCount).toBe(29);
+      expect(summary.rowErrorCount).toBe(0);
+    });
+  });
 });
 
 describe('parseHikCentralTimeToUtcIso', () => {
