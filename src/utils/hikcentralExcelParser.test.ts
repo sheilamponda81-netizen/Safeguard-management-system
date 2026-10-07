@@ -81,6 +81,43 @@ describe('parseHikCentralSheet', () => {
     expect(result.rows[0].hikcentralPersonNo).not.toBe('174');
   });
 
+  // Regression (2026-10-07, Person Mapping schema-foundation audit): the
+  // real combined 4-terminal export contains distinct physical people
+  // whose Person Nos would collide if leading zeros were ever stripped
+  // or numerically normalized (confirmed on STAGING by name: these are
+  // NOT the same person). The parser must keep "00000018" and "18" (and
+  // similarly "00000021"/"21", "00000022"/"22") as byte-distinct strings
+  // -- never cast to a number, never zero-stripped/padded.
+  it('keeps "00000018" and "18" as distinct Person No. strings in the same file, never collapsing them (real distinct-people pair from the combined export)', async () => {
+    const result = await parseRows([
+      ...METADATA_ROWS, HEADER_ROW,
+      dataRow({ personNo: '00000018', firstName: 'PATRICK', lastName: 'KHAYANGA' }),
+      dataRow({ personNo: '18', firstName: 'PRECIOUS', lastName: 'DULA' }),
+    ]);
+    expect(result.rows).toHaveLength(2);
+    const personNos = result.rows.map((r) => r.hikcentralPersonNo);
+    expect(personNos).toEqual(['00000018', '18']);
+    expect(personNos[0]).not.toBe(personNos[1]);
+    const summary = summarizeHikCentralParseResult(result);
+    expect(summary.uniquePersonNoCount).toBe(2); // not silently collapsed to 1
+  });
+
+  it('keeps "00000021"/"21" and "00000022"/"22" as distinct Person No. strings (two more real distinct-people pairs)', async () => {
+    const result = await parseRows([
+      ...METADATA_ROWS, HEADER_ROW,
+      dataRow({ personNo: '00000021' }),
+      dataRow({ personNo: '21' }),
+      dataRow({ personNo: '00000022' }),
+      dataRow({ personNo: '22' }),
+    ]);
+    const personNos = result.rows.map((r) => r.hikcentralPersonNo);
+    expect(new Set(personNos).size).toBe(4); // all four remain distinct
+    expect(personNos).toContain('00000021');
+    expect(personNos).toContain('21');
+    expect(personNos).toContain('00000022');
+    expect(personNos).toContain('22');
+  });
+
   // 4. Africa/Blantyre timestamp interpretation
   it('interprets "2026-09-28 07:27:44" as Africa/Blantyre (UTC+02:00), not local/UTC', async () => {
     const result = await parseRows([...METADATA_ROWS, HEADER_ROW, dataRow({ time: '2026-09-28 07:27:44' })]);

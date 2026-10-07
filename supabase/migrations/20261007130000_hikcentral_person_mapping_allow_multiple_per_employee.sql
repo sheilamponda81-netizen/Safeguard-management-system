@@ -1,0 +1,114 @@
+-- ============================================================
+-- MIGRATION: HikCentral Attendance MVP -- Person Mapping schema
+-- foundation: allow one employee to have multiple active
+-- HikCentral identities
+-- Date: 2026-10-07
+-- ============================================================
+--
+-- CONTEXT
+-- -----------------------------------------------------------
+-- A read-only discovery audit of the 108 distinct HikCentral Person
+-- Nos observed in the real 886-event dataset (4 terminals, Oct 1-4)
+-- found:
+--   - No safe identifier bridge exists today between HikCentral Person
+--     No. and any Safeguard employee field (employee_number's format
+--     is structurally incompatible; guardId is 100% unpopulated; a
+--     superficially promising "employee_number numeric suffix"
+--     coincidence was tested and definitively disproven -- it agreed
+--     with name evidence in 0 of 45 testable cases).
+--   - HikCentral Person No. must be treated as an exact raw string,
+--     never numerically normalized: the real data already contains
+--     distinct physical people whose Person Nos would collide if
+--     leading zeros were stripped (00000018 != 18, 00000021 != 21,
+--     00000022 != 22, 00000200 != 200 -- each pair is a DIFFERENT real
+--     person, confirmed by name).
+--   - tenant_id + exact raw hikcentral_person_no is collision-free
+--     across all 886 real events today, but classified "probably safe,
+--     not proven globally" -- it is the identity key for THIS schema
+--     foundation, not a claim about every future HikCentral deployment.
+--   - A guard may legitimately be enrolled under more than one
+--     HikCentral Person No. (e.g. re-enrolled, or enrolled at more than
+--     one terminal under a different number) -- cardinality should be
+--     "one Person No. -> at most one employee" but "one employee -> may
+--     have multiple Person Nos", not 1:1 both ways.
+--
+-- THE FIX
+-- -----------------------------------------------------------
+-- The foundation migration's uq_hikcentral_person_mappings_active_employee
+-- unique index enforced 1:1 in BOTH directions, which is too strict for
+-- the cardinality above. This migration:
+--   1. DROPS that unique index.
+--   2. CREATES a plain (non-unique) index on the same columns
+--      (tenant_id, employee_id) WHERE is_active, preserving the
+--      existing query-performance characteristic (an active-mapping
+--      lookup by employee is still index-backed) without the
+--      uniqueness constraint.
+--
+-- uq_hikcentral_person_mappings_active_person (tenant_id,
+-- hikcentral_person_no) WHERE is_active is UNCHANGED -- a given exact
+-- Person No. can still have at most one ACTIVE employee mapping at a
+-- time, which remains the correct invariant per the verified decisions
+-- above.
+--
+-- Table has 0 rows on STAGING at the time of this migration (confirmed
+-- read-only before writing this file) -- this is a pure DDL change,
+-- no data is touched, no backfill is needed or performed.
+--
+-- WHAT THIS MIGRATION DELIBERATELY DOES NOT DO
+-- -----------------------------------------------------------
+-- - Does NOT edit any previously-applied migration in place.
+-- - Does NOT touch uq_hikcentral_person_mappings_active_person, the
+--   table's other columns, its CHECK constraint, its foreign keys, or
+--   its RLS policies -- none of those reference or depend on the
+--   employee-side uniqueness being removed here (every policy's
+--   USING/WITH CHECK clause is evaluated per-row via employee_id
+--   directly, e.g. employee_region_allowed(employee_id); none of them
+--   assume or require at-most-one-mapping-per-employee), so no RLS
+--   change is technically necessary and none is made.
+-- - Does NOT add any device/access-point scoping to the identity key.
+-- - Does NOT normalize, trim-to-equivalence, or numerically cast
+--   hikcentral_person_no anywhere -- it remains an exact raw string
+--   throughout the schema and this migration.
+-- - Does NOT create, update, or delete any row in
+--   hikcentral_person_mappings, hikcentral_raw_events,
+--   hikcentral_import_batches, employees, attendance, payroll,
+--   payment_status, or employee_deductions.
+-- - Does NOT build the mapping UI/service, create any real mapping, or
+--   process any of the 233 anonymous events -- out of scope for this
+--   schema-foundation step.
+--
+-- FUTURE COLLISION GUARDRAIL (documented here for the next phase, not
+-- implemented in this schema-only step -- no mapping-domain
+-- TypeScript/UI/service code exists yet in this codebase for it to
+-- naturally belong to)
+-- -----------------------------------------------------------
+-- Because tenant_id + exact raw hikcentral_person_no is "probably safe,
+-- not proven globally" rather than a guaranteed-unique physical
+-- identity, the upcoming mapping workflow (confirming/suggesting a
+-- Person No. -> employee mapping) MUST NOT silently treat an exact
+-- Person No. match as unquestionably clean identity evidence. Required
+-- behavior for that next phase:
+--   - Before suggesting or allowing confirmation of a mapping for a
+--     given hikcentral_person_no, the service must check whether that
+--     EXACT raw Person No. has been observed in hikcentral_raw_events
+--     with more than one distinct non-empty normalized name (the same
+--     check this schema-foundation audit ran manually: GROUP BY
+--     hikcentral_person_no, compare distinct (first_name, last_name)
+--     pairs after trim/case-normalization, ignoring blank names).
+--   - If conflicting non-empty names are found for the same exact
+--     Person No., the mapping candidate must be surfaced for explicit
+--     human review as a conflict (never silently auto-confirmed or
+--     auto-suggested as clean), and must NOT be resolved by inventing
+--     an access-point/device scoping key -- access-point scoping is
+--     explicitly rejected as a workaround for this.
+--   - This check is naturally a single pure function over already-
+--     queried raw-event rows (no new table/column required) and
+--     belongs in whatever mapping-suggestion service the next phase
+--     introduces, with its own focused tests at that time.
+-- ============================================================
+
+DROP INDEX IF EXISTS uq_hikcentral_person_mappings_active_employee;
+
+CREATE INDEX IF NOT EXISTS idx_hikcentral_person_mappings_active_employee
+  ON hikcentral_person_mappings (tenant_id, employee_id)
+  WHERE is_active;
