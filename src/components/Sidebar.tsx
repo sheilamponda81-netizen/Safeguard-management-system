@@ -5,7 +5,7 @@ import {
   Wallet,
   Calculator, ClipboardList,
   CalendarCheck, BarChart3, BookOpen,
-  Banknote, Fingerprint
+  Banknote, Fingerprint, UserCheck
 } from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
@@ -24,6 +24,7 @@ export type NavKey =
   | "recruitment"
   | "attendance"
   | "hikcentral-import"
+  | "hikcentral-mapping"
   | "payroll"
   | "payslips"
   | "payments"
@@ -45,6 +46,7 @@ const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "recruitment", label: "Recruitment", icon: ClipboardList },
   { id: "attendance", label: "Attendance", icon: CalendarCheck },
   { id: "hikcentral-import", label: "HikCentral Import", icon: Fingerprint },
+  { id: "hikcentral-mapping", label: "Person Mapping", icon: UserCheck },
   { id: "payroll", label: "Payroll", icon: Wallet },
   { id: "payslips", label: "Payslips", icon: FileText },
   { id: "payments", label: "Payments", icon: DollarSign },
@@ -62,6 +64,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "recruitment",
     "attendance",
     "hikcentral-import",
+    "hikcentral-mapping",
     "payroll",
     "payslips",
     "payments",
@@ -80,6 +83,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "recruitment",
     "attendance",
     "hikcentral-import",
+    "hikcentral-mapping",
     "payments",
     "terminal-dues",
     "salary-advances",
@@ -124,6 +128,7 @@ export const NAV_PERMISSIONS: Partial<Record<NavKey, PermissionKey[]>> = {
   recruitment: [PERMISSIONS.RECRUITMENT_VIEW],
   attendance: [PERMISSIONS.ATTENDANCE_VIEW],
   "hikcentral-import": [PERMISSIONS.ATTENDANCE_IMPORT_HIKCENTRAL],
+  "hikcentral-mapping": [PERMISSIONS.ATTENDANCE_MAP_HIKCENTRAL_PERSONS],
   payroll: [PERMISSIONS.PAYROLL_VIEW],
   payslips: [PERMISSIONS.PAYSLIPS_VIEW],
   payments: [PERMISSIONS.PAYMENTS_VIEW],
