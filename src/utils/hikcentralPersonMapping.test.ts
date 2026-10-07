@@ -197,7 +197,7 @@ describe('classifyHikCentralIdentities', () => {
 });
 
 describe('suggestEmployeesForIdentity (needs-review candidates -- suggestions only, never auto-mapped)', () => {
-  it('a single-letter spelling variation produces a useful "Possible match" suggestion (synthetic stand-in for the real AFIKI NJANJI / AFFICK NJANJI-class pattern observed in STAGING)', () => {
+  it('a 3-letter spelling drift with no competing candidate stays "Possible match", not "Strong" (synthetic stand-in for the real AFIKI NJANJI / AFFICK NJANJI-class pattern observed in STAGING)', () => {
     const profiles = profileHikCentralIdentities([row({ firstName: 'Afiki', lastName: 'Njanji' })]);
     const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Affick Njanji' })]);
     expect(suggestions).toHaveLength(1);
@@ -205,17 +205,90 @@ describe('suggestEmployeesForIdentity (needs-review candidates -- suggestions on
     expect(suggestions[0].employee.fullName).toBe('Affick Njanji');
   });
 
-  it('a one-character substitution produces a useful suggestion (synthetic stand-in for the real "canada"/"KANADA"-class pattern)', () => {
+  it('a one-character substitution with no competing candidate is a "Strong suggestion" (synthetic stand-in for the real "CANADA"/"KANADA"-class pattern)', () => {
     const profiles = profileHikCentralIdentities([row({ firstName: 'Steven', lastName: 'Canada' })]);
     const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Steven Kanada' })]);
-    expect(suggestions.length).toBeGreaterThan(0);
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0].label).toBe('Strong suggestion');
+  });
+
+  it('the SAME one-character substitution is demoted to "Possible match" once a second, similarly-scoring employee competes for it -- a strong suggestion requires clear separation from alternatives, not just a good score', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'Steven', lastName: 'Canada' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [
+      employee({ id: 'e1', fullName: 'Steven Kanada' }),
+      employee({ id: 'e2', fullName: 'Steven Banada' }), // same edit distance from "Canada" as "Kanada"
+    ]);
+    expect(suggestions.every((s) => s.label === 'Possible match')).toBe(true);
+  });
+
+  it('an inserted/dropped letter with no competing candidate is a "Strong suggestion" (synthetic stand-in for the real "MIKSON"/"MICKSON"-class pattern)', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'Wyson', lastName: 'Mikson' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Wyson Mickson' })]);
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0].label).toBe('Strong suggestion');
+  });
+
+  it('reordered name tokens plus a spelling variant still produce a "Strong suggestion" (synthetic stand-in for the real "ELLIAS SEMU MAKUNGWA" / "SEMU ELIAS MAKUNGWA" token-order pattern)', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'Ellias', lastName: 'Semu Tokola' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Semu Elias Tokola' })]);
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0].label).toBe('Strong suggestion');
+  });
+
+  it('exactly reordered tokens (no spelling variant at all) are a "Strong suggestion" regardless of which token comes first', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'First', lastName: 'Middle Last' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Middle First Last' })]);
+    expect(suggestions[0].label).toBe('Strong suggestion');
+  });
+
+  it('an employee record with an extra middle name the HikCentral capture omits is still a "Strong suggestion" -- the optional extra token is forgiven, not penalized', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'John', lastName: 'Banda' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'John K Banda' })]);
+    expect(suggestions[0].label).toBe('Strong suggestion');
+  });
+
+  it('a HikCentral capture with an extra middle initial the employee record omits is still a "Strong suggestion" -- same forgiveness in the other direction', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'John K', lastName: 'Banda' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'John Banda' })]);
+    expect(suggestions[0].label).toBe('Strong suggestion');
+  });
+
+  it('a single-token identity name ("Ted"-class) is capped at "Possible match" even against a PERFECT single-token candidate -- one matched token is never enough evidence for "Strong"', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'Ted', lastName: '' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Ted' })]);
+    expect(suggestions).toHaveLength(1);
     expect(suggestions[0].label).toBe('Possible match');
   });
 
-  it('an inserted/dropped letter produces a useful suggestion (synthetic stand-in for the real "MIKSON"/"MICKSON"-class pattern)', () => {
-    const profiles = profileHikCentralIdentities([row({ firstName: 'Wyson', lastName: 'Mikson' })]);
-    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Wyson Mickson' })]);
+  it('a single-token identity name with NO sufficiently close candidate produces NO suggestion at all -- weak fuzzy similarity must never manufacture a confident match for a bare name like "Ted"', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'Ted', lastName: '' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Bartholomew Ndhlovu' })]);
+    expect(suggestions).toEqual([]);
+  });
+
+  it('two candidates with materially different but near-tied scores ("JAMES PHIRE" vs "JAMES PHIRO" for "JAMES PHIRI") both stay "Possible match" -- genuine ambiguity between real competing employees must never be force-resolved into one confident pick', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'James', lastName: 'Phiri' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [
+      employee({ id: 'e1', fullName: 'James Phire' }),
+      employee({ id: 'e2', fullName: 'James Phiro' }),
+    ]);
     expect(suggestions.length).toBeGreaterThan(0);
+    expect(suggestions.every((s) => s.label === 'Possible match')).toBe(true);
+  });
+
+  it('a surname-only match (shared last name, unrelated first name) never clears "Strong" -- matching only one of two informative tokens is insufficient evidence', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'Dave', lastName: 'Chisale' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Godwin Chisale' })]);
+    expect(suggestions[0].label).toBe('Possible match');
+  });
+
+  it('at most one suggestion is ever labeled "Strong suggestion" -- runner-up candidates are always "Possible match"', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'Wyson', lastName: 'Mikson' })]);
+    const suggestions = suggestEmployeesForIdentity(profiles[0], [
+      employee({ id: 'e1', fullName: 'Wyson Mickson' }),
+      employee({ id: 'e2', fullName: 'Wyson Major' }),
+    ]);
+    expect(suggestions.filter((s) => s.label === 'Strong suggestion')).toHaveLength(1);
   });
 
   it('returns at most 3 candidates, ranked best-first', () => {
@@ -255,6 +328,40 @@ describe('suggestEmployeesForIdentity (needs-review candidates -- suggestions on
     const profiles = profileHikCentralIdentities([row({ firstName: 'Afiki', lastName: 'Njanji' })]);
     const suggestions = suggestEmployeesForIdentity(profiles[0], [employee({ fullName: 'Affick Njanji' })]);
     expect(Object.keys(suggestions[0]).sort()).toEqual(['employee', 'label']);
+  });
+
+  it('a leading-zero Person No. and its bare numeric look-alike score their suggestions completely independently -- the suggestion algorithm only ever sees already-grouped profile data, never the raw Person No. string itself', () => {
+    const profiles = profileHikCentralIdentities([
+      row({ hikcentralPersonNo: '00000013', firstName: 'Wyson', lastName: 'Mikson' }),
+      row({ hikcentralPersonNo: '13', firstName: 'Completely', lastName: 'Different' }),
+    ]);
+    const employees = [employee({ fullName: 'Wyson Mickson' })];
+    const byPersonNo = new Map(profiles.map((p) => [p.hikcentralPersonNo, p]));
+    const leadingZeroSuggestions = suggestEmployeesForIdentity(byPersonNo.get('00000013')!, employees);
+    const bareSuggestions = suggestEmployeesForIdentity(byPersonNo.get('13')!, employees);
+    expect(leadingZeroSuggestions[0].label).toBe('Strong suggestion');
+    expect(bareSuggestions).toEqual([]);
+  });
+});
+
+describe('classifyHikCentralIdentities integration: a Strong suggestion never bypasses human confirmation', () => {
+  it('a close-but-not-byte-identical name match stays "needs_review" (never silently promoted to "exact"), even when its top suggestion is "Strong suggestion"', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'Wyson', lastName: 'Mikson' })]);
+    const result = classifyHikCentralIdentities(profiles, [employee({ fullName: 'Wyson Mickson' })], []);
+    expect(result[0].category).toBe('needs_review');
+    expect(result[0].matchedEmployee).toBeNull();
+    expect(result[0].suggestions[0].label).toBe('Strong suggestion');
+  });
+
+  it('an ambiguous pair of ties stays "needs_review" with only "Possible match" suggestions -- classification never collapses real ambiguity into a single confident pick', () => {
+    const profiles = profileHikCentralIdentities([row({ firstName: 'James', lastName: 'Phiri' })]);
+    const result = classifyHikCentralIdentities(
+      profiles,
+      [employee({ id: 'e1', fullName: 'James Phire' }), employee({ id: 'e2', fullName: 'James Phiro' })],
+      []
+    );
+    expect(result[0].category).toBe('needs_review');
+    expect(result[0].suggestions.every((s) => s.label === 'Possible match')).toBe(true);
   });
 });
 

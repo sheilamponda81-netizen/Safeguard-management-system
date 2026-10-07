@@ -46,6 +46,7 @@ export default function HikCentralPersonMappingPage() {
 
   const [activeTab, setActiveTab] = useState<TabId>('exact');
   const [selectedExact, setSelectedExact] = useState<Set<string>>(new Set());
+  const [selectedStrongReview, setSelectedStrongReview] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState(false);
 
   // Shared employee-picker modal, used both for a "needs review" manual
@@ -98,6 +99,18 @@ export default function HikCentralPersonMappingPage() {
   const mapped = useMemo(() => identities.filter((i) => i.category === 'mapped'), [identities]);
   const conflicts = useMemo(() => identities.filter((i) => i.category === 'conflict'), [identities]);
 
+  // Needs Review identities whose TOP suggestion clears the "Strong
+  // suggestion" bar -- see suggestEmployeesForIdentity()'s classification
+  // in hikcentralPersonMapping.ts for the multi-signal rules (name
+  // similarity, token-order-independent alignment, minimum evidence, and a
+  // separation/margin check against the next-best candidate). At most one
+  // suggestion per identity can ever be "Strong", so the employee to
+  // confirm for bulk purposes is always suggestions[0].
+  const strongReviewIdentities = useMemo(
+    () => needsReview.filter((i) => i.suggestions[0]?.label === 'Strong suggestion'),
+    [needsReview]
+  );
+
   useEffect(() => {
     // Drop any selection that no longer corresponds to a currently-listed
     // exact match (e.g. after a reload following a confirmation).
@@ -107,6 +120,17 @@ export default function HikCentralPersonMappingPage() {
       return next.size === prev.size ? prev : next;
     });
   }, [exactMatches]);
+
+  useEffect(() => {
+    // Same pruning for strong-suggestion selections -- a confirmation,
+    // reload, or a suggestion that no longer clears the Strong bar must
+    // never leave a stale selection sitting in the bulk-confirm set.
+    setSelectedStrongReview((prev) => {
+      const validPersonNos = new Set(strongReviewIdentities.map((i) => i.profile.hikcentralPersonNo));
+      const next = new Set(Array.from(prev).filter((p) => validPersonNos.has(p)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [strongReviewIdentities]);
 
   const toggleSelected = useCallback((personNo: string) => {
     setSelectedExact((prev) => {
@@ -148,6 +172,49 @@ export default function HikCentralPersonMappingPage() {
       setConfirming(false);
     }
   }, [exactMatches, selectedExact, loadData]);
+
+  const toggleStrongReviewSelected = useCallback((personNo: string) => {
+    setSelectedStrongReview((prev) => {
+      const next = new Set(prev);
+      if (next.has(personNo)) next.delete(personNo);
+      else next.add(personNo);
+      return next;
+    });
+  }, []);
+
+  const toggleSelectAllStrongReview = useCallback(() => {
+    setSelectedStrongReview((prev) =>
+      prev.size === strongReviewIdentities.length
+        ? new Set()
+        : new Set(strongReviewIdentities.map((i) => i.profile.hikcentralPersonNo))
+    );
+  }, [strongReviewIdentities]);
+
+  const handleConfirmSelectedStrongReview = useCallback(async () => {
+    const toConfirm = strongReviewIdentities.filter((i) => selectedStrongReview.has(i.profile.hikcentralPersonNo));
+    if (toConfirm.length === 0) return;
+    setConfirming(true);
+    try {
+      const payload: MappingConfirmationInput[] = toConfirm.map((i) => ({
+        hikcentralPersonNo: i.profile.hikcentralPersonNo,
+        employeeId: i.suggestions[0].employee.id,
+        matchMethod: 'suggested_name',
+      }));
+      const result = await confirmHikCentralPersonMappings(payload);
+      if (result.success) {
+        showNotification(
+          `Confirmed ${result.confirmedCount} mapping(s).${result.alreadyMappedCount ? ` ${result.alreadyMappedCount} were already mapped.` : ''}`,
+          'success'
+        );
+        setSelectedStrongReview(new Set());
+        await loadData();
+      } else {
+        showNotification(result.error || 'Could not confirm mappings.', 'error');
+      }
+    } finally {
+      setConfirming(false);
+    }
+  }, [strongReviewIdentities, selectedStrongReview, loadData]);
 
   const confirmOne = useCallback(
     async (personNo: string, employeeId: string, matchMethod: 'manual' | 'suggested_name', successMessage: string) => {
@@ -323,43 +390,88 @@ export default function HikCentralPersonMappingPage() {
           <EmptyState icon={Search} title="Nothing needs review" description="Every remaining identity is either already mapped, an exact match, or blocked as a conflict." />
         ) : (
           <div className="space-y-3">
-            {needsReview.map((i) => (
-              <Card key={i.profile.hikcentralPersonNo} className="p-5">
-                <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
-                  <div>
-                    <p className="font-semibold text-slate-800">{displayName(i.profile)}</p>
-                    <p className="text-xs text-slate-500 font-mono mt-0.5">Person No. {i.profile.hikcentralPersonNo}</p>
-                    <p className="text-xs text-slate-500 mt-1">
-                      {i.profile.eventCount} event(s) &middot; <Badge color="gray" className="ml-1">{i.profile.accessPoints.join(', ') || '—'}</Badge>
-                    </p>
+            <p className="text-sm text-slate-600">
+              {strongReviewIdentities.length} strong suggestion{strongReviewIdentities.length === 1 ? '' : 's'} ready for bulk confirmation &middot;{' '}
+              {needsReview.length - strongReviewIdentities.length} other identit{needsReview.length - strongReviewIdentities.length === 1 ? 'y needs' : 'ies need'} individual review.
+            </p>
+            {canMap && strongReviewIdentities.length > 0 && (
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+                <label className="flex items-center gap-2 text-sm text-emerald-800">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all strong suggestions"
+                    checked={selectedStrongReview.size === strongReviewIdentities.length && strongReviewIdentities.length > 0}
+                    onChange={toggleSelectAllStrongReview}
+                  />
+                  Select all strong suggestions ({selectedStrongReview.size} of {strongReviewIdentities.length} selected)
+                </label>
+                <Button onClick={handleConfirmSelectedStrongReview} disabled={confirming || selectedStrongReview.size === 0}>
+                  {confirming ? 'Confirming...' : `Confirm Selected Strong Suggestions (${selectedStrongReview.size})`}
+                </Button>
+              </div>
+            )}
+            {needsReview.map((i) => {
+              const topIsStrong = i.suggestions[0]?.label === 'Strong suggestion';
+              const otherSuggestions = topIsStrong ? i.suggestions.slice(1) : i.suggestions;
+              return (
+                <Card key={i.profile.hikcentralPersonNo} className="p-5">
+                  <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-800">{displayName(i.profile)}</p>
+                      <p className="text-xs text-slate-500 font-mono mt-0.5">Person No. {i.profile.hikcentralPersonNo}</p>
+                      <p className="text-xs text-slate-500 mt-1">
+                        {i.profile.eventCount} event(s) &middot; <Badge color="gray" className="ml-1">{i.profile.accessPoints.join(', ') || '—'}</Badge>
+                      </p>
+                    </div>
+                    {canMap && (
+                      <Button variant="outline" size="sm" onClick={() => { setPickerFor(i.profile); setPickerIsRemap(false); setPickerQuery(''); }}>
+                        <Search size={14} /> Search Employee
+                      </Button>
+                    )}
                   </div>
-                  {canMap && (
-                    <Button variant="outline" size="sm" onClick={() => { setPickerFor(i.profile); setPickerIsRemap(false); setPickerQuery(''); }}>
-                      <Search size={14} /> Search Employee
-                    </Button>
+
+                  {topIsStrong && (
+                    <div className="mt-4 flex items-center gap-3 p-3 rounded-lg border border-emerald-300 bg-emerald-50">
+                      {canMap && (
+                        <input
+                          type="checkbox"
+                          aria-label={`Select strong suggestion for Person No ${i.profile.hikcentralPersonNo}`}
+                          checked={selectedStrongReview.has(i.profile.hikcentralPersonNo)}
+                          onChange={() => toggleStrongReviewSelected(i.profile.hikcentralPersonNo)}
+                        />
+                      )}
+                      <div className="flex-1">
+                        <span className="block text-sm font-medium text-slate-800">{i.suggestions[0].employee.fullName}</span>
+                        <span className="block text-xs text-slate-500">{i.suggestions[0].employee.employeeNumber} &middot; {i.suggestions[0].employee.workstation || '—'}</span>
+                      </div>
+                      <Badge color="green">Strong suggestion</Badge>
+                    </div>
                   )}
-                </div>
-                {i.suggestions.length > 0 ? (
-                  <div className="mt-4 flex flex-wrap gap-2">
-                    {i.suggestions.map((s) => (
-                      <button
-                        key={s.employee.id}
-                        type="button"
-                        disabled={!canMap || confirming}
-                        onClick={() => handlePickSuggestion(i.profile.hikcentralPersonNo, s.employee.id)}
-                        className="text-left p-3 rounded-lg border border-slate-200 hover:border-[#081C3A]/40 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-                      >
-                        <span className="block text-sm font-medium text-slate-800">{s.employee.fullName}</span>
-                        <span className="block text-xs text-slate-500">{s.employee.employeeNumber} &middot; {s.employee.workstation || '—'}</span>
-                        <Badge color={s.label === 'Exact name' ? 'green' : 'gold'} className="mt-1">{s.label}</Badge>
-                      </button>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-xs text-slate-400 mt-3">No strong suggestion found -- use Search Employee above.</p>
-                )}
-              </Card>
-            ))}
+
+                  {otherSuggestions.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {otherSuggestions.map((s) => (
+                        <button
+                          key={s.employee.id}
+                          type="button"
+                          disabled={!canMap || confirming}
+                          onClick={() => handlePickSuggestion(i.profile.hikcentralPersonNo, s.employee.id)}
+                          className="text-left p-3 rounded-lg border border-slate-200 hover:border-[#081C3A]/40 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                          <span className="block text-sm font-medium text-slate-800">{s.employee.fullName}</span>
+                          <span className="block text-xs text-slate-500">{s.employee.employeeNumber} &middot; {s.employee.workstation || '—'}</span>
+                          <Badge color="gold" className="mt-1">{s.label}</Badge>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {i.suggestions.length === 0 && (
+                    <p className="text-xs text-slate-400 mt-3">No strong suggestion found -- use Search Employee above.</p>
+                  )}
+                </Card>
+              );
+            })}
           </div>
         )
       )}

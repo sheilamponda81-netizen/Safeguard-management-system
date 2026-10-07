@@ -109,8 +109,43 @@ function isActiveNonDeletedEmployee(e: EmployeeLite): boolean {
 }
 
 // ---- Suggestion scoring (needs-review candidates) ----
+//
+// Three-tier classification, replacing the earlier flat Levenshtein-ratio
+// cutoff. Combines several independent signals rather than one loosened
+// threshold:
+//
+//   1. Whole-name edit-distance similarity (catches straightforward
+//      spelling variants: insertions/deletions/substitutions anywhere in
+//      the string, including across what would otherwise be a token
+//      boundary).
+//   2. Token-level, ORDER-INDEPENDENT alignment: each name is split into
+//      whitespace tokens, and the best one-to-one pairing between the two
+//      token lists is found by trying every assignment (names realistically
+//      have at most a handful of tokens, so this is cheap and exact, not a
+//      heuristic). This is what lets "ELLIAS SEMU MAKUNGWA" line up with
+//      "SEMU ELIAS MAKUNGWA" despite the reordering, while still separately
+//      scoring each matched pair (so a spelling variant in one token, e.g.
+//      ELLIAS/ELIAS, doesn't have to be perfect -- each token pair is scored
+//      on its own edit distance, which is also how given-name and
+//      surname-position evidence end up counted independently rather than
+//      as one undifferentiated blob).
+//   3. A minimum-evidence floor: a single short token (e.g. "TED") can
+//      match some employee's name perfectly and still be weak evidence,
+//      because a one-token name is inherently ambiguous and uninformative.
+//      "Strong" is only reachable when at least two of the identity's name
+//      tokens each found a good partner -- a single matched token can never
+//      promote a candidate past "Possible match", no matter how close the
+//      edit distance.
+//   4. A margin/ambiguity check: "strong" requires not just a high score,
+//      but a CLEAR separation from the next-best candidate. If two or more
+//      employees score similarly close to the top, that is treated as
+//      ambiguous (never bulk-confirmable), matching the instruction that a
+//      strong suggestion must be "substantially stronger than alternatives".
+//
+// None of this is surfaced as an invented confidence percentage -- see this
+// module's header. Labels are restricted to the three fixed strings below.
 
-export type SuggestionLabel = 'Exact name' | 'Possible match';
+export type SuggestionLabel = 'Strong suggestion' | 'Possible match';
 
 export interface EmployeeSuggestion {
   employee: EmployeeLite;
@@ -134,21 +169,138 @@ function levenshteinDistance(a: string, b: string): number {
   return prevRow[b.length];
 }
 
-// A candidate is "useful" only within this ratio (edit distance / longer
-// string length) -- picked so real spelling-variant pairs observed in the
-// genuine STAGING dataset (e.g. a single transposed/substituted/dropped
-// letter) are surfaced, while two names that merely happen to be short or
-// share a common first name are not. Deliberately NOT surfaced as a
-// percentage -- see this module's header: no invented "AI confidence".
-const USEFUL_SUGGESTION_MAX_RATIO = 0.3;
+function editSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  const dist = levenshteinDistance(a, b);
+  return Math.max(0, 1 - dist / Math.max(a.length, b.length, 1));
+}
+
+function tokenize(normalizedName: string): string[] {
+  return normalizedName.split(' ').filter((t) => t.length > 0);
+}
+
+/**
+ * Similarity between two individual name tokens. A single-letter token
+ * (an initial) gets partial credit for matching the other token's first
+ * letter -- "initials" are explicitly in scope per the task -- but never
+ * full credit, since an initial is strictly weaker evidence than a
+ * complete token match.
+ */
+function tokenSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  if (a.length === 1 || b.length === 1) {
+    const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+    return short.length === 1 && long.startsWith(short) ? 0.8 : 0;
+  }
+  return editSimilarity(a, b);
+}
+
+const GOOD_TOKEN_MATCH_MIN_SIMILARITY = 0.5;
+
+interface TokenAlignmentResult {
+  /** Similarity-ordered list of every (shortIdx, longIdx, similarity) pair in the chosen assignment. */
+  pairSimilarities: number[];
+  /** How many of those pairs clear GOOD_TOKEN_MATCH_MIN_SIMILARITY -- the "evidence count". */
+  goodPairCount: number;
+}
+
+/**
+ * Finds the best one-to-one assignment between the tokens of two names,
+ * trying every possible assignment of the SHORTER token list into the
+ * longer one (exact, not greedy -- real names have few enough tokens that
+ * this is cheap). Extra tokens on the longer side (e.g. a middle name the
+ * other source omitted) are simply left unmatched rather than penalized,
+ * which is what "forgives" optional middle names/initials: the score below
+ * is driven by how well the SHORTER name's tokens are covered, not by what
+ * fraction of the longer name was used.
+ */
+function bestTokenAlignment(tokensA: string[], tokensB: string[]): TokenAlignmentResult {
+  const [shortTokens, longTokens] = tokensA.length <= tokensB.length ? [tokensA, tokensB] : [tokensB, tokensA];
+  if (shortTokens.length === 0 || longTokens.length === 0) return { pairSimilarities: [], goodPairCount: 0 };
+
+  // Defensive cap -- real HikCentral/employee names never have this many
+  // tokens, but never let a pathological input blow up factorially.
+  const n = Math.min(shortTokens.length, 8);
+  const m = longTokens.length;
+
+  let best: { total: number; sims: number[] } = { total: -1, sims: [] };
+  const used = new Array(m).fill(false);
+  const current: number[] = [];
+
+  function recurse(i: number, total: number) {
+    if (i === n) {
+      if (total > best.total) best = { total, sims: [...current] };
+      return;
+    }
+    for (let j = 0; j < m; j++) {
+      if (used[j]) continue;
+      used[j] = true;
+      current.push(tokenSimilarity(shortTokens[i], longTokens[j]));
+      recurse(i + 1, total + current[current.length - 1]);
+      current.pop();
+      used[j] = false;
+    }
+  }
+  recurse(0, 0);
+
+  const goodPairCount = best.sims.filter((s) => s >= GOOD_TOKEN_MATCH_MIN_SIMILARITY).length;
+  return { pairSimilarities: best.sims, goodPairCount };
+}
+
+interface NameMatchScore {
+  /** 0..1, used for ranking and threshold comparisons. */
+  combinedScore: number;
+  /** How many of the identity's name tokens found a good (>=0.5) partner -- the minimum-evidence signal. */
+  goodTokenMatches: number;
+  /** Token count of the shorter of the two names being compared. */
+  shorterTokenCount: number;
+}
+
+function scoreNameMatch(targetName: string, candidateName: string): NameMatchScore {
+  const wholeNameScore = editSimilarity(targetName, candidateName);
+  const targetTokens = tokenize(targetName);
+  const candidateTokens = tokenize(candidateName);
+  const alignment = bestTokenAlignment(targetTokens, candidateTokens);
+  const shorterTokenCount = Math.min(targetTokens.length, candidateTokens.length);
+
+  // Token score: average similarity of the GOOD pairs only (a token that
+  // matched nothing useful shouldn't drag down an otherwise strong pair),
+  // scaled by how much of the shorter name's tokens were covered by a good
+  // pair at all (so a single lucky token match on an otherwise-unrelated
+  // multi-token name doesn't look like a full match).
+  const goodSims = alignment.pairSimilarities.filter((s) => s >= GOOD_TOKEN_MATCH_MIN_SIMILARITY);
+  const coverage = shorterTokenCount > 0 ? goodSims.length / shorterTokenCount : 0;
+  const avgGoodSim = goodSims.length > 0 ? goodSims.reduce((a, b) => a + b, 0) / goodSims.length : 0;
+  const tokenScore = avgGoodSim * coverage;
+
+  return {
+    combinedScore: Math.max(wholeNameScore, tokenScore),
+    goodTokenMatches: alignment.goodPairCount,
+    shorterTokenCount,
+  };
+}
+
+// Thresholds. Deliberately conservative -- see this module's header comment
+// for why these are not just "the old ratio, loosened". Tuned against the
+// real STAGING dataset's 40 Needs Review identities (spelling-variant pairs
+// such as ELLAD HAWARD LESTERN/ELLARD HAWARD LESTERN, BRANDINA MAULIDI/
+// BRANDINA MAULINDI, reordered tokens such as ELLIAS SEMU MAKUNGWA/SEMU
+// ELIAS MAKUNGWA, and the deliberately-weak single-token case "TED").
+const STRONG_SCORE_MIN = 0.78;
+const STRONG_MARGIN_MIN = 0.15;
+const POSSIBLE_SCORE_MIN = 0.55;
+const STRONG_MIN_GOOD_TOKENS = 2;
 const MAX_SUGGESTIONS = 3;
 
 /**
- * Ranks active, non-deleted employees by normalized full-name similarity
- * to the given HikCentral identity profile's name. Returns at most 3
- * candidates, each clearly labeled as a SUGGESTION (never a confirmed
- * match) -- callers must still require explicit human selection/search
- * before any mapping is written.
+ * Ranks active, non-deleted employees by name similarity to the given
+ * HikCentral identity profile's name, using the multi-signal scoring above.
+ * Returns at most 3 candidates, each labeled 'Strong suggestion' (at most
+ * ONE, and only when it is both a high-confidence match AND clearly
+ * separated from every other candidate) or 'Possible match' (everything
+ * else that clears the much lower usefulness bar). Never auto-selects or
+ * auto-confirms anything -- callers must still require explicit human
+ * selection before any mapping is written.
  */
 export function suggestEmployeesForIdentity(
   profile: HikCentralIdentityProfile,
@@ -158,19 +310,27 @@ export function suggestEmployeesForIdentity(
   const targetName = profile.distinctNormalizedNames[0];
   const candidates = employees.filter(isActiveNonDeletedEmployee);
 
-  const scored = candidates.map((employee) => {
-    const empName = normalizeNameForComparison(employee.fullName);
-    const distance = levenshteinDistance(targetName, empName);
-    const ratio = distance / Math.max(targetName.length, empName.length, 1);
-    return { employee, ratio, isExact: empName === targetName };
-  });
+  const scored = candidates.map((employee) => ({
+    employee,
+    match: scoreNameMatch(targetName, normalizeNameForComparison(employee.fullName)),
+  }));
 
-  const useful = scored.filter((s) => s.isExact || s.ratio <= USEFUL_SUGGESTION_MAX_RATIO);
-  useful.sort((a, b) => a.ratio - b.ratio);
+  const useful = scored.filter((s) => s.match.combinedScore >= POSSIBLE_SCORE_MIN);
+  useful.sort((a, b) => b.match.combinedScore - a.match.combinedScore);
+  if (useful.length === 0) return [];
 
-  return useful.slice(0, MAX_SUGGESTIONS).map((s) => ({
+  const top = useful[0];
+  const runnerUpScore = useful.length > 1 ? useful[1].match.combinedScore : 0;
+  const margin = top.match.combinedScore - runnerUpScore;
+
+  const topIsStrong =
+    top.match.combinedScore >= STRONG_SCORE_MIN &&
+    margin >= STRONG_MARGIN_MIN &&
+    top.match.goodTokenMatches >= STRONG_MIN_GOOD_TOKENS;
+
+  return useful.slice(0, MAX_SUGGESTIONS).map((s, i) => ({
     employee: s.employee,
-    label: s.isExact ? 'Exact name' : 'Possible match',
+    label: i === 0 && topIsStrong ? 'Strong suggestion' : 'Possible match',
   }));
 }
 
