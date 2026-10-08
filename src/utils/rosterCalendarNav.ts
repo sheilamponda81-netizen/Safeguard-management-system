@@ -125,7 +125,14 @@ export function formatDayHeading(date: string): string {
   return `${WEEKDAY_SHORT[weekdayOf(date)]} ${String(d).padStart(2, '0')} ${MONTH_SHORT[m - 1]}`;
 }
 
-/** The heading for the currently displayed period, always including the year, e.g. "October 2026" or "5 -- 11 Oct 2026". */
+// En dash (U+2013), not a double hyphen -- the correct typographic
+// separator for a date/number range, matching how every other range in
+// this UI (e.g. "Showing 1-50 of 200") should eventually read, and the
+// one this function's own callers render directly with no further
+// transformation.
+const RANGE_SEPARATOR = '–';
+
+/** The heading for the currently displayed period, always including the year, e.g. "October 2026" or "5 – 11 Oct 2026". */
 export function formatPeriodHeading(viewMode: CalendarViewMode, dateFrom: string, dateTo: string): string {
   const [fy, fm, fd] = dateFrom.split('-').map(Number);
   const [ty, tm, td] = dateTo.split('-').map(Number);
@@ -134,12 +141,12 @@ export function formatPeriodHeading(viewMode: CalendarViewMode, dateFrom: string
     return `${MONTH_FULL[fm - 1]} ${fy}`;
   }
   if (fy === ty && fm === tm) {
-    return `${fd} -- ${td} ${MONTH_SHORT[fm - 1]} ${fy}`;
+    return `${fd} ${RANGE_SEPARATOR} ${td} ${MONTH_SHORT[fm - 1]} ${fy}`;
   }
   if (fy === ty) {
-    return `${fd} ${MONTH_SHORT[fm - 1]} -- ${td} ${MONTH_SHORT[tm - 1]} ${fy}`;
+    return `${fd} ${MONTH_SHORT[fm - 1]} ${RANGE_SEPARATOR} ${td} ${MONTH_SHORT[tm - 1]} ${fy}`;
   }
-  return `${fd} ${MONTH_SHORT[fm - 1]} ${fy} -- ${td} ${MONTH_SHORT[tm - 1]} ${ty}`;
+  return `${fd} ${MONTH_SHORT[fm - 1]} ${fy} ${RANGE_SEPARATOR} ${td} ${MONTH_SHORT[tm - 1]} ${ty}`;
 }
 
 /** The only validity rule for an independently-editable From/To pair: the range must not be inverted. */

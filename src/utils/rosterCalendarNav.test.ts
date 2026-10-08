@@ -161,21 +161,27 @@ describe('formatDayHeading (replaces the ambiguous raw "MM-DD" slice)', () => {
   });
 });
 
-describe('formatPeriodHeading (always includes the year)', () => {
+describe('formatPeriodHeading (always includes the year, and never the ambiguous double-hyphen "--" as a range separator)', () => {
   it('month view shows the full month name and year', () => {
     expect(formatPeriodHeading('month', '2026-10-01', '2026-10-31')).toBe('October 2026');
   });
 
-  it('week view within a single month shows a compact day range with one month/year', () => {
-    expect(formatPeriodHeading('week', '2026-10-05', '2026-10-11')).toBe('5 -- 11 Oct 2026');
+  it('week view within a single month shows a compact day range with one month/year, separated by an en dash', () => {
+    expect(formatPeriodHeading('week', '2026-10-05', '2026-10-11')).toBe('5 – 11 Oct 2026');
   });
 
-  it('a range spanning two months in the same year names both months once each, with the year once', () => {
-    expect(formatPeriodHeading('custom', '2026-10-29', '2026-11-04')).toBe('29 Oct -- 4 Nov 2026');
+  it('a range spanning two months in the same year names both months once each, with the year once, separated by an en dash', () => {
+    expect(formatPeriodHeading('custom', '2026-10-29', '2026-11-04')).toBe('29 Oct – 4 Nov 2026');
   });
 
-  it('a range spanning two different years names both years', () => {
-    expect(formatPeriodHeading('custom', '2026-12-29', '2027-01-04')).toBe('29 Dec 2026 -- 4 Jan 2027');
+  it('a range spanning two different years names both years, separated by an en dash', () => {
+    expect(formatPeriodHeading('custom', '2026-12-29', '2027-01-04')).toBe('29 Dec 2026 – 4 Jan 2027');
+  });
+
+  it('never produces the old double-hyphen "--" separator, for any range shape', () => {
+    expect(formatPeriodHeading('week', '2026-10-05', '2026-10-11')).not.toContain('--');
+    expect(formatPeriodHeading('custom', '2026-10-29', '2026-11-04')).not.toContain('--');
+    expect(formatPeriodHeading('custom', '2026-12-29', '2027-01-04')).not.toContain('--');
   });
 });
 

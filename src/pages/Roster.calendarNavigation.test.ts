@@ -100,3 +100,63 @@ describe('Roster calendar navigation: no handler ever calls a roster write RPC',
     }
   });
 });
+
+// Extracts the Calendar tab's whole JSX block (from the `activeTab === 'calendar'` branch up to the next `) : activeTab ===` branch), used by the polish-fix tests below to anchor their assertions to the actual rendered markup.
+function getCalendarTabJsx(): string {
+  const match = rosterSource.match(/activeTab === 'calendar' \? \([\s\S]*?\n\s*\) : activeTab === 'off-pattern'/);
+  expect(match, 'expected to find the Calendar tab JSX block in Roster.tsx').toBeTruthy();
+  return match![0];
+}
+
+describe('Roster calendar UX polish: date-range separator, invalid-range heading, oversized-range navigation', () => {
+  it('never renders the old double-hyphen "--" as a date-range separator anywhere in the Calendar tab', () => {
+    const jsx = getCalendarTabJsx();
+    // The page subtitle and the unrelated Assign Dates tab's own prose
+    // both legitimately use "--" as a sentence dash elsewhere in this
+    // file -- scoping this check to the Calendar tab's own JSX block
+    // keeps it from false-failing on that unrelated, out-of-scope text.
+    expect(jsx).not.toContain('--');
+  });
+
+  it('formatPeriodHeading\'s en dash is actually what the heading element renders (calendarPeriodHeading, not a second copy of the separator logic in the component)', () => {
+    const jsx = getCalendarTabJsx();
+    expect(jsx).toMatch(/<h2[^>]*>\{calendarPeriodHeading\}<\/h2>/);
+  });
+
+  it('shows a clear "Invalid date range" heading when From is later than To, and still preserves the original validation sentence', () => {
+    const jsx = getCalendarTabJsx();
+    expect(jsx).toMatch(/\{!isCalendarRangeValid \? \(/);
+    expect(jsx).toMatch(/Invalid date range/);
+    expect(jsx).toMatch(/The To date must be on or after the From date\. Adjust one of the dates above to see the calendar\./);
+  });
+
+  it('the custom-range helper paragraph only renders when the range is valid -- it can never show the misleading "? day(s)" fallback, because that fallback no longer exists in the source at all', () => {
+    const jsx = getCalendarTabJsx();
+    expect(rosterSource).not.toContain("day(s)) : '?'");
+    expect(rosterSource).not.toContain("'?' day(s)");
+    expect(jsx).toMatch(/calendarViewMode === 'custom' && isCalendarRangeValid && !calendarRangeTooLarge && \(/);
+  });
+
+  it('shows a distinct, action-oriented navigation message (not the day-count helper) when a valid custom range is oversized', () => {
+    const jsx = getCalendarTabJsx();
+    expect(jsx).toMatch(/calendarViewMode === 'custom' && isCalendarRangeValid && calendarRangeTooLarge && \(/);
+    expect(jsx).toMatch(/Previous\/Next are unavailable for this range\. Shorten it to \{MAX_CUSTOM_RANGE_DAYS\} days or fewer, or switch to Week or Month view\./);
+  });
+
+  it('preserves the existing maximum-range warning Card contents (day count and the configured maximum)', () => {
+    const jsx = getCalendarTabJsx();
+    expect(jsx).toMatch(/This custom range is too large to display \(\{dateRangeLengthDays\(calendarFrom, calendarTo\)\} days/);
+    expect(jsx).toMatch(/the maximum is \{MAX_CUSTOM_RANGE_DAYS\}\)/);
+  });
+
+  it('disables Previous/Next both when the range is invalid AND when a valid custom range is oversized -- not only on inversion', () => {
+    const jsx = getCalendarTabJsx();
+    const disabledAttrs = jsx.match(/disabled=\{!isCalendarRangeValid \|\| calendarRangeTooLarge\}/g) || [];
+    expect(disabledAttrs.length).toBe(2); // Previous and Next buttons
+  });
+
+  it('handleCalendarNav itself (not just the buttons\' disabled attribute) refuses to navigate while the range is invalid or oversized', () => {
+    const body = getHandlerBody('handleCalendarNav');
+    expect(body).toMatch(/if \(!isCalendarRangeValid \|\| calendarRangeTooLarge\) return;/);
+  });
+});

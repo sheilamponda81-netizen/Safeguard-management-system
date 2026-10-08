@@ -73,12 +73,17 @@ export default function RosterPage() {
 
   const handleCalendarNav = useCallback(
     (direction: 1 | -1) => {
-      if (!isCalendarRangeValid) return;
+      // Guarded here too, not just via the buttons' `disabled` attribute --
+      // an invalid (inverted) or oversized custom range has no grid shown
+      // to navigate, so silently shifting it further would only ever
+      // produce another hidden range (same policy as loadData's own
+      // shouldFetchAssignments guard below).
+      if (!isCalendarRangeValid || calendarRangeTooLarge) return;
       const next = shiftCalendarRange(calendarFrom, calendarTo, calendarViewMode, direction);
       setCalendarFrom(next.from);
       setCalendarTo(next.to);
     },
-    [calendarFrom, calendarTo, calendarViewMode, isCalendarRangeValid]
+    [calendarFrom, calendarTo, calendarViewMode, isCalendarRangeValid, calendarRangeTooLarge]
   );
 
   const handleCalendarToday = useCallback(() => {
@@ -336,10 +341,10 @@ export default function RosterPage() {
           <Card className="p-4 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => handleCalendarNav(-1)} disabled={!isCalendarRangeValid} title="Previous period">
+                <Button variant="outline" size="sm" onClick={() => handleCalendarNav(-1)} disabled={!isCalendarRangeValid || calendarRangeTooLarge} title="Previous period">
                   <ChevronLeft size={16} />
                 </Button>
-                <Button variant="outline" size="sm" onClick={() => handleCalendarNav(1)} disabled={!isCalendarRangeValid} title="Next period">
+                <Button variant="outline" size="sm" onClick={() => handleCalendarNav(1)} disabled={!isCalendarRangeValid || calendarRangeTooLarge} title="Next period">
                   <ChevronRight size={16} />
                 </Button>
                 <Button variant="outline" size="sm" onClick={handleCalendarToday}>Today</Button>
@@ -366,19 +371,23 @@ export default function RosterPage() {
               <Input label="From" type="date" value={calendarFrom} onChange={(e) => handleCalendarFromChange(e.target.value)} />
               <Input label="To" type="date" value={calendarTo} onChange={(e) => handleCalendarToChange(e.target.value)} />
             </div>
-            {calendarViewMode === 'custom' && (
-              <p className="text-xs text-slate-500">Custom range selected -- Previous/Next will now move by this range's own length ({isCalendarRangeValid ? dateRangeLengthDays(calendarFrom, calendarTo) : '?'} day(s)). Switch back to Week or Month at any time.</p>
+            {calendarViewMode === 'custom' && isCalendarRangeValid && !calendarRangeTooLarge && (
+              <p className="text-xs text-slate-500">Custom range selected – Previous/Next will now move by this range's own length ({dateRangeLengthDays(calendarFrom, calendarTo)} day(s)). Switch back to Week or Month at any time.</p>
+            )}
+            {calendarViewMode === 'custom' && isCalendarRangeValid && calendarRangeTooLarge && (
+              <p className="text-xs text-amber-700">Previous/Next are unavailable for this range. Shorten it to {MAX_CUSTOM_RANGE_DAYS} days or fewer, or switch to Week or Month view.</p>
             )}
           </Card>
 
           {!isCalendarRangeValid ? (
             <Card className="p-4 bg-red-50 border-red-200 border">
-              <p className="text-sm text-red-700">The To date must be on or after the From date. Adjust one of the dates above to see the calendar.</p>
+              <p className="text-sm font-semibold text-red-800">Invalid date range</p>
+              <p className="text-sm text-red-700 mt-1">The To date must be on or after the From date. Adjust one of the dates above to see the calendar.</p>
             </Card>
           ) : calendarRangeTooLarge ? (
             <Card className="p-4 bg-amber-50 border-amber-200 border">
               <p className="text-sm text-amber-800">
-                This custom range is too large to display ({dateRangeLengthDays(calendarFrom, calendarTo)} days -- the maximum is {MAX_CUSTOM_RANGE_DAYS}).
+                This custom range is too large to display ({dateRangeLengthDays(calendarFrom, calendarTo)} days – the maximum is {MAX_CUSTOM_RANGE_DAYS}).
                 Narrow the From/To dates above, or use Week or Month view.
               </p>
             </Card>
