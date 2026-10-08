@@ -5,7 +5,7 @@ import {
   Wallet,
   Calculator, ClipboardList,
   CalendarCheck, BarChart3, BookOpen,
-  Banknote, Fingerprint, UserCheck, Eye
+  Banknote, Fingerprint, UserCheck, Eye, CalendarClock
 } from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
@@ -26,6 +26,7 @@ export type NavKey =
   | "hikcentral-import"
   | "hikcentral-mapping"
   | "hikcentral-attendance-preview"
+  | "roster"
   | "payroll"
   | "payslips"
   | "payments"
@@ -49,6 +50,7 @@ const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "hikcentral-import", label: "HikCentral Import", icon: Fingerprint },
   { id: "hikcentral-mapping", label: "Person Mapping", icon: UserCheck },
   { id: "hikcentral-attendance-preview", label: "Attendance Preview", icon: Eye },
+  { id: "roster", label: "Roster Management", icon: CalendarClock },
   { id: "payroll", label: "Payroll", icon: Wallet },
   { id: "payslips", label: "Payslips", icon: FileText },
   { id: "payments", label: "Payments", icon: DollarSign },
@@ -68,6 +70,7 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "hikcentral-import",
     "hikcentral-mapping",
     "hikcentral-attendance-preview",
+    "roster",
     "payroll",
     "payslips",
     "payments",

@@ -45,6 +45,7 @@ const AttendancePage = safeLazy(() => import("./pages/Attendance"));
 const HikCentralImportPage = safeLazy(() => import("./pages/HikCentralImport"));
 const HikCentralPersonMappingPage = safeLazy(() => import("./pages/HikCentralPersonMapping"));
 const HikCentralAttendancePreviewPage = safeLazy(() => import("./pages/HikCentralAttendancePreview"));
+const RosterPage = safeLazy(() => import("./pages/Roster"));
 const PayrollPage = safeLazy(() => import("./pages/Payroll"));
 const PayslipsPage = safeLazy(() => import("./pages/Payslips"));
 const PaymentsPage = safeLazy(() => import("./pages/Payments"));
@@ -86,13 +87,14 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
   features: FeaturesPage,
   auditlogs: AuditLogsPage,
   "user-manual": UserManualPage,
+  roster: RosterPage,
 };
 
 // ===== ROLE CONFIGURATION =====
 const rolePages: Record<number, NavKey[]> = {
   1: [
     "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
-    "hikcentral-mapping", "hikcentral-attendance-preview",
+    "hikcentral-mapping", "hikcentral-attendance-preview", "roster",
     "payroll", "payslips", "payments", "terminal-dues", "salary-advances",
     "reports", "settings", "security", "features", "auditlogs",
     "user-manual",
@@ -124,6 +126,7 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   "hikcentral-import": { title: "HikCentral Attendance Import", breadcrumb: "HikCentral Import" },
   "hikcentral-mapping": { title: "HikCentral Person Mapping", breadcrumb: "Person Mapping" },
   "hikcentral-attendance-preview": { title: "HikCentral Attendance Preview", breadcrumb: "Attendance Preview" },
+  roster: { title: "Roster Management", breadcrumb: "Roster" },
   payroll: { title: "Payroll Management", breadcrumb: "Payroll" },
   payslips: { title: "Payslips", breadcrumb: "Payslips" },
   payments: { title: "Payment Management", breadcrumb: "Payments" },
