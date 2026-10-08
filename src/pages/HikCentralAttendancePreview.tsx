@@ -21,6 +21,7 @@ import { Card, Button, Badge, PageHeader, EmptyState, Input, Select, StatCard } 
 import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import {
   buildEmployeeDayScanGroups, blantyreDateRangeToUtcBounds, splitByActiveMapping,
+  filterEmployeeDayScanGroups, summarizeEmployeeDayScanGroups,
   EmployeeDayScanGroup, ReviewFlag,
 } from '../utils/hikcentralAttendancePreview';
 import { fetchActiveHikCentralPersonMappings, fetchAllEmployeesById } from '../utils/hikcentralPersonMappingService';
@@ -127,29 +128,21 @@ export default function HikCentralAttendancePreviewPage() {
     return Array.from(sites).sort();
   }, [groups]);
 
-  const filteredGroups = useMemo(() => {
-    const q = employeeSearch.trim().toLowerCase();
-    return groups.filter((g) => {
-      if (siteFilter && !g.accessPoints.includes(siteFilter)) return false;
-      if (q === '') return true;
-      const name = g.employee?.fullName?.toLowerCase() ?? '';
-      const num = g.employee?.employeeNumber?.toLowerCase() ?? '';
-      return name.includes(q) || num.includes(q);
-    });
-  }, [groups, employeeSearch, siteFilter]);
+  const filteredGroups = useMemo(
+    () => filterEmployeeDayScanGroups(groups, { employeeSearch, siteFilter }),
+    [groups, employeeSearch, siteFilter]
+  );
 
   const visibleGroups = filteredGroups.slice(0, MAX_RENDERED_GROUPS);
   const truncated = filteredGroups.length > MAX_RENDERED_GROUPS;
 
-  const counts = useMemo(() => {
-    const byCategory = { single_scan: 0, two_scans: 0, three_or_more_scans: 0 };
-    let overnight = 0;
-    for (const g of groups) {
-      byCategory[g.scanCountCategory]++;
-      if (g.reviewFlags.includes('potential_overnight')) overnight++;
-    }
-    return { ...byCategory, overnight, total: groups.length };
-  }, [groups]);
+  // Derived from filteredGroups (the full filtered set, NOT the
+  // MAX_RENDERED_GROUPS-capped visibleGroups) so these summary cards
+  // always match what the employee-search/site filters below actually
+  // select -- including when the matching set is larger than what's
+  // rendered, where the truncation banner (not these cards) is what
+  // communicates the render cap.
+  const counts = useMemo(() => summarizeEmployeeDayScanGroups(filteredGroups), [filteredGroups]);
 
   if (!permissionsLoaded) {
     return <div className="p-8 text-center text-slate-400">Loading...</div>;
@@ -212,18 +205,21 @@ export default function HikCentralAttendancePreviewPage() {
       )}
 
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-        <StatCard title="Employee-day groups" value={counts.total.toLocaleString()} icon={CalendarDays} accent="navy" />
+        <StatCard title="Employee-day groups" value={counts.total.toLocaleString()} icon={CalendarDays} accent="navy" sub="Matches search & site filters" />
         <StatCard title="Single scan" value={counts.single_scan.toLocaleString()} icon={AlertTriangle} accent="gold" />
         <StatCard title="Two scans" value={counts.two_scans.toLocaleString()} icon={Clock} accent="green" />
         <StatCard title="3+ scans" value={counts.three_or_more_scans.toLocaleString()} icon={AlertTriangle} accent="red" />
-        <StatCard title="Potential overnight" value={counts.overnight.toLocaleString()} icon={Clock} accent="blue" />
+        <StatCard title="Potential overnight" value={counts.potentialOvernight.toLocaleString()} icon={Clock} accent="blue" />
       </div>
 
       <Card className="p-4 bg-slate-50 border-slate-200 border">
         <p className="text-sm text-slate-600 flex items-center gap-2">
           <UsersIcon size={16} className="text-slate-400" />
-          In this date range: {identifiedUnmappedCount.toLocaleString()} identified-but-unmapped event(s) and{' '}
-          {anonymousCount.toLocaleString()} anonymous event(s) -- shown for context only, excluded from every group below.
+          In the selected date range: {identifiedUnmappedCount.toLocaleString()} identified-but-unmapped event(s) and{' '}
+          {anonymousCount.toLocaleString()} anonymous event(s) -- shown for context only, excluded from every group
+          below. These two counts reflect the <strong>date range only</strong> -- neither the employee search nor the
+          site filter applies to them, since an unmapped/anonymous event has no resolved employee identity to search
+          by and is intentionally never grouped or site-filtered here.
         </p>
       </Card>
 

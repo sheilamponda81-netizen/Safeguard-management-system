@@ -5,8 +5,11 @@ import {
   blantyreTimeOfDay,
   blantyreDateRangeToUtcBounds,
   splitByActiveMapping,
+  filterEmployeeDayScanGroups,
+  summarizeEmployeeDayScanGroups,
   MappedScanEventRow,
   RawIdentifiedEventRow,
+  EmployeeDayScanGroup,
 } from './hikcentralAttendancePreview';
 import { EmployeeLite } from './hikcentralPersonMapping';
 
@@ -290,6 +293,104 @@ describe('splitByActiveMapping', () => {
     );
     expect(mapped.every((m) => m.employeeId === 'emp-1')).toBe(true);
     expect(mapped).toHaveLength(2);
+  });
+});
+
+describe('filterEmployeeDayScanGroups / summarizeEmployeeDayScanGroups: page filter consistency', () => {
+  // Built via the real pipeline (buildEmployeeDayScanGroups), not hand-rolled
+  // literals, so these tests exercise the exact same group shape the page
+  // actually works with. Two employees, two dates, two sites:
+  //   emp-1 "Alice Banda" / SFG-S-001 -- 2026-10-01 at Site A, single scan
+  //   emp-1 "Alice Banda" / SFG-S-001 -- 2026-10-02 at Site B, two scans
+  //   emp-2 "Bob Phiri"   / SFG-S-002 -- 2026-10-01 at Site B, three scans
+  function buildFixtureGroups(): EmployeeDayScanGroup[] {
+    const events: MappedScanEventRow[] = [
+      scan({ employeeId: 'emp-1', eventTimeIso: '2026-10-01T04:00:00.000Z', accessPoint: 'Site A' }),
+      scan({ employeeId: 'emp-1', eventTimeIso: '2026-10-02T04:00:00.000Z', accessPoint: 'Site B' }),
+      scan({ employeeId: 'emp-1', eventTimeIso: '2026-10-02T15:00:00.000Z', accessPoint: 'Site B' }),
+      scan({ employeeId: 'emp-2', eventTimeIso: '2026-10-01T04:00:00.000Z', accessPoint: 'Site B' }),
+      scan({ employeeId: 'emp-2', eventTimeIso: '2026-10-01T10:00:00.000Z', accessPoint: 'Site B' }),
+      scan({ employeeId: 'emp-2', eventTimeIso: '2026-10-01T15:00:00.000Z', accessPoint: 'Site B' }),
+    ];
+    const employeesById = new Map([
+      ['emp-1', employee({ id: 'emp-1', fullName: 'Alice Banda', employeeNumber: 'SFG-S-001' })],
+      ['emp-2', employee({ id: 'emp-2', fullName: 'Bob Phiri', employeeNumber: 'SFG-S-002' })],
+    ]);
+    return buildEmployeeDayScanGroups(events, employeesById);
+  }
+
+  it('with no filters applied, returns every group unchanged', () => {
+    const all = buildFixtureGroups();
+    const filtered = filterEmployeeDayScanGroups(all, { employeeSearch: '', siteFilter: '' });
+    expect(filtered).toHaveLength(3);
+  });
+
+  it('employee search by name narrows to only that employee\'s groups (case-insensitive, substring)', () => {
+    const filtered = filterEmployeeDayScanGroups(buildFixtureGroups(), { employeeSearch: 'alice', siteFilter: '' });
+    expect(filtered).toHaveLength(2);
+    expect(filtered.every((g) => g.employee?.fullName === 'Alice Banda')).toBe(true);
+  });
+
+  it('employee search by employee number also matches', () => {
+    const filtered = filterEmployeeDayScanGroups(buildFixtureGroups(), { employeeSearch: 'SFG-S-002', siteFilter: '' });
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].employee?.fullName).toBe('Bob Phiri');
+  });
+
+  it('site filter narrows to only groups whose accessPoints include that exact site', () => {
+    const filtered = filterEmployeeDayScanGroups(buildFixtureGroups(), { employeeSearch: '', siteFilter: 'Site A' });
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].employeeId).toBe('emp-1');
+    expect(filtered[0].localDate).toBe('2026-10-01');
+  });
+
+  it('combined employee search AND site filter apply together, not independently', () => {
+    // Alice appears at both Site A (Oct 1) and Site B (Oct 2) -- filtering
+    // her name AND Site B must return ONLY the Oct 2 group, not both.
+    const filtered = filterEmployeeDayScanGroups(buildFixtureGroups(), { employeeSearch: 'alice', siteFilter: 'Site B' });
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].localDate).toBe('2026-10-02');
+  });
+
+  it('a filter combination matching nothing returns an empty array, never throws', () => {
+    const filtered = filterEmployeeDayScanGroups(buildFixtureGroups(), { employeeSearch: 'nobody-with-this-name', siteFilter: '' });
+    expect(filtered).toEqual([]);
+  });
+
+  it('date range is irrelevant to this function -- it operates purely on whatever already-date-scoped groups it is given, never re-derives or drops a date on its own', () => {
+    const all = buildFixtureGroups();
+    const filtered = filterEmployeeDayScanGroups(all, { employeeSearch: '', siteFilter: '' });
+    expect(new Set(filtered.map((g) => g.localDate))).toEqual(new Set(['2026-10-01', '2026-10-02']));
+  });
+
+  it('REGRESSION: summarizeEmployeeDayScanGroups, given the FILTERED set, produces counts matching the filter -- not the full unfiltered set (the original Phase 2A bug)', () => {
+    const all = buildFixtureGroups(); // 3 groups total: 1 single-scan, 1 two-scan, 1 three-or-more-scan
+    const aliceOnly = filterEmployeeDayScanGroups(all, { employeeSearch: 'alice', siteFilter: '' }); // 2 groups: 1 single-scan, 1 two-scan
+
+    const unfilteredCounts = summarizeEmployeeDayScanGroups(all);
+    expect(unfilteredCounts.total).toBe(3);
+
+    const filteredCounts = summarizeEmployeeDayScanGroups(aliceOnly);
+    expect(filteredCounts.total).toBe(2);
+    expect(filteredCounts.single_scan).toBe(1);
+    expect(filteredCounts.two_scans).toBe(1);
+    expect(filteredCounts.three_or_more_scans).toBe(0); // Bob's 3-scan group is correctly excluded once filtered to Alice
+  });
+
+  it('summarizeEmployeeDayScanGroups on an empty (filtered-to-nothing) array returns all-zero counts, never undefined/NaN', () => {
+    const counts = summarizeEmployeeDayScanGroups([]);
+    expect(counts).toEqual({ total: 0, single_scan: 0, two_scans: 0, three_or_more_scans: 0, potentialOvernight: 0 });
+  });
+
+  it('summarizeEmployeeDayScanGroups counts the potential-overnight flag only among the groups actually passed in', () => {
+    const overnightGroup = buildEmployeeDayScanGroups(
+      [scan({ employeeId: 'emp-3', eventTimeIso: '2026-10-01T23:30:00.000Z' })], // Blantyre 01:30 -- inside the overnight window
+      new Map([['emp-3', employee({ id: 'emp-3', fullName: 'Carol Mvula' })]])
+    );
+    const combined = [...buildFixtureGroups(), ...overnightGroup];
+    expect(summarizeEmployeeDayScanGroups(combined).potentialOvernight).toBe(1);
+    const withoutCarol = filterEmployeeDayScanGroups(combined, { employeeSearch: 'alice', siteFilter: '' });
+    expect(summarizeEmployeeDayScanGroups(withoutCarol).potentialOvernight).toBe(0);
   });
 });
 

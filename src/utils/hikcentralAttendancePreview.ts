@@ -261,3 +261,70 @@ export function buildEmployeeDayScanGroups(
 
   return groups.sort((a, b) => (a.localDate === b.localDate ? a.employeeId.localeCompare(b.employeeId) : a.localDate.localeCompare(b.localDate)));
 }
+
+// ---- Page-level filtering and summary counts ----
+//
+// Extracted as pure functions (rather than left inline in the page
+// component) specifically so the page's employee-search/site-filter
+// controls and its summary stat cards can never drift apart again: the
+// page computes `filteredGroups` via filterEmployeeDayScanGroups() ONCE,
+// then derives EVERYTHING displayed -- the rendered list AND the summary
+// counts -- from that same single filtered array. The original Phase 2A
+// bug (summary cards reading from the unfiltered `groups` while the
+// rendered list read from `filteredGroups`) is structurally impossible to
+// reintroduce once both consumers call through this one function.
+//
+// Date-range filtering is NOT part of this -- it happens server-side (see
+// hikcentralAttendancePreviewService.ts + blantyreDateRangeToUtcBounds
+// above), since it drives which rows are fetched at all, not a client-side
+// narrowing of an already-fetched set.
+
+export interface AttendancePreviewFilters {
+  employeeSearch: string;
+  /** Exact access-point string, or '' for "all sites". */
+  siteFilter: string;
+}
+
+/**
+ * An employee-day group matches when it has the selected site among its
+ * accessPoints (if a site is selected) AND its employee's name or
+ * employee number contains the search text (if any was entered) --
+ * both filters apply together (AND), matching the page's two
+ * independent controls being used in combination.
+ */
+export function filterEmployeeDayScanGroups(
+  groups: EmployeeDayScanGroup[],
+  filters: AttendancePreviewFilters
+): EmployeeDayScanGroup[] {
+  const q = filters.employeeSearch.trim().toLowerCase();
+  return groups.filter((g) => {
+    if (filters.siteFilter && !g.accessPoints.includes(filters.siteFilter)) return false;
+    if (q === '') return true;
+    const name = g.employee?.fullName?.toLowerCase() ?? '';
+    const num = g.employee?.employeeNumber?.toLowerCase() ?? '';
+    return name.includes(q) || num.includes(q);
+  });
+}
+
+export interface AttendancePreviewSummaryCounts {
+  total: number;
+  single_scan: number;
+  two_scans: number;
+  three_or_more_scans: number;
+  potentialOvernight: number;
+}
+
+/**
+ * Summary counts for display -- callers must pass the ALREADY-FILTERED
+ * group list (the output of filterEmployeeDayScanGroups) so these counts
+ * always match what's actually being shown, never the full unfiltered set.
+ */
+export function summarizeEmployeeDayScanGroups(groups: EmployeeDayScanGroup[]): AttendancePreviewSummaryCounts {
+  const byCategory = { single_scan: 0, two_scans: 0, three_or_more_scans: 0 };
+  let potentialOvernight = 0;
+  for (const g of groups) {
+    byCategory[g.scanCountCategory]++;
+    if (g.reviewFlags.includes('potential_overnight')) potentialOvernight++;
+  }
+  return { ...byCategory, potentialOvernight, total: groups.length };
+}
