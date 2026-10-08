@@ -4,13 +4,25 @@ import path from 'node:path';
 
 // Roster Management Foundation: this migration is NOT applied to any
 // database yet (explicitly not authorized this phase -- see the
-// migration's own header). This repo has no live-Postgres test harness
-// (established precedent: hikcentralAttendanceMigration.test.ts,
-// hikcentralPersonMappingConfirmRpc.test.ts) -- these tests pin the
+// migration's own header). This repo has no committed live-Postgres test
+// harness (established precedent: hikcentralAttendanceMigration.test.ts,
+// hikcentralPersonMappingConfirmRpc.test.ts), so these tests pin the
 // migration at the SQL SOURCE level, proving its security model (no
 // direct-write path exists outside the three SECURITY DEFINER RPCs),
 // its Admin-only checks, its tenant validation, its append-only trigger,
 // its bulk limit, and its rolling-rest hard-block (no override path).
+//
+// Source-pinned regex assertions alone cannot prove runtime correctness
+// (NULL propagation through PL/pgSQL conditionals, for one, is invisible
+// to a regex). This file's three confirmed-and-fixed defects (the Admin
+// NULL-propagation bug, the Off-day override bypass, and the rolling-rest
+// downstream-boundary gap) were each found and verified by actually
+// applying this exact migration file to a throwaway, isolated local
+// PostgreSQL 16 instance (outside this repo, never touching STAGING or
+// Production) and exercising it with real SELECT/INSERT calls under
+// SET ROLE authenticated and SET SESSION test.current_uid -- not merely
+// inferred from source text. These regex tests remain as a committed,
+// repeatable regression guard for the fixed source going forward.
 const migrationSource = fs.readFileSync(
   path.resolve(__dirname, '../../supabase/migrations/20261008000000_roster_management_foundation.sql'),
   'utf-8'
@@ -22,6 +34,18 @@ function getFunctionBody(name: string): string {
   expect(body).toBeTruthy();
   return body!;
 }
+
+// Strips `-- ...` line comments (which include historical defect
+// explanations that legitimately mention old, now-removed identifiers
+// such as `p_override_off_day` or `v_role_level`) so "this identifier no
+// longer exists" assertions check only live SQL, not prose about it.
+function stripSqlComments(source: string): string {
+  return source
+    .split('\n')
+    .map((line) => line.replace(/--.*$/, ''))
+    .join('\n');
+}
+const migrationCode = stripSqlComments(migrationSource);
 
 describe('roster migration: table-level direct-write lockdown', () => {
   it('revokes ALL table privileges from PUBLIC, anon, AND authenticated on both tables before re-granting', () => {
@@ -58,6 +82,15 @@ describe('roster migration: table-level direct-write lockdown', () => {
       expect(policy).not.toMatch(/has_permission\(/);
       expect(policy).not.toMatch(/role_level\s*<=/);
     }
+  });
+});
+
+describe('roster migration: weekday column and parameter types', () => {
+  it('weekday is INTEGER, not SMALLINT, on the table column and every function parameter/variable -- eliminates a raw-literal overload-resolution ambiguity (observed in psql: bare integer literals without an explicit ::smallint cast do not resolve to a SMALLINT-typed overload) without relying solely on PostgREST'+"'"+'s type-aware JSON binding as the only protection', () => {
+    expect(migrationSource).toMatch(/weekday INTEGER NOT NULL CHECK \(weekday BETWEEN 0 AND 6\)/);
+    // SMALLINT is only ever mentioned in a `--` comment documenting why it
+    // was replaced; confirm no live SQL still declares anything SMALLINT.
+    expect(migrationCode).not.toMatch(/SMALLINT/);
   });
 });
 
@@ -110,25 +143,50 @@ describe('roster migration: write RPC security model (SECURITY DEFINER, explicit
     }
   });
 
-  it('every write RPC requires authentication and re-derives tenant/role directly from profiles (never trusts a client-supplied tenant)', () => {
+  it('every write RPC requires authentication and re-derives tenant directly from profiles (never trusts a client-supplied tenant)', () => {
     for (const name of writeRpcs) {
       const fn = getFunctionBody(name);
       expect(fn).toMatch(/IF v_caller_id IS NULL THEN\s*\n\s*RAISE EXCEPTION 'Not authenticated'/);
-      expect(fn).toMatch(/SELECT tenant_id, role_level, role, is_super_admin, is_active, deleted_at\s*\n\s*INTO v_tenant_id, v_role_level, v_role, v_is_super_admin, v_is_active, v_deleted_at\s*\n\s*FROM profiles WHERE id = v_caller_id;/);
+      expect(fn).toMatch(/SELECT tenant_id INTO v_tenant_id FROM profiles WHERE id = v_caller_id;\s*\n\s*IF v_tenant_id IS NULL THEN\s*\n\s*RAISE EXCEPTION 'No profile found for the current user'/);
     }
   });
 
-  it('every write RPC explicitly checks Admin-only authorization (is_super_admin OR role=admin OR role_level=1) and RAISEs otherwise -- no permission-table branch', () => {
+  it('every write RPC delegates its Admin-only check to the already-hardened is_super_admin()/is_business_admin() helpers, never re-deriving role/role_level inline', () => {
+    // CONFIRMED, FIXED DEFECT: an earlier version of this migration
+    // re-implemented the admin check inline as
+    // `COALESCE(v_is_super_admin, false) OR v_role = 'admin' OR v_role_level = 1`.
+    // For every functional-role account, role_level is NULL by design, so
+    // `v_role_level = 1` is SQL NULL (not false); `false OR NULL` is NULL;
+    // `NOT NULL` is NULL; and PL/pgSQL's `IF NULL THEN` behaves as not-true,
+    // silently skipping the RAISE EXCEPTION for ANY non-Admin functional
+    // account. Verified by actually running the unfixed function against an
+    // isolated local Postgres 16 instance: an operations_manager-role
+    // caller's write succeeded. This exact bug class was already fixed once
+    // in this codebase (20260817000007_functional_roles_null_boolean_fix.sql)
+    // -- the fix here is to call the already-corrected helpers directly.
     for (const name of writeRpcs) {
       const fn = getFunctionBody(name);
-      expect(fn).toMatch(/IF NOT \(COALESCE\(v_is_super_admin, false\) OR v_role = 'admin' OR v_role_level = 1\) THEN/);
-      expect(fn).not.toMatch(/has_permission\(/);
+      const fnCode = stripSqlComments(fn);
+      expect(fn).toMatch(/IF NOT \(is_super_admin\(\) OR is_business_admin\(\)\) THEN/);
+      // The vulnerable inline re-derivation is gone as executable code: no
+      // DECLARE line for these variables exists anymore (the historical
+      // bug is only ever mentioned in an explanatory `--` comment, never
+      // as live PL/pgSQL).
+      expect(fnCode).not.toMatch(/v_role_level/);
+      expect(fnCode).not.toMatch(/v_role\b/);
+      expect(fnCode).not.toMatch(/v_is_super_admin\b/);
+      expect(fnCode).not.toMatch(/has_permission\(/);
     }
   });
 
-  it('every write RPC checks the caller account is active and not deleted', () => {
+  it('every write RPC checks the caller account is active via is_current_user_active(), before the admin check', () => {
     for (const name of writeRpcs) {
-      expect(getFunctionBody(name)).toMatch(/IF COALESCE\(v_is_active, false\) = false OR v_deleted_at IS NOT NULL THEN/);
+      const fn = getFunctionBody(name);
+      expect(fn).toMatch(/IF NOT is_current_user_active\(\) THEN\s*\n\s*RAISE EXCEPTION 'Your account is disabled'/);
+      const activeIdx = fn.indexOf('is_current_user_active()');
+      const adminIdx = fn.indexOf('is_super_admin() OR is_business_admin()');
+      expect(activeIdx).toBeGreaterThan(-1);
+      expect(adminIdx).toBeGreaterThan(activeIdx);
     }
   });
 
@@ -198,27 +256,60 @@ describe('roster migration: idempotent retry behavior', () => {
     expect(fn).toMatch(/IF v_existing_id IS NOT NULL AND v_existing_weekday = p_weekday THEN\s*\n\s*v_noop_count := v_noop_count \+ 1;\s*\n\s*CONTINUE; -- idempotent no-op/);
   });
 
-  it('roster_assign_dates treats an identical (employee, date, assignment_type, override flag) as a no-op', () => {
+  it('roster_assign_dates treats an identical (employee, date, assignment_type) as a no-op', () => {
     const fn = getFunctionBody('roster_assign_dates');
-    expect(fn).toMatch(/IF v_existing_id IS NOT NULL AND v_existing_type = p_assignment_type AND v_existing_overrides = v_overrides THEN/);
+    expect(fn).toMatch(/IF v_existing_id IS NOT NULL AND v_existing_type = p_assignment_type THEN/);
   });
 });
 
-describe('roster migration: Off-day override must be explicit, never silent', () => {
-  it('assigning a working (day/night) type onto a date that resolves Off requires override_off_day=true AND a non-empty correction_reason, or the call is rejected', () => {
-    const fn = getFunctionBody('roster_assign_dates');
-    expect(fn).toMatch(/IF v_resolved = 'off' THEN\s*\n\s*IF NOT p_override_off_day OR p_correction_reason IS NULL OR btrim\(p_correction_reason\) = '' THEN/);
+describe('roster migration: assigning work onto a recorded Off day is an unconditional hard block -- no override exists', () => {
+  // CONFIRMED, FIXED DEFECT: an earlier version of roster_assign_dates
+  // accepted a `p_override_off_day BOOLEAN` parameter that let a working
+  // (day/night) assignment directly replace a recorded Off day as long as
+  // a correction_reason was also supplied. Verified (by actually calling
+  // the unfixed function against an isolated local Postgres instance) that
+  // this worked exactly as written -- which contradicts confirmed business
+  // policy: Admin must move the Off day itself via
+  // roster_reschedule_off_day (which validates and commits both the
+  // vacated date and the new Off date atomically, including the rolling
+  // seven-day check), never just acknowledge an override here. The
+  // parameter has been removed entirely; the function's signature now has
+  // 5 parameters, not 6, and the Off-day check cannot be bypassed by any
+  // argument.
+
+  it('roster_assign_dates no longer accepts a p_override_off_day parameter, or any override parameter at all', () => {
+    const signature = migrationSource.match(/CREATE OR REPLACE FUNCTION roster_assign_dates\([\s\S]*?\)\s*\nRETURNS/)?.[0] ?? '';
+    expect(signature).not.toMatch(/p_override_off_day/i);
+    expect(signature).not.toMatch(/BOOLEAN/);
+    // `p_override_off_day` is only ever mentioned in a `--` comment
+    // documenting the historical defect and its fix -- confirm it no
+    // longer appears as live SQL anywhere (not as a parameter, not
+    // referenced in a function body).
+    const overrideParams = migrationCode.match(/p_override_\w+/g) || [];
+    expect(overrideParams).toEqual([]);
   });
 
-  it('a successful override stamps overrides_recurring_off_day=true on the written row, never silently', () => {
+  it('assigning a working (day/night) type onto a date that resolves Off is unconditionally rejected, with no condition that could let it through', () => {
     const fn = getFunctionBody('roster_assign_dates');
-    expect(fn).toMatch(/v_overrides := true;/);
-    expect(fn).toMatch(/VALUES \(v_tenant_id, v_employee_id, v_date, p_assignment_type, v_overrides, v_caller_id, p_correction_reason\);/);
+    expect(fn).toMatch(/IF v_resolved = 'off' THEN\s*\n\s*-- Unconditional hard block -- no override parameter exists\./);
+    expect(fn).toMatch(/RAISE EXCEPTION 'Employee % is scheduled Off on % -- a working assignment cannot be made here; use roster_reschedule_off_day to move the Off day first/);
   });
 
-  it('assigning "off" itself never triggers the override check (cannot override Off with Off)', () => {
+  it('every row roster_assign_dates writes is stamped overrides_recurring_off_day=false literally -- this function can never create an override', () => {
+    const fn = getFunctionBody('roster_assign_dates');
+    expect(fn).toMatch(/INSERT INTO roster_date_assignments \(tenant_id, employee_id, assignment_date, assignment_type, overrides_recurring_off_day, assigned_by, correction_reason\)\s*\n\s*VALUES \(v_tenant_id, v_employee_id, v_date, p_assignment_type, false, v_caller_id, p_correction_reason\);/);
+  });
+
+  it('assigning "off" itself never triggers the Off-day block (cannot collide with Off with Off)', () => {
     const fn = getFunctionBody('roster_assign_dates');
     expect(fn).toMatch(/IF p_assignment_type <> 'off' THEN\s*\n\s*v_resolved := roster_resolve_schedule/);
+  });
+
+  it('roster_reschedule_off_day remains the sole path to put work on a currently-Off date, and stamps overrides_recurring_off_day based on the actual prior state, not a client-supplied flag', () => {
+    const fn = getFunctionBody('roster_reschedule_off_day');
+    expect(fn).toMatch(/v_vacated_was_off BOOLEAN;/);
+    expect(fn).toMatch(/v_vacated_was_off := roster_resolve_schedule\(p_employee_id, p_vacated_work_date\) = 'off';/);
+    expect(fn).not.toMatch(/p_override/i);
   });
 });
 
@@ -239,9 +330,9 @@ describe('roster migration: Night-to-Day adjacency is ALWAYS hard-blocked, no ov
     expect(fn).toMatch(/IF v_adjacent_type = 'day' THEN/);
   });
 
-  it('no function in this migration exposes an override parameter for the Night-to-Day check (the only override parameter anywhere is p_override_off_day, for the Off-day case only)', () => {
-    const overrideParams = migrationSource.match(/p_override_\w+/g) || [];
-    expect(new Set(overrideParams)).toEqual(new Set(['p_override_off_day']));
+  it('no function in this migration exposes any override parameter at all, for the Night-to-Day case or any other', () => {
+    const overrideParams = migrationCode.match(/p_override_\w+/g) || [];
+    expect(overrideParams).toEqual([]);
   });
 });
 
@@ -272,6 +363,26 @@ describe('roster migration: rolling seven-day rest rule has NO override path', (
     const fn = getFunctionBody('roster_rolling_rest_windows');
     expect(fn).toMatch(/v_buffer_days CONSTANT INTEGER := 13;/);
   });
+
+  it('roster_assign_off_pattern additionally re-checks the one downstream pattern boundary a backdated or far-future insert can shift, beyond its own +-13-day window', () => {
+    // CONFIRMED, FIXED DEFECT: a pattern write only ever shifts resolution
+    // starting AT its own effective_from, up until whatever pattern next
+    // takes over -- but checking only the just-written effective_from's
+    // own +-13-day window can miss a violation this write exposes at that
+    // NEXT pattern's boundary, whenever the two effective_from dates are
+    // more than 13 days apart (exactly what a backdated correction
+    // inserted between two existing rows produces). Verified by actually
+    // constructing this scenario (two existing patterns 20 days apart,
+    // with 11 pre-existing working days between them) against an isolated
+    // local Postgres instance: the unfixed function returned success
+    // instead of rejecting a confirmed rolling-rest violation it had just
+    // exposed. The fix re-checks the one possible downstream boundary --
+    // the next existing active pattern's effective_from after this write,
+    // if any.
+    const fn = getFunctionBody('roster_assign_off_pattern');
+    expect(fn).toMatch(/SELECT MIN\(effective_from\) INTO v_next_effective_from\s*\n\s*FROM roster_off_day_patterns\s*\n\s*WHERE employee_id = v_employee_id AND is_active AND effective_from > p_effective_from;/);
+    expect(fn).toMatch(/IF v_next_effective_from IS NOT NULL THEN\s*\n\s*FOR v_violation IN\s*\n\s*SELECT \* FROM roster_rolling_rest_windows\(v_employee_id, v_next_effective_from\) WHERE status = 'confirmed_violation'/);
+  });
 });
 
 describe('roster migration: reason required for every change to an existing assignment', () => {
@@ -296,8 +407,8 @@ describe('roster migration: function execution grants', () => {
     const names = [
       'roster_resolve_schedule\\(UUID, DATE\\)',
       'roster_rolling_rest_windows\\(UUID, DATE\\)',
-      'roster_assign_off_pattern\\(UUID\\[\\], SMALLINT, DATE, TEXT\\)',
-      'roster_assign_dates\\(UUID\\[\\], DATE, DATE, TEXT, BOOLEAN, TEXT\\)',
+      'roster_assign_off_pattern\\(UUID\\[\\], INTEGER, DATE, TEXT\\)',
+      'roster_assign_dates\\(UUID\\[\\], DATE, DATE, TEXT, TEXT\\)',
       'roster_reschedule_off_day\\(UUID, DATE, DATE, TEXT, TEXT\\)',
     ];
     for (const sig of names) {

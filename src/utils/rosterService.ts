@@ -121,7 +121,6 @@ export async function assignDates(
   dateFrom: string,
   dateTo: string,
   assignmentType: AssignmentType,
-  overrideOffDay: boolean,
   correctionReason?: string
 ): Promise<RosterRpcResult> {
   return callCountedRpc('roster_assign_dates', {
@@ -129,7 +128,6 @@ export async function assignDates(
     p_date_from: dateFrom,
     p_date_to: dateTo,
     p_assignment_type: assignmentType,
-    p_override_off_day: overrideOffDay,
     p_correction_reason: correctionReason ?? null,
   });
 }

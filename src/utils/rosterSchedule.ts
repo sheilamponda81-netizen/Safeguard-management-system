@@ -201,10 +201,12 @@ export function hasNightToDayConflict(
 }
 
 /**
- * True when assigning `newType` (day/night) to `date` would silently
- * replace what the employee's recorded schedule (dated exception or
- * recurring pattern) says is an Off day -- the signal the write path uses
- * to require an explicit, non-silent override with a reason.
+ * True when assigning `newType` (day/night) to `date` would collide with
+ * what the employee's recorded schedule (dated exception or recurring
+ * pattern) says is an Off day. The write path (`roster_assign_dates`)
+ * always hard-blocks this case -- there is no override. This helper is for
+ * the UI to warn before submitting and point the user at
+ * `roster_reschedule_off_day` instead of waiting for the RPC to reject it.
  */
 export function wouldOverrideRecurringOffDay(
   employeeId: string,

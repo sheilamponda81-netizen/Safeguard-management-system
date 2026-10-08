@@ -127,8 +127,14 @@ CREATE TABLE IF NOT EXISTS roster_off_day_patterns (
   employee_id UUID NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
   -- 0 = Sunday .. 6 = Saturday, matching JS Date#getUTCDay() so the
   -- client-side pure module (rosterSchedule.ts) never needs a translation
-  -- layer between the two.
-  weekday SMALLINT NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+  -- layer between the two. INTEGER, not SMALLINT -- a prior isolated-
+  -- Postgres test run found that a bare-literal call to a SMALLINT-typed
+  -- RPC parameter can fail overload resolution unless explicitly cast;
+  -- PostgREST's own JSON-to-SQL binding is type-aware and would not hit
+  -- this, but there is no real storage benefit to SMALLINT at 7 possible
+  -- values, so INTEGER removes the risk entirely rather than relying on
+  -- that distinction.
+  weekday INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),
   effective_from DATE NOT NULL,
   is_active BOOLEAN NOT NULL DEFAULT true,
   assigned_by UUID NOT NULL REFERENCES profiles(id),
@@ -301,8 +307,8 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_dated_type TEXT;
-  v_weekday SMALLINT;
-  v_pattern_weekday SMALLINT;
+  v_weekday INTEGER;
+  v_pattern_weekday INTEGER;
 BEGIN
   SELECT assignment_type INTO v_dated_type
   FROM roster_date_assignments
@@ -387,7 +393,7 @@ GRANT EXECUTE ON FUNCTION roster_rolling_rest_windows(UUID, DATE) TO authenticat
 
 CREATE OR REPLACE FUNCTION roster_assign_off_pattern(
   p_employee_ids UUID[],
-  p_weekday SMALLINT,
+  p_weekday INTEGER,
   p_effective_from DATE,
   p_correction_reason TEXT DEFAULT NULL
 )
@@ -399,35 +405,52 @@ AS $$
 DECLARE
   v_caller_id UUID := auth.uid();
   v_tenant_id UUID;
-  v_role_level INTEGER;
-  v_role TEXT;
-  v_is_super_admin BOOLEAN;
-  v_is_active BOOLEAN;
-  v_deleted_at TIMESTAMPTZ;
   v_employee_id UUID;
   v_employee_tenant_id UUID;
   v_existing_id UUID;
-  v_existing_weekday SMALLINT;
+  v_existing_weekday INTEGER;
   v_assigned_count INTEGER := 0;
   v_noop_count INTEGER := 0;
   v_violation RECORD;
+  v_next_effective_from DATE;
 BEGIN
   IF v_caller_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
   END IF;
 
-  SELECT tenant_id, role_level, role, is_super_admin, is_active, deleted_at
-    INTO v_tenant_id, v_role_level, v_role, v_is_super_admin, v_is_active, v_deleted_at
-  FROM profiles WHERE id = v_caller_id;
-
-  IF v_tenant_id IS NULL THEN
-    RAISE EXCEPTION 'No profile found for the current user' USING ERRCODE = '42501';
-  END IF;
-  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+  -- Delegating to is_current_user_active()/is_super_admin()/is_business_admin()
+  -- (all already SEARCH_PATH-hardened and NULL-safe -- see their own
+  -- bodies, e.g. is_business_admin() internally does
+  -- `COALESCE(current_user_role() = 'admin', false) OR COALESCE(current_user_role_level() = 1, false)`)
+  -- instead of re-deriving role/role_level/is_super_admin inline. An
+  -- EARLIER version of this migration re-implemented this check as
+  -- `COALESCE(v_is_super_admin, false) OR v_role = 'admin' OR v_role_level = 1`
+  -- -- which is a CONFIRMED, since-fixed security bug: for every
+  -- functional-role account role_level is NULL by design, so
+  -- `v_role_level = 1` evaluates to SQL NULL, `false OR NULL` is NULL (not
+  -- false), `NOT NULL` is NULL, and PL/pgSQL's `IF NULL THEN` behaves as
+  -- not-true -- silently skipping the exception and letting ANY
+  -- authenticated non-Admin functional account (operations_manager,
+  -- hr_manager, accountant) through. Verified by actually running the
+  -- unfixed version against an isolated local Postgres 16 instance: an
+  -- operations_manager-role caller's write succeeded. Reusing the
+  -- already-correct helper functions (the same fix this codebase already
+  -- applied once before, see 20260817000007_functional_roles_null_boolean_fix.sql)
+  -- removes this entire class of risk rather than re-patching it.
+  IF NOT is_current_user_active() THEN
     RAISE EXCEPTION 'Your account is disabled' USING ERRCODE = '42501';
   END IF;
-  IF NOT (COALESCE(v_is_super_admin, false) OR v_role = 'admin' OR v_role_level = 1) THEN
+  IF NOT (is_super_admin() OR is_business_admin()) THEN
     RAISE EXCEPTION 'Only Admin may manage roster Off-day patterns' USING ERRCODE = '42501';
+  END IF;
+
+  -- Tenant is still re-derived directly from `profiles` (never
+  -- get_current_tenant_id(), the one helper without its own
+  -- SET search_path -- see this migration's header), same as
+  -- import_hikcentral_raw_events()'s established pattern.
+  SELECT tenant_id INTO v_tenant_id FROM profiles WHERE id = v_caller_id;
+  IF v_tenant_id IS NULL THEN
+    RAISE EXCEPTION 'No profile found for the current user' USING ERRCODE = '42501';
   END IF;
 
   IF p_employee_ids IS NULL OR array_length(p_employee_ids, 1) IS NULL OR array_length(p_employee_ids, 1) = 0 THEN
@@ -487,18 +510,65 @@ BEGIN
       RAISE EXCEPTION 'This change would leave employee % with no Off day between % and % -- rolling seven-day rest violations cannot be overridden',
         v_employee_id, v_violation.window_start, v_violation.window_end USING ERRCODE = '23514';
     END LOOP;
+
+    -- CONFIRMED DEFECT FIX (found by actually running the unfixed version
+    -- against an isolated local Postgres instance): a pattern write only
+    -- ever shifts resolution starting AT its own effective_from, up until
+    -- whatever pattern next takes over -- but checking ONLY the just-
+    -- written effective_from's own +-13 window can miss a violation this
+    -- write created or exposed at that NEXT pattern's boundary, whenever
+    -- the two effective_from dates are more than 13 days apart (the exact
+    -- scenario a backdated correction between two existing rows produces).
+    -- Concretely verified: Off-day patterns Sunday (ancient) and Saturday
+    -- (effective 20 days later) with 11 pre-existing working days
+    -- between them; inserting a backdated Monday pattern 20 days before
+    -- the Saturday row shifts "the pattern immediately before Saturday"
+    -- from Sunday to Monday, exposing a 12-day gap at the Saturday
+    -- boundary that a check centered only on the Monday insert's own
+    -- effective_from (13 days short of reaching it) never saw -- the
+    -- unfixed function returned success instead of rejecting it. Re-
+    -- checking around the next existing active pattern's effective_from
+    -- (if any exists after this write) closes that gap: only ONE
+    -- downstream boundary can ever be affected by a single insert (the
+    -- boundary immediately after it in the sorted effective_from chain --
+    -- every boundary beyond that is governed by a pattern pair this write
+    -- never touched).
+    SELECT MIN(effective_from) INTO v_next_effective_from
+    FROM roster_off_day_patterns
+    WHERE employee_id = v_employee_id AND is_active AND effective_from > p_effective_from;
+
+    IF v_next_effective_from IS NOT NULL THEN
+      FOR v_violation IN
+        SELECT * FROM roster_rolling_rest_windows(v_employee_id, v_next_effective_from) WHERE status = 'confirmed_violation'
+      LOOP
+        RAISE EXCEPTION 'This change would leave employee % with no Off day between % and % -- rolling seven-day rest violations cannot be overridden',
+          v_employee_id, v_violation.window_start, v_violation.window_end USING ERRCODE = '23514';
+      END LOOP;
+    END IF;
   END LOOP;
 
   RETURN jsonb_build_object('assigned_count', v_assigned_count, 'already_set_count', v_noop_count);
 END;
 $$;
 
+-- CONFIRMED DEFECT FIX: the earlier version accepted a p_override_off_day
+-- flag that let a working (day/night) assignment directly replace a
+-- recorded Off day here, as long as a reason was also supplied. Verified
+-- (by actually calling it against an isolated local Postgres instance)
+-- that this worked exactly as written -- which is precisely the bypass
+-- the confirmed business policy now explicitly forbids: Admin must move
+-- the Off day itself (preserving the rolling-seven-day check across BOTH
+-- the vacated date and the new Off date, atomically) via
+-- roster_reschedule_off_day, never just acknowledge an override here.
+-- Assigning 'day'/'night' onto a date that currently resolves Off is now
+-- an unconditional hard block, with no override parameter of any kind --
+-- the only legal way to put work on a currently-Off date is to reschedule
+-- the Off day away from it first.
 CREATE OR REPLACE FUNCTION roster_assign_dates(
   p_employee_ids UUID[],
   p_date_from DATE,
   p_date_to DATE,
   p_assignment_type TEXT,
-  p_override_off_day BOOLEAN DEFAULT false,
   p_correction_reason TEXT DEFAULT NULL
 )
 RETURNS JSONB
@@ -509,20 +579,13 @@ AS $$
 DECLARE
   v_caller_id UUID := auth.uid();
   v_tenant_id UUID;
-  v_role_level INTEGER;
-  v_role TEXT;
-  v_is_super_admin BOOLEAN;
-  v_is_active BOOLEAN;
-  v_deleted_at TIMESTAMPTZ;
   v_employee_id UUID;
   v_employee_tenant_id UUID;
   v_date DATE;
   v_total_rows INTEGER;
   v_resolved TEXT;
-  v_overrides BOOLEAN;
   v_existing_id UUID;
   v_existing_type TEXT;
-  v_existing_overrides BOOLEAN;
   v_adjacent_type TEXT;
   v_assigned_count INTEGER := 0;
   v_noop_count INTEGER := 0;
@@ -532,18 +595,16 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
   END IF;
 
-  SELECT tenant_id, role_level, role, is_super_admin, is_active, deleted_at
-    INTO v_tenant_id, v_role_level, v_role, v_is_super_admin, v_is_active, v_deleted_at
-  FROM profiles WHERE id = v_caller_id;
-
-  IF v_tenant_id IS NULL THEN
-    RAISE EXCEPTION 'No profile found for the current user' USING ERRCODE = '42501';
-  END IF;
-  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+  IF NOT is_current_user_active() THEN
     RAISE EXCEPTION 'Your account is disabled' USING ERRCODE = '42501';
   END IF;
-  IF NOT (COALESCE(v_is_super_admin, false) OR v_role = 'admin' OR v_role_level = 1) THEN
+  IF NOT (is_super_admin() OR is_business_admin()) THEN
     RAISE EXCEPTION 'Only Admin may manage roster assignments' USING ERRCODE = '42501';
+  END IF;
+
+  SELECT tenant_id INTO v_tenant_id FROM profiles WHERE id = v_caller_id;
+  IF v_tenant_id IS NULL THEN
+    RAISE EXCEPTION 'No profile found for the current user' USING ERRCODE = '42501';
   END IF;
 
   IF p_employee_ids IS NULL OR array_length(p_employee_ids, 1) IS NULL OR array_length(p_employee_ids, 1) = 0 THEN
@@ -572,16 +633,14 @@ BEGIN
 
     v_date := p_date_from;
     WHILE v_date <= p_date_to LOOP
-      v_overrides := false;
-
       IF p_assignment_type <> 'off' THEN
         v_resolved := roster_resolve_schedule(v_employee_id, v_date);
         IF v_resolved = 'off' THEN
-          IF NOT p_override_off_day OR p_correction_reason IS NULL OR btrim(p_correction_reason) = '' THEN
-            RAISE EXCEPTION 'Employee % is scheduled Off on % -- assigning % requires override_off_day=true and a correction_reason (a working assignment may never silently replace an Off day)',
-              v_employee_id, v_date, p_assignment_type USING ERRCODE = '23514';
-          END IF;
-          v_overrides := true;
+          -- Unconditional hard block -- no override parameter exists.
+          -- Admin must use roster_reschedule_off_day to move the Off day
+          -- first; see this function's header for why.
+          RAISE EXCEPTION 'Employee % is scheduled Off on % -- a working assignment cannot be made here; use roster_reschedule_off_day to move the Off day first, which also preserves the rolling seven-day rest check across both dates atomically',
+            v_employee_id, v_date USING ERRCODE = '23514';
         END IF;
       END IF;
 
@@ -600,11 +659,11 @@ BEGIN
         END IF;
       END IF;
 
-      SELECT id, assignment_type, overrides_recurring_off_day INTO v_existing_id, v_existing_type, v_existing_overrides
+      SELECT id, assignment_type INTO v_existing_id, v_existing_type
       FROM roster_date_assignments
       WHERE employee_id = v_employee_id AND assignment_date = v_date AND is_active;
 
-      IF v_existing_id IS NOT NULL AND v_existing_type = p_assignment_type AND v_existing_overrides = v_overrides THEN
+      IF v_existing_id IS NOT NULL AND v_existing_type = p_assignment_type THEN
         v_noop_count := v_noop_count + 1;
         v_date := v_date + 1;
         CONTINUE; -- idempotent no-op
@@ -619,8 +678,11 @@ BEGIN
         WHERE id = v_existing_id;
       END IF;
 
+      -- overrides_recurring_off_day is always false for rows written here
+      -- -- this function can never create an override (see header); only
+      -- roster_reschedule_off_day's own vacated-work-date write may set it.
       INSERT INTO roster_date_assignments (tenant_id, employee_id, assignment_date, assignment_type, overrides_recurring_off_day, assigned_by, correction_reason)
-      VALUES (v_tenant_id, v_employee_id, v_date, p_assignment_type, v_overrides, v_caller_id, p_correction_reason);
+      VALUES (v_tenant_id, v_employee_id, v_date, p_assignment_type, false, v_caller_id, p_correction_reason);
       v_assigned_count := v_assigned_count + 1;
 
       FOR v_violation IN
@@ -658,32 +720,26 @@ AS $$
 DECLARE
   v_caller_id UUID := auth.uid();
   v_tenant_id UUID;
-  v_role_level INTEGER;
-  v_role TEXT;
-  v_is_super_admin BOOLEAN;
-  v_is_active BOOLEAN;
-  v_deleted_at TIMESTAMPTZ;
   v_employee_tenant_id UUID;
   v_existing_id UUID;
   v_adjacent_type TEXT;
   v_violation RECORD;
+  v_vacated_was_off BOOLEAN;
 BEGIN
   IF v_caller_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
   END IF;
 
-  SELECT tenant_id, role_level, role, is_super_admin, is_active, deleted_at
-    INTO v_tenant_id, v_role_level, v_role, v_is_super_admin, v_is_active, v_deleted_at
-  FROM profiles WHERE id = v_caller_id;
-
-  IF v_tenant_id IS NULL THEN
-    RAISE EXCEPTION 'No profile found for the current user' USING ERRCODE = '42501';
-  END IF;
-  IF COALESCE(v_is_active, false) = false OR v_deleted_at IS NOT NULL THEN
+  IF NOT is_current_user_active() THEN
     RAISE EXCEPTION 'Your account is disabled' USING ERRCODE = '42501';
   END IF;
-  IF NOT (COALESCE(v_is_super_admin, false) OR v_role = 'admin' OR v_role_level = 1) THEN
+  IF NOT (is_super_admin() OR is_business_admin()) THEN
     RAISE EXCEPTION 'Only Admin may reschedule roster Off days' USING ERRCODE = '42501';
+  END IF;
+
+  SELECT tenant_id INTO v_tenant_id FROM profiles WHERE id = v_caller_id;
+  IF v_tenant_id IS NULL THEN
+    RAISE EXCEPTION 'No profile found for the current user' USING ERRCODE = '42501';
   END IF;
 
   IF p_new_off_date IS NULL THEN
@@ -718,8 +774,13 @@ BEGIN
   INSERT INTO roster_date_assignments (tenant_id, employee_id, assignment_date, assignment_type, overrides_recurring_off_day, assigned_by, correction_reason)
   VALUES (v_tenant_id, p_employee_id, p_new_off_date, 'off', false, v_caller_id, p_correction_reason);
 
-  -- Step B (optional): working assignment on the vacated date.
+  -- Step B (optional): working assignment on the vacated date. The
+  -- overrides_recurring_off_day flag records whether the vacated date
+  -- ACTUALLY resolved Off beforehand (truthful provenance), rather than
+  -- being hardcoded true regardless of whether that was really the case.
   IF p_vacated_work_date IS NOT NULL THEN
+    v_vacated_was_off := roster_resolve_schedule(p_employee_id, p_vacated_work_date) = 'off';
+
     IF p_vacated_work_assignment_type = 'day' THEN
       SELECT assignment_type INTO v_adjacent_type FROM roster_date_assignments
       WHERE employee_id = p_employee_id AND assignment_date = p_vacated_work_date - 1 AND is_active;
@@ -742,7 +803,7 @@ BEGIN
       WHERE id = v_existing_id;
     END IF;
     INSERT INTO roster_date_assignments (tenant_id, employee_id, assignment_date, assignment_type, overrides_recurring_off_day, assigned_by, correction_reason)
-    VALUES (v_tenant_id, p_employee_id, p_vacated_work_date, p_vacated_work_assignment_type, true, v_caller_id, p_correction_reason);
+    VALUES (v_tenant_id, p_employee_id, p_vacated_work_date, p_vacated_work_assignment_type, v_vacated_was_off, v_caller_id, p_correction_reason);
   END IF;
 
   -- Validate the NET effect of BOTH changes together, around both dates --
@@ -767,11 +828,11 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION roster_assign_off_pattern(UUID[], SMALLINT, DATE, TEXT) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION roster_assign_off_pattern(UUID[], SMALLINT, DATE, TEXT) TO authenticated;
+REVOKE ALL ON FUNCTION roster_assign_off_pattern(UUID[], INTEGER, DATE, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION roster_assign_off_pattern(UUID[], INTEGER, DATE, TEXT) TO authenticated;
 
-REVOKE ALL ON FUNCTION roster_assign_dates(UUID[], DATE, DATE, TEXT, BOOLEAN, TEXT) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION roster_assign_dates(UUID[], DATE, DATE, TEXT, BOOLEAN, TEXT) TO authenticated;
+REVOKE ALL ON FUNCTION roster_assign_dates(UUID[], DATE, DATE, TEXT, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION roster_assign_dates(UUID[], DATE, DATE, TEXT, TEXT) TO authenticated;
 
 REVOKE ALL ON FUNCTION roster_reschedule_off_day(UUID, DATE, DATE, TEXT, TEXT) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION roster_reschedule_off_day(UUID, DATE, DATE, TEXT, TEXT) TO authenticated;

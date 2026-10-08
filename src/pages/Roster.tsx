@@ -140,7 +140,6 @@ export default function RosterPage() {
   const [assignType, setAssignType] = useState<AssignmentType>('day');
   const [assignDateFrom, setAssignDateFrom] = useState(defaults.from);
   const [assignDateTo, setAssignDateTo] = useState(defaults.from);
-  const [assignOverrideOffDay, setAssignOverrideOffDay] = useState(false);
   const [assignReason, setAssignReason] = useState('');
 
   const handleSubmitAssignDates = useCallback(async () => {
@@ -155,7 +154,6 @@ export default function RosterPage() {
         assignDateFrom,
         assignDateTo,
         assignType,
-        assignOverrideOffDay,
         assignReason || undefined
       );
       if (result.success) {
@@ -172,7 +170,7 @@ export default function RosterPage() {
     } finally {
       setSubmitting(false);
     }
-  }, [assignEmployeeIds, assignDateFrom, assignDateTo, assignType, assignOverrideOffDay, assignReason, loadData]);
+  }, [assignEmployeeIds, assignDateFrom, assignDateTo, assignType, assignReason, loadData]);
 
   // --- Reschedule Off day (atomic composite) form ---
   const [rescheduleEmployeeId, setRescheduleEmployeeId] = useState('');
@@ -330,6 +328,10 @@ export default function RosterPage() {
       ) : activeTab === 'assign-dates' ? (
         <Card className="p-5 space-y-4">
           <p className="text-sm text-slate-600">Assign Day, Night, or a dated Off exception across a date range for one or more employees.</p>
+          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            A working assignment cannot be placed on a date an employee is already scheduled Off -- this is always blocked, with no override.
+            To work a normally-Off date, use the <strong>Reschedule Off Day</strong> tab, which moves the Off day and assigns the vacated date atomically.
+          </p>
           <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
             {filteredEmployees.map((emp) => (
               <label key={emp.id} className="flex items-center gap-2 px-3 py-2 text-sm">
@@ -343,11 +345,7 @@ export default function RosterPage() {
             <Input label="To" type="date" value={assignDateTo} onChange={(e) => setAssignDateTo(e.target.value)} />
             <Select label="Assignment" value={assignType} onChange={(e) => setAssignType(e.target.value as AssignmentType)} options={ASSIGNMENT_TYPE_OPTIONS} />
           </div>
-          <label className="flex items-center gap-2 text-sm text-slate-700">
-            <input type="checkbox" checked={assignOverrideOffDay} onChange={(e) => setAssignOverrideOffDay(e.target.checked)} />
-            This may override a recorded Off day -- I confirm this is intentional
-          </label>
-          <Input label="Reason (required for an override or a change to an existing assignment)" value={assignReason} onChange={(e) => setAssignReason(e.target.value)} />
+          <Input label="Reason (required for a change to an existing assignment)" value={assignReason} onChange={(e) => setAssignReason(e.target.value)} />
           <Button onClick={handleSubmitAssignDates} disabled={submitting || assignEmployeeIds.size === 0}>
             {submitting ? 'Saving...' : `Assign ${assignType} to ${assignEmployeeIds.size} Employee(s)`}
           </Button>
