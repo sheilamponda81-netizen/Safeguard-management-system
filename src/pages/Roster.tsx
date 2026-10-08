@@ -14,7 +14,7 @@
 // employee_deductions, never generates attendance from HikCentral data,
 // and computes no Present/Absent/Late/hours-worked/deduction value.
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { CalendarDays, Search, Users as UsersIcon, RefreshCw, AlertTriangle } from '../utils/icons';
+import { CalendarDays, Search, Users as UsersIcon, RefreshCw, AlertTriangle, ChevronLeft, ChevronRight } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, EmptyState, Input, Select, Tabs, Table, THead, TBody, TR, TH, TD } from '../components/ui';
 import { getCurrentProfile, UserProfile } from '../utils/currentProfile';
 import { isBusinessAdmin } from '../utils/permissions';
@@ -23,6 +23,10 @@ import {
   resolveScheduleForDate, expandDateRange, addDays, WEEKDAY_LABELS,
   AssignmentType, OffDayPatternRow, DateAssignmentRow,
 } from '../utils/rosterSchedule';
+import {
+  CalendarViewMode, getBlantyreToday, startOfWeek, endOfWeek, startOfMonth, endOfMonth,
+  shiftCalendarRange, formatDayHeading, formatPeriodHeading, isValidDateRange, dateRangeLengthDays, MAX_CUSTOM_RANGE_DAYS,
+} from '../utils/rosterCalendarNav';
 import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import {
   fetchActiveOffDayPatterns, fetchActiveDateAssignments, fetchActiveEmployeesForRoster,
@@ -39,9 +43,9 @@ const ASSIGNMENT_TYPE_OPTIONS = [
 
 const WEEKDAY_OPTIONS = WEEKDAY_LABELS.map((label, value) => ({ label, value: String(value) }));
 
-function defaultCalendarRange(): { from: string; to: string } {
-  const today = new Date().toISOString().slice(0, 10);
-  return { from: today, to: addDays(today, 6) };
+function defaultCalendarRange(): { from: string; to: string; today: string } {
+  const today = getBlantyreToday();
+  return { from: startOfWeek(today), to: endOfWeek(today), today };
 }
 
 export default function RosterPage() {
@@ -60,16 +64,72 @@ export default function RosterPage() {
   const defaults = useMemo(defaultCalendarRange, []);
   const [calendarFrom, setCalendarFrom] = useState(defaults.from);
   const [calendarTo, setCalendarTo] = useState(defaults.to);
+  const [calendarViewMode, setCalendarViewMode] = useState<CalendarViewMode>('week');
   const [submitting, setSubmitting] = useState(false);
+
+  const isCalendarRangeValid = isValidDateRange(calendarFrom, calendarTo);
+  const calendarRangeTooLarge =
+    calendarViewMode === 'custom' && isCalendarRangeValid && dateRangeLengthDays(calendarFrom, calendarTo) > MAX_CUSTOM_RANGE_DAYS;
+
+  const handleCalendarNav = useCallback(
+    (direction: 1 | -1) => {
+      if (!isCalendarRangeValid) return;
+      const next = shiftCalendarRange(calendarFrom, calendarTo, calendarViewMode, direction);
+      setCalendarFrom(next.from);
+      setCalendarTo(next.to);
+    },
+    [calendarFrom, calendarTo, calendarViewMode, isCalendarRangeValid]
+  );
+
+  const handleCalendarToday = useCallback(() => {
+    const today = getBlantyreToday();
+    setCalendarViewMode('week');
+    setCalendarFrom(startOfWeek(today));
+    setCalendarTo(endOfWeek(today));
+  }, []);
+
+  const handleCalendarViewMode = useCallback(
+    (mode: 'week' | 'month') => {
+      const anchor = isCalendarRangeValid ? calendarFrom : getBlantyreToday();
+      setCalendarViewMode(mode);
+      if (mode === 'week') {
+        setCalendarFrom(startOfWeek(anchor));
+        setCalendarTo(endOfWeek(anchor));
+      } else {
+        setCalendarFrom(startOfMonth(anchor));
+        setCalendarTo(endOfMonth(anchor));
+      }
+    },
+    [calendarFrom, isCalendarRangeValid]
+  );
+
+  const handleCalendarFromChange = useCallback((value: string) => {
+    setCalendarViewMode('custom');
+    setCalendarFrom(value);
+  }, []);
+
+  const handleCalendarToChange = useCallback((value: string) => {
+    setCalendarViewMode('custom');
+    setCalendarTo(value);
+  }, []);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
     try {
+      // An invalid (inverted) or oversized custom range can never resolve
+      // to a sensible calendar grid -- skip the (potentially huge, always
+      // pointless) date-assignments fetch rather than send PostgREST a
+      // query that would just return zero or excessive rows. Employees
+      // and patterns are still needed by the other tabs regardless of
+      // what the Calendar tab's range currently is.
+      const shouldFetchAssignments = isCalendarRangeValid && !calendarRangeTooLarge;
       const [emps, pats, assigns] = await Promise.all([
         fetchActiveEmployeesForRoster(),
         fetchActiveOffDayPatterns(),
-        fetchActiveDateAssignments(addDays(calendarFrom, -1), addDays(calendarTo, 1)),
+        shouldFetchAssignments
+          ? fetchActiveDateAssignments(addDays(calendarFrom, -1), addDays(calendarTo, 1))
+          : Promise.resolve([]),
       ]);
       setEmployees(emps);
       setPatterns(pats);
@@ -79,7 +139,7 @@ export default function RosterPage() {
     } finally {
       setLoading(false);
     }
-  }, [calendarFrom, calendarTo]);
+  }, [calendarFrom, calendarTo, isCalendarRangeValid, calendarRangeTooLarge]);
 
   useEffect(() => {
     (async () => {
@@ -98,12 +158,20 @@ export default function RosterPage() {
     return employees.filter((e) => e.fullName.toLowerCase().includes(q) || e.employeeNumber.toLowerCase().includes(q));
   }, [employees, employeeSearch]);
 
-  const calendarDates = useMemo(() => expandDateRange(calendarFrom, calendarTo), [calendarFrom, calendarTo]);
+  const calendarDates = useMemo(() => {
+    if (!isCalendarRangeValid || calendarRangeTooLarge) return [];
+    return expandDateRange(calendarFrom, calendarTo);
+  }, [calendarFrom, calendarTo, isCalendarRangeValid, calendarRangeTooLarge]);
+
+  const calendarPeriodHeading = useMemo(
+    () => formatPeriodHeading(calendarViewMode, calendarFrom, calendarTo),
+    [calendarViewMode, calendarFrom, calendarTo]
+  );
 
   // --- Set recurring Off-day pattern form ---
   const [offPatternEmployeeIds, setOffPatternEmployeeIds] = useState<Set<string>>(new Set());
   const [offPatternWeekday, setOffPatternWeekday] = useState('0');
-  const [offPatternEffectiveFrom, setOffPatternEffectiveFrom] = useState(defaults.from);
+  const [offPatternEffectiveFrom, setOffPatternEffectiveFrom] = useState(defaults.today);
   const [offPatternReason, setOffPatternReason] = useState('');
 
   const handleSubmitOffPattern = useCallback(async () => {
@@ -138,8 +206,8 @@ export default function RosterPage() {
   // --- Assign Day/Night/Off for a date range form ---
   const [assignEmployeeIds, setAssignEmployeeIds] = useState<Set<string>>(new Set());
   const [assignType, setAssignType] = useState<AssignmentType>('day');
-  const [assignDateFrom, setAssignDateFrom] = useState(defaults.from);
-  const [assignDateTo, setAssignDateTo] = useState(defaults.from);
+  const [assignDateFrom, setAssignDateFrom] = useState(defaults.today);
+  const [assignDateTo, setAssignDateTo] = useState(defaults.today);
   const [assignReason, setAssignReason] = useState('');
 
   const handleSubmitAssignDates = useCallback(async () => {
@@ -174,7 +242,7 @@ export default function RosterPage() {
 
   // --- Reschedule Off day (atomic composite) form ---
   const [rescheduleEmployeeId, setRescheduleEmployeeId] = useState('');
-  const [rescheduleNewOffDate, setRescheduleNewOffDate] = useState(defaults.from);
+  const [rescheduleNewOffDate, setRescheduleNewOffDate] = useState(defaults.today);
   const [rescheduleVacatedDate, setRescheduleVacatedDate] = useState('');
   const [rescheduleVacatedType, setRescheduleVacatedType] = useState<'day' | 'night'>('day');
   const [rescheduleAssignVacated, setRescheduleAssignVacated] = useState(false);
@@ -265,28 +333,71 @@ export default function RosterPage() {
         <div className="p-8 text-center text-slate-400">Loading roster data...</div>
       ) : activeTab === 'calendar' ? (
         <div className="space-y-3">
-          <Card className="p-4">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <Input label="From" type="date" value={calendarFrom} onChange={(e) => setCalendarFrom(e.target.value)} />
-              <Input label="To" type="date" value={calendarTo} onChange={(e) => setCalendarTo(e.target.value)} />
+          <Card className="p-4 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => handleCalendarNav(-1)} disabled={!isCalendarRangeValid} title="Previous period">
+                  <ChevronLeft size={16} />
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => handleCalendarNav(1)} disabled={!isCalendarRangeValid} title="Next period">
+                  <ChevronRight size={16} />
+                </Button>
+                <Button variant="outline" size="sm" onClick={handleCalendarToday}>Today</Button>
+                <h2 className="text-base font-semibold text-slate-800 ml-2">{calendarPeriodHeading}</h2>
+              </div>
+              <div className="flex items-center gap-1 bg-slate-100 rounded-lg p-1">
+                <button
+                  type="button"
+                  onClick={() => handleCalendarViewMode('week')}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${calendarViewMode === 'week' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                >
+                  Week
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleCalendarViewMode('month')}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${calendarViewMode === 'month' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                >
+                  Month
+                </button>
+              </div>
             </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <Input label="From" type="date" value={calendarFrom} onChange={(e) => handleCalendarFromChange(e.target.value)} />
+              <Input label="To" type="date" value={calendarTo} onChange={(e) => handleCalendarToChange(e.target.value)} />
+            </div>
+            {calendarViewMode === 'custom' && (
+              <p className="text-xs text-slate-500">Custom range selected -- Previous/Next will now move by this range's own length ({isCalendarRangeValid ? dateRangeLengthDays(calendarFrom, calendarTo) : '?'} day(s)). Switch back to Week or Month at any time.</p>
+            )}
           </Card>
-          {filteredEmployees.length === 0 ? (
+
+          {!isCalendarRangeValid ? (
+            <Card className="p-4 bg-red-50 border-red-200 border">
+              <p className="text-sm text-red-700">The To date must be on or after the From date. Adjust one of the dates above to see the calendar.</p>
+            </Card>
+          ) : calendarRangeTooLarge ? (
+            <Card className="p-4 bg-amber-50 border-amber-200 border">
+              <p className="text-sm text-amber-800">
+                This custom range is too large to display ({dateRangeLengthDays(calendarFrom, calendarTo)} days -- the maximum is {MAX_CUSTOM_RANGE_DAYS}).
+                Narrow the From/To dates above, or use Week or Month view.
+              </p>
+            </Card>
+          ) : filteredEmployees.length === 0 ? (
             <EmptyState icon={UsersIcon} title="No employees match your search" description="Adjust the search above." />
           ) : (
             <Table>
               <THead>
                 <TR hover={false}>
-                  <TH>Employee</TH>
+                  <TH className="sticky left-0 z-10 bg-[#F8FAFC]">Employee</TH>
                   {calendarDates.map((d) => (
-                    <TH key={d}>{d.slice(5)}</TH>
+                    <TH key={d}>{formatDayHeading(d)}</TH>
                   ))}
                 </TR>
               </THead>
               <TBody>
                 {filteredEmployees.slice(0, 100).map((emp) => (
                   <TR key={emp.id}>
-                    <TD className="font-medium text-slate-800">{emp.fullName}<span className="block text-xs text-slate-500 font-normal">{emp.employeeNumber}</span></TD>
+                    <TD className="sticky left-0 z-10 bg-white font-medium text-slate-800">{emp.fullName}<span className="block text-xs text-slate-500 font-normal">{emp.employeeNumber}</span></TD>
                     {calendarDates.map((d) => {
                       const resolved = resolveScheduleForDate(emp.id, d, dateAssignments, patterns);
                       const color = resolved === 'off' ? 'gold' : resolved === 'day' ? 'navy' : resolved === 'night' ? 'blue' : 'gray';
@@ -301,7 +412,7 @@ export default function RosterPage() {
               </TBody>
             </Table>
           )}
-          {filteredEmployees.length > 100 && (
+          {isCalendarRangeValid && !calendarRangeTooLarge && filteredEmployees.length > 100 && (
             <p className="text-xs text-slate-500">Showing the first 100 of {filteredEmployees.length} matching employees. Narrow your search to see the rest.</p>
           )}
         </div>
