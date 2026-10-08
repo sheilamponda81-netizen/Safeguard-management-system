@@ -34,7 +34,11 @@ const REQUIRED_HEADERS = [
 const OPTIONAL_KNOWN_HEADERS = ['Attendance Type'] as const;
 
 const MAX_HEADER_SCAN_ROWS = 20;
-const AFRICA_BLANTYRE_OFFSET_MINUTES = 2 * 60; // UTC+02:00, no DST
+// Exported so any other module needing the SAME fixed offset (e.g. the
+// reverse UTC-instant -> Blantyre-calendar-date conversion in
+// hikcentralAttendancePreview.ts) imports this one constant rather than
+// re-declaring the magic number "120" a second time.
+export const AFRICA_BLANTYRE_OFFSET_MINUTES = 2 * 60; // UTC+02:00, no DST
 
 export type SheetCell = string | number | boolean | Date | null | undefined;
 export type SheetRow = SheetCell[];

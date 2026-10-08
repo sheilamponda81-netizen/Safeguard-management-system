@@ -44,6 +44,7 @@ const RecruitmentPage = safeLazy(() => import("./pages/Recruitment"));
 const AttendancePage = safeLazy(() => import("./pages/Attendance"));
 const HikCentralImportPage = safeLazy(() => import("./pages/HikCentralImport"));
 const HikCentralPersonMappingPage = safeLazy(() => import("./pages/HikCentralPersonMapping"));
+const HikCentralAttendancePreviewPage = safeLazy(() => import("./pages/HikCentralAttendancePreview"));
 const PayrollPage = safeLazy(() => import("./pages/Payroll"));
 const PayslipsPage = safeLazy(() => import("./pages/Payslips"));
 const PaymentsPage = safeLazy(() => import("./pages/Payments"));
@@ -73,6 +74,7 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
   attendance: AttendancePage,
   "hikcentral-import": HikCentralImportPage,
   "hikcentral-mapping": HikCentralPersonMappingPage,
+  "hikcentral-attendance-preview": HikCentralAttendancePreviewPage,
   payroll: PayrollPage,
   payslips: PayslipsPage,
   payments: PaymentsPage,
@@ -90,14 +92,14 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
 const rolePages: Record<number, NavKey[]> = {
   1: [
     "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
-    "hikcentral-mapping",
+    "hikcentral-mapping", "hikcentral-attendance-preview",
     "payroll", "payslips", "payments", "terminal-dues", "salary-advances",
     "reports", "settings", "security", "features", "auditlogs",
     "user-manual",
   ],
   2: [
     "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
-    "hikcentral-mapping",
+    "hikcentral-mapping", "hikcentral-attendance-preview",
     "payments", "terminal-dues", "salary-advances", "reports", "security",
     "user-manual",
   ],
@@ -121,6 +123,7 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   attendance: { title: "Attendance Management", breadcrumb: "Attendance" },
   "hikcentral-import": { title: "HikCentral Attendance Import", breadcrumb: "HikCentral Import" },
   "hikcentral-mapping": { title: "HikCentral Person Mapping", breadcrumb: "Person Mapping" },
+  "hikcentral-attendance-preview": { title: "HikCentral Attendance Preview", breadcrumb: "Attendance Preview" },
   payroll: { title: "Payroll Management", breadcrumb: "Payroll" },
   payslips: { title: "Payslips", breadcrumb: "Payslips" },
   payments: { title: "Payment Management", breadcrumb: "Payments" },
