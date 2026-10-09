@@ -13,8 +13,8 @@
 // This page never touches attendance/payroll/payment_status/
 // employee_deductions, never generates attendance from HikCentral data,
 // and computes no Present/Absent/Late/hours-worked/deduction value.
-import { useState, useEffect, useMemo, useCallback } from 'react';
-import { CalendarDays, Search, Users as UsersIcon, RefreshCw, AlertTriangle, ChevronLeft, ChevronRight } from '../utils/icons';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { CalendarDays, Search, Users as UsersIcon, RefreshCw, AlertTriangle, ChevronLeft, ChevronRight, X } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, EmptyState, Input, Select, Tabs, Table, THead, TBody, TR, TH, TD } from '../components/ui';
 import { getCurrentProfile, UserProfile } from '../utils/currentProfile';
 import { isBusinessAdmin } from '../utils/permissions';
@@ -31,7 +31,140 @@ import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import {
   fetchActiveOffDayPatterns, fetchActiveDateAssignments, fetchActiveEmployeesForRoster,
   assignOffPattern, assignDates, rescheduleOffDay,
+  filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex,
 } from '../utils/rosterService';
+
+// Phase 2B.2C: a reusable searchable single-employee selector for the
+// Reschedule Off Day tab, replacing a plain <select> that was unusable
+// once the employee list grows into the hundreds -- see this file's
+// other three tabs for the equivalent multi-select search pattern
+// (a local search Input above an unbounded checkbox list; a combobox
+// needs its own component instead, since a native <select> cannot offer
+// live type-ahead filtering). Its filtering and keyboard-navigation
+// index math are the pure, independently-tested functions imported above
+// (filterEmployeesForSearch, moveHighlightedIndex) -- this component is
+// only the thin, untested-by-necessity wiring around them (this codebase
+// has no component-test harness; see rosterMigrationSecurity.test.ts's
+// own header for the established precedent).
+const COMBOBOX_MAX_VISIBLE_RESULTS = 50;
+
+function EmployeeSingleSelect({ employees, value, onChange, placeholder }: {
+  employees: EmployeeLite[];
+  value: string;
+  onChange: (employeeId: string) => void;
+  placeholder?: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [highlightedIndex, setHighlightedIndex] = useState(-1);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const selected = employees.find((e) => e.id === value) || null;
+  const matches = useMemo(() => filterEmployeesForSearch(employees, query), [employees, query]);
+  const visibleMatches = matches.slice(0, COMBOBOX_MAX_VISIBLE_RESULTS);
+
+  const openForSearch = () => {
+    setQuery('');
+    setHighlightedIndex(-1);
+    setIsOpen(true);
+  };
+
+  const selectEmployee = (employeeId: string) => {
+    onChange(employeeId);
+    setQuery('');
+    setHighlightedIndex(-1);
+    setIsOpen(false);
+  };
+
+  const clearSelection = () => {
+    onChange('');
+    openForSearch();
+    inputRef.current?.focus();
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!isOpen) { openForSearch(); return; }
+      setHighlightedIndex((i) => moveHighlightedIndex(i, 1, visibleMatches.length));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!isOpen) { openForSearch(); return; }
+      setHighlightedIndex((i) => moveHighlightedIndex(i, -1, visibleMatches.length));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (isOpen && highlightedIndex >= 0 && visibleMatches[highlightedIndex]) {
+        selectEmployee(visibleMatches[highlightedIndex].id);
+      }
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      setQuery('');
+      setHighlightedIndex(-1);
+      setIsOpen(false);
+    }
+  };
+
+  const displayValue = isOpen ? query : selected ? formatEmployeeLabel(selected) : '';
+
+  return (
+    <div className="relative">
+      <label className="block text-sm font-medium text-slate-700 mb-1.5">Employee</label>
+      <div className="relative">
+        <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+        <input
+          ref={inputRef}
+          type="text"
+          role="combobox"
+          aria-expanded={isOpen}
+          aria-autocomplete="list"
+          value={displayValue}
+          placeholder={placeholder || 'Search employee by name or number...'}
+          onFocus={openForSearch}
+          onChange={(e) => { setQuery(e.target.value); setHighlightedIndex(-1); setIsOpen(true); }}
+          onKeyDown={handleKeyDown}
+          onBlur={() => setTimeout(() => setIsOpen(false), 150)}
+          className="w-full pl-10 pr-9 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent outline-none bg-white"
+        />
+        {selected && !isOpen && (
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); clearSelection(); }}
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+            aria-label="Clear selected employee"
+            title="Clear selection"
+          >
+            <X size={16} />
+          </button>
+        )}
+      </div>
+      {isOpen && (
+        <div className="absolute z-20 mt-1 w-full max-h-64 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-lg">
+          {visibleMatches.length === 0 ? (
+            <p className="px-3 py-3 text-sm text-slate-500">No employees match your search.</p>
+          ) : (
+            <>
+              {visibleMatches.map((emp, i) => (
+                <button
+                  type="button"
+                  key={emp.id}
+                  onMouseDown={(e) => { e.preventDefault(); selectEmployee(emp.id); }}
+                  className={`w-full text-left px-3 py-2 text-sm ${i === highlightedIndex ? 'bg-[#081C3A] text-white' : emp.id === value ? 'bg-slate-100 text-slate-800' : 'text-slate-700 hover:bg-slate-50'}`}
+                >
+                  {emp.fullName} <span className={i === highlightedIndex ? 'text-slate-300' : 'text-slate-500'}>({emp.employeeNumber})</span>
+                </button>
+              ))}
+              {matches.length > COMBOBOX_MAX_VISIBLE_RESULTS && (
+                <p className="px-3 py-2 text-xs text-slate-500 border-t border-slate-100">
+                  Showing the first {COMBOBOX_MAX_VISIBLE_RESULTS} of {matches.length} matches. Keep typing to narrow further.
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 type TabId = 'calendar' | 'off-pattern' | 'assign-dates' | 'reschedule';
 
@@ -157,11 +290,21 @@ export default function RosterPage() {
     if (profileLoaded && canManage) loadData();
   }, [profileLoaded, canManage, loadData]);
 
-  const filteredEmployees = useMemo(() => {
-    const q = employeeSearch.trim().toLowerCase();
-    if (q === '') return employees;
-    return employees.filter((e) => e.fullName.toLowerCase().includes(q) || e.employeeNumber.toLowerCase().includes(q));
-  }, [employees, employeeSearch]);
+  // Calendar's own employee filter -- unchanged behavior, still driven by
+  // the page-level search above the tabs. The other three tabs each got
+  // their own independent, tab-local search in Phase 2B.2C (below), so
+  // that searching on one tab never changes what's selected or visible
+  // on another, and selections never get silently cleared by a search
+  // change on an unrelated tab.
+  const filteredEmployees = useMemo(() => filterEmployeesForSearch(employees, employeeSearch), [employees, employeeSearch]);
+
+  // --- Recurring Off Day: its own local search, decoupled from the page-level one above ---
+  const [offPatternSearch, setOffPatternSearch] = useState('');
+  const offPatternFilteredEmployees = useMemo(() => filterEmployeesForSearch(employees, offPatternSearch), [employees, offPatternSearch]);
+
+  // --- Assign Dates: its own local search, decoupled from the page-level one above ---
+  const [assignSearch, setAssignSearch] = useState('');
+  const assignFilteredEmployees = useMemo(() => filterEmployeesForSearch(employees, assignSearch), [employees, assignSearch]);
 
   const calendarDates = useMemo(() => {
     if (!isCalendarRangeValid || calendarRangeTooLarge) return [];
@@ -428,14 +571,23 @@ export default function RosterPage() {
       ) : activeTab === 'off-pattern' ? (
         <Card className="p-5 space-y-4">
           <p className="text-sm text-slate-600">Select employees, then the weekday that should be their recurring Off day and the date it takes effect.</p>
-          <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
-            {filteredEmployees.map((emp) => (
-              <label key={emp.id} className="flex items-center gap-2 px-3 py-2 text-sm">
-                <input type="checkbox" checked={offPatternEmployeeIds.has(emp.id)} onChange={() => toggleInSet(offPatternEmployeeIds, setOffPatternEmployeeIds, emp.id)} />
-                {emp.fullName} <span className="text-xs text-slate-500">{emp.employeeNumber}</span>
-              </label>
-            ))}
+          <Input icon={Search} placeholder="Search employee by name or number..." value={offPatternSearch} onChange={(e) => setOffPatternSearch(e.target.value)} />
+          <div className="flex items-center justify-between text-xs text-slate-500">
+            <span>{offPatternFilteredEmployees.length} of {employees.length} employee(s) shown</span>
+            <span className="font-medium text-slate-700">{offPatternEmployeeIds.size} selected</span>
           </div>
+          {offPatternFilteredEmployees.length === 0 ? (
+            <EmptyState icon={UsersIcon} title="No employees match your search" description="Adjust the search above. Any employees already selected remain selected." />
+          ) : (
+            <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+              {offPatternFilteredEmployees.map((emp) => (
+                <label key={emp.id} className="flex items-center gap-2 px-3 py-2 text-sm">
+                  <input type="checkbox" checked={offPatternEmployeeIds.has(emp.id)} onChange={() => toggleInSet(offPatternEmployeeIds, setOffPatternEmployeeIds, emp.id)} />
+                  {emp.fullName} <span className="text-xs text-slate-500">{emp.employeeNumber}</span>
+                </label>
+              ))}
+            </div>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <Select label="Off weekday" value={offPatternWeekday} onChange={(e) => setOffPatternWeekday(e.target.value)} options={WEEKDAY_OPTIONS} />
             <Input label="Effective from" type="date" value={offPatternEffectiveFrom} onChange={(e) => setOffPatternEffectiveFrom(e.target.value)} />
@@ -452,14 +604,23 @@ export default function RosterPage() {
             A working assignment cannot be placed on a date an employee is already scheduled Off -- this is always blocked, with no override.
             To work a normally-Off date, use the <strong>Reschedule Off Day</strong> tab, which moves the Off day and assigns the vacated date atomically.
           </p>
-          <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
-            {filteredEmployees.map((emp) => (
-              <label key={emp.id} className="flex items-center gap-2 px-3 py-2 text-sm">
-                <input type="checkbox" checked={assignEmployeeIds.has(emp.id)} onChange={() => toggleInSet(assignEmployeeIds, setAssignEmployeeIds, emp.id)} />
-                {emp.fullName} <span className="text-xs text-slate-500">{emp.employeeNumber}</span>
-              </label>
-            ))}
+          <Input icon={Search} placeholder="Search employee by name or number..." value={assignSearch} onChange={(e) => setAssignSearch(e.target.value)} />
+          <div className="flex items-center justify-between text-xs text-slate-500">
+            <span>{assignFilteredEmployees.length} of {employees.length} employee(s) shown</span>
+            <span className="font-medium text-slate-700">{assignEmployeeIds.size} selected</span>
           </div>
+          {assignFilteredEmployees.length === 0 ? (
+            <EmptyState icon={UsersIcon} title="No employees match your search" description="Adjust the search above. Any employees already selected remain selected." />
+          ) : (
+            <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+              {assignFilteredEmployees.map((emp) => (
+                <label key={emp.id} className="flex items-center gap-2 px-3 py-2 text-sm">
+                  <input type="checkbox" checked={assignEmployeeIds.has(emp.id)} onChange={() => toggleInSet(assignEmployeeIds, setAssignEmployeeIds, emp.id)} />
+                  {emp.fullName} <span className="text-xs text-slate-500">{emp.employeeNumber}</span>
+                </label>
+              ))}
+            </div>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <Input label="From" type="date" value={assignDateFrom} onChange={(e) => setAssignDateFrom(e.target.value)} />
             <Input label="To" type="date" value={assignDateTo} onChange={(e) => setAssignDateTo(e.target.value)} />
@@ -476,12 +637,7 @@ export default function RosterPage() {
             Move one employee's Off day to a new date, optionally assigning explicit work on the date being vacated --
             both changes are validated and committed together.
           </p>
-          <Select
-            label="Employee"
-            value={rescheduleEmployeeId}
-            onChange={(e) => setRescheduleEmployeeId(e.target.value)}
-            options={[{ label: 'Select an employee...', value: '' }, ...filteredEmployees.map((e) => ({ label: `${e.fullName} (${e.employeeNumber})`, value: e.id }))]}
-          />
+          <EmployeeSingleSelect employees={employees} value={rescheduleEmployeeId} onChange={setRescheduleEmployeeId} />
           <Input label="New Off date" type="date" value={rescheduleNewOffDate} onChange={(e) => setRescheduleNewOffDate(e.target.value)} />
           <label className="flex items-center gap-2 text-sm text-slate-700">
             <input type="checkbox" checked={rescheduleAssignVacated} onChange={(e) => setRescheduleAssignVacated(e.target.checked)} />

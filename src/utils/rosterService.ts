@@ -44,12 +44,26 @@ export async function fetchActiveDateAssignments(dateFrom: string, dateTo: strin
   }));
 }
 
+// Phase 2B.2C: a single, explicit, documented bound rather than relying on
+// whatever PostgREST's own default row cap happens to be today -- RLS
+// already scopes this to the caller's own tenant, so this is a safety
+// ceiling against a single tenant's Active, non-deleted headcount growing
+// far beyond anything the roster UI's search/select widgets are designed
+// to browse, not a pagination mechanism. At the current ~935 employees
+// (STAGING, 2026-10) this is never reached; if it ever is, every roster
+// employee-search surface (Calendar, Recurring Off Day, Assign Dates,
+// Reschedule Off Day) searches only within the fetched set, so search
+// would need to be made properly server-side at that point -- see this
+// function's and filterEmployeesForSearch's own callers in Roster.tsx.
+const MAX_ROSTER_EMPLOYEES_FETCHED = 5000;
+
 export async function fetchActiveEmployeesForRoster(): Promise<EmployeeLite[]> {
   const { data, error } = await supabase
     .from('employees')
     .select('id, employee_number, full_name, workstation, status, is_deleted')
     .eq('status', 'Active')
-    .or('is_deleted.is.null,is_deleted.eq.false');
+    .or('is_deleted.is.null,is_deleted.eq.false')
+    .limit(MAX_ROSTER_EMPLOYEES_FETCHED);
   if (error) throw error;
   return (data || []).map((row) => ({
     id: row.id,
@@ -59,6 +73,42 @@ export async function fetchActiveEmployeesForRoster(): Promise<EmployeeLite[]> {
     status: row.status,
     isDeleted: row.is_deleted,
   }));
+}
+
+/**
+ * The single shared employee-search predicate used by every roster
+ * employee-selection surface (Calendar's grid filter, Recurring Off Day's
+ * and Assign Dates' checkbox lists, and the Reschedule Off Day combobox) --
+ * case-insensitive partial match on full name OR employee number. A blank
+ * query matches everyone. Operates on an already-fetched, already
+ * tenant-scoped (via RLS) array -- it never queries the network itself,
+ * so it is correct over however many employees were actually fetched,
+ * never limited to whatever subset a caller happens to be displaying.
+ */
+export function filterEmployeesForSearch(employees: EmployeeLite[], query: string): EmployeeLite[] {
+  const q = query.trim().toLowerCase();
+  if (q === '') return employees;
+  return employees.filter((e) => e.fullName.toLowerCase().includes(q) || e.employeeNumber.toLowerCase().includes(q));
+}
+
+/** "Full Name (EMP-NUMBER)" -- the one display label every roster employee-selection surface uses, so a combobox's closed-state text and a multi-select checkbox's row label never drift apart. */
+export function formatEmployeeLabel(employee: EmployeeLite): string {
+  return `${employee.fullName} (${employee.employeeNumber})`;
+}
+
+/**
+ * Moves a combobox's highlighted result index by one Arrow key press,
+ * clamped to the current result count -- pure so the Reschedule Off Day
+ * single-select combobox's keyboard navigation is directly unit-testable
+ * without mounting any component. Wraps around in both directions (Arrow
+ * Down past the last result returns to the first, Arrow Up past the first
+ * returns to the last), matching common combobox convention. Returns -1
+ * (nothing highlighted) when there are no results to highlight at all.
+ */
+export function moveHighlightedIndex(currentIndex: number, direction: 1 | -1, resultCount: number): number {
+  if (resultCount === 0) return -1;
+  if (currentIndex < 0) return direction === 1 ? 0 : resultCount - 1;
+  return (currentIndex + direction + resultCount) % resultCount;
 }
 
 export type RosterRpcOutcome = 'success' | 'unauthorized' | 'missing_rpc' | 'network_error' | 'unexpected_response';
