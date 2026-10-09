@@ -21,6 +21,7 @@ import { isBusinessAdmin } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import {
   resolveScheduleForDate, expandDateRange, addDays, WEEKDAY_LABELS,
+  buildRescheduleOffDayPreview, ResolvedSchedule,
   AssignmentType, OffDayPatternRow, DateAssignmentRow,
 } from '../utils/rosterSchedule';
 import {
@@ -30,9 +31,14 @@ import {
 import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import {
   fetchActiveOffDayPatterns, fetchActiveDateAssignments, fetchActiveEmployeesForRoster,
-  assignOffPattern, assignDates, rescheduleOffDay,
+  assignOffPattern, assignDates, rescheduleOffDay, humanizeRosterError,
   filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex,
 } from '../utils/rosterService';
+
+/** Shared Calendar/preview color mapping -- one place for the resolved-state-to-Badge-color rule, so the Reschedule preview and the Calendar grid never drift apart. */
+function scheduleBadgeColor(resolved: ResolvedSchedule): 'gold' | 'navy' | 'blue' | 'gray' {
+  return resolved === 'off' ? 'gold' : resolved === 'day' ? 'navy' : resolved === 'night' ? 'blue' : 'gray';
+}
 
 // Phase 2B.2C: a reusable searchable single-employee selector for the
 // Reschedule Off Day tab, replacing a plain <select> that was unusable
@@ -344,12 +350,12 @@ export default function RosterPage() {
         setOffPatternReason('');
         await loadData();
       } else {
-        showNotification(result.error || 'Could not set the Off-day pattern.', 'error');
+        showNotification(humanizeRosterError(result.error || 'Could not set the Off-day pattern.', employees), 'error');
       }
     } finally {
       setSubmitting(false);
     }
-  }, [offPatternEmployeeIds, offPatternWeekday, offPatternEffectiveFrom, offPatternReason, loadData]);
+  }, [offPatternEmployeeIds, offPatternWeekday, offPatternEffectiveFrom, offPatternReason, employees, loadData]);
 
   // --- Assign Day/Night/Off for a date range form ---
   const [assignEmployeeIds, setAssignEmployeeIds] = useState<Set<string>>(new Set());
@@ -381,52 +387,77 @@ export default function RosterPage() {
         setAssignReason('');
         await loadData();
       } else {
-        showNotification(result.error || 'Could not assign the selected dates.', 'error');
+        showNotification(humanizeRosterError(result.error || 'Could not assign the selected dates.', employees), 'error');
       }
     } finally {
       setSubmitting(false);
     }
-  }, [assignEmployeeIds, assignDateFrom, assignDateTo, assignType, assignReason, loadData]);
+  }, [assignEmployeeIds, assignDateFrom, assignDateTo, assignType, assignReason, employees, loadData]);
 
-  // --- Reschedule Off day (atomic composite) form ---
+  // --- Reschedule Off day (atomic composite) form -- Phase 2B.2C, Policy
+  // Option A: a mandatory symmetric swap. There is no longer an "also
+  // assign work on the vacated date" checkbox -- converting the original
+  // date into a real shift is now always part of the same call (see the
+  // reschedule service wrapper's own header and the new migration's own
+  // header for why the old optional-checkbox design was replaced).
   const [rescheduleEmployeeId, setRescheduleEmployeeId] = useState('');
-  const [rescheduleNewOffDate, setRescheduleNewOffDate] = useState(defaults.today);
-  const [rescheduleVacatedDate, setRescheduleVacatedDate] = useState('');
-  const [rescheduleVacatedType, setRescheduleVacatedType] = useState<'day' | 'night'>('day');
-  const [rescheduleAssignVacated, setRescheduleAssignVacated] = useState(false);
+  const [rescheduleOriginalDate, setRescheduleOriginalDate] = useState('');
+  const [rescheduleReplacementDate, setRescheduleReplacementDate] = useState('');
+  const [rescheduleShift, setRescheduleShift] = useState<'day' | 'night'>('day');
   const [rescheduleReason, setRescheduleReason] = useState('');
 
+  const rescheduleSelectedEmployee = useMemo(
+    () => employees.find((e) => e.id === rescheduleEmployeeId) || null,
+    [employees, rescheduleEmployeeId]
+  );
+
+  // Advisory preview only -- see buildRescheduleOffDayPreview's own header.
+  // The database independently re-verifies everything, including the
+  // rolling seven-day rest rule, which this preview deliberately does not
+  // replicate.
+  const reschedulePreview = useMemo(
+    () =>
+      rescheduleEmployeeId && rescheduleOriginalDate && rescheduleReplacementDate
+        ? buildRescheduleOffDayPreview(rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns)
+        : null,
+    [rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns]
+  );
+
+  const canSubmitReschedule =
+    !!rescheduleEmployeeId &&
+    !!rescheduleOriginalDate &&
+    !!rescheduleReplacementDate &&
+    !!rescheduleReason.trim() &&
+    !!reschedulePreview &&
+    !reschedulePreview.blockingReason;
+
   const handleSubmitReschedule = useCallback(async () => {
-    if (!rescheduleEmployeeId) {
-      showNotification('Select an employee.', 'error');
-      return;
-    }
-    if (!rescheduleReason.trim()) {
-      showNotification('A reason is required to reschedule an Off day.', 'error');
+    if (!canSubmitReschedule) {
+      showNotification('Complete all required fields and resolve the issue shown in the preview before submitting.', 'error');
       return;
     }
     setSubmitting(true);
     try {
       const result = await rescheduleOffDay(
         rescheduleEmployeeId,
-        rescheduleNewOffDate,
-        rescheduleReason,
-        rescheduleAssignVacated ? rescheduleVacatedDate : undefined,
-        rescheduleAssignVacated ? rescheduleVacatedType : undefined
+        rescheduleOriginalDate,
+        rescheduleReplacementDate,
+        rescheduleShift,
+        rescheduleReason
       );
       if (result.success) {
         showNotification('Off day rescheduled.', 'success');
+        setRescheduleOriginalDate('');
+        setRescheduleReplacementDate('');
         setRescheduleReason('');
-        setRescheduleVacatedDate('');
-        setRescheduleAssignVacated(false);
         await loadData();
       } else {
-        showNotification(result.error || 'Could not reschedule the Off day.', 'error');
+        showNotification(humanizeRosterError(result.error || 'Could not reschedule the Off day.', employees), 'error');
       }
     } finally {
       setSubmitting(false);
     }
-  }, [rescheduleEmployeeId, rescheduleNewOffDate, rescheduleReason, rescheduleAssignVacated, rescheduleVacatedDate, rescheduleVacatedType, loadData]);
+  }, [canSubmitReschedule, rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, rescheduleReason, employees, loadData]);
 
   const toggleInSet = (set: Set<string>, setSet: (s: Set<string>) => void, id: string) => {
     const next = new Set(set);
@@ -552,7 +583,7 @@ export default function RosterPage() {
                     <TD className="sticky left-0 z-10 bg-white font-medium text-slate-800">{emp.fullName}<span className="block text-xs text-slate-500 font-normal">{emp.employeeNumber}</span></TD>
                     {calendarDates.map((d) => {
                       const resolved = resolveScheduleForDate(emp.id, d, dateAssignments, patterns);
-                      const color = resolved === 'off' ? 'gold' : resolved === 'day' ? 'navy' : resolved === 'night' ? 'blue' : 'gray';
+                      const color = scheduleBadgeColor(resolved);
                       return (
                         <TD key={d}>
                           <Badge color={color}>{resolved}</Badge>
@@ -634,28 +665,50 @@ export default function RosterPage() {
       ) : (
         <Card className="p-5 space-y-4">
           <p className="text-sm text-slate-600">
-            Move one employee's Off day to a new date, optionally assigning explicit work on the date being vacated --
-            both changes are validated and committed together.
+            Move one employee's genuine, currently-Off original date to a different replacement date. The original date
+            becomes a real Day or Night shift and the replacement date becomes Off -- both changes are validated and
+            committed together, atomically. The database independently re-verifies every rule shown in the preview
+            below, including the rolling seven-day rest window.
           </p>
           <EmployeeSingleSelect employees={employees} value={rescheduleEmployeeId} onChange={setRescheduleEmployeeId} />
-          <Input label="New Off date" type="date" value={rescheduleNewOffDate} onChange={(e) => setRescheduleNewOffDate(e.target.value)} />
-          <label className="flex items-center gap-2 text-sm text-slate-700">
-            <input type="checkbox" checked={rescheduleAssignVacated} onChange={(e) => setRescheduleAssignVacated(e.target.checked)} />
-            Also assign work on the vacated date
-          </label>
-          {rescheduleAssignVacated && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <Input label="Vacated date" type="date" value={rescheduleVacatedDate} onChange={(e) => setRescheduleVacatedDate(e.target.value)} />
-              <Select
-                label="Assignment"
-                value={rescheduleVacatedType}
-                onChange={(e) => setRescheduleVacatedType(e.target.value as 'day' | 'night')}
-                options={[{ label: 'Day shift', value: 'day' }, { label: 'Night shift', value: 'night' }]}
-              />
-            </div>
-          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Input label="Original Off date (required)" type="date" value={rescheduleOriginalDate} onChange={(e) => setRescheduleOriginalDate(e.target.value)} required />
+            <Input label="Replacement Off date (required)" type="date" value={rescheduleReplacementDate} onChange={(e) => setRescheduleReplacementDate(e.target.value)} required />
+          </div>
+          <Select
+            label="Shift on original date (required)"
+            value={rescheduleShift}
+            onChange={(e) => setRescheduleShift(e.target.value as 'day' | 'night')}
+            options={[{ label: 'Day shift', value: 'day' }, { label: 'Night shift', value: 'night' }]}
+          />
           <Input label="Reason (required)" value={rescheduleReason} onChange={(e) => setRescheduleReason(e.target.value)} placeholder="e.g. Operations requested swap for this week only" required />
-          <Button onClick={handleSubmitReschedule} disabled={submitting || !rescheduleEmployeeId}>
+
+          {rescheduleSelectedEmployee && rescheduleOriginalDate && rescheduleReplacementDate && reschedulePreview && (
+            <Card className={`p-4 space-y-3 border ${reschedulePreview.blockingReason ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
+              <p className="text-sm font-semibold text-slate-800">
+                Preview for {rescheduleSelectedEmployee.fullName} <span className="text-slate-500 font-normal">({rescheduleSelectedEmployee.employeeNumber})</span>
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Before</p>
+                  <p>Original date ({rescheduleOriginalDate}): <Badge color={scheduleBadgeColor(reschedulePreview.originalResolved)}>{reschedulePreview.originalResolved}</Badge></p>
+                  <p>Replacement date ({rescheduleReplacementDate}): <Badge color={scheduleBadgeColor(reschedulePreview.replacementResolved)}>{reschedulePreview.replacementResolved}</Badge></p>
+                </div>
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">After</p>
+                  <p>Original date ({rescheduleOriginalDate}): <Badge color={scheduleBadgeColor(rescheduleShift)}>{rescheduleShift}</Badge></p>
+                  <p>Replacement date ({rescheduleReplacementDate}): <Badge color="gold">off</Badge></p>
+                </div>
+              </div>
+              {reschedulePreview.blockingReason ? (
+                <p className="text-sm text-red-700 flex items-start gap-1.5"><AlertTriangle size={15} className="mt-0.5 flex-shrink-0" /> {reschedulePreview.blockingReason}</p>
+              ) : (
+                <p className="text-xs text-slate-500">This preview is advisory. The database independently re-verifies every rule (including the rolling seven-day rest window) before committing.</p>
+              )}
+            </Card>
+          )}
+
+          <Button onClick={handleSubmitReschedule} disabled={submitting || !canSubmitReschedule}>
             {submitting ? 'Saving...' : 'Reschedule Off Day'}
           </Button>
         </Card>

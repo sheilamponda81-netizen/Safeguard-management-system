@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex } from './rosterService';
+import { filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex, humanizeRosterError } from './rosterService';
 import { EmployeeLite } from './hikcentralPersonMapping';
 
 function emp(overrides: Partial<EmployeeLite> = {}): EmployeeLite {
@@ -112,5 +112,34 @@ describe('moveHighlightedIndex (Reschedule Off Day combobox keyboard navigation,
   it('handles the single-result case without oscillating out of range', () => {
     expect(moveHighlightedIndex(0, 1, 1)).toBe(0);
     expect(moveHighlightedIndex(0, -1, 1)).toBe(0);
+  });
+});
+
+describe('humanizeRosterError (Phase 2B.2C: substitute a known employee UUID in a raw Postgres rejection for a readable name/number label)', () => {
+  const employees: EmployeeLite[] = [emp({ id: '11111111-1111-1111-1111-111111111111', fullName: 'Jane Doe', employeeNumber: 'SFG-S-001' })];
+
+  it('replaces a UUID matching a known employee with "Full Name (NUMBER)"', () => {
+    const message = 'This reschedule would leave employee 11111111-1111-1111-1111-111111111111 with no Off day between 2026-10-15 and 2026-10-21.';
+    expect(humanizeRosterError(message, employees)).toBe(
+      'This reschedule would leave employee Jane Doe (SFG-S-001) with no Off day between 2026-10-15 and 2026-10-21.'
+    );
+  });
+
+  it('is case-insensitive when matching the UUID', () => {
+    const message = 'Employee 11111111-1111-1111-1111-111111111111 not found';
+    expect(humanizeRosterError(message, employees)).toBe('Employee Jane Doe (SFG-S-001) not found');
+  });
+
+  it('leaves a UUID that matches no known employee exactly as-is, never guessing', () => {
+    const message = 'Employee 22222222-2222-2222-2222-222222222222 does not belong to your tenant';
+    expect(humanizeRosterError(message, employees)).toBe(message);
+  });
+
+  it('leaves a message with no UUID at all unchanged', () => {
+    expect(humanizeRosterError('Only Admin may reschedule roster Off days', employees)).toBe('Only Admin may reschedule roster Off days');
+  });
+
+  it('handles an empty or undefined-ish message without throwing', () => {
+    expect(humanizeRosterError('', employees)).toBe('');
   });
 });

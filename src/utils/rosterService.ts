@@ -188,20 +188,32 @@ export interface RescheduleOffDayResult {
   error?: string;
 }
 
-/** The atomic composite operation: move an Off day to a new date, optionally assigning explicit work on the vacated date, in one transaction. */
+/**
+ * The atomic composite operation (Phase 2B.2C, Policy Option A): move an
+ * employee's genuine, currently-Off original date to a different
+ * replacement date, converting the original date into a real Day or Night
+ * shift, in one transaction. Both the original date's Off-ness and the
+ * replacement date's eligibility are independently re-verified server-side
+ * by roster_reschedule_off_day (20261009000000_roster_reschedule_off_day_option_a.sql)
+ * -- this function is a thin RPC wrapper only, never itself the authority.
+ * There is no longer an "optionally assign work on the vacated date" mode:
+ * converting the original date into a real shift is now mandatory on every
+ * call, closing the gap where the old 5-parameter signature could leave
+ * the real Off day untouched while adding an unrelated second one.
+ */
 export async function rescheduleOffDay(
   employeeId: string,
-  newOffDate: string,
-  correctionReason: string,
-  vacatedWorkDate?: string,
-  vacatedWorkAssignmentType?: 'day' | 'night'
+  originalOffDate: string,
+  replacementOffDate: string,
+  originalDateShift: 'day' | 'night',
+  correctionReason: string
 ): Promise<RescheduleOffDayResult> {
   try {
     const { error } = await supabase.rpc('roster_reschedule_off_day', {
       p_employee_id: employeeId,
-      p_new_off_date: newOffDate,
-      p_vacated_work_date: vacatedWorkDate ?? null,
-      p_vacated_work_assignment_type: vacatedWorkAssignmentType ?? null,
+      p_original_off_date: originalOffDate,
+      p_replacement_off_date: replacementOffDate,
+      p_original_date_shift: originalDateShift,
       p_correction_reason: correctionReason,
     });
     if (error) {
@@ -214,4 +226,24 @@ export async function rescheduleOffDay(
   } catch {
     return { success: false, outcome: 'network_error', error: 'Network error while rescheduling the Off day. Please try again.' };
   }
+}
+
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+/**
+ * Replaces any employee UUID embedded in a raw Postgres rejection message
+ * (e.g. "...employee <uuid> with no Off day between...") with that
+ * employee's "Full Name (EMP-NUMBER)" label, when the UUID matches a
+ * currently-fetched employee -- closes the Phase 2B.2C STAGING preflight
+ * finding that Admin otherwise sees an internal id instead of a name.
+ * Pure string substitution; a UUID not found in `employees` (e.g. it
+ * belongs to another tenant, or the list is stale) is left exactly as-is,
+ * never replaced with a guess.
+ */
+export function humanizeRosterError(message: string, employees: EmployeeLite[]): string {
+  if (!message) return message;
+  return message.replace(UUID_RE, (match) => {
+    const emp = employees.find((e) => e.id.toLowerCase() === match.toLowerCase());
+    return emp ? formatEmployeeLabel(emp) : match;
+  });
 }

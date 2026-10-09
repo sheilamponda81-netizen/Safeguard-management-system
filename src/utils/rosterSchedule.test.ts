@@ -7,6 +7,7 @@ import {
   wouldOverrideRecurringOffDay,
   isDateAssignmentNoOp,
   isOffPatternNoOp,
+  buildRescheduleOffDayPreview,
   weekdayOf,
   addDays,
   expandDateRange,
@@ -254,5 +255,62 @@ describe('isDateAssignmentNoOp / isOffPatternNoOp (idempotent-retry detection)',
   it('a different weekday for the same effectiveFrom is NOT a no-op', () => {
     const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
     expect(isOffPatternNoOp('emp-1', 4, '2026-01-01', p)).toBe(false);
+  });
+});
+
+describe('buildRescheduleOffDayPreview (Phase 2B.2C, Policy Option A -- advisory only, database remains authoritative)', () => {
+  it('a genuinely Off original date with an eligible (unassigned) replacement date has no blocking reason', () => {
+    const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday off
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'day', [], p); // Wed -> Thu
+    expect(preview.originalResolved).toBe('off');
+    expect(preview.replacementResolved).toBe('unassigned');
+    expect(preview.isOriginalGenuinelyOff).toBe(true);
+    expect(preview.isReplacementEligible).toBe(true);
+    expect(preview.hasAdjacencyConflict).toBe(false);
+    expect(preview.blockingReason).toBeNull();
+  });
+
+  it('an eligible replacement date that is already Off is allowed (redundant, not an overwrite)', () => {
+    const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
+    const d = [dated({ assignmentDate: '2026-10-08', assignmentType: 'off' })];
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'night', d, p);
+    expect(preview.replacementResolved).toBe('off');
+    expect(preview.isReplacementEligible).toBe(true);
+    expect(preview.blockingReason).toBeNull();
+  });
+
+  it('identical original and replacement dates are blocked', () => {
+    const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-07', 'day', [], p);
+    expect(preview.blockingReason).toMatch(/must be different/);
+  });
+
+  it('an original date that does not genuinely resolve Off is blocked, naming its actual resolved state', () => {
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'day', [], []); // nothing resolves Off at all
+    expect(preview.isOriginalGenuinelyOff).toBe(false);
+    expect(preview.blockingReason).toMatch(/does not currently resolve to Off/);
+    expect(preview.blockingReason).toMatch(/unassigned/);
+  });
+
+  it('a replacement date that already has a working shift is blocked as a silent-overwrite risk, naming the conflicting shift', () => {
+    const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
+    const d = [dated({ assignmentDate: '2026-10-08', assignmentType: 'night' })];
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'day', d, p);
+    expect(preview.isReplacementEligible).toBe(false);
+    expect(preview.blockingReason).toMatch(/already has a night shift/);
+  });
+
+  it('a Day shift on the original date conflicting with an active Night the day before is blocked', () => {
+    const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
+    const d = [dated({ assignmentDate: '2026-10-06', assignmentType: 'night' }), dated({ assignmentDate: '2026-10-07', assignmentType: 'off' })];
+    // emp-1's 10-07 is Off via the dated row (overriding the pattern) -- still genuinely Off.
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-09', 'day', d, p);
+    expect(preview.hasAdjacencyConflict).toBe(true);
+    expect(preview.blockingReason).toMatch(/conflicts with an adjacent/);
+  });
+
+  it('checks run in a stable priority order: identical-dates is reported even when the original is also not Off', () => {
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-07', 'day', [], []);
+    expect(preview.blockingReason).toMatch(/must be different/);
   });
 });

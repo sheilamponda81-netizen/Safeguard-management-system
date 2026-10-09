@@ -241,6 +241,56 @@ export function isOffPatternNoOp(
   return !!existing && existing.weekday === weekday;
 }
 
+// Phase 2B.2C: Reschedule Off Day, Policy Option A. Pure preview logic
+// mirroring exactly what the new roster_reschedule_off_day RPC
+// (20261009000000_roster_reschedule_off_day_option_a.sql) independently
+// re-verifies server-side -- this is advisory only (lets the UI show a
+// clear Before/After preview and disable submission early), never the
+// actual authority. The database remains the sole source of truth,
+// including for the rolling seven-day rest rule, which this preview does
+// NOT attempt to replicate (that check depends on the employee's full
+// resolved schedule across a 27-day window, which the UI does not fetch
+// in full) -- a reschedule that looks clean here can still be correctly
+// rejected by the database, and that rejection is never a bug in this
+// preview.
+export interface RescheduleOffDayPreview {
+  originalResolved: ResolvedSchedule;
+  replacementResolved: ResolvedSchedule;
+  isOriginalGenuinelyOff: boolean;
+  isReplacementEligible: boolean;
+  hasAdjacencyConflict: boolean;
+  /** Non-null means the UI should disable submission; null means the preview found no issue (the database still re-checks everything independently). */
+  blockingReason: string | null;
+}
+
+export function buildRescheduleOffDayPreview(
+  employeeId: string,
+  originalDate: string,
+  replacementDate: string,
+  shiftOnOriginal: 'day' | 'night',
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[]
+): RescheduleOffDayPreview {
+  const originalResolved = resolveScheduleForDate(employeeId, originalDate, datedAssignments, patterns);
+  const replacementResolved = resolveScheduleForDate(employeeId, replacementDate, datedAssignments, patterns);
+  const isOriginalGenuinelyOff = originalResolved === 'off';
+  const isReplacementEligible = replacementResolved === 'unassigned' || replacementResolved === 'off';
+  const hasAdjacencyConflict = hasNightToDayConflict(employeeId, originalDate, shiftOnOriginal, datedAssignments);
+
+  let blockingReason: string | null = null;
+  if (originalDate === replacementDate) {
+    blockingReason = 'The replacement Off date must be different from the original Off date.';
+  } else if (!isOriginalGenuinelyOff) {
+    blockingReason = `The original date does not currently resolve to Off (it is "${originalResolved}"). Choose the employee's actual Off date.`;
+  } else if (!isReplacementEligible) {
+    blockingReason = `The replacement date already has a ${replacementResolved} shift. Choose a different date, or change that assignment first.`;
+  } else if (hasAdjacencyConflict) {
+    blockingReason = `A ${shiftOnOriginal} shift cannot be placed on the original date -- it conflicts with an adjacent Night/Day shift.`;
+  }
+
+  return { originalResolved, replacementResolved, isOriginalGenuinelyOff, isReplacementEligible, hasAdjacencyConflict, blockingReason };
+}
+
 /** Every date in [dateFrom, dateTo] inclusive, as plain YYYY-MM-DD strings. */
 export function expandDateRange(dateFrom: string, dateTo: string): string[] {
   const dates: string[] = [];
