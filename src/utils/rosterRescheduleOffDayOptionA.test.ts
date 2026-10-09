@@ -167,10 +167,16 @@ describe('roster reschedule Option A migration: the mandatory swap -- original d
     expect(insertIdx).toBeGreaterThan(checkIdx);
   });
 
-  it('rejects a replacement date that already has a day or night shift -- never a silent overwrite', () => {
+  it('rejects a replacement date that does not resolve to exactly "unassigned" -- never a silent overwrite, and an already-Off replacement is rejected too (not merely allowed as harmless)', () => {
     const fn = getFunctionBody(migrationSource, 'roster_reschedule_off_day');
     expect(fn).toMatch(/v_replacement_resolved := roster_resolve_schedule\(p_employee_id, p_replacement_off_date\);/);
-    expect(fn).toMatch(/IF v_replacement_resolved IN \('day', 'night'\) THEN\s*\n\s*RAISE EXCEPTION 'Employee % already has a % shift on %/);
+    expect(fn).toMatch(/IF v_replacement_resolved <> 'unassigned' THEN\s*\n\s*RAISE EXCEPTION 'Employee % replacement date % already resolves to "%"/);
+    // The old, corrected check accepted 'off' as well as 'unassigned' --
+    // confirm that permissive form (checking the replacement against
+    // day/night only) no longer appears anywhere as live SQL.
+    const migrationCode = stripSqlComments(migrationSource);
+    expect(migrationCode).not.toMatch(/v_replacement_resolved IN \('day', 'night'\)/);
+    expect(migrationCode).not.toMatch(/already has a % shift on %/);
   });
 
   it('requires original_date_shift to be exactly day or night, and correction_reason to be non-empty', () => {

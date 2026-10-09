@@ -270,11 +270,20 @@ describe('buildRescheduleOffDayPreview (Phase 2B.2C, Policy Option A -- advisory
     expect(preview.blockingReason).toBeNull();
   });
 
-  it('an eligible replacement date that is already Off is allowed (redundant, not an overwrite)', () => {
+  it('a replacement date that already resolves Off is REJECTED, not allowed as harmless -- it would contribute no new rest day and could mislead Admin into believing a genuine swap happened', () => {
     const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
     const d = [dated({ assignmentDate: '2026-10-08', assignmentType: 'off' })];
     const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'night', d, p);
     expect(preview.replacementResolved).toBe('off');
+    expect(preview.isReplacementEligible).toBe(false);
+    expect(preview.blockingReason).toMatch(/must be unassigned/);
+    expect(preview.blockingReason).toMatch(/"off"/);
+  });
+
+  it('only a replacement date that resolves to exactly "unassigned" is eligible', () => {
+    const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'day', [], p); // Wed off, Thu unassigned
+    expect(preview.replacementResolved).toBe('unassigned');
     expect(preview.isReplacementEligible).toBe(true);
     expect(preview.blockingReason).toBeNull();
   });
@@ -292,12 +301,13 @@ describe('buildRescheduleOffDayPreview (Phase 2B.2C, Policy Option A -- advisory
     expect(preview.blockingReason).toMatch(/unassigned/);
   });
 
-  it('a replacement date that already has a working shift is blocked as a silent-overwrite risk, naming the conflicting shift', () => {
+  it('a replacement date that already has a working shift is blocked as a silent-overwrite risk, naming the conflicting state', () => {
     const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
     const d = [dated({ assignmentDate: '2026-10-08', assignmentType: 'night' })];
     const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'day', d, p);
     expect(preview.isReplacementEligible).toBe(false);
-    expect(preview.blockingReason).toMatch(/already has a night shift/);
+    expect(preview.blockingReason).toMatch(/must be unassigned/);
+    expect(preview.blockingReason).toMatch(/"night"/);
   });
 
   it('a Day shift on the original date conflicting with an active Night the day before is blocked', () => {

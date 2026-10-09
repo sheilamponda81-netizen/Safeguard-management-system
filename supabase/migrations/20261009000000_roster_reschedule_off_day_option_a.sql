@@ -23,9 +23,17 @@
 --   - Admin must name the employee's genuine, CURRENTLY-Off original
 --     date -- verified server-side by actually resolving it, never
 --     trusted from the client.
---   - Admin must name a different replacement date, which must be
---     eligible to become Off without silently overwriting an existing
---     Day/Night shift there.
+--   - Admin must name a different replacement date, which must currently
+--     resolve to 'unassigned' -- not already Off, Day, or Night. An
+--     already-Off replacement is REJECTED (not silently accepted as
+--     "harmless"): letting it through would allow Admin to believe a
+--     genuine swap happened while the employee's real weekly rest
+--     entitlement was actually reduced (the original date's rest is
+--     converted to work, with no new rest gained in exchange, since the
+--     "replacement" was already going to be a rest day regardless). This
+--     was corrected after review identified the risk in an earlier
+--     version of this same (still-unapplied) file, which accepted
+--     'unassigned' OR already-'off' replacements.
 --   - Admin must choose what shift (day or night) the original date
 --     becomes -- there is no longer any way to add a replacement Off day
 --     without also converting the genuine original Off date into a real
@@ -153,13 +161,14 @@ BEGIN
     RAISE EXCEPTION 'Employee % is not currently scheduled Off on % (it currently resolves to "%") -- rescheduling requires a genuine existing Off date', p_employee_id, p_original_off_date, v_original_resolved USING ERRCODE = '23514';
   END IF;
 
-  -- The replacement date must be eligible to become Off without silently
-  -- overwriting existing work -- 'unassigned' or already 'off' are both
-  -- fine (an already-Off replacement is redundant but harmless, never an
-  -- overwrite); an existing 'day'/'night' is not.
+  -- CONFIRMED FINAL POLICY: the replacement date must resolve to EXACTLY
+  -- 'unassigned' -- an existing 'day'/'night' would silently overwrite
+  -- real work, and an already-'off' replacement contributes no new rest
+  -- day at all (see this migration's header for why that is rejected,
+  -- not merely allowed-as-harmless).
   v_replacement_resolved := roster_resolve_schedule(p_employee_id, p_replacement_off_date);
-  IF v_replacement_resolved IN ('day', 'night') THEN
-    RAISE EXCEPTION 'Employee % already has a % shift on % -- choose a different replacement date, or change that assignment first', p_employee_id, v_replacement_resolved, p_replacement_off_date USING ERRCODE = '23514';
+  IF v_replacement_resolved <> 'unassigned' THEN
+    RAISE EXCEPTION 'Employee % replacement date % already resolves to "%" -- the replacement date must be unassigned, not already Off, Day, or Night', p_employee_id, p_replacement_off_date, v_replacement_resolved USING ERRCODE = '23514';
   END IF;
 
   -- Night-to-Day adjacency for the NEW shift being placed on the original

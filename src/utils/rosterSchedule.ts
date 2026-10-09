@@ -274,7 +274,14 @@ export function buildRescheduleOffDayPreview(
   const originalResolved = resolveScheduleForDate(employeeId, originalDate, datedAssignments, patterns);
   const replacementResolved = resolveScheduleForDate(employeeId, replacementDate, datedAssignments, patterns);
   const isOriginalGenuinelyOff = originalResolved === 'off';
-  const isReplacementEligible = replacementResolved === 'unassigned' || replacementResolved === 'off';
+  // CONFIRMED FINAL POLICY: the replacement date must resolve to EXACTLY
+  // 'unassigned' -- an already-'off' replacement is REJECTED, not merely
+  // allowed as harmless, because it would let Admin believe a genuine
+  // swap happened while the employee's real weekly rest entitlement was
+  // actually reduced (the original date's rest converts to work, with no
+  // new rest gained in exchange). Mirrors the identical, equally-corrected
+  // check in the new roster_reschedule_off_day RPC.
+  const isReplacementEligible = replacementResolved === 'unassigned';
   const hasAdjacencyConflict = hasNightToDayConflict(employeeId, originalDate, shiftOnOriginal, datedAssignments);
 
   let blockingReason: string | null = null;
@@ -283,7 +290,7 @@ export function buildRescheduleOffDayPreview(
   } else if (!isOriginalGenuinelyOff) {
     blockingReason = `The original date does not currently resolve to Off (it is "${originalResolved}"). Choose the employee's actual Off date.`;
   } else if (!isReplacementEligible) {
-    blockingReason = `The replacement date already has a ${replacementResolved} shift. Choose a different date, or change that assignment first.`;
+    blockingReason = `The replacement date must be unassigned -- it currently resolves to "${replacementResolved}". Choose a different date.`;
   } else if (hasAdjacencyConflict) {
     blockingReason = `A ${shiftOnOriginal} shift cannot be placed on the original date -- it conflicts with an adjacent Night/Day shift.`;
   }
