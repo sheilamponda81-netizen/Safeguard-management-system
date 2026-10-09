@@ -119,12 +119,12 @@ describe('roster reschedule Option A migration: security model unchanged from th
     expect(fn).toMatch(/SET search_path = public, pg_temp/);
   });
 
-  it('requires authentication, an active account, and delegates admin-check to is_super_admin()/is_business_admin()', () => {
+  it('requires authentication, an active account, and delegates admin-check to is_super_admin()/is_business_admin() -- NULL-safely (IS NOT TRUE, not NOT)', () => {
     const fn = getFunctionBody(migrationSource, 'roster_reschedule_off_day');
     const fnCode = stripSqlComments(fn);
     expect(fn).toMatch(/IF v_caller_id IS NULL THEN\s*\n\s*RAISE EXCEPTION 'Not authenticated'/);
-    expect(fn).toMatch(/IF NOT is_current_user_active\(\) THEN/);
-    expect(fn).toMatch(/IF NOT \(is_super_admin\(\) OR is_business_admin\(\)\) THEN/);
+    expect(fn).toMatch(/IF is_current_user_active\(\) IS NOT TRUE THEN/);
+    expect(fn).toMatch(/IF \(is_super_admin\(\) OR is_business_admin\(\)\) IS NOT TRUE THEN/);
     expect(fnCode).not.toMatch(/v_role_level/);
     expect(fnCode).not.toMatch(/has_permission\(/);
   });
@@ -152,10 +152,10 @@ describe('roster reschedule Option A migration: security model unchanged from th
 });
 
 describe('roster reschedule Option A migration: the mandatory swap -- original date genuinely Off, replacement eligible, no silent overwrite', () => {
-  it('verifies the original date genuinely resolves to off via roster_resolve_schedule, never trusting the client', () => {
+  it('verifies the original date genuinely resolves to off via roster_resolve_schedule, never trusting the client -- NULL-safely (IS DISTINCT FROM, not <>)', () => {
     const fn = getFunctionBody(migrationSource, 'roster_reschedule_off_day');
     expect(fn).toMatch(/v_original_resolved := roster_resolve_schedule\(p_employee_id, p_original_off_date\);/);
-    expect(fn).toMatch(/IF v_original_resolved <> 'off' THEN\s*\n\s*RAISE EXCEPTION 'Employee % is not currently scheduled Off on %/);
+    expect(fn).toMatch(/IF v_original_resolved IS DISTINCT FROM 'off' THEN\s*\n\s*RAISE EXCEPTION 'Employee % is not currently scheduled Off on %/);
   });
 
   it('rejects an identical original and replacement date before any write', () => {
@@ -167,10 +167,10 @@ describe('roster reschedule Option A migration: the mandatory swap -- original d
     expect(insertIdx).toBeGreaterThan(checkIdx);
   });
 
-  it('rejects a replacement date that does not resolve to exactly "unassigned" -- never a silent overwrite, and an already-Off replacement is rejected too (not merely allowed as harmless)', () => {
+  it('rejects a replacement date that does not resolve to exactly "unassigned" -- never a silent overwrite, and an already-Off replacement is rejected too (not merely allowed as harmless) -- NULL-safely (IS DISTINCT FROM, not <>)', () => {
     const fn = getFunctionBody(migrationSource, 'roster_reschedule_off_day');
     expect(fn).toMatch(/v_replacement_resolved := roster_resolve_schedule\(p_employee_id, p_replacement_off_date\);/);
-    expect(fn).toMatch(/IF v_replacement_resolved <> 'unassigned' THEN\s*\n\s*RAISE EXCEPTION 'Employee % replacement date % already resolves to "%"/);
+    expect(fn).toMatch(/IF v_replacement_resolved IS DISTINCT FROM 'unassigned' THEN\s*\n\s*RAISE EXCEPTION 'Employee % replacement date % already resolves to "%"/);
     // The old, corrected check accepted 'off' as well as 'unassigned' --
     // confirm that permissive form (checking the replacement against
     // day/night only) no longer appears anywhere as live SQL.
@@ -232,5 +232,67 @@ describe('roster reschedule Option A migration: Night-to-Day adjacency and rolli
     const migrationCode = stripSqlComments(migrationSource);
     const overrideParams = migrationCode.match(/p_override_\w+/g) || [];
     expect(overrideParams).toEqual([]);
+  });
+});
+
+describe('roster reschedule Option A migration: NULL-safe hardening (Postgres three-valued-logic fail-closed)', () => {
+  // `IF NOT x THEN` and `IF x <> y THEN` both silently skip their
+  // rejection branch when the left-hand expression is SQL NULL, because
+  // `NOT NULL` and `NULL <> y` both evaluate to NULL, and PL/pgSQL's
+  // `IF ... THEN` treats a NULL condition as not-true (the branch simply
+  // doesn't fire -- it is NOT an error). `IS NOT TRUE` and
+  // `IS DISTINCT FROM` are NULL-safe: they always evaluate to a real
+  // boolean (never NULL) for every possible NULL/TRUE/FALSE input, so a
+  // helper or resolver that unexpectedly returned NULL could never bypass
+  // these four checks. The real, currently-deployed helper bodies
+  // (is_current_user_active, is_super_admin, is_business_admin) and
+  // roster_resolve_schedule were independently confirmed (read-only,
+  // against STAGING) to never actually return NULL today -- every branch
+  // in each of their bodies returns a non-null literal or a COALESCE'd/
+  // IS-NULL-derived boolean -- so this hardening is defense-in-depth
+  // against a hypothetical future change to those helpers, not a fix for
+  // a currently reachable bypass. Runtime proof that the new syntax
+  // actually fails closed when a helper is simulated to return NULL is in
+  // this phase's isolated-Postgres test report, not here (this file has
+  // no live-Postgres harness -- see this file's own header).
+  const fn = getFunctionBody(migrationSource, 'roster_reschedule_off_day');
+
+  it('uses IS NOT TRUE (never NOT) for the active-account and admin-permission checks', () => {
+    expect(fn).toMatch(/IF is_current_user_active\(\) IS NOT TRUE THEN/);
+    expect(fn).toMatch(/IF \(is_super_admin\(\) OR is_business_admin\(\)\) IS NOT TRUE THEN/);
+    expect(fn).not.toMatch(/IF NOT is_current_user_active\(\)/);
+    expect(fn).not.toMatch(/IF NOT \(is_super_admin\(\) OR is_business_admin\(\)\)/);
+  });
+
+  it('uses IS DISTINCT FROM (never <>) for the original-date and replacement-date resolution checks', () => {
+    expect(fn).toMatch(/IF v_original_resolved IS DISTINCT FROM 'off' THEN/);
+    expect(fn).toMatch(/IF v_replacement_resolved IS DISTINCT FROM 'unassigned' THEN/);
+    expect(fn).not.toMatch(/v_original_resolved <> 'off'/);
+    expect(fn).not.toMatch(/v_replacement_resolved <> 'unassigned'/);
+  });
+
+  it('all four hardened checks still precede any write (INSERT/UPDATE) in the function body', () => {
+    const firstInsertIdx = fn.indexOf('INSERT INTO roster_date_assignments');
+    for (const needle of [
+      'is_current_user_active() IS NOT TRUE',
+      '(is_super_admin() OR is_business_admin()) IS NOT TRUE',
+      "v_original_resolved IS DISTINCT FROM 'off'",
+      "v_replacement_resolved IS DISTINCT FROM 'unassigned'",
+    ]) {
+      const idx = fn.indexOf(needle);
+      expect(idx).toBeGreaterThan(-1);
+      expect(idx).toBeLessThan(firstInsertIdx);
+    }
+  });
+
+  it('leaves every other condition in the function (tenant match, adjacency, bulk/date validation) exactly as before -- this hardening is narrowly scoped to the four specified checks only', () => {
+    // The tenant-ownership check still uses plain <>, unchanged --
+    // v_employee_tenant_id is always derived from a NOT NULL table
+    // column, never a helper function's possibly-NULL return, so it was
+    // correctly out of scope for this hardening pass.
+    expect(fn).toMatch(/IF v_employee_tenant_id <> v_tenant_id THEN/);
+    expect(fn).toMatch(/IF v_adjacent_type = 'night' THEN/);
+    expect(fn).toMatch(/IF v_adjacent_type = 'day' THEN/);
+    expect(fn).toMatch(/IF p_original_off_date = p_replacement_off_date THEN/);
   });
 });

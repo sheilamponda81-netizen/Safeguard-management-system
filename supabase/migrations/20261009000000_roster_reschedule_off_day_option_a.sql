@@ -116,10 +116,15 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
   END IF;
 
-  IF NOT is_current_user_active() THEN
+  -- NULL-safe: Postgres's three-valued logic means `IF NOT x THEN` never
+  -- fires when x is NULL (`NOT NULL` is NULL, which PL/pgSQL's IF treats
+  -- as not-true) -- `IS NOT TRUE` instead fails closed for NULL, false,
+  -- and true alike, so a helper returning NULL can never bypass this
+  -- rejection branch.
+  IF is_current_user_active() IS NOT TRUE THEN
     RAISE EXCEPTION 'Your account is disabled' USING ERRCODE = '42501';
   END IF;
-  IF NOT (is_super_admin() OR is_business_admin()) THEN
+  IF (is_super_admin() OR is_business_admin()) IS NOT TRUE THEN
     RAISE EXCEPTION 'Only Admin may reschedule roster Off days' USING ERRCODE = '42501';
   END IF;
 
@@ -155,9 +160,13 @@ BEGIN
   END IF;
 
   -- The original date must GENUINELY resolve to Off right now -- never
-  -- assumed, never trusted from the client.
+  -- assumed, never trusted from the client. NULL-safe: `<>` against a
+  -- NULL v_original_resolved would itself evaluate to NULL (never TRUE),
+  -- which `IF ... THEN` treats as not-true and would silently skip the
+  -- rejection -- `IS DISTINCT FROM` treats NULL as a genuine, comparable
+  -- value, so an unexpected NULL result correctly fails closed here too.
   v_original_resolved := roster_resolve_schedule(p_employee_id, p_original_off_date);
-  IF v_original_resolved <> 'off' THEN
+  IF v_original_resolved IS DISTINCT FROM 'off' THEN
     RAISE EXCEPTION 'Employee % is not currently scheduled Off on % (it currently resolves to "%") -- rescheduling requires a genuine existing Off date', p_employee_id, p_original_off_date, v_original_resolved USING ERRCODE = '23514';
   END IF;
 
@@ -166,8 +175,11 @@ BEGIN
   -- real work, and an already-'off' replacement contributes no new rest
   -- day at all (see this migration's header for why that is rejected,
   -- not merely allowed-as-harmless).
+  -- NULL-safe for the same reason as the original-date check above: `IS
+  -- DISTINCT FROM` rather than `<>`, so an unexpected NULL resolved value
+  -- cannot bypass this rejection either.
   v_replacement_resolved := roster_resolve_schedule(p_employee_id, p_replacement_off_date);
-  IF v_replacement_resolved <> 'unassigned' THEN
+  IF v_replacement_resolved IS DISTINCT FROM 'unassigned' THEN
     RAISE EXCEPTION 'Employee % replacement date % already resolves to "%" -- the replacement date must be unassigned, not already Off, Day, or Night', p_employee_id, p_replacement_off_date, v_replacement_resolved USING ERRCODE = '23514';
   END IF;
 
