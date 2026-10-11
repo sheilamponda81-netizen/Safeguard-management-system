@@ -45,6 +45,7 @@ const AttendancePage = safeLazy(() => import("./pages/Attendance"));
 const HikCentralImportPage = safeLazy(() => import("./pages/HikCentralImport"));
 const HikCentralPersonMappingPage = safeLazy(() => import("./pages/HikCentralPersonMapping"));
 const HikCentralAttendancePreviewPage = safeLazy(() => import("./pages/HikCentralAttendancePreview"));
+const AttendanceCalculationPreviewPage = safeLazy(() => import("./pages/AttendanceCalculationPreview"));
 const RosterPage = safeLazy(() => import("./pages/Roster"));
 const PayrollPage = safeLazy(() => import("./pages/Payroll"));
 const PayslipsPage = safeLazy(() => import("./pages/Payslips"));
@@ -76,6 +77,7 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
   "hikcentral-import": HikCentralImportPage,
   "hikcentral-mapping": HikCentralPersonMappingPage,
   "hikcentral-attendance-preview": HikCentralAttendancePreviewPage,
+  "hikcentral-attendance-calculation-preview": AttendanceCalculationPreviewPage,
   payroll: PayrollPage,
   payslips: PayslipsPage,
   payments: PaymentsPage,
@@ -94,7 +96,8 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
 const rolePages: Record<number, NavKey[]> = {
   1: [
     "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
-    "hikcentral-mapping", "hikcentral-attendance-preview", "roster",
+    "hikcentral-mapping", "hikcentral-attendance-preview",
+    "hikcentral-attendance-calculation-preview", "roster",
     "payroll", "payslips", "payments", "terminal-dues", "salary-advances",
     "reports", "settings", "security", "features", "auditlogs",
     "user-manual",
@@ -102,6 +105,7 @@ const rolePages: Record<number, NavKey[]> = {
   2: [
     "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
     "hikcentral-mapping", "hikcentral-attendance-preview",
+    "hikcentral-attendance-calculation-preview",
     "payments", "terminal-dues", "salary-advances", "reports", "security",
     "user-manual",
   ],
@@ -126,6 +130,7 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   "hikcentral-import": { title: "HikCentral Attendance Import", breadcrumb: "HikCentral Import" },
   "hikcentral-mapping": { title: "HikCentral Person Mapping", breadcrumb: "Person Mapping" },
   "hikcentral-attendance-preview": { title: "HikCentral Attendance Preview", breadcrumb: "Attendance Preview" },
+  "hikcentral-attendance-calculation-preview": { title: "Attendance Calculation Preview", breadcrumb: "Calculation Preview" },
   roster: { title: "Roster Management", breadcrumb: "Roster" },
   payroll: { title: "Payroll Management", breadcrumb: "Payroll" },
   payslips: { title: "Payslips", breadcrumb: "Payslips" },

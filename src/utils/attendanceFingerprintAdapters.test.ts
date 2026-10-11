@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeHikCentralRowsForEmployee } from './attendanceFingerprintAdapters';
+import { normalizeHikCentralRowsForEmployee, normalizeStoredFingerprintEventsForEmployee } from './attendanceFingerprintAdapters';
 import { ParsedHikCentralRow } from './hikcentralExcelParser';
 
 function row(overrides: Partial<ParsedHikCentralRow> = {}): ParsedHikCentralRow {
@@ -50,5 +50,26 @@ describe('normalizeHikCentralRowsForEmployee -- denied and repeated scans', () =
     const rows = [row({ authenticationResult: 'Authorized' }), row({ authenticationResult: 'Authorization', eventTimeIso: '2026-10-05T04:08:00.000Z' })];
     const result = normalizeHikCentralRowsForEmployee(rows, '00000104');
     expect(result).toHaveLength(2);
+  });
+});
+
+describe('normalizeStoredFingerprintEventsForEmployee -- already-stored hikcentral_raw_events rows', () => {
+  it('maps a matching employee\'s rows to normalized events without re-applying eligibility filtering', () => {
+    const rows = [
+      { employeeId: 'emp-1', eventTimeIso: '2026-10-05T04:05:00.000Z' },
+      { employeeId: 'emp-1', eventTimeIso: '2026-10-05T14:30:00.000Z' },
+      { employeeId: 'emp-2', eventTimeIso: '2026-10-05T04:06:00.000Z' },
+    ];
+    const result = normalizeStoredFingerprintEventsForEmployee(rows, 'emp-1');
+    expect(result).toEqual([{ timestampIso: '2026-10-05T04:05:00.000Z' }, { timestampIso: '2026-10-05T14:30:00.000Z' }]);
+  });
+
+  it('excludes rows belonging to a different employee', () => {
+    const rows = [{ employeeId: 'emp-1', eventTimeIso: '2026-10-05T04:05:00.000Z' }, { employeeId: 'emp-2', eventTimeIso: '2026-10-05T04:06:00.000Z' }];
+    expect(normalizeStoredFingerprintEventsForEmployee(rows, 'emp-2')).toEqual([{ timestampIso: '2026-10-05T04:06:00.000Z' }]);
+  });
+
+  it('returns an empty array for an employee with no rows', () => {
+    expect(normalizeStoredFingerprintEventsForEmployee([], 'emp-1')).toEqual([]);
   });
 });
