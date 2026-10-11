@@ -3,25 +3,25 @@ import { aggregateSiteAlerts, SiteAlertCase, SITE_ALERT_THRESHOLD } from './atte
 import { AttendanceCalculationResult } from './attendanceCalculationEngine';
 
 function absentNoRecords(): AttendanceCalculationResult {
-  return { status: 'absent', checkInIso: null, checkOutIso: null, reason: 'x' };
+  return { status: 'absent', checkInIso: null, checkOutIso: null, reason: 'x', basis: 'not_applicable' };
 }
 function absentCheckInOnly(): AttendanceCalculationResult {
-  return { status: 'absent', checkInIso: '2026-10-05T04:05:00.000Z', checkOutIso: null, reason: 'x' };
+  return { status: 'absent', checkInIso: '2026-10-05T04:05:00.000Z', checkOutIso: null, reason: 'x', basis: 'not_applicable' };
 }
 function absentCheckoutOnly(): AttendanceCalculationResult {
-  return { status: 'absent', checkInIso: null, checkOutIso: '2026-10-05T14:30:00.000Z', reason: 'x' };
+  return { status: 'absent', checkInIso: null, checkOutIso: '2026-10-05T14:30:00.000Z', reason: 'x', basis: 'not_applicable' };
 }
 function pending(): AttendanceCalculationResult {
-  return { status: 'pending', checkInIso: null, checkOutIso: null, reason: 'x' };
+  return { status: 'pending', checkInIso: null, checkOutIso: null, reason: 'x', basis: 'not_applicable' };
 }
 function present(): AttendanceCalculationResult {
-  return { status: 'present', checkInIso: '2026-10-05T04:05:00.000Z', checkOutIso: '2026-10-05T14:30:00.000Z', reason: 'x' };
+  return { status: 'present', checkInIso: '2026-10-05T04:05:00.000Z', checkOutIso: '2026-10-05T14:30:00.000Z', reason: 'x', basis: 'confirmed' };
 }
 function off(): AttendanceCalculationResult {
-  return { status: 'off', checkInIso: null, checkOutIso: null, reason: 'x' };
+  return { status: 'off', checkInIso: null, checkOutIso: null, reason: 'x', basis: 'not_applicable' };
 }
 function unassigned(): AttendanceCalculationResult {
-  return { status: 'unassigned', checkInIso: null, checkOutIso: null, reason: 'x' };
+  return { status: 'unassigned', checkInIso: null, checkOutIso: null, reason: 'x', basis: 'not_applicable' };
 }
 
 function caseFor(employeeId: string, result: AttendanceCalculationResult, overrides: Partial<SiteAlertCase> = {}): SiteAlertCase {

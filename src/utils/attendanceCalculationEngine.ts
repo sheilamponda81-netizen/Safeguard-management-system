@@ -57,11 +57,38 @@ export type CoverageStatus = 'confirmed_complete' | 'insufficient';
  */
 export interface ShiftCoverage {
   status: CoverageStatus;
-  /** Required when status is 'confirmed_complete'. The UTC instant up to which data is verified complete. Ignored when status is 'insufficient'. */
+  /**
+   * Required when status is 'confirmed_complete'. The UTC instant up to
+   * which data is verified complete -- in practice, the explicitly
+   * supplied HikCentral Excel export's own cutoff/generation timestamp
+   * (never inferred inside this module from the latest fingerprint event
+   * it was handed; see earliestEventInWindow/calculateAttendanceStatus,
+   * neither of which reads this field at all). Ignored when status is
+   * 'insufficient'. When this is earlier than a shift's checkout window
+   * end, that shift's export is an EARLY export for that shift -- see
+   * calculateAttendanceStatus's early-export credit rule below.
+   */
   verifiedThroughIso?: string;
 }
 
 export type AttendanceCalculationStatus = 'present' | 'late' | 'absent' | 'off' | 'unassigned' | 'pending';
+
+/**
+ * Distinguishes HOW a 'present'/'late' result was reached, without
+ * introducing a new official attendance status code (the existing
+ * `attendance.status` CHECK constraint is untouched by Stage A and
+ * never sees this value):
+ *  - 'confirmed': both a valid check-in and a valid checkout were found.
+ *  - 'check_in_only_provisional': credited under the early-export rule --
+ *    a valid check-in was found, but the checkout window is not yet
+ *    confirmed closed, so there has been no opportunity to observe a
+ *    checkout at all yet. This is provisional: recalculating once a
+ *    later, more complete export arrives applies the normal rules again
+ *    and can still resolve to 'absent' if the checkout window closes
+ *    with no checkout ever recorded.
+ *  - 'not_applicable': every other status (off/unassigned/pending/absent).
+ */
+export type AttendanceCalculationBasis = 'confirmed' | 'check_in_only_provisional' | 'not_applicable';
 
 export interface AttendanceCalculationInput {
   /** The shift's own STARTING calendar date (Africa/Blantyre), YYYY-MM-DD -- a Night shift belongs to this date even though its checkout window falls on the next calendar date. */
@@ -77,6 +104,7 @@ export interface AttendanceCalculationResult {
   checkInIso: string | null;
   checkOutIso: string | null;
   reason: string;
+  basis: AttendanceCalculationBasis;
 }
 
 function blantyreDateTimeToUtcIso(dateStr: string, hhmm: string): string {
@@ -133,10 +161,10 @@ export function calculateAttendanceStatus(input: AttendanceCalculationInput): At
   const { resolvedShift, shiftDate, events, coverage } = input;
 
   if (resolvedShift === 'off') {
-    return { status: 'off', checkInIso: null, checkOutIso: null, reason: 'Scheduled Off day.' };
+    return { status: 'off', checkInIso: null, checkOutIso: null, reason: 'Scheduled Off day.', basis: 'not_applicable' };
   }
   if (resolvedShift === 'unassigned') {
-    return { status: 'unassigned', checkInIso: null, checkOutIso: null, reason: 'No roster assignment recorded for this date.' };
+    return { status: 'unassigned', checkInIso: null, checkOutIso: null, reason: 'No roster assignment recorded for this date.', basis: 'not_applicable' };
   }
 
   const windows = getShiftWindows(resolvedShift, shiftDate);
@@ -149,7 +177,7 @@ export function calculateAttendanceStatus(input: AttendanceCalculationInput): At
       status === 'present'
         ? 'Valid check-in within grace period and valid checkout recorded.'
         : 'Valid checkout recorded, but check-in was after the grace period.';
-    return { status, checkInIso, checkOutIso, reason };
+    return { status, checkInIso, checkOutIso, reason, basis: 'confirmed' };
   }
 
   // One or both of check-in/checkout are missing. Per the confirmed
@@ -158,25 +186,49 @@ export function calculateAttendanceStatus(input: AttendanceCalculationInput): At
   // after the check-in window for both Day and Night) is confirmed
   // closed by verified coverage -- otherwise the missing piece might
   // simply not have happened yet, or might exist but not yet be covered
-  // by verified data. Until then, the correct result is Pending, never
-  // Absent.
+  // by verified data.
   const checkOutWindowConfirmedClosed =
     coverage.status === 'confirmed_complete' &&
     coverage.verifiedThroughIso !== undefined &&
     coverage.verifiedThroughIso >= windows.checkOutWindowEndIso;
 
   if (!checkOutWindowConfirmedClosed) {
-    const reason = checkInIso
-      ? 'Valid check-in recorded, but the checkout window is not yet confirmed closed or data coverage is insufficient.'
-      : 'No valid check-in or checkout confirmed yet -- the checkout window is not yet confirmed closed or data coverage is insufficient.';
-    return { status: 'pending', checkInIso, checkOutIso: null, reason };
+    // EARLY EXPORT RULE: the export/coverage cutoff is before this
+    // shift's checkout window has closed (or coverage is simply
+    // unknown), so there has been no opportunity yet to observe a
+    // checkout at all -- its absence carries no information. A valid,
+    // already-observed check-in is real data regardless, though, and is
+    // credited immediately using the same grace-period rule as a fully
+    // confirmed day: Present (on time) or Late (after grace), never held
+    // back as Pending merely because the checkout side of the shift
+    // hasn't happened/been exported yet. This is provisional -- recalculating
+    // with a later, complete export re-runs the normal rules below and
+    // can still resolve to Absent if no checkout is ever found once the
+    // window genuinely closes. Only the no-check-in case remains Pending
+    // here: a missing check-in is NEVER assumed Absent before coverage
+    // is confirmed, per the base completeness rule.
+    if (checkInIso) {
+      const status: AttendanceCalculationStatus = checkInIso <= windows.lateAfterIso ? 'present' : 'late';
+      const reason =
+        status === 'present'
+          ? 'Valid check-in within grace period; credited Present under the early-export policy pending checkout window closure (no checkout observed yet).'
+          : 'Check-in was after the grace period; credited Late under the early-export policy pending checkout window closure (no checkout observed yet).';
+      return { status, checkInIso, checkOutIso: null, reason, basis: 'check_in_only_provisional' };
+    }
+    return {
+      status: 'pending',
+      checkInIso: null,
+      checkOutIso: null,
+      reason: 'No valid check-in recorded yet -- the check-in window is not yet confirmed closed or data coverage is insufficient.',
+      basis: 'not_applicable',
+    };
   }
 
   if (checkInIso && !checkOutIso) {
-    return { status: 'absent', checkInIso, checkOutIso: null, reason: 'Valid check-in recorded, but no valid checkout was recorded after the checkout window closed.' };
+    return { status: 'absent', checkInIso, checkOutIso: null, reason: 'Valid check-in recorded, but no valid checkout was recorded after the checkout window closed.', basis: 'not_applicable' };
   }
   if (!checkInIso && checkOutIso) {
-    return { status: 'absent', checkInIso: null, checkOutIso, reason: 'Valid checkout recorded, but no valid check-in was recorded.' };
+    return { status: 'absent', checkInIso: null, checkOutIso, reason: 'Valid checkout recorded, but no valid check-in was recorded.', basis: 'not_applicable' };
   }
-  return { status: 'absent', checkInIso: null, checkOutIso: null, reason: 'No valid fingerprint scans recorded for this scheduled shift after data coverage was confirmed complete.' };
+  return { status: 'absent', checkInIso: null, checkOutIso: null, reason: 'No valid fingerprint scans recorded for this scheduled shift after data coverage was confirmed complete.', basis: 'not_applicable' };
 }
