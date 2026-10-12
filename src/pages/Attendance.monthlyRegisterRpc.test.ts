@@ -59,3 +59,37 @@ describe('Monthly Register: individual manual edits are routed through attendanc
     expect(attendanceSource).toMatch(/already been processed -- flagged for reconciliation review/);
   });
 });
+
+describe('Monthly Register: "Copy from previous month" is routed through attendance_correct, not a direct bulk insert', () => {
+  const copyFromPreviousMonthBody = attendanceSource.slice(
+    attendanceSource.indexOf('const copyFromPreviousMonth ='),
+    attendanceSource.indexOf('// ===== RENDER =====')
+  );
+
+  it('no longer bulk-inserts directly into the attendance table', () => {
+    expect(copyFromPreviousMonthBody).not.toMatch(/\.from\('attendance'\)\s*\.insert/);
+  });
+
+  it('calls attendance_correct once per copied record, preserving each day\'s own source status', () => {
+    expect(copyFromPreviousMonthBody).toMatch(
+      /supabase\.rpc\('attendance_correct', \{\s*p_employee_id: record\.employee_id,\s*p_date: record\.date,\s*p_status: record\.status,/
+    );
+  });
+
+  it('counts successes and failures independently instead of treating the batch as all-or-nothing', () => {
+    expect(copyFromPreviousMonthBody).toMatch(/let succeeded = 0;/);
+    expect(copyFromPreviousMonthBody).toMatch(/const failures:/);
+    expect(copyFromPreviousMonthBody).toMatch(/succeeded\+\+;/);
+    expect(copyFromPreviousMonthBody).toMatch(/failures\.push\(/);
+  });
+
+  it('reports a partial-failure outcome distinctly from full success and full failure', () => {
+    expect(copyFromPreviousMonthBody).toMatch(/if \(failures\.length === 0\)/);
+    expect(copyFromPreviousMonthBody).toMatch(/else if \(succeeded > 0\)/);
+    expect(copyFromPreviousMonthBody).toMatch(/Copied \$\{succeeded\} of \$\{newRecords\.length\} records/);
+  });
+
+  it('never claims automatic source for a copied record (manual precedence is preserved -- attendance_correct has no source parameter at all)', () => {
+    expect(copyFromPreviousMonthBody).not.toMatch(/p_source\s*:/);
+  });
+});

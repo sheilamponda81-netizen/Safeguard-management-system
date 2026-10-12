@@ -1075,8 +1075,6 @@ function MonthlyRegisterTab() {
     }
 
     if (sourceData && sourceData.length > 0) {
-      // tenant_id is omitted -- it defaults to the current user's own tenant
-      // via the DB column default, same convention as processSingleUpdate.
       const newRecords = sourceData.map(record => {
         const originalDate = new Date(record.date);
         const dayOfMonth = originalDate.getDate();
@@ -1087,28 +1085,58 @@ function MonthlyRegisterTab() {
         };
       }).filter(record => record.date);
 
-      const { error: insertError } = await supabase
-        .from('attendance')
-        .insert(newRecords);
+      // Routed through attendance_correct (Stage C), one call per record,
+      // rather than attendance_bulk_correct: that RPC applies a single
+      // status across a whole employee x date range, but a copied day can
+      // carry a DIFFERENT status per employee per day (whatever the source
+      // day actually was) -- its uniform-status shape doesn't fit this
+      // operation. Per-call also gives genuine partial-failure isolation:
+      // attendance_bulk_correct runs its whole employee loop inside ONE
+      // function call/transaction, so a single out-of-region employee
+      // would abort every other employee's copy along with it; separate
+      // RPC calls let the rest continue and succeed independently.
+      let succeeded = 0;
+      const failures: { employee_id: string; date: string; message: string }[] = [];
+      for (const record of newRecords) {
+        try {
+          const { error } = await supabase.rpc('attendance_correct', {
+            p_employee_id: record.employee_id,
+            p_date: record.date,
+            p_status: record.status,
+            p_reason: `Copied from ${getMonthLabel(sourceMonth)}`,
+          });
+          if (error) throw error;
+          succeeded++;
+        } catch (err) {
+          console.error('Error copying attendance record:', record, err);
+          failures.push({ employee_id: record.employee_id, date: record.date, message: getErrorMessage(err) });
+        }
+      }
 
-      if (insertError) {
-        console.error('Error copying data:', insertError);
-        showNotification('Failed to copy data: ' + insertError.message, 'error');
-      } else {
+      if (succeeded > 0) {
         await logAudit({
           action: 'CREATE',
           entity_type: 'attendance',
           new_data: {
             sourceMonth: sourceMonth,
             targetMonth: selectedMonth,
-            recordsCopied: newRecords.length
+            recordsCopied: succeeded,
+            recordsFailed: failures.length
           },
           region_id: userProfile?.region_id
         });
 
         await fetchData();
+      }
+
+      if (failures.length === 0) {
         showNotification(`Attendance data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}`, 'success');
         setShowCopyModal(false);
+      } else if (succeeded > 0) {
+        showNotification(`Copied ${succeeded} of ${newRecords.length} records. ${failures.length} failed (${failures[0].message}) -- check permissions or region scope and retry for those employees.`, 'error');
+        setShowCopyModal(false);
+      } else {
+        showNotification(`Failed to copy data: ${failures[0].message}`, 'error');
       }
     } else {
       showNotification('No attendance data found in the source month.', 'error');
