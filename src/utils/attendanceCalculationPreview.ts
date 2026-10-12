@@ -89,6 +89,8 @@ export interface AttendanceCalculationPreviewRow {
   expectedShiftTimes: { scheduledStart: string; scheduledEnd: string } | null;
   calculation: AttendanceCalculationResult;
   officialStatus: string | null;
+  /** False means this employee has no active HikCentral Person Mapping at all -- zero events is a MAPPING gap, not evidence of absence, so coverage is always forced 'insufficient' for them regardless of any operator confirmation (see buildAttendanceCalculationPreviewRows). */
+  hasActiveMapping: boolean;
 }
 
 /** Every employeeId appearing in at least one active dated assignment or recurring Off pattern -- "has roster evidence" for the empty-state check and the row-candidate union below. */
@@ -106,7 +108,15 @@ export function collectEmployeeIdsWithFingerprintEvidence(eventsByEmployeeId: Ma
   return ids;
 }
 
-/** True iff at least one employee has BOTH roster and fingerprint evidence -- the exact condition that gates the page's helpful empty state (requirement: never show confident results when the two sources simply don't overlap in time). */
+/**
+ * True iff at least one employee has BOTH roster and fingerprint
+ * evidence. NOT used to gate row generation or the page's empty state
+ * (the preview is roster-first: an employee with a resolved Day/Night
+ * shift and zero fingerprint events must still appear, calculating
+ * Pending or -- only once coverage is genuinely confirmed -- Absent).
+ * Kept as a diagnostic signal only (e.g. for a non-blocking note that
+ * the two sources don't currently overlap in time).
+ */
 export function hasAnyEmployeeWithBothRosterAndFingerprintEvidence(rosterIds: Set<string>, fingerprintIds: Set<string>): boolean {
   for (const id of rosterIds) if (fingerprintIds.has(id)) return true;
   return false;
@@ -135,7 +145,12 @@ export function expectedShiftTimesFor(resolvedShift: ResolvedSchedule): { schedu
  * candidate employees -- the caller decides which employees are worth
  * computing at all (this module provides the evidence-based helpers
  * above for that), so this stays a simple nested loop with no hidden
- * filtering. Every actual calculation is delegated to
+ * filtering. ROSTER-FIRST: an employee with a resolved Day/Night shift
+ * and zero fingerprint events is still given a row (resolving to
+ * Pending unless coverage is genuinely confirmed) -- callers must pass
+ * every roster-evidenced employee here even when they have no entry in
+ * `eventsByEmployeeId` at all, never only the ones who happen to have
+ * scanned. Every actual calculation is delegated to
  * calculateAttendanceStatus (Stage A) -- this function only resolves the
  * roster schedule (resolveScheduleForDate, also pre-existing) and looks
  * up each employee's events/coverage/official-status from the supplied
@@ -149,13 +164,18 @@ export function buildAttendanceCalculationPreviewRows(params: {
   eventsByEmployeeId: Map<string, NormalizedFingerprintEvent[]>;
   coveragePolicy: ResolvedCoveragePolicy;
   officialStatusByKey: Map<string, string>;
+  /** Employees with NO active HikCentral Person Mapping always get forced 'insufficient' coverage, regardless of any operator workstation confirmation -- their zero events reflect an unresolved mapping, never an observed absence. */
+  employeeIdsWithActiveMapping: Set<string>;
 }): AttendanceCalculationPreviewRow[] {
-  const { employees, shiftDates, datedAssignments, patterns, eventsByEmployeeId, coveragePolicy, officialStatusByKey } = params;
+  const { employees, shiftDates, datedAssignments, patterns, eventsByEmployeeId, coveragePolicy, officialStatusByKey, employeeIdsWithActiveMapping } = params;
   const rows: AttendanceCalculationPreviewRow[] = [];
 
   for (const employee of employees) {
     const events = eventsByEmployeeId.get(employee.id) ?? [];
-    const coverage = coverageForWorkstationKey(coveragePolicy, normalizeWorkstationKey(employee.workstation || ''));
+    const hasActiveMapping = employeeIdsWithActiveMapping.has(employee.id);
+    const coverage = hasActiveMapping
+      ? coverageForWorkstationKey(coveragePolicy, normalizeWorkstationKey(employee.workstation || ''))
+      : ({ status: 'insufficient' } as const);
     for (const shiftDate of shiftDates) {
       const resolvedShift = resolveScheduleForDate(employee.id, shiftDate, datedAssignments, patterns);
       const calculation = calculateAttendanceStatus({ shiftDate, resolvedShift, events, coverage });
@@ -169,6 +189,7 @@ export function buildAttendanceCalculationPreviewRows(params: {
         expectedShiftTimes: expectedShiftTimesFor(resolvedShift),
         calculation,
         officialStatus: officialStatusByKey.get(`${employee.id}|${shiftDate}`) ?? null,
+        hasActiveMapping,
       });
     }
   }

@@ -18,6 +18,11 @@ function ev(timestampIso: string): NormalizedFingerprintEvent {
   return { timestampIso };
 }
 
+/** Convenience for tests that aren't exercising the mapping-gap distinction -- everyone is mapped. */
+function allMapped(employees: EmployeeLite[]): Set<string> {
+  return new Set(employees.map((e) => e.id));
+}
+
 describe('normalizeWorkstationKey', () => {
   it('merges whitespace/case differences', () => {
     expect(normalizeWorkstationKey('Chirimba ')).toBe(normalizeWorkstationKey('  chirimba'));
@@ -137,6 +142,7 @@ describe('buildAttendanceCalculationPreviewRows -- roster resolution, shift date
       eventsByEmployeeId: new Map(),
       coveragePolicy: noActivePolicy,
       officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee()]),
     });
     expect(rows.map((r) => r.resolvedShift)).toEqual(['day', 'night', 'off', 'unassigned']);
     expect(rows[0].expectedShiftTimes).toEqual({ scheduledStart: '06:00', scheduledEnd: '18:00' });
@@ -155,6 +161,7 @@ describe('buildAttendanceCalculationPreviewRows -- roster resolution, shift date
       eventsByEmployeeId: events,
       coveragePolicy: noActivePolicy,
       officialStatusByKey: new Map([['emp-1|2026-10-05', 'A']]), // deliberately contradicts the calculation
+      employeeIdsWithActiveMapping: allMapped([employee()]),
     });
     expect(rows[0].calculation.status).toBe('present');
     expect(rows[0].officialStatus).toBe('A'); // shown read-only, never altering the calculation
@@ -170,6 +177,7 @@ describe('buildAttendanceCalculationPreviewRows -- roster resolution, shift date
       eventsByEmployeeId: events,
       coveragePolicy: noActivePolicy,
       officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee()]),
     });
     expect(rows[0].resolvedShift).toBe('night');
     expect(rows[0].calculation.status).toBe('present');
@@ -184,7 +192,24 @@ describe('buildAttendanceCalculationPreviewRows -- roster resolution, shift date
       eventsByEmployeeId: new Map(),
       coveragePolicy: noActivePolicy,
       officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee()]),
     });
+    expect(rows[0].calculation.status).toBe('pending');
+  });
+
+  it('ROSTER-FIRST REGRESSION: an employee with a resolved Day shift and ZERO fingerprint events anywhere (eventsByEmployeeId has no entry for them at all, not even an empty array) still gets a row, never silently dropped', () => {
+    const rows = buildAttendanceCalculationPreviewRows({
+      employees: [employee()],
+      shiftDates: ['2026-10-05'],
+      datedAssignments,
+      patterns: [],
+      eventsByEmployeeId: new Map(), // no entry for emp-1 at all -- the exact shape a "zero fingerprint records anywhere in range" employee has
+      coveragePolicy: noActivePolicy,
+      officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee()]),
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].resolvedShift).toBe('day');
     expect(rows[0].calculation.status).toBe('pending');
   });
 
@@ -203,6 +228,22 @@ describe('buildAttendanceCalculationPreviewRows -- roster resolution, shift date
       eventsByEmployeeId: events,
       coveragePolicy: policy,
       officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee()]),
+    });
+    expect(rows[0].calculation.status).toBe('absent');
+  });
+
+  it('ROSTER-FIRST + CONFIRMED COVERAGE: a scheduled employee with a mapped identity, ZERO events, and genuinely confirmed coverage finalizes to Absent (the site-alert-relevant case)', () => {
+    const policy = resolveCoveragePolicy({ exportTimeBlantyreLocal: '2026-10-05T20:00', confirmedWorkstationsRaw: 'CHIRIMBA', operatorConfirmed: true });
+    const rows = buildAttendanceCalculationPreviewRows({
+      employees: [employee()],
+      shiftDates: ['2026-10-05'],
+      datedAssignments,
+      patterns: [],
+      eventsByEmployeeId: new Map(),
+      coveragePolicy: policy,
+      officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee()]),
     });
     expect(rows[0].calculation.status).toBe('absent');
   });
@@ -217,7 +258,24 @@ describe('buildAttendanceCalculationPreviewRows -- roster resolution, shift date
       eventsByEmployeeId: new Map(),
       coveragePolicy: policy,
       officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee({ workstation: 'CHIRIMBA' })]),
     });
+    expect(rows[0].calculation.status).toBe('pending');
+  });
+
+  it('MAPPING-GAP: an employee with NO active HikCentral person mapping stays Pending even with confirmed coverage for their workstation and a sufficiently-late export time -- zero events must never be read as a confirmed absence for them', () => {
+    const policy = resolveCoveragePolicy({ exportTimeBlantyreLocal: '2026-10-05T20:00', confirmedWorkstationsRaw: 'CHIRIMBA', operatorConfirmed: true });
+    const rows = buildAttendanceCalculationPreviewRows({
+      employees: [employee()],
+      shiftDates: ['2026-10-05'],
+      datedAssignments,
+      patterns: [],
+      eventsByEmployeeId: new Map(),
+      coveragePolicy: policy,
+      officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: new Set(), // nobody mapped
+    });
+    expect(rows[0].hasActiveMapping).toBe(false);
     expect(rows[0].calculation.status).toBe('pending');
   });
 
@@ -236,6 +294,7 @@ describe('buildAttendanceCalculationPreviewRows -- roster resolution, shift date
       eventsByEmployeeId: events,
       coveragePolicy: policy,
       officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee()]),
     });
     expect(rows[0].calculation.status).toBe('present');
     expect(rows[0].calculation.basis).toBe('check_in_only_provisional');
@@ -248,14 +307,16 @@ describe('filterAttendancePreviewRows', () => {
     { employeeId: 'emp-2', assignmentDate: '2026-10-05', assignmentType: 'night', isActive: true },
   ];
   const noActivePolicy = resolveCoveragePolicy({ exportTimeBlantyreLocal: '', confirmedWorkstationsRaw: '', operatorConfirmed: false });
+  const filterTestEmployees = [employee({ id: 'emp-1', workstation: 'SITE A' }), employee({ id: 'emp-2', employeeNumber: 'SFG-S-002', workstation: 'SITE B' })];
   const rows = buildAttendanceCalculationPreviewRows({
-    employees: [employee({ id: 'emp-1', workstation: 'SITE A' }), employee({ id: 'emp-2', employeeNumber: 'SFG-S-002', workstation: 'SITE B' })],
+    employees: filterTestEmployees,
     shiftDates: ['2026-10-05'],
     datedAssignments,
     patterns: [],
     eventsByEmployeeId: new Map(),
     coveragePolicy: noActivePolicy,
     officialStatusByKey: new Map(),
+    employeeIdsWithActiveMapping: allMapped(filterTestEmployees),
   });
 
   it('filters by site, shift, result, and employee search independently', () => {
@@ -279,6 +340,7 @@ describe('buildSiteAlertCasesFromRows -- site alert wiring (reuses Stage A aggre
       eventsByEmployeeId: new Map(),
       coveragePolicy: policy,
       officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped(employees),
     });
   }
 
@@ -324,6 +386,7 @@ describe('buildSiteAlertCasesFromRows -- site alert wiring (reuses Stage A aggre
       eventsByEmployeeId: new Map(),
       coveragePolicy: noActivePolicy,
       officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped(employees),
     });
     expect(rows.every((r) => r.calculation.status === 'pending')).toBe(true);
     const { cases } = buildSiteAlertCasesFromRows(rows);
@@ -337,5 +400,46 @@ describe('buildSiteAlertCasesFromRows -- site alert wiring (reuses Stage A aggre
     ];
     const { cases } = buildSiteAlertCasesFromRows(rows);
     expect(cases).toHaveLength(0);
+  });
+
+  it('ROSTER-FIRST SITE ALERT: 5 scheduled employees with zero successful scans and genuinely confirmed coverage DO trigger a "no fingerprint records" alert', () => {
+    const employees = Array.from({ length: 5 }, (_, i) => employee({ id: `z${i}`, workstation: 'SITE A' }));
+    const datedAssignments: DateAssignmentRow[] = employees.map((e) => ({ employeeId: e.id, assignmentDate: '2026-10-05', assignmentType: 'day', isActive: true }));
+    const policy = resolveCoveragePolicy({ exportTimeBlantyreLocal: '2026-10-05T20:00', confirmedWorkstationsRaw: 'SITE A', operatorConfirmed: true });
+    const rows = buildAttendanceCalculationPreviewRows({
+      employees,
+      shiftDates: ['2026-10-05'],
+      datedAssignments,
+      patterns: [],
+      eventsByEmployeeId: new Map(), // zero successful scans for all 5 -- no entries at all, not even empty arrays
+      coveragePolicy: policy,
+      officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: allMapped(employees),
+    });
+    expect(rows.every((r) => r.calculation.status === 'absent')).toBe(true);
+    const { cases } = buildSiteAlertCasesFromRows(rows);
+    const alerts = aggregateSiteAlerts(cases);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].totalCount).toBe(5);
+    expect(alerts[0].breakdown.noFingerprintRecords).toBe(5);
+  });
+
+  it('MAPPING-GAP SITE ALERT: the same 5 scheduled employees with zero scans but NO active person mapping never trigger an alert -- a mapping gap is not a confirmed absence', () => {
+    const employees = Array.from({ length: 5 }, (_, i) => employee({ id: `u${i}`, workstation: 'SITE A' }));
+    const datedAssignments: DateAssignmentRow[] = employees.map((e) => ({ employeeId: e.id, assignmentDate: '2026-10-05', assignmentType: 'day', isActive: true }));
+    const policy = resolveCoveragePolicy({ exportTimeBlantyreLocal: '2026-10-05T20:00', confirmedWorkstationsRaw: 'SITE A', operatorConfirmed: true });
+    const rows = buildAttendanceCalculationPreviewRows({
+      employees,
+      shiftDates: ['2026-10-05'],
+      datedAssignments,
+      patterns: [],
+      eventsByEmployeeId: new Map(),
+      coveragePolicy: policy,
+      officialStatusByKey: new Map(),
+      employeeIdsWithActiveMapping: new Set(), // nobody mapped
+    });
+    expect(rows.every((r) => r.calculation.status === 'pending')).toBe(true);
+    const { cases } = buildSiteAlertCasesFromRows(rows);
+    expect(aggregateSiteAlerts(cases)).toHaveLength(0);
   });
 });

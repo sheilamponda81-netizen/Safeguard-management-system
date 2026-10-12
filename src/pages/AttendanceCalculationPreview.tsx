@@ -167,8 +167,14 @@ export default function AttendanceCalculationPreviewPage() {
     return data.employees.filter((e) => candidateIds.has(e.id));
   }, [data, rosterIds, fingerprintIds]);
 
+  // ROSTER-FIRST: every employee with roster OR fingerprint evidence
+  // (candidateEmployees, the union) gets a row for every shiftDate --
+  // never gated on the two sources overlapping. An employee with a
+  // resolved Day/Night shift and zero fingerprint events still appears,
+  // calculating Pending (or Absent only once coverage is genuinely
+  // confirmed for their workstation -- see resolveCoveragePolicy).
   const rows: AttendanceCalculationPreviewRow[] = useMemo(() => {
-    if (!data || !hasOverlap) return [];
+    if (!data) return [];
     return buildAttendanceCalculationPreviewRows({
       employees: candidateEmployees,
       shiftDates,
@@ -177,8 +183,9 @@ export default function AttendanceCalculationPreviewPage() {
       eventsByEmployeeId: data.eventsByEmployeeId,
       coveragePolicy,
       officialStatusByKey: data.officialStatusByKey,
+      employeeIdsWithActiveMapping: data.employeeIdsWithActiveMapping,
     });
-  }, [data, hasOverlap, candidateEmployees, shiftDates, coveragePolicy]);
+  }, [data, candidateEmployees, shiftDates, coveragePolicy]);
 
   const siteOptions = useMemo(() => Array.from(new Set(rows.map((r) => r.workstation))).sort(), [rows]);
 
@@ -328,18 +335,30 @@ export default function AttendanceCalculationPreviewPage() {
 
       {loading ? (
         <div className="p-8 text-center text-slate-400">Loading...</div>
-      ) : !hasOverlap ? (
+      ) : candidateEmployees.length === 0 ? (
         <EmptyState
           icon={CalendarDays}
-          title="No employee has both roster and fingerprint evidence for this range"
+          title="No roster assignments or fingerprint records found for this range"
           description={
             `Roster assignments found: ${rosterDateExtent ? `${rosterDateExtent.earliest} to ${rosterDateExtent.latest}` : 'none in this range'}. ` +
             `Fingerprint data found: ${fingerprintDateExtent ? `${fingerprintDateExtent.earliest} to ${fingerprintDateExtent.latest}` : 'none in this range'}. ` +
-            `These do not overlap, so no employee can have a calculated result yet. Pick a date range where both exist, or import/assign roster data covering the same period.`
+            `This preview is roster-first and does not need fingerprint records to calculate a result -- a scheduled Day/Night shift with no scans still shows as Pending. ` +
+            `There is simply no roster assignment and no fingerprint record for any employee in this range yet. Pick a different range, or assign roster shifts for this period.`
           }
         />
       ) : (
         <>
+          {!hasOverlap && (
+            <Card className="p-3 bg-slate-50 border-slate-200 border">
+              <p className="text-xs text-slate-600 flex items-center gap-2">
+                <Info size={14} className="text-slate-400 shrink-0" />
+                Roster assignments ({rosterDateExtent ? `${rosterDateExtent.earliest} to ${rosterDateExtent.latest}` : 'none'}) and fingerprint
+                records ({fingerprintDateExtent ? `${fingerprintDateExtent.earliest} to ${fingerprintDateExtent.latest}` : 'none'}) do not
+                currently overlap in this range -- the rows below are still calculated from roster data alone and will show Pending for any
+                missing checkout/check-in evidence, never a false Absent.
+              </p>
+            </Card>
+          )}
           <Card className="p-4">
             <div className="flex items-center justify-between mb-3">
               <p className="text-sm font-semibold text-slate-700 flex items-center gap-2"><AlertTriangle size={16} className="text-amber-500" /> Site-level alerts</p>
@@ -424,7 +443,12 @@ export default function AttendanceCalculationPreviewPage() {
                         {row.calculation.basis === 'check_in_only_provisional' && <Badge color="gold">Provisional (check-in only)</Badge>}
                         {row.calculation.basis === 'not_applicable' && '—'}
                       </TD>
-                      <TD className="max-w-xs whitespace-normal text-xs text-slate-500">{row.calculation.reason}</TD>
+                      <TD className="max-w-xs whitespace-normal text-xs text-slate-500">
+                        {row.calculation.reason}
+                        {!row.hasActiveMapping && (row.resolvedShift === 'day' || row.resolvedShift === 'night') && (
+                          <span className="block text-amber-600 mt-0.5">No HikCentral person mapping confirmed yet -- zero events here does not mean this employee was absent.</span>
+                        )}
+                      </TD>
                       <TD>{row.officialStatus ? (OFFICIAL_STATUS_LABELS[row.officialStatus] ?? row.officialStatus) : '—'}</TD>
                     </TR>
                   ))}

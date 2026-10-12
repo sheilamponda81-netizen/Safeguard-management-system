@@ -22,6 +22,8 @@ export interface AttendanceCalculationPreviewData {
   patterns: OffDayPatternRow[];
   eventsByEmployeeId: Map<string, NormalizedFingerprintEvent[]>;
   officialStatusByKey: Map<string, string>;
+  /** Every employeeId with at least one ACTIVE HikCentral Person Mapping -- i.e. an employee this preview could ever observe a scan for at all. An employee absent from this set has zero events for an entirely different reason than "didn't scan": nobody has confirmed which HikCentral identity is theirs yet. See attendanceCalculationPreview.ts's use of this set -- it must never be treated as equivalent to a confirmed absence. */
+  employeeIdsWithActiveMapping: Set<string>;
 }
 
 /**
@@ -67,7 +69,9 @@ export async function fetchAttendanceCalculationPreviewData(dateFrom: string, da
     dateTo
   );
 
-  return { employees, datedAssignments, patterns, eventsByEmployeeId, officialStatusByKey };
+  const employeeIdsWithActiveMapping = new Set(mappings.map((m) => m.employeeId));
+
+  return { employees, datedAssignments, patterns, eventsByEmployeeId, officialStatusByKey, employeeIdsWithActiveMapping };
 }
 
 /** Read-only -- `${employeeId}|${date}` -> the existing official attendance.status code, for display/comparison only. */
