@@ -16,9 +16,9 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   Eye, Search, AlertTriangle, RefreshCw, Clock, MapPin, CalendarDays, ClipboardCheck,
-  ShieldCheck, ChevronDown, ChevronUp, Info,
+  ShieldCheck, ChevronDown, ChevronUp, Info, CheckCircle2, XCircle, HelpCircle,
 } from '../utils/icons';
-import { Card, Button, Badge, PageHeader, EmptyState, Input, Select, Table, THead, TBody, TR, TH, TD } from '../components/ui';
+import { Card, Button, Badge, PageHeader, EmptyState, Input, Select, StatCard } from '../components/ui';
 import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import { expandDateRange, ResolvedSchedule } from '../utils/rosterSchedule';
 import { AttendanceCalculationStatus } from '../utils/attendanceCalculationEngine';
@@ -93,6 +93,14 @@ export default function AttendanceCalculationPreviewPage() {
   const [siteFilter, setSiteFilter] = useState('');
   const [shiftFilter, setShiftFilter] = useState<ResolvedSchedule | ''>('');
   const [resultFilter, setResultFilter] = useState<AttendanceCalculationStatus | ''>('');
+  // Default view: scheduled Day/Night shifts only -- Off/Unassigned days
+  // are real, correct results (never a bug), but repeating them for
+  // every employee on every date would flood the list. This toggle is
+  // purely a display preference; it never changes what was calculated
+  // or how many rows exist underneath.
+  const [showOffUnassigned, setShowOffUnassigned] = useState(false);
+  const [coverageSectionOpen, setCoverageSectionOpen] = useState(false);
+  const [expandedRowKey, setExpandedRowKey] = useState<string | null>(null);
 
   // Coverage workflow inputs -- see attendanceCalculationPreview.ts's
   // resolveCoveragePolicy for why typing an export time alone never
@@ -189,10 +197,15 @@ export default function AttendanceCalculationPreviewPage() {
 
   const siteOptions = useMemo(() => Array.from(new Set(rows.map((r) => r.workstation))).sort(), [rows]);
 
-  const filteredRows = useMemo(
-    () => filterAttendancePreviewRows(rows, { siteFilter, shiftFilter, resultFilter, employeeSearch }),
-    [rows, siteFilter, shiftFilter, resultFilter, employeeSearch]
-  );
+  // Default view hides Off/Unassigned rows (never a bug, just noise at
+  // scale) UNLESS the user explicitly asked for them, either via the
+  // "Show Off/Unassigned" toggle or by picking "Off"/"Unassigned"
+  // directly in the Shift filter -- an explicit choice always wins.
+  const filteredRows = useMemo(() => {
+    const explicitlyFiltered = filterAttendancePreviewRows(rows, { siteFilter, shiftFilter, resultFilter, employeeSearch });
+    if (showOffUnassigned || shiftFilter === 'off' || shiftFilter === 'unassigned') return explicitlyFiltered;
+    return explicitlyFiltered.filter((r) => r.resolvedShift === 'day' || r.resolvedShift === 'night');
+  }, [rows, siteFilter, shiftFilter, resultFilter, employeeSearch, showOffUnassigned]);
 
   const visibleRows = filteredRows.slice(0, MAX_RENDERED_ROWS);
   const truncated = filteredRows.length > MAX_RENDERED_ROWS;
@@ -201,6 +214,25 @@ export default function AttendanceCalculationPreviewPage() {
     if (rows.length === 0) return [];
     const { cases, workstationLabelByKey } = buildSiteAlertCasesFromRows(rows);
     return aggregateSiteAlerts(cases).map((alert) => ({ ...alert, workstation: workstationLabelByKey.get(alert.workstation) ?? alert.workstation }));
+  }, [rows]);
+
+  // Summary counts are deliberately computed from `rows` -- every row
+  // calculated for the selected date range -- NOT from `filteredRows`/
+  // `visibleRows`. They are therefore unaffected by the site/shift/
+  // result filters or the Off/Unassigned toggle below, and by the
+  // MAX_RENDERED_ROWS display cap; the label under the stat cards makes
+  // this explicit per the "clearly label if filters/pagination limit
+  // scope" requirement.
+  const summaryCounts = useMemo(() => {
+    const counts = { scheduled: 0, present: 0, late: 0, absent: 0, pending: 0 };
+    for (const row of rows) {
+      if (row.resolvedShift === 'day' || row.resolvedShift === 'night') counts.scheduled++;
+      if (row.calculation.status === 'present') counts.present++;
+      else if (row.calculation.status === 'late') counts.late++;
+      else if (row.calculation.status === 'absent') counts.absent++;
+      else if (row.calculation.status === 'pending') counts.pending++;
+    }
+    return counts;
   }, [rows]);
 
   const employeeNameById = useMemo(() => {
@@ -216,9 +248,9 @@ export default function AttendanceCalculationPreviewPage() {
   if (!canView) {
     return (
       <div className="space-y-6">
-        <PageHeader title="Attendance Calculation Preview" subtitle="Read-only preview of calculated attendance results." />
+        <PageHeader title="Attendance Review" subtitle="Read-only preview of calculated attendance results." />
         <Card className="p-6 bg-amber-50 border-amber-200 border">
-          <p className="text-sm text-amber-800">You do not have permission to view the Attendance Calculation Preview.</p>
+          <p className="text-sm text-amber-800">You do not have permission to view Attendance Review.</p>
         </Card>
       </div>
     );
@@ -227,21 +259,33 @@ export default function AttendanceCalculationPreviewPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Attendance Calculation Preview"
-        subtitle="Calculated Present/Late/Absent/Pending/Off/Unassigned results from roster + fingerprint data -- read-only. Nothing on this page writes to official Attendance or Payroll."
+        title="Attendance Review"
+        subtitle="Calculated Present/Late/Absent/Pending results from roster + fingerprint data -- read-only. Nothing here writes to official Attendance or Payroll."
         actions={<Button variant="outline" onClick={loadData}><RefreshCw size={14} /> Refresh</Button>}
       />
 
-      <Card className="p-4 bg-blue-50 border-blue-200 border">
-        <div className="flex items-start gap-3">
-          <Eye size={18} className="text-blue-600 shrink-0 mt-0.5" />
-          <p className="text-sm text-blue-800">
-            Every result below is a <strong>calculation preview</strong> only, using the same engine that will later power the
-            official Attendance page. No row here has been saved anywhere, and no official Attendance or Payroll record is
-            changed by viewing, filtering, or exporting this page.
+      <Card className="p-3 bg-blue-50 border-blue-200 border">
+        <div className="flex items-start gap-2">
+          <Eye size={16} className="text-blue-600 shrink-0 mt-0.5" />
+          <p className="text-xs text-blue-800">
+            Every result below is a <strong>calculation preview</strong>, using the same engine that will later power the
+            official Attendance page. Nothing here is saved anywhere, and no official Attendance or Payroll record is ever
+            changed by viewing, filtering, or expanding rows on this page.
           </p>
         </div>
       </Card>
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+        <StatCard title="Scheduled shifts" value={summaryCounts.scheduled.toLocaleString()} icon={CalendarDays} accent="navy" />
+        <StatCard title="Present" value={summaryCounts.present.toLocaleString()} icon={CheckCircle2} accent="green" />
+        <StatCard title="Late" value={summaryCounts.late.toLocaleString()} icon={Clock} accent="gold" />
+        <StatCard title="Absent" value={summaryCounts.absent.toLocaleString()} icon={XCircle} accent="red" />
+        <StatCard title="Pending" value={summaryCounts.pending.toLocaleString()} icon={HelpCircle} accent="blue" />
+        <StatCard title="Site alerts" value={siteAlerts.length.toLocaleString()} icon={AlertTriangle} accent={siteAlerts.length > 0 ? 'red' : 'navy'} />
+      </div>
+      <p className="text-xs text-slate-400 -mt-1">
+        Totals cover every shift calculated for {fromDate} to {toDate} -- they are not affected by the site/shift/result filters, the Off/Unassigned toggle, or the row display limit below.
+      </p>
 
       <Card className="p-4">
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
@@ -277,53 +321,71 @@ export default function AttendanceCalculationPreviewPage() {
         {!rangeInvalid && rangeTooWide && (
           <p className="text-xs text-red-600 mt-2">That range spans more than {MAX_RANGE_DAYS} days. Please narrow it.</p>
         )}
+        <label className="flex items-center gap-2 mt-3 text-sm text-slate-600 border-t border-slate-100 pt-3">
+          <input type="checkbox" checked={showOffUnassigned} onChange={(e) => setShowOffUnassigned(e.target.checked)} />
+          Show Off / Unassigned days (hidden by default)
+        </label>
       </Card>
 
       <Card className="p-4">
-        <div className="flex items-center gap-2 mb-3">
-          <ShieldCheck size={16} className="text-slate-500" />
-          <p className="text-sm font-semibold text-slate-700">Fingerprint data coverage</p>
-        </div>
-        <p className="text-xs text-slate-500 mb-3">
-          An export time by itself is <strong>not</strong> proof that fingerprint data is complete. A shift with a missing
-          checkout stays <strong>Pending</strong> (never a false Absent) unless an authorized operator explicitly confirms,
-          below, that data is complete through a given time for specific, named workstations.
-        </p>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <Input
-            label="Export time supplied by administrator (Blantyre local)"
-            type="datetime-local"
-            value={exportTimeBlantyreLocal}
-            onChange={(e) => setExportTimeBlantyreLocal(e.target.value)}
-          />
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">Confirmed-coverage workstations (comma or newline separated)</label>
-            <textarea
-              value={confirmedWorkstationsRaw}
-              onChange={(e) => setConfirmedWorkstationsRaw(e.target.value)}
-              placeholder="e.g. CHIRIMBA, HEAD OFFICE"
-              rows={2}
-              className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent outline-none bg-white"
-            />
-          </div>
-        </div>
-        <label className="flex items-start gap-2 mt-3 text-sm text-slate-700">
-          <input
-            type="checkbox"
-            checked={operatorConfirmed}
-            onChange={(e) => setOperatorConfirmed(e.target.checked)}
-            className="mt-0.5"
-          />
-          <span>
-            I am an authorized operator and I confirm fingerprint data is complete through the time above, for exactly the
-            workstation(s) named above. Unnamed workstations -- including the HikCentral access points, which are not assumed
-            to cover every employee's assigned workstation -- remain Pending for missing evidence.
+        <button onClick={() => setCoverageSectionOpen((v) => !v)} className="w-full flex items-center justify-between gap-3 text-left">
+          <span className="flex items-center gap-2">
+            <ShieldCheck size={16} className="text-slate-500" />
+            <span className="text-sm font-semibold text-slate-700">Fingerprint coverage settings</span>
           </span>
-        </label>
-        {coveragePolicy.isActive ? (
-          <p className="text-xs text-green-700 mt-2 flex items-center gap-1"><ShieldCheck size={12} /> Coverage confirmed for {coveragePolicy.confirmedWorkstationKeys.size} workstation(s) through {exportTimeBlantyreLocal || '—'} (Blantyre).</p>
-        ) : (
-          <p className="text-xs text-slate-500 mt-2 flex items-center gap-1"><Info size={12} /> No coverage confirmed yet -- every shift with missing evidence will show Pending.</p>
+          <span className="flex items-center gap-2">
+            {coveragePolicy.isActive ? (
+              <Badge color="green">Confirmed for {coveragePolicy.confirmedWorkstationKeys.size} workstation(s)</Badge>
+            ) : (
+              <Badge color="gray">Not confirmed -- missing evidence shows Pending</Badge>
+            )}
+            {coverageSectionOpen ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
+          </span>
+        </button>
+        {coverageSectionOpen && (
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <p className="text-xs text-slate-500 mb-3">
+              An export time by itself is <strong>not</strong> proof that fingerprint data is complete. A shift with a missing
+              checkout stays <strong>Pending</strong> (never a false Absent) unless an authorized operator explicitly confirms,
+              below, that data is complete through a given time for specific, named workstations.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <Input
+                label="Export time supplied by administrator (Blantyre local)"
+                type="datetime-local"
+                value={exportTimeBlantyreLocal}
+                onChange={(e) => setExportTimeBlantyreLocal(e.target.value)}
+              />
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1.5">Confirmed-coverage workstations (comma or newline separated)</label>
+                <textarea
+                  value={confirmedWorkstationsRaw}
+                  onChange={(e) => setConfirmedWorkstationsRaw(e.target.value)}
+                  placeholder="e.g. CHIRIMBA, HEAD OFFICE"
+                  rows={2}
+                  className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent outline-none bg-white"
+                />
+              </div>
+            </div>
+            <label className="flex items-start gap-2 mt-3 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={operatorConfirmed}
+                onChange={(e) => setOperatorConfirmed(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                I am an authorized operator and I confirm fingerprint data is complete through the time above, for exactly the
+                workstation(s) named above. Unnamed workstations -- including the HikCentral access points, which are not assumed
+                to cover every employee's assigned workstation -- remain Pending for missing evidence.
+              </span>
+            </label>
+            {coveragePolicy.isActive ? (
+              <p className="text-xs text-green-700 mt-2 flex items-center gap-1"><ShieldCheck size={12} /> Coverage confirmed for {coveragePolicy.confirmedWorkstationKeys.size} workstation(s) through {exportTimeBlantyreLocal || '—'} (Blantyre).</p>
+            ) : (
+              <p className="text-xs text-slate-500 mt-2 flex items-center gap-1"><Info size={12} /> No coverage confirmed yet -- every shift with missing evidence will show Pending.</p>
+            )}
+          </div>
         )}
       </Card>
 
@@ -398,7 +460,15 @@ export default function AttendanceCalculationPreviewPage() {
           </Card>
 
           {visibleRows.length === 0 ? (
-            <EmptyState icon={ClipboardCheck} title="No rows match the current filters" description="Try widening the site, shift, or result filters." />
+            <EmptyState
+              icon={ClipboardCheck}
+              title="No rows match the current filters"
+              description={
+                showOffUnassigned || shiftFilter === 'off' || shiftFilter === 'unassigned'
+                  ? 'Try widening the site, shift, or result filters.'
+                  : 'Try widening the site/shift/result filters, or turn on "Show Off / Unassigned days" above -- Day/Night shifts are hidden if none match.'
+              }
+            />
           ) : (
             <>
               {truncated && (
@@ -408,52 +478,75 @@ export default function AttendanceCalculationPreviewPage() {
                   </p>
                 </Card>
               )}
-              <Table>
-                <THead>
-                  <TR hover={false}>
-                    <TH>Employee</TH>
-                    <TH>Workstation</TH>
-                    <TH>Shift date</TH>
-                    <TH>Shift</TH>
-                    <TH>Expected times</TH>
-                    <TH>Earliest check-in</TH>
-                    <TH>First checkout</TH>
-                    <TH>Result</TH>
-                    <TH>Basis</TH>
-                    <TH>Reason</TH>
-                    <TH>Official status</TH>
-                  </TR>
-                </THead>
-                <TBody>
-                  {visibleRows.map((row) => (
-                    <TR key={`${row.employeeId}|${row.shiftDate}`}>
-                      <TD>
-                        <p className="font-medium text-slate-800">{row.employeeName}</p>
-                        <p className="text-xs text-slate-400">{row.employeeNumber}</p>
-                      </TD>
-                      <TD>{row.workstation || '—'}</TD>
-                      <TD>{row.shiftDate}</TD>
-                      <TD className="capitalize">{row.resolvedShift}</TD>
-                      <TD>{row.expectedShiftTimes ? `${row.expectedShiftTimes.scheduledStart}–${row.expectedShiftTimes.scheduledEnd}` : '—'}</TD>
-                      <TD><span className="inline-flex items-center gap-1"><Clock size={11} className="text-slate-400" /> {formatLocalTime(row.calculation.checkInIso)}</span></TD>
-                      <TD><span className="inline-flex items-center gap-1"><Clock size={11} className="text-slate-400" /> {formatLocalTime(row.calculation.checkOutIso)}</span></TD>
-                      <TD><Badge color={RESULT_COLORS[row.calculation.status]}>{RESULT_LABELS[row.calculation.status]}</Badge></TD>
-                      <TD>
-                        {row.calculation.basis === 'confirmed' && <Badge color="green">Confirmed</Badge>}
-                        {row.calculation.basis === 'check_in_only_provisional' && <Badge color="gold">Provisional (check-in only)</Badge>}
-                        {row.calculation.basis === 'not_applicable' && '—'}
-                      </TD>
-                      <TD className="max-w-xs whitespace-normal text-xs text-slate-500">
-                        {row.calculation.reason}
-                        {!row.hasActiveMapping && (row.resolvedShift === 'day' || row.resolvedShift === 'night') && (
-                          <span className="block text-amber-600 mt-0.5">No HikCentral person mapping confirmed yet -- zero events here does not mean this employee was absent.</span>
-                        )}
-                      </TD>
-                      <TD>{row.officialStatus ? (OFFICIAL_STATUS_LABELS[row.officialStatus] ?? row.officialStatus) : '—'}</TD>
-                    </TR>
-                  ))}
-                </TBody>
-              </Table>
+              <div className="space-y-1.5">
+                {visibleRows.map((row) => {
+                  const rowKey = `${row.employeeId}|${row.shiftDate}`;
+                  const expanded = expandedRowKey === rowKey;
+                  const mappingProblem = !row.hasActiveMapping && (row.resolvedShift === 'day' || row.resolvedShift === 'night');
+                  return (
+                    <div key={rowKey} className="border border-slate-200 rounded-lg bg-white">
+                      <button
+                        onClick={() => setExpandedRowKey(expanded ? null : rowKey)}
+                        className="w-full flex items-center gap-3 px-3 py-2.5 text-left hover:bg-slate-50 rounded-lg"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="font-medium text-slate-800 text-sm truncate">{row.employeeName}</p>
+                          <p className="text-xs text-slate-400 truncate">
+                            {row.employeeNumber} &middot; {row.workstation || '—'} &middot; {row.shiftDate} &middot; <span className="capitalize">{row.resolvedShift}</span>
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {mappingProblem && (
+                            <span title="No HikCentral person mapping confirmed yet">
+                              <AlertTriangle size={14} className="text-amber-500" />
+                            </span>
+                          )}
+                          {row.calculation.basis === 'check_in_only_provisional' && <Badge color="gold">Provisional</Badge>}
+                          <Badge color={RESULT_COLORS[row.calculation.status]}>{RESULT_LABELS[row.calculation.status]}</Badge>
+                          {expanded ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
+                        </div>
+                      </button>
+                      {expanded && (
+                        <div className="px-3 pb-3 pt-1 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                          <div>
+                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Expected shift times</p>
+                            <p className="text-slate-700">{row.expectedShiftTimes ? `${row.expectedShiftTimes.scheduledStart}–${row.expectedShiftTimes.scheduledEnd}` : '—'}</p>
+                          </div>
+                          <div>
+                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Fingerprint evidence</p>
+                            <p className="text-slate-700 flex flex-wrap items-center gap-x-3 gap-y-1">
+                              <span className="inline-flex items-center gap-1"><Clock size={11} className="text-slate-400" /> Check-in: {formatLocalTime(row.calculation.checkInIso)}</span>
+                              <span className="inline-flex items-center gap-1"><Clock size={11} className="text-slate-400" /> Checkout: {formatLocalTime(row.calculation.checkOutIso)}</span>
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Calculation basis</p>
+                            <p className="text-slate-700">
+                              {row.calculation.basis === 'confirmed' && 'Confirmed -- both check-in and checkout observed, or coverage genuinely confirmed.'}
+                              {row.calculation.basis === 'check_in_only_provisional' && 'Provisional -- credited from an on-time/late check-in alone, before the checkout window closed.'}
+                              {row.calculation.basis === 'not_applicable' && 'Not applicable to this result.'}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Official attendance status (read-only)</p>
+                            <p className="text-slate-700">{row.officialStatus ? (OFFICIAL_STATUS_LABELS[row.officialStatus] ?? row.officialStatus) : 'Not marked'}</p>
+                          </div>
+                          <div className="sm:col-span-2">
+                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Full explanation</p>
+                            <p className="text-slate-600">{row.calculation.reason}</p>
+                            {mappingProblem && (
+                              <p className="text-amber-700 mt-1 flex items-start gap-1">
+                                <AlertTriangle size={13} className="shrink-0 mt-0.5" />
+                                No HikCentral person mapping confirmed yet for this employee -- zero events here does not mean they were absent.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </>
           )}
         </>
