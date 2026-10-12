@@ -4,7 +4,7 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs 
 import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
-import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
+import { getAvailableMonthsFromSystem, getActualCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
 import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
 import { sanitizeInput } from '../utils/securityHeaders';
@@ -666,13 +666,19 @@ function MonthlyRegisterTab() {
   // ===== INITIALIZATION =====
   useEffect(() => {
     const init = async () => {
-      const month = await getSystemCurrentMonth();
+      // The ACTUAL current calendar month (Africa/Blantyre) -- NOT the
+      // admin-advanced payroll-processing cursor getSystemCurrentMonth
+      // returns, which can legitimately lag behind the calendar and
+      // previously left this page treating July 2026 as "current" well
+      // into October. See getActualCurrentMonth's own comment in
+      // currentMonth.ts.
+      const month = getActualCurrentMonth();
       setSystemMonth(month);
       setSelectedMonth(month);
-      
+
       const months = getAvailableMonthsFromSystem(month);
       setAvailableMonths(months);
-      
+
       await fetchUserProfile();
     };
     init();

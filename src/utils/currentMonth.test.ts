@@ -1,10 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   getPreviousMonth,
   getNextMonth,
   getAvailableMonthsFromSystem,
   getSystemStartDate,
   getChartMonths,
+  getActualCurrentMonth,
 } from './currentMonth';
 
 // Local helper mirroring the file's own "YYYY-MM" key format, driven off
@@ -173,5 +174,40 @@ describe('getChartMonths', () => {
     const start = getSystemStartDate();
     const months = getChartMonths(monthKey(addMonths(start, 9)));
     expect(months).toEqual([...months].sort());
+  });
+});
+
+// Safeguard Stage C -- Monthly Register current-month bug: with
+// current_payroll_month (the admin-advanced payroll-processing cursor)
+// left at its default of 2026-07, Attendance.tsx treated July 2026 as
+// "current" well into October, silently saving a manual edit against
+// 1 July instead of the real date. getActualCurrentMonth() must track the
+// real Africa/Blantyre calendar month instead, completely independent of
+// that setting -- these tests pin the system clock rather than reading
+// current_payroll_month at all.
+describe('getActualCurrentMonth: real Africa/Blantyre calendar month, independent of current_payroll_month', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('matches today in UTC when well clear of a day boundary', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-12T12:00:00.000Z'));
+    expect(getActualCurrentMonth()).toBe('2026-10');
+  });
+
+  it('rolls over to the next calendar month at the Blantyre (UTC+2) day boundary, not the UTC one', () => {
+    vi.useFakeTimers();
+    // 2026-07-31T23:00:00Z is 2026-08-01T01:00 in Blantyre (UTC+2) --
+    // already August locally even though it's still July in UTC.
+    vi.setSystemTime(new Date('2026-07-31T23:00:00.000Z'));
+    expect(getActualCurrentMonth()).toBe('2026-08');
+  });
+
+  it('does not fall back to July 2026 once the real date has moved well past it', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-12-25T10:00:00.000Z'));
+    expect(getActualCurrentMonth()).not.toBe('2026-07');
+    expect(getActualCurrentMonth()).toBe('2026-12');
   });
 });

@@ -12,6 +12,18 @@ import path from 'node:path';
 // at the source level instead of rendering the component.
 const attendanceSource = fs.readFileSync(path.resolve(__dirname, './Attendance.tsx'), 'utf-8');
 
+describe('Monthly Register: the current month comes from the real calendar date, not the payroll-processing cursor', () => {
+  it('initializes systemMonth/selectedMonth from getActualCurrentMonth(), not getSystemCurrentMonth()', () => {
+    expect(attendanceSource).toMatch(/const month = getActualCurrentMonth\(\);/);
+    expect(attendanceSource).not.toMatch(/getSystemCurrentMonth\(/);
+    expect(attendanceSource).not.toMatch(/import \{[^}]*getSystemCurrentMonth/);
+  });
+
+  it('imports getActualCurrentMonth from currentMonth.ts', () => {
+    expect(attendanceSource).toMatch(/import \{[^}]*getActualCurrentMonth[^}]*\} from '\.\.\/utils\/currentMonth'/);
+  });
+});
+
 describe('Monthly Register: individual manual edits are routed through attendance_correct', () => {
   it('processSingleUpdate calls supabase.rpc(\'attendance_correct\', ...) with employee/date/status only -- never a source or basis', () => {
     expect(attendanceSource).toMatch(
