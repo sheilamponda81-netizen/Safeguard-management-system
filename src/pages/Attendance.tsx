@@ -575,7 +575,10 @@ function MonthlyRegisterTab() {
   useEffect(() => { getDefaultPageSize().then(setAttendanceItemsPerPage); }, []);
 
   // ===== REFS =====
-  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string }>>(new Map());
+  // previousStatus is carried alongside the queued write so a failed RPC
+  // call can revert the optimistic UI change it caused -- the grid applies
+  // the new status immediately on click, before the write is confirmed.
+  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string; previousStatus: string }>>(new Map());
   const isProcessingUpdate = useRef(false);
 
   // ===== HELPER FUNCTIONS =====
@@ -713,44 +716,46 @@ function MonthlyRegisterTab() {
   }, [selectedMonth]);
 
   // ===== PROCESS SINGLE UPDATE =====
-  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string) => {
+  // Routed through the protected attendance_correct RPC (Stage C) instead of
+  // a direct table SELECT-then-INSERT/UPDATE: the server resolves insert vs.
+  // update itself, re-checks the same permission/region boundary server-side
+  // (defense in depth beyond the client-side gates above), and -- in the
+  // same transaction as the attendance write -- records old/new status into
+  // attendance_audit_log and raises a payroll reconciliation flag if this
+  // month already has a payroll record. On failure, the optimistic UI
+  // change made in updateAttendance is reverted back to previousStatus so
+  // the grid never shows an edit that didn't actually save.
+  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string, previousStatus: string) => {
     try {
-      const { data: existingRecord, error: checkError } = await supabase
-        .from('attendance')
-        .select('id')
-        .eq('employee_id', employeeId)
-        .eq('date', date)
-        .maybeSingle();
+      const { data, error } = await supabase.rpc('attendance_correct', {
+        p_employee_id: employeeId,
+        p_date: date,
+        p_status: nextStatus,
+      });
 
-      if (checkError) throw checkError;
+      if (error) throw error;
 
-      let result;
-      if (existingRecord) {
-        result = await supabase
-          .from('attendance')
-          .update({ status: nextStatus })
-          .eq('id', existingRecord.id);
-      } else {
-        // tenant_id is omitted -- it defaults to the current user's own
-        // tenant via the DB column default, same convention used by
-        // positions/regions inserts elsewhere in the app. Explicitly
-        // passing `tenant_id: null` here previously (when userProfile
-        // hadn't finished loading yet) would override that default and
-        // violate the NOT NULL constraint, silently failing every insert.
-        result = await supabase
-          .from('attendance')
-          .insert({
-            employee_id: employeeId,
-            date: date,
-            status: nextStatus,
-          });
+      const outcome = Array.isArray(data) ? data[0] : data;
+      if (outcome?.payroll_flag) {
+        showNotification(
+          outcome.payroll_flag === 'approved'
+            ? 'Attendance updated. Payroll for this month is already approved -- flagged for reconciliation review.'
+            : 'Attendance updated. Payroll for this month has already been processed -- flagged for reconciliation review.',
+          'info'
+        );
       }
-
-      if (result.error) throw result.error;
-
     } catch (err) {
       console.error('Error processing update:', err);
       showNotification(`Failed to save attendance: ${getErrorMessage(err)}`, 'error');
+      setAttendance(prev => {
+        const existingIndex = prev.findIndex(a => a.employee_id === employeeId && a.date === date);
+        if (existingIndex >= 0) {
+          const reverted = [...prev];
+          reverted[existingIndex] = { ...reverted[existingIndex], status: previousStatus };
+          return reverted;
+        }
+        return prev;
+      });
     }
   }, []);
 
@@ -765,7 +770,7 @@ function MonthlyRegisterTab() {
       updateQueue.current.clear();
 
       // Group updates by employee for efficiency
-      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string }[]> = {};
+      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string; previousStatus: string }[]> = {};
       for (const entry of entries) {
         if (!groupedUpdates[entry.employeeId]) {
           groupedUpdates[entry.employeeId] = [];
@@ -776,7 +781,7 @@ function MonthlyRegisterTab() {
       // Process each employee's updates
       for (const updates of Object.values(groupedUpdates)) {
         for (const update of updates) {
-          await processSingleUpdate(update.employeeId, update.date, update.status);
+          await processSingleUpdate(update.employeeId, update.date, update.status, update.previousStatus);
         }
       }
     } catch (err) {
@@ -838,7 +843,7 @@ function MonthlyRegisterTab() {
     });
     
     // Queue the update for background processing
-    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus });
+    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus, previousStatus: currentStatus });
     
     // Trigger queue processing
     if (!isProcessingUpdate.current) {
