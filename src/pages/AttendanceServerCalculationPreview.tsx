@@ -1,18 +1,28 @@
-// Safeguard HikCentral Attendance MVP -- Phase 2C, Stage C, Step 3.
+// Safeguard HikCentral Attendance MVP -- Phase 2C, Stage C, Steps 3-4.
 //
 // Read-only comparison of the SERVER-side calculation engine
 // (attendance_resolve_and_calculate, via attendance_preview_calculate)
 // against the existing client-side Stage A/B JavaScript preview, for a
-// single employee over a bounded date range. Writes nothing -- there is
-// no save/apply/confirm action that actually executes anywhere on this
-// page. The "Apply to Monthly Register" control below is a deliberately
-// disabled placeholder: the workflow it will eventually drive
-// (attendance_apply_automatic, already permission-gated and already
-// protective of manual edits/payroll/Pending/Off/Unassigned/unverified
-// Absent -- see that RPC's own definition) is NOT enabled by this
-// change. It stays disabled until BOTH (a) the tenant-scoping and
-// coverage-window corrective migration (20261013000000) is reviewed and
-// applied, and (b) a controlled STAGING test of that fix is approved.
+// single employee over a bounded date range -- plus a real, permission-
+// protected Apply workflow (Step 4) that writes ONLY the exact
+// (employee, date) pairs an operator has reviewed and explicitly
+// confirmed, restricted this round to confirmed Present/Late results
+// backed by a genuine check-in AND checkout scan (never Absent/Pending/
+// Off/Unassigned, and never a 'check_in_only_provisional' basis -- see
+// classifyAutomaticEligibility). Manual-correction precedence, the
+// approved-payroll block, tenant isolation, and append-only audit
+// logging are all enforced by attendance_write_one/attendance_apply_
+// automatic themselves (Stage C Step 1) -- this page adds the extra
+// Present/Late-only restriction on top, and narrows every Apply call to
+// a single date so a wider range's Absent/Pending/Off/Unassigned
+// results are never touched by it.
+//
+// What-if Simulation (AttendanceWhatIfSimulation.tsx, a sibling section)
+// is a wholly separate, hypothetical-shift tool and is NEVER read from
+// or wired into this page -- a What-if result can never become an
+// eligible row here, by construction (this page only ever classifies
+// attendance_preview_calculate's own output, which always resolves the
+// shift from real roster data, never an operator's hypothetical choice).
 //
 // PREREQUISITE NOTE: as of this page's introduction, a read-only check
 // against STAGING found ZERO overlap between employees with an active
@@ -20,20 +30,39 @@
 // evidence -- every real (employee, date) pair currently resolves to
 // 'unassigned' before the engine ever reaches event/coverage logic. The
 // readiness panel below runs that same check live and reports it
-// plainly; this page never fabricates a working example to compensate.
+// plainly; this page never fabricates a working example to compensate,
+// and the Apply action simply has nothing eligible to offer until that
+// changes.
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Server, AlertTriangle, RefreshCw, Lock, Search, Info } from '../utils/icons';
+import { Server, AlertTriangle, RefreshCw, Lock, Search, Info, CheckCircle2 } from '../utils/icons';
 import { Card, Button, Badge, Select } from '../components/ui';
 import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import { expandDateRange } from '../utils/rosterSchedule';
 import { AttendanceCalculationStatus, AttendanceCalculationBasis } from '../utils/attendanceCalculationEngine';
 import { fetchServerCalculationPreview, checkAutomaticAttendanceReadiness, AutomaticAttendanceReadiness } from '../utils/attendanceServerPreviewService';
+import {
+  fetchExistingAttendanceAndPayroll, classifyAutomaticEligibility, applyEligibleAutomaticResults,
+  AutomaticEligibility, ApplyOutcome,
+} from '../utils/attendanceAutomaticApplyService';
 import { fetchAttendanceCalculationPreviewData } from '../utils/attendanceCalculationPreviewService';
 import { resolveCoveragePolicy, buildAttendanceCalculationPreviewRows } from '../utils/attendanceCalculationPreview';
 import { fetchActiveEmployeesForRoster } from '../utils/rosterService';
 import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import { getBlantyreToday } from '../utils/rosterCalendarNav';
 import { getErrorMessage } from '../utils/errorHandler';
+
+const ELIGIBILITY_LABELS: Record<AutomaticEligibility, string> = {
+  eligible: 'Eligible',
+  skipped_not_confirmed_present_late: 'Skipped (not a confirmed Present/Late)',
+  protected_manual: 'Protected (existing manual correction)',
+  protected_payroll_approved: 'Protected (payroll already approved)',
+};
+const ELIGIBILITY_COLORS: Record<AutomaticEligibility, 'green' | 'gray' | 'blue' | 'red'> = {
+  eligible: 'green',
+  skipped_not_confirmed_present_late: 'gray',
+  protected_manual: 'blue',
+  protected_payroll_approved: 'red',
+};
 
 const MAX_RANGE_DAYS = 14;
 
@@ -59,6 +88,7 @@ interface ComparisonRow {
   jsStatus: AttendanceCalculationStatus | null;
   jsBasis: AttendanceCalculationBasis | null;
   match: boolean;
+  eligibility: AutomaticEligibility;
 }
 
 export default function AttendanceServerCalculationPreview() {
@@ -79,6 +109,11 @@ export default function AttendanceServerCalculationPreview() {
   const [loading, setLoading] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [rows, setRows] = useState<ComparisonRow[] | null>(null);
+
+  const [operatorConfirmed, setOperatorConfirmed] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const [applyOutcomes, setApplyOutcomes] = useState<ApplyOutcome[] | null>(null);
 
   const rangeInvalid = fromDate > toDate;
   const rangeTooWide = expandDateRange(fromDate, toDate).length > MAX_RANGE_DAYS;
@@ -114,14 +149,18 @@ export default function AttendanceServerCalculationPreview() {
     setLoading(true);
     setRunError(null);
     setRows(null);
+    setOperatorConfirmed(false);
+    setApplyOutcomes(null);
+    setApplyError(null);
     try {
       const shiftDates = expandDateRange(fromDate, toDate);
       const employee = employees.find((e) => e.id === selectedEmployeeId);
       if (!employee) throw new Error('Select an employee first.');
 
-      const [serverRows, previewData] = await Promise.all([
+      const [serverRows, previewData, existing] = await Promise.all([
         fetchServerCalculationPreview([selectedEmployeeId], fromDate, toDate),
         fetchAttendanceCalculationPreviewData(fromDate, toDate),
+        fetchExistingAttendanceAndPayroll(selectedEmployeeId, fromDate, toDate),
       ]);
 
       // No operator-typed export time/workstation confirmation is applied
@@ -151,6 +190,10 @@ export default function AttendanceServerCalculationPreview() {
       const combined: ComparisonRow[] = shiftDates.map((date) => {
         const server = serverByDate.get(date);
         const js = jsByDate.get(date);
+        const eligibility = classifyAutomaticEligibility(
+          { employeeId: selectedEmployeeId, date, status: server?.status ?? '', calculationBasis: server?.calculationBasis ?? null },
+          existing
+        );
         return {
           date,
           serverStatus: server?.status ?? null,
@@ -158,6 +201,7 @@ export default function AttendanceServerCalculationPreview() {
           jsStatus: js?.calculation.status ?? null,
           jsBasis: js && js.calculation.basis !== 'not_applicable' ? js.calculation.basis : null,
           match: (server?.status ?? null) === (js?.calculation.status ?? null),
+          eligibility,
         };
       });
       setRows(combined);
@@ -168,10 +212,31 @@ export default function AttendanceServerCalculationPreview() {
     }
   }, [selectedEmployeeId, fromDate, toDate, rangeInvalid, rangeTooWide, employees]);
 
+  const eligibleRows = useMemo(() => (rows ?? []).filter((r) => r.eligibility === 'eligible'), [rows]);
+
+  const applyNow = useCallback(async () => {
+    if (!canApply || !operatorConfirmed || eligibleRows.length === 0) return;
+    setApplying(true);
+    setApplyError(null);
+    try {
+      const outcomes = await applyEligibleAutomaticResults(
+        eligibleRows.map((r) => ({ employeeId: selectedEmployeeId, date: r.date }))
+      );
+      setApplyOutcomes(outcomes);
+    } catch (err) {
+      setApplyError(getErrorMessage(err));
+    } finally {
+      setApplying(false);
+    }
+  }, [canApply, operatorConfirmed, eligibleRows, selectedEmployeeId]);
+
   if (!permissionsLoaded) return null;
   if (!canView) return null;
 
   const mismatchCount = rows ? rows.filter((r) => !r.match).length : 0;
+  const eligibilityCounts = rows
+    ? rows.reduce((acc, r) => { acc[r.eligibility] = (acc[r.eligibility] ?? 0) + 1; return acc; }, {} as Record<AutomaticEligibility, number>)
+    : null;
 
   return (
     <div className="space-y-4">
@@ -253,6 +318,7 @@ export default function AttendanceServerCalculationPreview() {
                   <th className="py-2 pr-4">Server result</th>
                   <th className="py-2 pr-4">JS preview result</th>
                   <th className="py-2 pr-4">Match</th>
+                  <th className="py-2 pr-4">Automatic-apply status</th>
                 </tr>
               </thead>
               <tbody>
@@ -266,6 +332,9 @@ export default function AttendanceServerCalculationPreview() {
                       {r.jsStatus && <Badge color={STATUS_COLORS[r.jsStatus]}>{STATUS_LABELS[r.jsStatus]}{r.jsBasis === 'check_in_only_provisional' ? ' (provisional)' : ''}</Badge>}
                     </td>
                     <td className="py-2 pr-4">{r.match ? '✓' : '✗'}</td>
+                    <td className="py-2 pr-4">
+                      <Badge color={ELIGIBILITY_COLORS[r.eligibility]}>{ELIGIBILITY_LABELS[r.eligibility]}</Badge>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -274,20 +343,81 @@ export default function AttendanceServerCalculationPreview() {
         </Card>
       )}
 
-      {canApply && (
+      {rows && eligibilityCounts && (
         <Card className="p-4 bg-amber-50 border border-amber-200">
           <div className="flex items-start gap-2">
             <Lock size={16} className="text-amber-700 mt-0.5 shrink-0" />
             <div className="flex-1">
               <p className="text-sm font-medium text-amber-800">Apply eligible results to the Monthly Register</p>
               <p className="text-xs text-amber-700 mt-1">
-                Disabled pending the tenant-scoping/coverage-window corrective migration and a controlled STAGING test being approved. When enabled, this will call the already-protected attendance_apply_automatic RPC, which never writes Pending/Off/Unassigned or an unverified Absent, never overwrites a manual correction, and refuses to touch a month with approved payroll.
+                {eligibleRows.length} of {rows.length} day(s) in range are eligible: a confirmed Present/Late result backed by a genuine check-in AND checkout scan, for this genuinely rostered employee, with no existing manual correction and no approved payroll for that month. Absent, Pending, Off, Unassigned, and provisional (check-in-only) results are never applied automatically.
               </p>
-              <Button className="mt-3" disabled title="Disabled until the SQL fix and controlled STAGING testing are approved">
-                Apply to Monthly Register
-              </Button>
+              <div className="flex flex-wrap gap-2 mt-2 text-xs">
+                {(Object.keys(ELIGIBILITY_LABELS) as AutomaticEligibility[]).map((key) => (
+                  <Badge key={key} color={ELIGIBILITY_COLORS[key]}>{ELIGIBILITY_LABELS[key]}: {eligibilityCounts[key] ?? 0}</Badge>
+                ))}
+              </div>
+
+              {!canApply ? (
+                <p className="text-xs text-amber-700 mt-3">You do not hold the attendance.auto_apply permission, so the Apply control is not shown.</p>
+              ) : eligibleRows.length === 0 ? (
+                <p className="text-xs text-amber-700 mt-3">No eligible day in this range -- there is nothing to apply. This is not an error: it means no day both resolved to a confirmed Present/Late AND is free of manual/payroll protection.</p>
+              ) : (
+                <>
+                  <label className="flex items-start gap-2 mt-3 text-xs text-amber-800">
+                    <input
+                      type="checkbox"
+                      checked={operatorConfirmed}
+                      onChange={(e) => setOperatorConfirmed(e.target.checked)}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      I have verified that {employees.find((e) => e.id === selectedEmployeeId)?.fullName} was genuinely rostered and these {eligibleRows.length} day(s) reflect a real shift -- not a What-if Simulation or an assumption. I understand this will write official attendance records.
+                    </span>
+                  </label>
+                  <Button className="mt-3" onClick={applyNow} disabled={!operatorConfirmed || applying}>
+                    {applying ? <span className="flex items-center gap-2"><RefreshCw size={14} className="animate-spin" /> Applying...</span> : `Apply ${eligibleRows.length} record(s) to Monthly Register`}
+                  </Button>
+                </>
+              )}
+              {applyError && (
+                <div className="flex items-center gap-2 text-sm text-red-600 mt-2">
+                  <AlertTriangle size={14} /> {applyError}
+                </div>
+              )}
             </div>
           </div>
+        </Card>
+      )}
+
+      {applyOutcomes && (
+        <Card className="p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <CheckCircle2 size={16} className="text-emerald-600" />
+            <h5 className="text-sm font-semibold text-slate-800">Actual outcomes</h5>
+          </div>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+                <th className="py-2 pr-4">Date</th>
+                <th className="py-2 pr-4">Outcome</th>
+                <th className="py-2 pr-4">Old status</th>
+                <th className="py-2 pr-4">New status</th>
+                <th className="py-2 pr-4">Payroll flag</th>
+              </tr>
+            </thead>
+            <tbody>
+              {applyOutcomes.map((o) => (
+                <tr key={o.date} className="border-b border-slate-100">
+                  <td className="py-2 pr-4 text-slate-700">{o.date}</td>
+                  <td className="py-2 pr-4 text-slate-700">{o.outcome}</td>
+                  <td className="py-2 pr-4 text-slate-700">{o.oldStatus ?? '—'}</td>
+                  <td className="py-2 pr-4 text-slate-700">{o.newStatus ?? '—'}</td>
+                  <td className="py-2 pr-4 text-slate-700">{o.payrollFlag ?? '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </Card>
       )}
     </div>
