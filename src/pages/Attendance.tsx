@@ -1,6 +1,7 @@
-﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, ChevronLeft, ChevronRight } from '../utils/icons';
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
+﻿import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
+import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Eye, CalendarCheck } from '../utils/icons';
+import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs } from '../components/ui';
+import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
@@ -515,7 +516,13 @@ async function fetchAttendanceInBatches(
   return dedupeById(records);
 }
 
-export function AttendancePage() {
+// The official monthly attendance register -- unchanged from the
+// original AttendancePage (renamed only, as part of the Attendance
+// Interface Consolidation). Every write path, permission check, and
+// payroll-deduction calculation below is byte-for-byte the same as
+// before; only the exported wrapper around it changed (see
+// AttendancePage at the bottom of this file).
+function MonthlyRegisterTab() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
@@ -1386,4 +1393,105 @@ export function AttendancePage() {
   );
 }
 
-export default AttendancePage;
+// Lazy, loaded only when the Attendance Review tab is actually opened --
+// same "no preloading" discipline App.tsx's own top-level pages follow.
+// Each of these already does its own permission check, its own loading
+// state, and its own read-only data fetching -- mounted here exactly as
+// they were as standalone pages, so none of their existing behavior
+// (including the roster-first fix and the mapping-vs-absence distinction)
+// changes by being nested instead of top-level.
+const AttendanceCalculationPreviewPage = lazy(() => import('./AttendanceCalculationPreview'));
+const HikCentralAttendancePreviewPage = lazy(() => import('./HikCentralAttendancePreview'));
+
+function PreviewLoadingFallback() {
+  return <div className="p-8 text-center text-slate-400">Loading...</div>;
+}
+
+/**
+ * Attendance Interface Consolidation: the calculated/provisional/Pending
+ * review (Stage B's former standalone "Attendance Calculation Preview"
+ * page), plus the older raw-scan diagnostics (the former standalone
+ * "HikCentral Attendance Preview" page) folded in as a collapsed,
+ * opt-in secondary view rather than deleted -- it still shows every
+ * observed scan, review flag (single scan / 3+ scans / multiple sites /
+ * potential overnight / duplicate timestamp), and the identified-
+ * unmapped/anonymous event counts it always has. Strictly read-only:
+ * neither sub-page has ever had a write action.
+ */
+function AttendanceReviewTab() {
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  return (
+    <div className="space-y-4">
+      <Suspense fallback={<PreviewLoadingFallback />}>
+        <AttendanceCalculationPreviewPage />
+      </Suspense>
+      <Card className="p-4">
+        <button
+          onClick={() => setShowDiagnostics((v) => !v)}
+          className="text-sm font-medium text-slate-700 flex items-center gap-2 w-full"
+        >
+          {showDiagnostics ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          Raw fingerprint diagnostics (advanced)
+        </button>
+        {showDiagnostics && (
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <Suspense fallback={<PreviewLoadingFallback />}>
+              <HikCentralAttendancePreviewPage />
+            </Suspense>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+type AttendanceTabId = 'register' | 'review';
+
+/**
+ * Attendance Interface Consolidation: the single sidebar entry point for
+ * everything attendance-related. "Monthly Register" is the existing
+ * official page (MonthlyRegisterTab, unchanged) -- every Admin/HR/
+ * Accountant/Operations user who could already reach Attendance still
+ * lands here first, with identical editing behavior and permissions.
+ * "Attendance Review" (AttendanceReviewTab, read-only) is gated on the
+ * SAME permission its two constituent pages already required
+ * (attendance.map_hikcentral_persons) -- a user without it never even
+ * sees the tab, and MonthlyRegisterTab's own write permissions
+ * (attendance.create/attendance.edit) are completely untouched by any
+ * of this, so this consolidation neither widens nor narrows any
+ * existing access.
+ */
+export default function AttendancePage() {
+  const [activeTab, setActiveTab] = useState<AttendanceTabId>('register');
+  const [canReview, setCanReview] = useState(false);
+  const [reviewPermissionChecked, setReviewPermissionChecked] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      setCanReview(await hasPermission(PERMISSIONS.ATTENDANCE_MAP_HIKCENTRAL_PERSONS));
+      setReviewPermissionChecked(true);
+    })();
+  }, []);
+
+  // Never render the Review tab's content for a user who lacks the
+  // permission, even if `activeTab` were somehow already 'review' (e.g.
+  // a stale value from before a permission change) -- the tab button
+  // itself is also simply absent below for the same user.
+  const effectiveTab: AttendanceTabId = canReview ? activeTab : 'register';
+
+  return (
+    <div className="space-y-4">
+      {reviewPermissionChecked && canReview && (
+        <Tabs
+          tabs={[
+            { id: 'register', label: 'Monthly Register', icon: CalendarCheck },
+            { id: 'review', label: 'Attendance Review', icon: Eye },
+          ]}
+          active={effectiveTab}
+          onChange={(id) => setActiveTab(id as AttendanceTabId)}
+        />
+      )}
+      {effectiveTab === 'register' ? <MonthlyRegisterTab /> : <AttendanceReviewTab />}
+    </div>
+  );
+}

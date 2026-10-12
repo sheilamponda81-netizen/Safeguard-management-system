@@ -44,8 +44,11 @@ const RecruitmentPage = safeLazy(() => import("./pages/Recruitment"));
 const AttendancePage = safeLazy(() => import("./pages/Attendance"));
 const HikCentralImportPage = safeLazy(() => import("./pages/HikCentralImport"));
 const HikCentralPersonMappingPage = safeLazy(() => import("./pages/HikCentralPersonMapping"));
-const HikCentralAttendancePreviewPage = safeLazy(() => import("./pages/HikCentralAttendancePreview"));
-const AttendanceCalculationPreviewPage = safeLazy(() => import("./pages/AttendanceCalculationPreview"));
+// Attendance Interface Consolidation: the former standalone "Attendance
+// Preview" and "Attendance Calculation Preview" top-level pages are now
+// tabs INSIDE AttendancePage (src/pages/Attendance.tsx's "Attendance
+// Review" tab, itself lazy-loaded from there only when opened) -- no
+// separate top-level route/nav entry for either one anymore.
 const RosterPage = safeLazy(() => import("./pages/Roster"));
 const PayrollPage = safeLazy(() => import("./pages/Payroll"));
 const PayslipsPage = safeLazy(() => import("./pages/Payslips"));
@@ -76,8 +79,6 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
   attendance: AttendancePage,
   "hikcentral-import": HikCentralImportPage,
   "hikcentral-mapping": HikCentralPersonMappingPage,
-  "hikcentral-attendance-preview": HikCentralAttendancePreviewPage,
-  "hikcentral-attendance-calculation-preview": AttendanceCalculationPreviewPage,
   payroll: PayrollPage,
   payslips: PayslipsPage,
   payments: PaymentsPage,
@@ -96,16 +97,14 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
 const rolePages: Record<number, NavKey[]> = {
   1: [
     "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
-    "hikcentral-mapping", "hikcentral-attendance-preview",
-    "hikcentral-attendance-calculation-preview", "roster",
+    "hikcentral-mapping", "roster",
     "payroll", "payslips", "payments", "terminal-dues", "salary-advances",
     "reports", "settings", "security", "features", "auditlogs",
     "user-manual",
   ],
   2: [
     "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
-    "hikcentral-mapping", "hikcentral-attendance-preview",
-    "hikcentral-attendance-calculation-preview",
+    "hikcentral-mapping",
     "payments", "terminal-dues", "salary-advances", "reports", "security",
     "user-manual",
   ],
@@ -129,8 +128,6 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   attendance: { title: "Attendance Management", breadcrumb: "Attendance" },
   "hikcentral-import": { title: "HikCentral Attendance Import", breadcrumb: "HikCentral Import" },
   "hikcentral-mapping": { title: "HikCentral Person Mapping", breadcrumb: "Person Mapping" },
-  "hikcentral-attendance-preview": { title: "HikCentral Attendance Preview", breadcrumb: "Attendance Preview" },
-  "hikcentral-attendance-calculation-preview": { title: "Attendance Calculation Preview", breadcrumb: "Calculation Preview" },
   roster: { title: "Roster Management", breadcrumb: "Roster" },
   payroll: { title: "Payroll Management", breadcrumb: "Payroll" },
   payslips: { title: "Payslips", breadcrumb: "Payslips" },
