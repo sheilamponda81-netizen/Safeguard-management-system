@@ -1442,6 +1442,7 @@ function MonthlyRegisterTab() {
 const AttendanceCalculationPreviewPage = lazy(() => import('./AttendanceCalculationPreview'));
 const HikCentralAttendancePreviewPage = lazy(() => import('./HikCentralAttendancePreview'));
 const AttendanceServerCalculationPreviewPage = lazy(() => import('./AttendanceServerCalculationPreview'));
+const AttendanceWhatIfSimulationPage = lazy(() => import('./AttendanceWhatIfSimulation'));
 
 function PreviewLoadingFallback() {
   return <div className="p-8 text-center text-slate-400">Loading...</div>;
@@ -1461,6 +1462,7 @@ function PreviewLoadingFallback() {
 function AttendanceReviewTab() {
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [showServerPreview, setShowServerPreview] = useState(false);
+  const [showWhatIf, setShowWhatIf] = useState(false);
   return (
     <div className="space-y-4">
       <Suspense fallback={<PreviewLoadingFallback />}>
@@ -1494,6 +1496,22 @@ function AttendanceReviewTab() {
           <div className="mt-4 pt-4 border-t border-slate-100">
             <Suspense fallback={<PreviewLoadingFallback />}>
               <AttendanceServerCalculationPreviewPage />
+            </Suspense>
+          </div>
+        )}
+      </Card>
+      <Card className="p-4">
+        <button
+          onClick={() => setShowWhatIf((v) => !v)}
+          className="text-sm font-medium text-slate-700 flex items-center gap-2 w-full"
+        >
+          {showWhatIf ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          What-if simulation (advanced)
+        </button>
+        {showWhatIf && (
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <Suspense fallback={<PreviewLoadingFallback />}>
+              <AttendanceWhatIfSimulationPage />
             </Suspense>
           </div>
         )}
