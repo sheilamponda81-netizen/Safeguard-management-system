@@ -53,6 +53,18 @@ export const PERMISSIONS = {
   // -- import/preview/mapping only, no "apply attendance" permission yet.
   ATTENDANCE_IMPORT_HIKCENTRAL: 'attendance.import_hikcentral',
   ATTENDANCE_MAP_HIKCENTRAL_PERSONS: 'attendance.map_hikcentral_persons',
+  // Attendance Automation, Stage C Step 1 (20261012000000_attendance_automation_foundation.sql)
+  // -- deliberately separate from ATTENDANCE_CREATE/EDIT: running the
+  // automatic engine over many rows, confirming fingerprint coverage,
+  // and resolving a payroll reconciliation flag are each a materially
+  // different level of authority than editing one attendance box. Not
+  // wired to any UI yet -- no page/route checks these -- the migration
+  // itself is additive-only this round (see that file's header); these
+  // constants exist only so Step 2+ frontend work has a single, named
+  // source of truth to reference instead of a hardcoded string.
+  ATTENDANCE_AUTO_APPLY: 'attendance.auto_apply',
+  ATTENDANCE_CONFIRM_COVERAGE: 'attendance.confirm_coverage',
+  ATTENDANCE_RESOLVE_RECONCILIATION: 'attendance.resolve_reconciliation',
   USER_MANUAL_VIEW: 'user_manual.view',
   FUTURE_FEATURES_VIEW: 'future_features.view',
 } as const;
