@@ -3,6 +3,30 @@
 -- Date: 2026-10-12
 -- ============================================================
 --
+-- DEPLOYED-STATE NOTE (added after STAGING application): the literal SQL
+-- below defines attendance_engine_shift_windows() via DROP + CREATE OR
+-- REPLACE, because changing a function's RETURNS TABLE columns requires
+-- a DROP first. On STAGING, `DROP FUNCTION` reliably timed out through
+-- the migration tool available in that session (confirmed repeatedly,
+-- including on a disposable throwaway function, with zero server-side
+-- blocking query each time -- a tool-layer limitation, not a Postgres
+-- one). As a behavior-equivalent workaround, STAGING instead has this
+-- two-boundary version defined under a NEW name,
+-- attendance_engine_shift_window_bounds, with attendance_resolve_and_
+-- calculate (a plain CREATE OR REPLACE, which needed no DROP) calling
+-- that name instead. The OLD single-column attendance_engine_shift_windows
+-- is still present on STAGING, now unused by any caller -- harmless dead
+-- code. Re-running THIS file's literal text against a fresh/local
+-- database (where DROP FUNCTION works normally) is fine and reproduces
+-- the intended single-name design; re-running it against STAGING as-is
+-- would attempt the same DROP and should be expected to hit the same
+-- tool limitation unless that limitation has since cleared. Whoever
+-- next touches this function on STAGING should either (a) retry the DROP
+-- now that time has passed, reconciling STAGING back to this file's
+-- literal names, or (b) deliberately rename this file's function to
+-- attendance_engine_shift_window_bounds to match deployed reality -- not
+-- silently assume the two already match.
+--
 -- SCOPE: fixes two concrete safety issues in attendance_resolve_and_calculate
 -- (20261012000000_attendance_automation_foundation.sql), identified by
 -- independent inspection of the installed STAGING functions, BEFORE
