@@ -109,12 +109,12 @@ export function Input({ label, type = 'text', value, defaultValue, onChange, pla
   );
 }
 
-export function Select({ label, value, onChange, options, className = '' }:
-  { label?: string; value?: any; onChange?: (e: React.ChangeEvent<HTMLSelectElement>) => void; options: { label: string; value: string }[]; className?: string }) {
+export function Select({ label, value, onChange, options, className = '', disabled = false }:
+  { label?: string; value?: any; onChange?: (e: React.ChangeEvent<HTMLSelectElement>) => void; options: { label: string; value: string }[]; className?: string; disabled?: boolean }) {
   return (
     <div className={className}>
       {label && <label className="block text-sm font-medium text-slate-700 mb-1.5">{label}</label>}
-      <select value={value} onChange={onChange} className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent outline-none bg-white">
+      <select value={value} onChange={onChange} disabled={disabled} className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent outline-none bg-white disabled:bg-slate-50 disabled:text-slate-400">
         {options.map(op => <option key={op.value} value={op.value}>{op.label}</option>)}
       </select>
     </div>

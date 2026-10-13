@@ -14,11 +14,14 @@ import path from 'node:path';
 // calendarViewMode) and read-only data loading -- never one of the three
 // roster write RPCs. The write RPCs remain reachable ONLY from the three
 // existing form-submission handlers on the other tabs
-// (handleSubmitOffPattern/handleSubmitAssignDates/handleSubmitReschedule),
-// which this phase does not touch.
+// (handleSubmitRecurringPattern/handleSubmitAssignDates/handleSubmitReschedule),
+// which this phase does not touch. (Stage C Step 6B renamed
+// handleSubmitOffPattern/assignOffPattern to handleSubmitRecurringPattern/
+// assignRecurringPattern when the Off-day and Shift-type patterns were
+// combined into one atomic save -- see Roster.recurringSchedule.test.ts.)
 const rosterSource = fs.readFileSync(path.resolve(__dirname, './Roster.tsx'), 'utf-8');
 
-const WRITE_RPC_NAMES = ['assignOffPattern(', 'assignDates(', 'rescheduleOffDay('];
+const WRITE_RPC_NAMES = ['assignRecurringPattern(', 'assignDates(', 'rescheduleOffDay('];
 
 function getHandlerBody(name: string): string {
   // Each handler is declared as `const <name> = useCallback(<fn>, [deps]);`
@@ -48,7 +51,7 @@ describe('Roster calendar navigation: no handler ever calls a roster write RPC',
     }
   });
 
-  it('handleCalendarNav only ever sets calendarFrom/calendarTo via shiftCalendarRange -- never calls loadData, assignOffPattern, assignDates, or rescheduleOffDay directly', () => {
+  it('handleCalendarNav only ever sets calendarFrom/calendarTo via shiftCalendarRange -- never calls loadData, assignRecurringPattern, assignDates, or rescheduleOffDay directly', () => {
     const body = getHandlerBody('handleCalendarNav');
     expect(body).toMatch(/shiftCalendarRange\(calendarFrom, calendarTo, calendarViewMode, direction\)/);
     expect(body).toMatch(/setCalendarFrom\(next\.from\)/);
@@ -71,9 +74,9 @@ describe('Roster calendar navigation: no handler ever calls a roster write RPC',
   });
 
   it('the three roster write RPCs are called ONLY from the pre-existing form-submission handlers, never from any Calendar-tab code', () => {
-    const submitHandlerNames = ['handleSubmitOffPattern', 'handleSubmitAssignDates', 'handleSubmitReschedule'];
+    const submitHandlerNames = ['handleSubmitRecurringPattern', 'handleSubmitAssignDates', 'handleSubmitReschedule'];
     const rpcToOwner: Record<string, string> = {
-      'assignOffPattern(': 'handleSubmitOffPattern',
+      'assignRecurringPattern(': 'handleSubmitRecurringPattern',
       'assignDates(': 'handleSubmitAssignDates',
       'rescheduleOffDay(': 'handleSubmitReschedule',
     };

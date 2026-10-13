@@ -7,12 +7,14 @@ import {
   wouldOverrideRecurringOffDay,
   isDateAssignmentNoOp,
   isOffPatternNoOp,
+  isShiftPatternNoOp,
   buildRescheduleOffDayPreview,
   weekdayOf,
   addDays,
   expandDateRange,
   OffDayPatternRow,
   DateAssignmentRow,
+  ShiftPatternRow,
 } from './rosterSchedule';
 
 function pattern(overrides: Partial<OffDayPatternRow> = {}): OffDayPatternRow {
@@ -20,6 +22,9 @@ function pattern(overrides: Partial<OffDayPatternRow> = {}): OffDayPatternRow {
 }
 function dated(overrides: Partial<DateAssignmentRow> = {}): DateAssignmentRow {
   return { employeeId: 'emp-1', assignmentDate: '2026-10-07', assignmentType: 'day', isActive: true, ...overrides };
+}
+function shiftPattern(overrides: Partial<ShiftPatternRow> = {}): ShiftPatternRow {
+  return { employeeId: 'emp-1', shiftType: 'day', effectiveFrom: '2026-01-01', isActive: true, ...overrides };
 }
 
 describe('weekdayOf / addDays (plain calendar-date arithmetic, never host-local-timezone-dependent)', () => {
@@ -115,6 +120,81 @@ describe('resolveScheduleForDate: effective-dated history, including backdated c
     expect(resolveScheduleForDate('emp-1', '2026-03-01', [], p)).toBe('off'); // 2026-03-01 is a Sunday
     // After Sep 1: the current Wednesday pattern still governs, untouched by the backdated insert.
     expect(resolveScheduleForDate('emp-1', '2026-10-07', [], p)).toBe('off'); // Wednesday
+  });
+});
+
+describe('resolveScheduleForDate: Stage C Step 6B recurring Day/Night baseline (step 3, between off-pattern and unassigned)', () => {
+  it('six Day shifts plus one weekly Off recur indefinitely, including dates far beyond any explicit roster', () => {
+    const off = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday Off
+    const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    // A full week, including a date 9 months past effectiveFrom -- no dated rows exist at all.
+    expect(resolveScheduleForDate('emp-1', '2026-10-05', [], off, shift)).toBe('day'); // Monday
+    expect(resolveScheduleForDate('emp-1', '2026-10-06', [], off, shift)).toBe('day'); // Tuesday
+    expect(resolveScheduleForDate('emp-1', '2026-10-07', [], off, shift)).toBe('off'); // Wednesday -- Off pattern still wins
+    expect(resolveScheduleForDate('emp-1', '2026-10-08', [], off, shift)).toBe('day'); // Thursday
+    expect(resolveScheduleForDate('emp-1', '2026-10-09', [], off, shift)).toBe('day'); // Friday
+    expect(resolveScheduleForDate('emp-1', '2026-10-10', [], off, shift)).toBe('day'); // Saturday
+    expect(resolveScheduleForDate('emp-1', '2026-10-11', [], off, shift)).toBe('day'); // Sunday
+  });
+
+  it('six Night shifts plus one weekly Off recur indefinitely', () => {
+    const off = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday Off
+    const shift = [shiftPattern({ shiftType: 'night', effectiveFrom: '2026-01-01' })];
+    expect(resolveScheduleForDate('emp-1', '2026-10-05', [], off, shift)).toBe('night');
+    expect(resolveScheduleForDate('emp-1', '2026-10-07', [], off, shift)).toBe('off'); // Wednesday
+    expect(resolveScheduleForDate('emp-1', '2026-10-11', [], off, shift)).toBe('night');
+  });
+
+  it('with no recurring shift pattern configured at all, a non-Off date remains unassigned (no silent default)', () => {
+    const off = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
+    expect(resolveScheduleForDate('emp-1', '2026-10-05', [], off, [])).toBe('unassigned');
+  });
+
+  it('an explicit dated assignment still overrides the recurring shift pattern', () => {
+    const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const d = [dated({ assignmentDate: '2026-10-05', assignmentType: 'night' })];
+    expect(resolveScheduleForDate('emp-1', '2026-10-05', d, [], shift)).toBe('night');
+  });
+
+  it('a mid-cycle shift-type change takes effect only from its own effectiveFrom onward', () => {
+    const shift = [
+      shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' }),
+      shiftPattern({ shiftType: 'night', effectiveFrom: '2026-09-01' }),
+    ];
+    expect(resolveScheduleForDate('emp-1', '2026-08-15', [], [], shift)).toBe('day');
+    expect(resolveScheduleForDate('emp-1', '2026-10-05', [], [], shift)).toBe('night');
+  });
+
+  it('changing only the weekly Off day leaves the recurring shift pattern (and its own effectiveFrom) completely unaffected', () => {
+    const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const offBefore = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday
+    const offAfter = [pattern({ weekday: 5, effectiveFrom: '2026-10-01' })]; // Friday, changed later
+    expect(resolveScheduleForDate('emp-1', '2026-10-09', [], offBefore, shift)).toBe('day'); // Friday, still working under the old Off day
+    expect(resolveScheduleForDate('emp-1', '2026-10-09', [], offAfter, shift)).toBe('off'); // Friday, now Off under the new pattern
+  });
+
+  it('an inactive (corrected-away) shift pattern is never used for resolution', () => {
+    const shift = [shiftPattern({ shiftType: 'night', effectiveFrom: '2026-01-01', isActive: false })];
+    expect(resolveScheduleForDate('emp-1', '2026-10-05', [], [], shift)).toBe('unassigned');
+  });
+
+  it('cross-tenant/cross-employee isolation: a different employee\'s shift pattern never leaks across', () => {
+    const shift = [shiftPattern({ employeeId: 'emp-2', shiftType: 'night', effectiveFrom: '2026-01-01' })];
+    expect(resolveScheduleForDate('emp-1', '2026-10-05', [], [], shift)).toBe('unassigned');
+  });
+
+  it('a shift pattern with effectiveFrom AFTER the queried date is not yet in effect', () => {
+    const shift = [shiftPattern({ shiftType: 'night', effectiveFrom: '2026-12-01' })];
+    expect(resolveScheduleForDate('emp-1', '2026-10-05', [], [], shift)).toBe('unassigned');
+  });
+});
+
+describe('isShiftPatternNoOp', () => {
+  it('true only when the exact shiftType is already active from the exact effectiveFrom date', () => {
+    const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-10-01' })];
+    expect(isShiftPatternNoOp('emp-1', 'day', '2026-10-01', shift)).toBe(true);
+    expect(isShiftPatternNoOp('emp-1', 'night', '2026-10-01', shift)).toBe(false);
+    expect(isShiftPatternNoOp('emp-1', 'day', '2026-11-01', shift)).toBe(false);
   });
 });
 
@@ -230,6 +310,11 @@ describe('wouldOverrideRecurringOffDay', () => {
     const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
     expect(wouldOverrideRecurringOffDay('emp-1', '2026-10-07', 'off', [], p)).toBe(false);
   });
+
+  it('a recurring shift pattern alone never counts as Off -- only the Off pattern or a dated "off" exception can', () => {
+    const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    expect(wouldOverrideRecurringOffDay('emp-1', '2026-10-07', 'night', [], [], shift)).toBe(false);
+  });
 });
 
 describe('isDateAssignmentNoOp / isOffPatternNoOp (idempotent-retry detection)', () => {
@@ -292,6 +377,15 @@ describe('buildRescheduleOffDayPreview (Phase 2B.2C, Policy Option A -- advisory
     const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
     const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-07', 'day', [], p);
     expect(preview.blockingReason).toMatch(/must be different/);
+  });
+
+  it('Stage C Step 6B: a replacement date that a recurring Shift pattern resolves to Day/Night is correctly rejected as ineligible, not mistaken for "unassigned"', () => {
+    const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday off
+    const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })]; // every other day is a normal Day shift
+    const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'night', [], p, shift); // Wed -> Thu (a Day under the recurring pattern)
+    expect(preview.replacementResolved).toBe('day');
+    expect(preview.isReplacementEligible).toBe(false);
+    expect(preview.blockingReason).toMatch(/must be unassigned/);
   });
 
   it('an original date that does not genuinely resolve Off is blocked, naming its actual resolved state', () => {

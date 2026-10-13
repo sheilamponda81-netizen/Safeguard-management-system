@@ -56,6 +56,16 @@ export interface OffDayPatternRow {
   isActive: boolean;
 }
 
+// Stage C Step 6B: recurring Day/Night baseline, symmetric to
+// OffDayPatternRow above -- same shape, shift_type instead of weekday.
+export interface ShiftPatternRow {
+  employeeId: string;
+  shiftType: 'day' | 'night';
+  /** YYYY-MM-DD -- the date this pattern took effect. */
+  effectiveFrom: string;
+  isActive: boolean;
+}
+
 export interface DateAssignmentRow {
   employeeId: string;
   /** YYYY-MM-DD */
@@ -84,33 +94,49 @@ export function addDays(date: string, days: number): string {
 
 /**
  * Resolves the effective schedule for one employee on one date, applying
- * the precedence rule exactly:
+ * the precedence rule exactly (Stage C Step 6B adds step 3; steps 1, 2,
+ * and the final fallback are unchanged from Step 6A):
  *   1. An active dated assignment for this exact date always wins
  *      (whether 'day', 'night', or an explicit 'off' exception) --
- *      regardless of what the recurring pattern says.
+ *      regardless of what either recurring pattern says.
  *   2. Else, the recurring Off-day pattern in effect on this date (the
  *      active pattern row with the LARGEST effectiveFrom <= date) -- if
  *      its weekday matches, the date is 'off'.
- *   3. Else, 'unassigned' -- no information recorded for this date at
- *      all. Never Absence, never Leave, never Sick Leave -- those remain
- *      exclusively `attendance.status` concerns, untouched by this module.
+ *   3. Else, the recurring Day/Night pattern in effect on this date (the
+ *      active shiftPatterns row with the LARGEST effectiveFrom <= date,
+ *      independent of the Off-day pattern's own effectiveFrom) -- if one
+ *      exists, the date is that pattern's shiftType.
+ *   4. Else, 'unassigned' -- no information recorded for this date at
+ *      all (including an employee with no recurring pattern of either
+ *      kind configured). Never Absence, never Leave, never Sick Leave --
+ *      those remain exclusively `attendance.status` concerns, untouched
+ *      by this module.
  */
 export function resolveScheduleForDate(
   employeeId: string,
   date: string,
   datedAssignments: DateAssignmentRow[],
-  patterns: OffDayPatternRow[]
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
 ): ResolvedSchedule {
   const dated = datedAssignments.find((a) => a.employeeId === employeeId && a.assignmentDate === date && a.isActive);
   if (dated) return dated.assignmentType;
 
-  let latest: OffDayPatternRow | null = null;
+  let latestOff: OffDayPatternRow | null = null;
   for (const p of patterns) {
     if (p.employeeId !== employeeId || !p.isActive || p.effectiveFrom > date) continue;
-    if (!latest || p.effectiveFrom > latest.effectiveFrom) latest = p;
+    if (!latestOff || p.effectiveFrom > latestOff.effectiveFrom) latestOff = p;
   }
-  if (!latest) return 'unassigned';
-  return weekdayOf(date) === latest.weekday ? 'off' : 'unassigned';
+  if (latestOff && weekdayOf(date) === latestOff.weekday) return 'off';
+
+  let latestShift: ShiftPatternRow | null = null;
+  for (const p of shiftPatterns) {
+    if (p.employeeId !== employeeId || !p.isActive || p.effectiveFrom > date) continue;
+    if (!latestShift || p.effectiveFrom > latestShift.effectiveFrom) latestShift = p;
+  }
+  if (latestShift) return latestShift.shiftType;
+
+  return 'unassigned';
 }
 
 // A rolling-rest window's zero-Off-days outcome is only ever a CONFIRMED
@@ -143,13 +169,14 @@ export function checkRollingRestWindows(
   employeeId: string,
   centerDate: string,
   datedAssignments: DateAssignmentRow[],
-  patterns: OffDayPatternRow[]
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
 ): RollingRestWindowResult[] {
   const rangeStart = addDays(centerDate, -ROLLING_WINDOW_BUFFER_DAYS);
   const totalDays = ROLLING_WINDOW_BUFFER_DAYS * 2 + 1;
   const dates: string[] = [];
   for (let i = 0; i < totalDays; i++) dates.push(addDays(rangeStart, i));
-  const resolved = dates.map((d) => resolveScheduleForDate(employeeId, d, datedAssignments, patterns));
+  const resolved = dates.map((d) => resolveScheduleForDate(employeeId, d, datedAssignments, patterns, shiftPatterns));
 
   const results: RollingRestWindowResult[] = [];
   for (let i = 0; i + 7 <= dates.length; i++) {
@@ -167,9 +194,10 @@ export function findConfirmedRollingRestViolations(
   employeeId: string,
   centerDate: string,
   datedAssignments: DateAssignmentRow[],
-  patterns: OffDayPatternRow[]
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
 ): RollingRestWindowResult[] {
-  return checkRollingRestWindows(employeeId, centerDate, datedAssignments, patterns).filter(
+  return checkRollingRestWindows(employeeId, centerDate, datedAssignments, patterns, shiftPatterns).filter(
     (w) => w.status === 'confirmed_violation'
   );
 }
@@ -213,10 +241,11 @@ export function wouldOverrideRecurringOffDay(
   date: string,
   newType: AssignmentType,
   datedAssignments: DateAssignmentRow[],
-  patterns: OffDayPatternRow[]
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
 ): boolean {
   if (newType === 'off') return false;
-  return resolveScheduleForDate(employeeId, date, datedAssignments, patterns) === 'off';
+  return resolveScheduleForDate(employeeId, date, datedAssignments, patterns, shiftPatterns) === 'off';
 }
 
 /** True when the currently-active dated assignment for (employeeId, date) already equals requestedType exactly -- the write path's idempotent-retry no-op signal. */
@@ -239,6 +268,17 @@ export function isOffPatternNoOp(
 ): boolean {
   const existing = patterns.find((p) => p.employeeId === employeeId && p.isActive && p.effectiveFrom === effectiveFrom);
   return !!existing && existing.weekday === weekday;
+}
+
+/** True when the currently-active recurring Shift pattern for employeeId already has this exact shiftType effective from this exact date -- the write path's idempotent-retry no-op signal, symmetric to isOffPatternNoOp above. */
+export function isShiftPatternNoOp(
+  employeeId: string,
+  shiftType: 'day' | 'night',
+  effectiveFrom: string,
+  shiftPatterns: ShiftPatternRow[]
+): boolean {
+  const existing = shiftPatterns.find((p) => p.employeeId === employeeId && p.isActive && p.effectiveFrom === effectiveFrom);
+  return !!existing && existing.shiftType === shiftType;
 }
 
 // Phase 2B.2C: Reschedule Off Day, Policy Option A. Pure preview logic
@@ -269,10 +309,11 @@ export function buildRescheduleOffDayPreview(
   replacementDate: string,
   shiftOnOriginal: 'day' | 'night',
   datedAssignments: DateAssignmentRow[],
-  patterns: OffDayPatternRow[]
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
 ): RescheduleOffDayPreview {
-  const originalResolved = resolveScheduleForDate(employeeId, originalDate, datedAssignments, patterns);
-  const replacementResolved = resolveScheduleForDate(employeeId, replacementDate, datedAssignments, patterns);
+  const originalResolved = resolveScheduleForDate(employeeId, originalDate, datedAssignments, patterns, shiftPatterns);
+  const replacementResolved = resolveScheduleForDate(employeeId, replacementDate, datedAssignments, patterns, shiftPatterns);
   const isOriginalGenuinelyOff = originalResolved === 'off';
   // CONFIRMED FINAL POLICY: the replacement date must resolve to EXACTLY
   // 'unassigned' -- an already-'off' replacement is REJECTED, not merely

@@ -67,9 +67,12 @@ describe('Reschedule Off Day: the Before/After preview is wired from the pure, i
     expect(rosterSource).toMatch(/buildRescheduleOffDayPreview/);
   });
 
-  it('computes the preview from employee id, both dates, and the chosen shift, fed by the already-loaded dateAssignments/patterns state', () => {
+  it('computes the preview from employee id, both dates, and the chosen shift, fed by the already-loaded dateAssignments/patterns/shiftPatterns state', () => {
+    // Stage C Step 6B added shiftPatterns as a 7th argument so the preview
+    // correctly accounts for a recurring Day/Night baseline, not just the
+    // recurring Off-day pattern -- see Roster.recurringSchedule.test.ts.
     expect(rosterSource).toMatch(
-      /buildRescheduleOffDayPreview\(rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns\)/
+      /buildRescheduleOffDayPreview\(rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns, shiftPatterns\)/
     );
   });
 

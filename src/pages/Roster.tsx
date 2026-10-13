@@ -22,7 +22,7 @@ import { showNotification } from '../utils/clickHandlers';
 import {
   resolveScheduleForDate, expandDateRange, addDays, WEEKDAY_LABELS,
   buildRescheduleOffDayPreview, ResolvedSchedule,
-  AssignmentType, OffDayPatternRow, DateAssignmentRow,
+  AssignmentType, OffDayPatternRow, DateAssignmentRow, ShiftPatternRow,
 } from '../utils/rosterSchedule';
 import {
   CalendarViewMode, getBlantyreToday, startOfWeek, endOfWeek, startOfMonth, endOfMonth,
@@ -30,8 +30,8 @@ import {
 } from '../utils/rosterCalendarNav';
 import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import {
-  fetchActiveOffDayPatterns, fetchActiveDateAssignments, fetchActiveEmployeesForRoster,
-  assignOffPattern, assignDates, rescheduleOffDay, humanizeRosterError,
+  fetchActiveOffDayPatterns, fetchActiveShiftPatterns, fetchActiveDateAssignments, fetchActiveEmployeesForRoster,
+  assignRecurringPattern, assignDates, rescheduleOffDay, humanizeRosterError,
   filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex,
 } from '../utils/rosterService';
 
@@ -182,6 +182,13 @@ const ASSIGNMENT_TYPE_OPTIONS = [
 
 const WEEKDAY_OPTIONS = WEEKDAY_LABELS.map((label, value) => ({ label, value: String(value) }));
 
+// Stage C Step 6B: recurring Day/Night baseline options, for the
+// extended Recurring Schedule tab's "Normal shift" selector.
+const SHIFT_TYPE_OPTIONS = [
+  { label: 'Day shift', value: 'day' },
+  { label: 'Night shift', value: 'night' },
+];
+
 function defaultCalendarRange(): { from: string; to: string; today: string } {
   const today = getBlantyreToday();
   return { from: startOfWeek(today), to: endOfWeek(today), today };
@@ -196,6 +203,7 @@ export default function RosterPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [employees, setEmployees] = useState<EmployeeLite[]>([]);
   const [patterns, setPatterns] = useState<OffDayPatternRow[]>([]);
+  const [shiftPatterns, setShiftPatterns] = useState<ShiftPatternRow[]>([]);
   const [dateAssignments, setDateAssignments] = useState<DateAssignmentRow[]>([]);
 
   const [activeTab, setActiveTab] = useState<TabId>('calendar');
@@ -268,15 +276,17 @@ export default function RosterPage() {
       // and patterns are still needed by the other tabs regardless of
       // what the Calendar tab's range currently is.
       const shouldFetchAssignments = isCalendarRangeValid && !calendarRangeTooLarge;
-      const [emps, pats, assigns] = await Promise.all([
+      const [emps, pats, shiftPats, assigns] = await Promise.all([
         fetchActiveEmployeesForRoster(),
         fetchActiveOffDayPatterns(),
+        fetchActiveShiftPatterns(),
         shouldFetchAssignments
           ? fetchActiveDateAssignments(addDays(calendarFrom, -1), addDays(calendarTo, 1))
           : Promise.resolve([]),
       ]);
       setEmployees(emps);
       setPatterns(pats);
+      setShiftPatterns(shiftPats);
       setDateAssignments(assigns);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Could not load roster data.');
@@ -322,22 +332,34 @@ export default function RosterPage() {
     [calendarViewMode, calendarFrom, calendarTo]
   );
 
-  // --- Set recurring Off-day pattern form ---
+  // --- Set recurring schedule form (Stage C Step 6B: Off day + Day/Night
+  // baseline, saved together atomically or independently via the two
+  // "Update..." checkboxes below) ---
   const [offPatternEmployeeIds, setOffPatternEmployeeIds] = useState<Set<string>>(new Set());
+  const [offPatternUpdateOffDay, setOffPatternUpdateOffDay] = useState(true);
   const [offPatternWeekday, setOffPatternWeekday] = useState('0');
+  const [offPatternUpdateShift, setOffPatternUpdateShift] = useState(true);
+  const [offPatternShiftType, setOffPatternShiftType] = useState<'day' | 'night'>('day');
   const [offPatternEffectiveFrom, setOffPatternEffectiveFrom] = useState(defaults.today);
   const [offPatternReason, setOffPatternReason] = useState('');
 
-  const handleSubmitOffPattern = useCallback(async () => {
+  const handleSubmitRecurringPattern = useCallback(async () => {
     if (offPatternEmployeeIds.size === 0) {
       showNotification('Select at least one employee.', 'error');
       return;
     }
+    if (!offPatternUpdateOffDay && !offPatternUpdateShift) {
+      showNotification('Select at least one of weekly Off day or normal shift to update.', 'error');
+      return;
+    }
     setSubmitting(true);
     try {
-      const result = await assignOffPattern(
+      const result = await assignRecurringPattern(
         Array.from(offPatternEmployeeIds),
-        Number(offPatternWeekday),
+        {
+          weekday: offPatternUpdateOffDay ? Number(offPatternWeekday) : undefined,
+          shiftType: offPatternUpdateShift ? offPatternShiftType : undefined,
+        },
         offPatternEffectiveFrom,
         offPatternReason || undefined
       );
@@ -350,12 +372,15 @@ export default function RosterPage() {
         setOffPatternReason('');
         await loadData();
       } else {
-        showNotification(humanizeRosterError(result.error || 'Could not set the Off-day pattern.', employees), 'error');
+        showNotification(humanizeRosterError(result.error || 'Could not save the recurring schedule.', employees), 'error');
       }
     } finally {
       setSubmitting(false);
     }
-  }, [offPatternEmployeeIds, offPatternWeekday, offPatternEffectiveFrom, offPatternReason, employees, loadData]);
+  }, [
+    offPatternEmployeeIds, offPatternUpdateOffDay, offPatternWeekday, offPatternUpdateShift, offPatternShiftType,
+    offPatternEffectiveFrom, offPatternReason, employees, loadData,
+  ]);
 
   // --- Assign Day/Night/Off for a date range form ---
   const [assignEmployeeIds, setAssignEmployeeIds] = useState<Set<string>>(new Set());
@@ -418,9 +443,9 @@ export default function RosterPage() {
   const reschedulePreview = useMemo(
     () =>
       rescheduleEmployeeId && rescheduleOriginalDate && rescheduleReplacementDate
-        ? buildRescheduleOffDayPreview(rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns)
+        ? buildRescheduleOffDayPreview(rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns, shiftPatterns)
         : null,
-    [rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns]
+    [rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns, shiftPatterns]
   );
 
   const canSubmitReschedule =
@@ -500,7 +525,7 @@ export default function RosterPage() {
       <Tabs
         tabs={[
           { id: 'calendar', label: 'Calendar', icon: CalendarDays },
-          { id: 'off-pattern', label: 'Recurring Off Day', icon: UsersIcon },
+          { id: 'off-pattern', label: 'Recurring Schedule', icon: UsersIcon },
           { id: 'assign-dates', label: 'Assign Dates', icon: CalendarDays },
           { id: 'reschedule', label: 'Reschedule Off Day', icon: AlertTriangle },
         ]}
@@ -582,11 +607,24 @@ export default function RosterPage() {
                   <TR key={emp.id}>
                     <TD className="sticky left-0 z-10 bg-white font-medium text-slate-800">{emp.fullName}<span className="block text-xs text-slate-500 font-normal">{emp.employeeNumber}</span></TD>
                     {calendarDates.map((d) => {
-                      const resolved = resolveScheduleForDate(emp.id, d, dateAssignments, patterns);
+                      const resolved = resolveScheduleForDate(emp.id, d, dateAssignments, patterns, shiftPatterns);
                       const color = scheduleBadgeColor(resolved);
+                      // Stage C Step 6B: a dated row for this exact
+                      // (employee, date) means the Calendar is showing an
+                      // explicit exception, not a recurring-rule result,
+                      // surfaced as a small dot so Admin can tell the two
+                      // apart at a glance without opening either tab.
+                      const isExplicitException = dateAssignments.some(
+                        (a) => a.employeeId === emp.id && a.assignmentDate === d && a.isActive
+                      );
                       return (
                         <TD key={d}>
-                          <Badge color={color}>{resolved}</Badge>
+                          <Badge color={color}>
+                            {resolved}
+                            {isExplicitException && (
+                              <span className="ml-1 inline-block w-1.5 h-1.5 rounded-full bg-current align-middle" title="Explicit dated exception (overrides any recurring pattern)" />
+                            )}
+                          </Badge>
                         </TD>
                       );
                     })}
@@ -601,7 +639,13 @@ export default function RosterPage() {
         </div>
       ) : activeTab === 'off-pattern' ? (
         <Card className="p-5 space-y-4">
-          <p className="text-sm text-slate-600">Select employees, then the weekday that should be their recurring Off day and the date it takes effect.</p>
+          <div>
+            <p className="text-sm text-slate-600">
+              Set an employee's normal recurring shift and/or weekly Off day once -- the schedule repeats automatically every
+              week from the effective date <strong>until changed</strong>, with no need to re-assign it. An explicit dated
+              assignment (Assign Dates tab) always overrides this for that one date only.
+            </p>
+          </div>
           <Input icon={Search} placeholder="Search employee by name or number..." value={offPatternSearch} onChange={(e) => setOffPatternSearch(e.target.value)} />
           <div className="flex items-center justify-between text-xs text-slate-500">
             <span>{offPatternFilteredEmployees.length} of {employees.length} employee(s) shown</span>
@@ -620,12 +664,36 @@ export default function RosterPage() {
             </div>
           )}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Select label="Off weekday" value={offPatternWeekday} onChange={(e) => setOffPatternWeekday(e.target.value)} options={WEEKDAY_OPTIONS} />
-            <Input label="Effective from" type="date" value={offPatternEffectiveFrom} onChange={(e) => setOffPatternEffectiveFrom(e.target.value)} />
+            <div className="space-y-1.5">
+              <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                <input type="checkbox" checked={offPatternUpdateShift} onChange={(e) => setOffPatternUpdateShift(e.target.checked)} />
+                Normal shift
+              </label>
+              <Select
+                value={offPatternShiftType}
+                onChange={(e) => setOffPatternShiftType(e.target.value as 'day' | 'night')}
+                options={SHIFT_TYPE_OPTIONS}
+                disabled={!offPatternUpdateShift}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                <input type="checkbox" checked={offPatternUpdateOffDay} onChange={(e) => setOffPatternUpdateOffDay(e.target.checked)} />
+                Weekly Off
+              </label>
+              <Select
+                value={offPatternWeekday}
+                onChange={(e) => setOffPatternWeekday(e.target.value)}
+                options={WEEKDAY_OPTIONS}
+                disabled={!offPatternUpdateOffDay}
+              />
+            </div>
           </div>
+          <Input label="Effective from" type="date" value={offPatternEffectiveFrom} onChange={(e) => setOffPatternEffectiveFrom(e.target.value)} />
+          <p className="text-xs text-slate-500">Duration: Until changed -- this schedule repeats every week indefinitely, with no end date, until a new pattern replaces it.</p>
           <Input label="Reason (required only if this changes an existing pattern)" value={offPatternReason} onChange={(e) => setOffPatternReason(e.target.value)} placeholder="e.g. Operations requested change, see email 10/8" />
-          <Button onClick={handleSubmitOffPattern} disabled={submitting || offPatternEmployeeIds.size === 0}>
-            {submitting ? 'Saving...' : `Set Off Day for ${offPatternEmployeeIds.size} Employee(s)`}
+          <Button onClick={handleSubmitRecurringPattern} disabled={submitting || offPatternEmployeeIds.size === 0 || (!offPatternUpdateOffDay && !offPatternUpdateShift)}>
+            {submitting ? 'Saving...' : `Save Recurring Pattern for ${offPatternEmployeeIds.size} Employee(s)`}
           </Button>
         </Card>
       ) : activeTab === 'assign-dates' ? (

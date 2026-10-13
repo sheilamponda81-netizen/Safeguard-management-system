@@ -10,7 +10,7 @@
 // Follows the same never-throws, discriminated-outcome RPC-wrapper
 // pattern already established by hikcentralPersonMappingService.ts.
 import { supabase } from '../lib/supabase';
-import { AssignmentType, DateAssignmentRow, OffDayPatternRow } from './rosterSchedule';
+import { AssignmentType, DateAssignmentRow, OffDayPatternRow, ShiftPatternRow } from './rosterSchedule';
 import { EmployeeLite } from './hikcentralPersonMapping';
 
 export async function fetchActiveOffDayPatterns(): Promise<OffDayPatternRow[]> {
@@ -22,6 +22,21 @@ export async function fetchActiveOffDayPatterns(): Promise<OffDayPatternRow[]> {
   return (data || []).map((row) => ({
     employeeId: row.employee_id,
     weekday: row.weekday,
+    effectiveFrom: row.effective_from,
+    isActive: row.is_active,
+  }));
+}
+
+/** Stage C Step 6B: recurring Day/Night baseline, symmetric to fetchActiveOffDayPatterns above. */
+export async function fetchActiveShiftPatterns(): Promise<ShiftPatternRow[]> {
+  const { data, error } = await supabase
+    .from('roster_shift_patterns')
+    .select('employee_id, shift_type, effective_from, is_active')
+    .eq('is_active', true);
+  if (error) throw error;
+  return (data || []).map((row) => ({
+    employeeId: row.employee_id,
+    shiftType: row.shift_type as 'day' | 'night',
     effectiveFrom: row.effective_from,
     isActive: row.is_active,
   }));
@@ -160,6 +175,31 @@ export async function assignOffPattern(
   return callCountedRpc('roster_assign_off_pattern', {
     p_employee_ids: employeeIds,
     p_weekday: weekday,
+    p_effective_from: effectiveFrom,
+    p_correction_reason: correctionReason ?? null,
+  });
+}
+
+/**
+ * Stage C Step 6B: saves a recurring weekly Off day, a recurring Day/Night
+ * baseline, or both together, for one or more employees, in a single
+ * atomic RPC call (roster_assign_recurring_pattern) -- replaces the
+ * Step 6A proposal's two sequential RPC calls. Pass only `weekday` to
+ * change just the Off day, only `shiftType` to change just the normal
+ * shift, or both to change them together as one "Save recurring
+ * pattern" action: either both changes land, or neither does, since
+ * both writes happen inside the RPC's own single transaction.
+ */
+export async function assignRecurringPattern(
+  employeeIds: string[],
+  pattern: { weekday?: number; shiftType?: 'day' | 'night' },
+  effectiveFrom: string,
+  correctionReason?: string
+): Promise<RosterRpcResult> {
+  return callCountedRpc('roster_assign_recurring_pattern', {
+    p_employee_ids: employeeIds,
+    p_weekday: pattern.weekday ?? null,
+    p_shift_type: pattern.shiftType ?? null,
     p_effective_from: effectiveFrom,
     p_correction_reason: correctionReason ?? null,
   });
