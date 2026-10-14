@@ -1,12 +1,19 @@
-// HikCentral Attendance MVP -- Phase 1: Excel preview/raw-event import.
+// HikCentral Attendance MVP -- Phase 1 import, extended in Stage C Step 8
+// with automatic attendance calculation and write-through.
 //
-// Scope deliberately narrow (per the approved Phase 1 plan): select a
-// file, parse it locally, show a validation/preview summary, and -- if
-// the caller has permission -- confirm a raw-event import. This page
-// NEVER writes to `attendance`, never implies attendance has changed,
-// and has no person-mapping UI (the schema/RPC already support Phase 2
-// mapping without redesign; a mapping screen is explicitly out of scope
-// here to avoid materially growing this PR).
+// Select a file, parse it locally, show a validation/preview summary,
+// then -- if the caller has permission -- import the raw events AND
+// (same action, same click) automatically calculate and apply
+// Present/Late/Absent to the official Monthly Register for the declared
+// processing scope (period + workstations). There is no separate
+// confirmation screen for this normal import flow; see
+// attendanceImportAutoApplyService.ts for the write-through RPC this
+// calls and supabase/migrations/20261016000000_attendance_import_auto_apply.sql
+// for its safety guarantees (tenant/region scope, manual-correction
+// precedence, approved-payroll protection, idempotent reprocessing).
+// This page has no person-mapping UI (the schema/RPC already support
+// Phase 2 mapping without redesign; a mapping screen is a separate,
+// existing page).
 import { useState, useCallback, useEffect } from 'react';
 import { Upload, FileSpreadsheet, AlertCircle, CheckCircle2, Fingerprint } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, EmptyState } from '../components/ui';
@@ -19,6 +26,10 @@ import {
   summarizeHikCentralParseResult,
 } from '../utils/hikcentralExcelParser';
 import { importHikCentralRawEvents, computeFileFingerprint, HikCentralImportResult } from '../utils/hikcentralImportService';
+import {
+  fetchDistinctWorkstations, processHikCentralImportBatch, isoToBlantyreDateStr,
+  ProcessImportBatchResult,
+} from '../utils/attendanceImportAutoApplyService';
 
 export default function HikCentralImportPage() {
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
@@ -33,6 +44,21 @@ export default function HikCentralImportPage() {
 
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<HikCentralImportResult | null>(null);
+  const [autoApplyResult, setAutoApplyResult] = useState<ProcessImportBatchResult | null>(null);
+
+  // Declared processing scope -- what period and which workstations this
+  // export covers. Asked for ONCE, on this same upload screen, as part of
+  // the one "Import Raw Events" action: these feed both the durable
+  // fingerprint coverage confirmation and the automatic P/L/A (now
+  // including a genuinely-confirmed Absent) write-through that runs
+  // immediately after a successful import -- see
+  // attendanceImportAutoApplyService.ts. This is not a second manual
+  // confirmation step; it is metadata about the file the administrator is
+  // already uploading.
+  const [workstationOptions, setWorkstationOptions] = useState<string[]>([]);
+  const [selectedWorkstations, setSelectedWorkstations] = useState<string[]>([]);
+  const [periodFrom, setPeriodFrom] = useState('');
+  const [periodTo, setPeriodTo] = useState('');
 
   useEffect(() => {
     (async () => {
@@ -40,6 +66,11 @@ export default function HikCentralImportPage() {
       setUserProfile(profile);
       setCanImport(await hasPermission(PERMISSIONS.ATTENDANCE_IMPORT_HIKCENTRAL));
       setPermissionsLoaded(true);
+      try {
+        setWorkstationOptions(await fetchDistinctWorkstations());
+      } catch {
+        setWorkstationOptions([]);
+      }
     })();
   }, []);
 
@@ -48,6 +79,10 @@ export default function HikCentralImportPage() {
     setSummary(null);
     setFileError(null);
     setImportResult(null);
+    setAutoApplyResult(null);
+    setSelectedWorkstations([]);
+    setPeriodFrom('');
+    setPeriodTo('');
   }, []);
 
   const handleFileSelect = useCallback(async (file: File) => {
@@ -57,7 +92,16 @@ export default function HikCentralImportPage() {
     try {
       const result = await parseHikCentralExcelFile(file);
       setParseResult(result);
-      setSummary(summarizeHikCentralParseResult(result));
+      const fileSummary = summarizeHikCentralParseResult(result);
+      setSummary(fileSummary);
+      // Convenience default only -- the file's own observed event range is
+      // never treated as proof of coverage by itself (see
+      // isoToBlantyreDateStr's own doc comment); the administrator must
+      // still explicitly confirm or adjust these before importing.
+      if (fileSummary.dateRange) {
+        setPeriodFrom(isoToBlantyreDateStr(fileSummary.dateRange.earliest));
+        setPeriodTo(isoToBlantyreDateStr(fileSummary.dateRange.latest));
+      }
     } catch (err) {
       setFileError(err instanceof HikCentralFileError ? err.message : 'Could not read this file. Please confirm it is a valid .xlsx HikCentral export.');
     } finally {
@@ -65,22 +109,84 @@ export default function HikCentralImportPage() {
     }
   }, [resetForNewFile]);
 
+  const canProcessScope = selectedWorkstations.length > 0 && !!periodFrom && !!periodTo && periodFrom <= periodTo;
+
+  const toggleWorkstation = useCallback((ws: string) => {
+    setSelectedWorkstations((prev) => (prev.includes(ws) ? prev.filter((w) => w !== ws) : [...prev, ws]));
+  }, []);
+
   const handleImport = useCallback(async () => {
-    if (!parseResult || !selectedFile || !userProfile) return;
+    if (!parseResult || !selectedFile || !userProfile || !canProcessScope) return;
     setImporting(true);
     try {
       const fileFingerprint = await computeFileFingerprint(selectedFile);
       const result = await importHikCentralRawEvents(selectedFile.name, fileFingerprint, parseResult);
       setImportResult(result);
-      if (result.success) {
-        showNotification(`Imported ${result.insertedCount} new raw event(s). ${result.duplicatesIgnored} exact duplicate(s) ignored.`, 'success');
-      } else {
+      if (!result.success || !result.batchId) {
         showNotification(result.error || 'Could not import HikCentral events.', 'error');
+        return;
+      }
+
+      // Immediately, same action, same click -- no second button: resolve
+      // roster + calculate + write eligible P/L/A (and now a genuinely-
+      // confirmed Absent) for the declared scope. The raw import having
+      // already succeeded is a separate, already-committed fact; if THIS
+      // step fails, that is surfaced distinctly below, never folded into a
+      // blanket "success" banner.
+      const autoApply = await processHikCentralImportBatch({
+        importBatchId: result.batchId,
+        workstations: selectedWorkstations,
+        periodFromDate: periodFrom,
+        periodToDate: periodTo,
+        dateFrom: periodFrom,
+        dateTo: periodTo,
+      });
+      setAutoApplyResult(autoApply);
+
+      if (autoApply.success) {
+        showNotification(
+          `Imported ${result.insertedCount} new raw event(s). Applied ${autoApply.appliedCount} attendance record(s) across ${autoApply.employeeCount} employee(s).`,
+          'success'
+        );
+      } else {
+        showNotification(`Raw events were imported, but automatic attendance processing failed: ${autoApply.error || 'unknown error'}`, 'error');
       }
     } finally {
       setImporting(false);
     }
-  }, [parseResult, selectedFile, userProfile]);
+  }, [parseResult, selectedFile, userProfile, canProcessScope, selectedWorkstations, periodFrom, periodTo]);
+
+  const [retrying, setRetrying] = useState(false);
+
+  // Retries ONLY the automatic processing step (not a re-import of raw
+  // events -- those are already durably stored) for the same batch and
+  // declared scope. Safe to call again at any time, including after more
+  // fingerprint events have since arrived for the same period: every
+  // underlying write is idempotent (attendance_write_one's own no-op
+  // guard), and re-declaring the identical coverage reuses the existing
+  // confirmation rather than duplicating it.
+  const handleRetryAutoApply = useCallback(async () => {
+    if (!importResult?.batchId) return;
+    setRetrying(true);
+    try {
+      const autoApply = await processHikCentralImportBatch({
+        importBatchId: importResult.batchId,
+        workstations: selectedWorkstations,
+        periodFromDate: periodFrom,
+        periodToDate: periodTo,
+        dateFrom: periodFrom,
+        dateTo: periodTo,
+      });
+      setAutoApplyResult(autoApply);
+      if (autoApply.success) {
+        showNotification(`Applied ${autoApply.appliedCount} attendance record(s) across ${autoApply.employeeCount} employee(s).`, 'success');
+      } else {
+        showNotification(`Automatic attendance processing still failed: ${autoApply.error || 'unknown error'}`, 'error');
+      }
+    } finally {
+      setRetrying(false);
+    }
+  }, [importResult, selectedWorkstations, periodFrom, periodTo]);
 
   if (!permissionsLoaded) {
     return <div className="p-8 text-center text-slate-400">Loading...</div>;
@@ -90,7 +196,7 @@ export default function HikCentralImportPage() {
     <div className="space-y-6">
       <PageHeader
         title="HikCentral Attendance Import"
-        subtitle="Upload a HikCentral fingerprint export to preview and import raw authentication events. This does not change official attendance."
+        subtitle="Upload a HikCentral fingerprint export to preview, import, and automatically apply attendance for the declared period and workstations."
       />
 
       {!canImport && (
@@ -192,16 +298,66 @@ export default function HikCentralImportPage() {
           )}
 
           {canImport && !importResult && (
-            <Card className="p-6 flex items-center justify-between">
+            <Card className="p-6 space-y-5">
               <div>
-                <p className="text-sm font-medium text-slate-800">Ready to import raw events</p>
+                <p className="text-sm font-medium text-slate-800">Attendance processing scope</p>
                 <p className="text-xs text-slate-500 mt-1">
-                  {summary.authorizationCount} successful event(s) will be stored as raw events. Failed events are counted above but not individually stored. No attendance records are created by this step.
+                  What period does this export cover, and which workstation(s) is it from? Both are used immediately after import to automatically calculate and apply Present/Late/Absent to the official Monthly Register for the matching employees -- no separate confirmation step.
                 </p>
               </div>
-              <Button onClick={handleImport} disabled={importing || summary.authorizationCount === 0}>
-                {importing ? 'Importing...' : 'Import Raw Events'}
-              </Button>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <label className="text-xs text-slate-600 space-y-1">
+                  <span className="block font-medium">Period start</span>
+                  <input
+                    type="date"
+                    value={periodFrom}
+                    onChange={(e) => setPeriodFrom(e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                  />
+                </label>
+                <label className="text-xs text-slate-600 space-y-1">
+                  <span className="block font-medium">Period end</span>
+                  <input
+                    type="date"
+                    value={periodTo}
+                    onChange={(e) => setPeriodTo(e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                  />
+                </label>
+              </div>
+              {periodFrom && periodTo && periodFrom > periodTo && (
+                <p className="text-xs text-red-600">Period start must be on or before period end.</p>
+              )}
+              <div>
+                <p className="text-xs font-medium text-slate-600 mb-2">Workstation(s) this export covers</p>
+                {workstationOptions.length === 0 ? (
+                  <p className="text-xs text-slate-400">No employee workstations found.</p>
+                ) : (
+                  <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto">
+                    {workstationOptions.map((ws) => (
+                      <label key={ws} className="flex items-center gap-1.5 text-xs bg-slate-50 border border-slate-200 rounded-full px-3 py-1 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedWorkstations.includes(ws)}
+                          onChange={() => toggleWorkstation(ws)}
+                        />
+                        {ws}
+                      </label>
+                    ))}
+                  </div>
+                )}
+                {selectedWorkstations.length === 0 && (
+                  <p className="text-xs text-amber-600 mt-2">Select at least one workstation to enable import.</p>
+                )}
+              </div>
+              <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+                <p className="text-xs text-slate-500">
+                  {summary.authorizationCount} successful event(s) will be stored as raw events, then attendance will be calculated and applied automatically for the selected scope.
+                </p>
+                <Button onClick={handleImport} disabled={importing || summary.authorizationCount === 0 || !canProcessScope}>
+                  {importing ? 'Importing...' : 'Import Raw Events'}
+                </Button>
+              </div>
             </Card>
           )}
 
@@ -222,10 +378,46 @@ export default function HikCentralImportPage() {
                       <p className="text-sm text-emerald-700">Unidentified successful events (no Person No.): {summary.withoutPersonNoCount}</p>
                       <p className="text-sm text-emerald-700">Failed authentication events (counted, not stored individually): {summary.failedCount}</p>
                       <p className="text-xs text-emerald-600 mt-2">Batch ID: {importResult.batchId}</p>
-                      <p className="text-xs text-emerald-600">No attendance records were created or changed.</p>
                     </>
                   ) : (
                     <p className="text-sm text-red-700">{importResult.error}</p>
+                  )}
+                </div>
+              </div>
+            </Card>
+          )}
+
+          {importResult?.success && autoApplyResult && (
+            <Card className={`p-6 border ${autoApplyResult.success ? 'bg-emerald-50 border-emerald-200' : 'bg-red-50 border-red-200'}`}>
+              <div className="flex items-start gap-3">
+                {autoApplyResult.success
+                  ? <CheckCircle2 size={20} className="text-emerald-600 shrink-0 mt-0.5" />
+                  : <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />}
+                <div className="space-y-1 w-full">
+                  <p className={`text-sm font-medium ${autoApplyResult.success ? 'text-emerald-800' : 'text-red-800'}`}>
+                    {autoApplyResult.success ? 'Attendance calculated and applied automatically' : 'Automatic attendance processing failed'}
+                  </p>
+                  {autoApplyResult.success ? (
+                    <>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2">
+                        <SummaryStat label="Employees" value={autoApplyResult.employeeCount ?? 0} />
+                        <SummaryStat label="Applied" value={autoApplyResult.appliedCount ?? 0} accent="green" />
+                        <SummaryStat label="Unchanged" value={autoApplyResult.unchangedCount ?? 0} />
+                        <SummaryStat label="Skipped" value={autoApplyResult.skippedCount ?? 0} accent="amber" />
+                      </div>
+                      <p className="text-xs text-emerald-600 mt-2">
+                        Skipped covers Off/Unassigned/Pending days, manually-corrected or approved-payroll-protected records, and anything already up to date -- these are never overwritten automatically.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-sm text-red-700">
+                        Raw events were imported successfully, but attendance was NOT calculated or applied: {autoApplyResult.error}
+                      </p>
+                      <Button onClick={handleRetryAutoApply} disabled={retrying} className="mt-2">
+                        {retrying ? 'Retrying...' : 'Retry Attendance Processing'}
+                      </Button>
+                    </>
                   )}
                 </div>
               </div>
