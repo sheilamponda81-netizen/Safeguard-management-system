@@ -122,6 +122,19 @@ export async function processHikCentralImportBatch(params: {
   dateFrom: string;
   dateTo: string;
   notes?: string;
+  /**
+   * HikCentral's own access_point values this import's raw events were
+   * actually observed at (e.g. the parsed file's summary.accessPoints) --
+   * Stage C Step 8B correction. Independent of employees.workstation: an
+   * employee whose stored home workstation differs from the site they
+   * actually badged in at (a guard transferred between sites) is still
+   * recognized for automatic Present/Late, because their mapped identity
+   * is matched here by the authoritative access_point actually recorded
+   * by HikCentral, not by comparing against a free-text home-workstation
+   * field. Optional -- omitting it falls back to workstation-only scope
+   * (the pre-Step-8B behavior).
+   */
+  accessPoints?: string[];
 }): Promise<ProcessImportBatchResult> {
   const { coversFromIso, coversThroughIso } = periodToCoverageWindow(params.periodFromDate, params.periodToDate);
   try {
@@ -133,6 +146,7 @@ export async function processHikCentralImportBatch(params: {
       p_date_from: params.dateFrom,
       p_date_to: params.dateTo,
       p_notes: params.notes ?? null,
+      p_access_points: params.accessPoints && params.accessPoints.length > 0 ? params.accessPoints : null,
     });
 
     if (error) {

@@ -160,6 +160,49 @@ GRANT EXECUTE ON FUNCTION attendance_apply_automatic(UUID[], DATE, DATE) TO auth
 -- attendance.import_hikcentral -- without that seed, the person who
 -- actually uploads exports could never trigger the now-automatic step,
 -- which would defeat this round's entire purpose.
+--
+-- Stage C Step 8B CORRECTION -- p_access_points (new, optional):
+-- employees.workstation is the employee's declared HOME site, not a
+-- reliable record of where they actually badged in -- guards move
+-- between sites. The ORIGINAL scope query below (employees.workstation
+-- = ANY(p_workstations)) alone would silently exclude a transferred
+-- employee's genuinely valid fingerprint event from automatic
+-- processing entirely, solely because their stored home workstation
+-- differs from the site this import's events came from. Identity
+-- resolution was ALREADY workstation-independent (attendance_resolve_
+-- and_calculate joins hikcentral_raw_events to hikcentral_person_
+-- mappings by hikcentral_person_no alone, never by workstation/access_
+-- point) -- the gap was entirely in THIS function's own scope-building
+-- query, which decided who even gets evaluated at all.
+--
+-- FIX: the employee scope is now the UNION of two independent sets --
+--   (a) EXPECTED (home-roster) scope: employees.workstation = ANY
+--       (p_workstations), unchanged from before -- this is the ONLY set
+--       ever eligible for a genuine Absent result, because it is the
+--       only set declared independently of who actually produced an
+--       event (never "invent absent employees solely from the list of
+--       people who fingerprinted" -- the access-point-observed addition
+--       below can only ever ADD people who DID produce a qualifying
+--       event, so it can never manufacture a new Absent candidate).
+--   (b) OBSERVED (access-point) scope: mapped employees (via the SAME
+--       hikcentral_person_mappings join attendance_resolve_and_calculate
+--       already uses) who have a real raw event at one of the declared
+--       p_access_points within the declared covers_from/covers_through
+--       window -- this is HikCentral's own access_point field, the
+--       authoritative record of where an authentication actually
+--       happened, completely independent of employees.workstation.
+-- Nothing about attendance_resolve_and_calculate, attendance_engine_
+-- calculate, or the fingerprint_coverage_confirmations/workstation
+-- match inside it changes -- a set-(b)-only employee's Present/Late is
+-- still recognized unconditionally the moment both a check-in and
+-- checkout are found (the engine's very first branch, which never even
+-- looks at coverage), and such an employee can never resolve to Absent
+-- on any date in range, because their stored workstation still will not
+-- match the declared coverage workstations, so coverage stays
+-- 'insufficient' for them exactly as it always did -- the one and only
+-- behavior change is that they are no longer silently skipped entirely.
+-- employees.workstation itself is never read for writing, only for
+-- matching -- nothing in this function ever UPDATEs it.
 CREATE OR REPLACE FUNCTION attendance_process_import_batch(
   p_import_batch_id UUID,
   p_workstations TEXT[],
@@ -167,7 +210,8 @@ CREATE OR REPLACE FUNCTION attendance_process_import_batch(
   p_covers_through TIMESTAMPTZ,
   p_date_from DATE,
   p_date_to DATE,
-  p_notes TEXT DEFAULT NULL
+  p_notes TEXT DEFAULT NULL,
+  p_access_points TEXT[] DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -181,6 +225,7 @@ DECLARE
   v_sorted_workstations TEXT[];
   v_confirmation_id UUID;
   v_employee_ids UUID[];
+  v_observed_employee_ids UUID[];
   v_results JSONB;
   v_applied_count INTEGER := 0;
   v_unchanged_count INTEGER := 0;
@@ -242,12 +287,43 @@ BEGIN
     RETURNING id INTO v_confirmation_id;
   END IF;
 
+  -- EXPECTED (home-roster) scope -- unchanged from before this
+  -- correction. The only set ever eligible for a genuine Absent result
+  -- (see this function's header comment).
   SELECT COALESCE(array_agg(id), ARRAY[]::UUID[]) INTO v_employee_ids
   FROM employees
   WHERE tenant_id = v_tenant_id
     AND workstation = ANY(p_workstations)
     AND status = 'Active'
     AND is_deleted = false;
+
+  -- OBSERVED (access-point) scope -- NEW this correction. Mapped
+  -- employees with a real event at a declared access_point in the
+  -- declared window, regardless of their stored home workstation. Reuses
+  -- the EXACT SAME join attendance_resolve_and_calculate already uses to
+  -- resolve identity (hikcentral_person_no, tenant-scoped on both
+  -- sides), so an employee can only enter this set via a genuinely
+  -- mapped, genuinely stored fingerprint event -- never invented.
+  IF p_access_points IS NOT NULL AND array_length(p_access_points, 1) IS NOT NULL THEN
+    SELECT COALESCE(array_agg(DISTINCT m.employee_id), ARRAY[]::UUID[]) INTO v_observed_employee_ids
+    FROM hikcentral_raw_events r
+    JOIN hikcentral_person_mappings m
+      ON m.hikcentral_person_no = r.hikcentral_person_no
+      AND m.is_active
+      AND m.tenant_id = r.tenant_id
+    JOIN employees e ON e.id = m.employee_id
+    WHERE r.tenant_id = v_tenant_id
+      AND m.tenant_id = v_tenant_id
+      AND r.access_point = ANY(p_access_points)
+      AND r.event_time >= p_covers_from
+      AND r.event_time <= p_covers_through
+      AND e.tenant_id = v_tenant_id
+      AND e.status = 'Active'
+      AND e.is_deleted = false;
+
+    SELECT COALESCE(array_agg(DISTINCT eid), ARRAY[]::UUID[]) INTO v_employee_ids
+    FROM unnest(v_employee_ids || v_observed_employee_ids) AS eid;
+  END IF;
 
   IF array_length(v_employee_ids, 1) IS NULL THEN
     RETURN jsonb_build_object(
@@ -295,8 +371,8 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAMPTZ, TIMESTAMPTZ, DATE, DATE, TEXT) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAMPTZ, TIMESTAMPTZ, DATE, DATE, TEXT) TO authenticated;
+REVOKE ALL ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAMPTZ, TIMESTAMPTZ, DATE, DATE, TEXT, TEXT[]) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAMPTZ, TIMESTAMPTZ, DATE, DATE, TEXT, TEXT[]) TO authenticated;
 
 -- ============================================================
 -- PART 3: permission seeding

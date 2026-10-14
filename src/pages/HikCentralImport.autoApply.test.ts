@@ -27,6 +27,14 @@ describe('HikCentralImport: importing automatically calculates and applies atten
     expect(body.indexOf('importHikCentralRawEvents(')).toBeLessThan(body.indexOf('processHikCentralImportBatch({'));
   });
 
+  it('Stage C Step 8B: both processHikCentralImportBatch call sites pass the file\'s own parsed access points, not just employees.workstation', () => {
+    const calls = source.match(/processHikCentralImportBatch\(\{[\s\S]*?\}\);/g) || [];
+    expect(calls.length).toBe(2);
+    for (const call of calls) {
+      expect(call).toMatch(/accessPoints: summary\?\.accessPoints/);
+    }
+  });
+
   it('does not call processHikCentralImportBatch from any handler other than handleImport/handleRetryAutoApply (no hidden second trigger)', () => {
     const callSites = (source.match(/processHikCentralImportBatch\(\{/g) || []).length;
     // Exactly two: the automatic call inside handleImport, and the explicit retry-only call inside handleRetryAutoApply.

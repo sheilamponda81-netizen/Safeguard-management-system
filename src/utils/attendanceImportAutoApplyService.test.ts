@@ -102,6 +102,7 @@ describe('processHikCentralImportBatch', () => {
       p_date_from: '2026-10-01',
       p_date_to: '2026-10-04',
       p_notes: null,
+      p_access_points: null,
     });
     expect(result).toEqual({
       success: true,
@@ -113,6 +114,34 @@ describe('processHikCentralImportBatch', () => {
       skippedCount: 0,
       failedCount: 0,
     });
+  });
+
+  it('Stage C Step 8B: passes the observed access points through to p_access_points when supplied', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
+      error: null,
+    });
+    await processHikCentralImportBatch({
+      importBatchId: 'b1', workstations: ['Gate 1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
+      accessPoints: ['GATE1', 'LIMBE-MAIN'],
+    });
+    expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
+      p_access_points: ['GATE1', 'LIMBE-MAIN'],
+    }));
+  });
+
+  it('Stage C Step 8B: an empty accessPoints array is sent as null, not an empty array (no accidental all-exclude/all-include ambiguity)', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
+      error: null,
+    });
+    await processHikCentralImportBatch({
+      importBatchId: 'b1', workstations: ['Gate 1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
+      accessPoints: [],
+    });
+    expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
+      p_access_points: null,
+    }));
   });
 
   it('reports a distinct missing_rpc outcome when the migration is not yet applied', async () => {

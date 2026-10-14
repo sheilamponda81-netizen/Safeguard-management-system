@@ -140,6 +140,12 @@ export default function HikCentralImportPage() {
         periodToDate: periodTo,
         dateFrom: periodFrom,
         dateTo: periodTo,
+        // Stage C Step 8B: the file's own observed HikCentral access
+        // points -- already parsed, no new input needed from the admin --
+        // so a mapped employee who badged in at one of these, even if it
+        // differs from their stored home workstation (a transfer between
+        // sites), is still recognized for automatic processing.
+        accessPoints: summary?.accessPoints,
       });
       setAutoApplyResult(autoApply);
 
@@ -154,7 +160,7 @@ export default function HikCentralImportPage() {
     } finally {
       setImporting(false);
     }
-  }, [parseResult, selectedFile, userProfile, canProcessScope, selectedWorkstations, periodFrom, periodTo]);
+  }, [parseResult, selectedFile, userProfile, canProcessScope, selectedWorkstations, periodFrom, periodTo, summary]);
 
   const [retrying, setRetrying] = useState(false);
 
@@ -176,6 +182,7 @@ export default function HikCentralImportPage() {
         periodToDate: periodTo,
         dateFrom: periodFrom,
         dateTo: periodTo,
+        accessPoints: summary?.accessPoints,
       });
       setAutoApplyResult(autoApply);
       if (autoApply.success) {
@@ -186,7 +193,7 @@ export default function HikCentralImportPage() {
     } finally {
       setRetrying(false);
     }
-  }, [importResult, selectedWorkstations, periodFrom, periodTo]);
+  }, [importResult, selectedWorkstations, periodFrom, periodTo, summary]);
 
   if (!permissionsLoaded) {
     return <div className="p-8 text-center text-slate-400">Loading...</div>;
