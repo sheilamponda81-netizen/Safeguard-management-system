@@ -75,3 +75,86 @@ describe('HikCentralImport: importing automatically calculates and applies atten
     expect(summaryBlock.slice(0, 800)).toMatch(/label="Skipped"/);
   });
 });
+
+describe('Stage C Step 10: batch continuity, explicit coverage confirmation, and site absence alerts', () => {
+  it('imports the new Step 10 service functions', () => {
+    expect(source).toMatch(/fetchCoverageTimeline, CoverageTimelineEntry,/);
+    expect(source).toMatch(/fetchSiteAbsenceAlerts, acknowledgeSiteAlert, SiteAbsenceAlert,/);
+  });
+
+  it('requires an explicit, separate confirmCoverageAccurate affirmation (not merely a chosen period) to enable import', () => {
+    const def = source.match(/const canProcessScope =[^;]*;/)?.[0] ?? '';
+    expect(def).toMatch(/confirmCoverageAccurate/);
+    // The checkbox's own label must explicitly distinguish a declared
+    // coverage period from the file's own first/last timestamps.
+    expect(source).toMatch(/not merely the first\/last fingerprint timestamps found in the file/);
+  });
+
+  it('resets confirmCoverageAccurate for every new file, same as the other scope fields', () => {
+    const resetFn = source.match(/const resetForNewFile = useCallback\(\(\) => \{[\s\S]*?\}, \[\]\);/)?.[0] ?? '';
+    expect(resetFn).toMatch(/setConfirmCoverageAccurate\(false\)/);
+  });
+
+  it('loads the coverage timeline and open site alerts on mount, and re-loads both after a successful import/retry', () => {
+    expect(source).toMatch(/const reloadCoverageTimeline = useCallback/);
+    expect(source).toMatch(/const reloadSiteAlerts = useCallback/);
+    const mountEffect = source.match(/useEffect\(\(\) => \{[\s\S]*?\}, \[reloadCoverageTimeline, reloadSiteAlerts\]\);/)?.[0] ?? '';
+    expect(mountEffect).toMatch(/await reloadCoverageTimeline\(\);/);
+    expect(mountEffect).toMatch(/await reloadSiteAlerts\(\);/);
+
+    const importHandler = source.match(/const handleImport = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(importHandler).toMatch(/await reloadCoverageTimeline\(\);/);
+    expect(importHandler).toMatch(/await reloadSiteAlerts\(\);/);
+  });
+
+  it('renders a missing-coverage warning per scope entry, listing the missing dates, only when gaps exist', () => {
+    const timelineBlock = source.slice(source.indexOf('coverageTimeline.length > 0'), source.indexOf('siteAlerts.length > 0'));
+    expect(timelineBlock).toMatch(/entry\.missingDates\.length > 0/);
+    expect(timelineBlock).toMatch(/Missing export coverage for \{entry\.scopeKey\} on: \{entry\.missingDates\.join\(', '\)\}/);
+    expect(timelineBlock).toMatch(/Attendance will not be marked Absent for these dates/);
+    expect(timelineBlock).toMatch(/Last confirmed:/);
+    expect(timelineBlock).toMatch(/Next expected:/);
+  });
+
+  it('renders open site absence alerts with site, date, live count, and affected employees', () => {
+    const alertsBlock = source.slice(source.indexOf('siteAlerts.length > 0'), source.indexOf('<Card className="p-6">\n        <label htmlFor="hikcentral-file-input"'));
+    expect(alertsBlock).toMatch(/\{alert\.site\} &mdash; \{alert\.alertDate\}: \{alert\.currentAbsentCount\} absent/);
+    expect(alertsBlock).toMatch(/alert\.affectedEmployees\.map/);
+  });
+
+  it('gates the acknowledge control on attendance.manage_site_alerts, loaded as its own permission', () => {
+    expect(source).toMatch(/setCanManageSiteAlerts\(await hasPermission\(PERMISSIONS\.ATTENDANCE_MANAGE_SITE_ALERTS\)\)/);
+    const alertsBlock = source.slice(source.indexOf('siteAlerts.length > 0'), source.indexOf('<Card className="p-6">\n        <label htmlFor="hikcentral-file-input"'));
+    expect(alertsBlock).toMatch(/\{canManageSiteAlerts && \(/);
+  });
+
+  it('requires a note before acknowledging, and never silently no-ops', () => {
+    const ackHandler = source.match(/const handleAcknowledgeAlert = useCallback\(async \(alertId: string\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(ackHandler).toMatch(/A note is required to acknowledge this alert\./);
+    expect(ackHandler).toMatch(/await acknowledgeSiteAlert\(alertId, note\);/);
+  });
+});
+
+describe('Stage C Step 10A: a zero-net-new-event reimport still runs automatic attendance processing', () => {
+  it('handleImport only bails out on result.success/result.batchId -- never on insertedCount/duplicatesIgnored', () => {
+    const importHandler = source.match(/const handleImport = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    const guardStart = importHandler.indexOf('if (!result.success || !result.batchId)');
+    expect(guardStart, 'expected the only early-return guard after a successful raw import').toBeGreaterThanOrEqual(0);
+    const applyCallStart = importHandler.indexOf('processHikCentralImportBatch({');
+    expect(applyCallStart).toBeGreaterThan(guardStart);
+    const betweenGuardAndApplyCall = importHandler.slice(guardStart, applyCallStart);
+    // The guard (and everything between it and the auto-apply call) must
+    // never reference insertedCount/duplicatesIgnored -- a pure-duplicate
+    // reimport (insertedCount: 0) is still a successful import with a
+    // real batchId, so it must fall through to processHikCentralImportBatch
+    // exactly like any other successful import, never treated as
+    // "nothing to do".
+    expect(betweenGuardAndApplyCall).not.toMatch(/insertedCount/);
+    expect(betweenGuardAndApplyCall).not.toMatch(/duplicatesIgnored/);
+  });
+
+  it('the success banner reports insertedCount honestly (e.g. 0) without ever skipping the auto-apply summary', () => {
+    const importHandler = source.match(/const handleImport = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(importHandler).toMatch(/Imported \$\{result\.insertedCount\} new raw event\(s\)\. Applied \$\{autoApply\.appliedCount\}/);
+  });
+});

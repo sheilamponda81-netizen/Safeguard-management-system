@@ -28,12 +28,14 @@ import {
 import { importHikCentralRawEvents, computeFileFingerprint, HikCentralImportResult } from '../utils/hikcentralImportService';
 import {
   fetchDistinctWorkstations, processHikCentralImportBatch, isoToBlantyreDateStr,
-  ProcessImportBatchResult,
+  ProcessImportBatchResult, fetchCoverageTimeline, CoverageTimelineEntry,
+  fetchSiteAbsenceAlerts, acknowledgeSiteAlert, SiteAbsenceAlert,
 } from '../utils/attendanceImportAutoApplyService';
 
 export default function HikCentralImportPage() {
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [canImport, setCanImport] = useState(false);
+  const [canManageSiteAlerts, setCanManageSiteAlerts] = useState(false);
   const [permissionsLoaded, setPermissionsLoaded] = useState(false);
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -59,20 +61,73 @@ export default function HikCentralImportPage() {
   const [selectedWorkstations, setSelectedWorkstations] = useState<string[]>([]);
   const [periodFrom, setPeriodFrom] = useState('');
   const [periodTo, setPeriodTo] = useState('');
+  // Stage C Step 10: an explicit, separate affirmation -- distinct from
+  // merely having picked a period above -- that the operator is declaring
+  // this as the export's actual complete coverage, not just echoing the
+  // file's own first/last recorded timestamps. Required to enable import;
+  // reset for every new file so it can never silently carry over.
+  const [confirmCoverageAccurate, setConfirmCoverageAccurate] = useState(false);
+
+  // Stage C Step 10: batch continuity -- per-workstation/access-point
+  // coverage timeline, so an operator can see what's already covered and
+  // what's missing before (and after) uploading. Degrades silently (empty
+  // list) in an environment where this migration isn't applied yet, same
+  // convention as processHikCentralImportBatch's own missing_rpc outcome.
+  const [coverageTimeline, setCoverageTimeline] = useState<CoverageTimelineEntry[]>([]);
+  const [siteAlerts, setSiteAlerts] = useState<SiteAbsenceAlert[]>([]);
+  const [ackNotes, setAckNotes] = useState<Record<string, string>>({});
+  const [acknowledging, setAcknowledging] = useState<Record<string, boolean>>({});
+
+  const reloadCoverageTimeline = useCallback(async () => {
+    try {
+      setCoverageTimeline(await fetchCoverageTimeline());
+    } catch {
+      setCoverageTimeline([]);
+    }
+  }, []);
+
+  const reloadSiteAlerts = useCallback(async () => {
+    try {
+      setSiteAlerts(await fetchSiteAbsenceAlerts('open'));
+    } catch {
+      setSiteAlerts([]);
+    }
+  }, []);
 
   useEffect(() => {
     (async () => {
       const profile = await getCurrentProfile();
       setUserProfile(profile);
       setCanImport(await hasPermission(PERMISSIONS.ATTENDANCE_IMPORT_HIKCENTRAL));
+      setCanManageSiteAlerts(await hasPermission(PERMISSIONS.ATTENDANCE_MANAGE_SITE_ALERTS));
       setPermissionsLoaded(true);
       try {
         setWorkstationOptions(await fetchDistinctWorkstations());
       } catch {
         setWorkstationOptions([]);
       }
+      await reloadCoverageTimeline();
+      await reloadSiteAlerts();
     })();
-  }, []);
+  }, [reloadCoverageTimeline, reloadSiteAlerts]);
+
+  const handleAcknowledgeAlert = useCallback(async (alertId: string) => {
+    const note = (ackNotes[alertId] || '').trim();
+    if (!note) {
+      showNotification('A note is required to acknowledge this alert.', 'error');
+      return;
+    }
+    setAcknowledging((prev) => ({ ...prev, [alertId]: true }));
+    try {
+      await acknowledgeSiteAlert(alertId, note);
+      await reloadSiteAlerts();
+      showNotification('Alert acknowledged.', 'success');
+    } catch (err) {
+      showNotification(err instanceof Error ? err.message : 'Could not acknowledge this alert.', 'error');
+    } finally {
+      setAcknowledging((prev) => ({ ...prev, [alertId]: false }));
+    }
+  }, [ackNotes, reloadSiteAlerts]);
 
   const resetForNewFile = useCallback(() => {
     setParseResult(null);
@@ -83,6 +138,7 @@ export default function HikCentralImportPage() {
     setSelectedWorkstations([]);
     setPeriodFrom('');
     setPeriodTo('');
+    setConfirmCoverageAccurate(false);
   }, []);
 
   const handleFileSelect = useCallback(async (file: File) => {
@@ -109,7 +165,7 @@ export default function HikCentralImportPage() {
     }
   }, [resetForNewFile]);
 
-  const canProcessScope = selectedWorkstations.length > 0 && !!periodFrom && !!periodTo && periodFrom <= periodTo;
+  const canProcessScope = selectedWorkstations.length > 0 && !!periodFrom && !!periodTo && periodFrom <= periodTo && confirmCoverageAccurate;
 
   const toggleWorkstation = useCallback((ws: string) => {
     setSelectedWorkstations((prev) => (prev.includes(ws) ? prev.filter((w) => w !== ws) : [...prev, ws]));
@@ -154,13 +210,19 @@ export default function HikCentralImportPage() {
           `Imported ${result.insertedCount} new raw event(s). Applied ${autoApply.appliedCount} attendance record(s) across ${autoApply.employeeCount} employee(s).`,
           'success'
         );
+        // Stage C Step 10: this import may have closed a gap or newly
+        // crossed the 5-absence threshold somewhere -- refresh both
+        // read-only panels so the operator sees current state, not what
+        // was true before this upload.
+        await reloadCoverageTimeline();
+        await reloadSiteAlerts();
       } else {
         showNotification(`Raw events were imported, but automatic attendance processing failed: ${autoApply.error || 'unknown error'}`, 'error');
       }
     } finally {
       setImporting(false);
     }
-  }, [parseResult, selectedFile, userProfile, canProcessScope, selectedWorkstations, periodFrom, periodTo, summary]);
+  }, [parseResult, selectedFile, userProfile, canProcessScope, selectedWorkstations, periodFrom, periodTo, summary, reloadCoverageTimeline, reloadSiteAlerts]);
 
   const [retrying, setRetrying] = useState(false);
 
@@ -187,13 +249,15 @@ export default function HikCentralImportPage() {
       setAutoApplyResult(autoApply);
       if (autoApply.success) {
         showNotification(`Applied ${autoApply.appliedCount} attendance record(s) across ${autoApply.employeeCount} employee(s).`, 'success');
+        await reloadCoverageTimeline();
+        await reloadSiteAlerts();
       } else {
         showNotification(`Automatic attendance processing still failed: ${autoApply.error || 'unknown error'}`, 'error');
       }
     } finally {
       setRetrying(false);
     }
-  }, [importResult, selectedWorkstations, periodFrom, periodTo, summary]);
+  }, [importResult, selectedWorkstations, periodFrom, periodTo, summary, reloadCoverageTimeline, reloadSiteAlerts]);
 
   if (!permissionsLoaded) {
     return <div className="p-8 text-center text-slate-400">Loading...</div>;
@@ -214,6 +278,77 @@ export default function HikCentralImportPage() {
               <p className="text-sm font-medium text-amber-800">View Only</p>
               <p className="text-sm text-amber-700">You can preview a file's contents, but you do not have permission to import raw events.</p>
             </div>
+          </div>
+        </Card>
+      )}
+
+      {coverageTimeline.length > 0 && (
+        <Card className="p-6">
+          <h3 className="font-semibold text-slate-800 mb-3">Coverage Timeline</h3>
+          <div className="space-y-3">
+            {coverageTimeline.map((entry) => (
+              <div key={`${entry.scopeType}:${entry.scopeKey}`} className="border border-slate-100 rounded-lg p-3">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-2">
+                    <Badge color={entry.scopeType === 'workstation' ? 'blue' : 'gray'}>
+                      {entry.scopeType === 'workstation' ? 'Workstation' : 'Access Point'}
+                    </Badge>
+                    <span className="text-sm font-medium text-slate-700">{entry.scopeKey}</span>
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    Last confirmed: <span className="font-medium text-slate-700">{entry.lastCoveredDate}</span>
+                    {' '}&middot; Next expected: <span className="font-medium text-slate-700">{entry.nextExpectedDate}</span>
+                  </div>
+                </div>
+                {entry.missingDates.length > 0 && (
+                  <div className="mt-2 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-md p-2">
+                    <AlertCircle size={14} className="text-amber-600 shrink-0 mt-0.5" />
+                    <p className="text-xs text-amber-800">
+                      Missing export coverage for {entry.scopeKey} on: {entry.missingDates.join(', ')}. Attendance will not be marked Absent for these dates until a later import declares coverage for them.
+                    </p>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {siteAlerts.length > 0 && (
+        <Card className="p-6">
+          <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
+            <AlertCircle size={18} className="text-red-600" /> Site Absence Alerts
+          </h3>
+          <div className="space-y-3">
+            {siteAlerts.map((alert) => (
+              <div key={alert.id} className="border border-red-200 bg-red-50 rounded-lg p-3">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <p className="text-sm font-medium text-red-800">
+                    {alert.site} &mdash; {alert.alertDate}: {alert.currentAbsentCount} absent
+                  </p>
+                  <Badge color="red">Open</Badge>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {alert.affectedEmployees.map((e) => (
+                    <Badge key={e.employeeId} color="gray">{e.fullName}</Badge>
+                  ))}
+                </div>
+                {canManageSiteAlerts && (
+                  <div className="mt-3 flex items-center gap-2">
+                    <input
+                      type="text"
+                      placeholder="Note required to acknowledge"
+                      value={ackNotes[alert.id] || ''}
+                      onChange={(e) => setAckNotes((prev) => ({ ...prev, [alert.id]: e.target.value }))}
+                      className="flex-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs"
+                    />
+                    <Button onClick={() => handleAcknowledgeAlert(alert.id)} disabled={!!acknowledging[alert.id]}>
+                      {acknowledging[alert.id] ? 'Acknowledging...' : 'Acknowledge'}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
         </Card>
       )}
@@ -357,6 +492,17 @@ export default function HikCentralImportPage() {
                   <p className="text-xs text-amber-600 mt-2">Select at least one workstation to enable import.</p>
                 )}
               </div>
+              <label className="flex items-start gap-2 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={confirmCoverageAccurate}
+                  onChange={(e) => setConfirmCoverageAccurate(e.target.checked)}
+                />
+                <span>
+                  I confirm the period selected above is this export&apos;s actual, complete coverage for the selected workstation(s) -- not merely the first/last fingerprint timestamps found in the file.
+                </span>
+              </label>
               <div className="flex items-center justify-between pt-2 border-t border-slate-100">
                 <p className="text-xs text-slate-500">
                   {summary.authorizationCount} successful event(s) will be stored as raw events, then attendance will be calculated and applied automatically for the selected scope.

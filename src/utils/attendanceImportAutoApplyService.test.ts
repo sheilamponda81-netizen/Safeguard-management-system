@@ -21,6 +21,7 @@ vi.mock('../lib/supabase', () => ({
 // processHikCentralImportBatch's own try/catch.
 const {
   periodToCoverageWindow, isoToBlantyreDateStr, fetchDistinctWorkstations, processHikCentralImportBatch,
+  fetchCoverageTimeline, fetchSiteAbsenceAlerts, acknowledgeSiteAlert,
 } = await import('./attendanceImportAutoApplyService');
 
 describe('periodToCoverageWindow', () => {
@@ -160,6 +161,75 @@ describe('processHikCentralImportBatch', () => {
     expect(result.success).toBe(false);
     expect(result.outcome).toBe('unauthorized');
     expect(result.error).toBe('Not authorized to confirm fingerprint coverage');
+  });
+
+  describe('Stage C Step 10: fetchCoverageTimeline', () => {
+    it('maps the RPC rows from snake_case to camelCase', async () => {
+      rpcMock.mockResolvedValue({
+        data: [{
+          scope_type: 'workstation', scope_key: 'HEAD OFFICE',
+          first_covered_date: '2026-10-01', last_covered_date: '2026-10-09',
+          next_expected_date: '2026-10-10', missing_dates: ['2026-10-05'],
+        }],
+        error: null,
+      });
+      const result = await fetchCoverageTimeline(90);
+      expect(rpcMock).toHaveBeenCalledWith('hikcentral_coverage_timeline', { p_lookback_days: 90 });
+      expect(result).toEqual([{
+        scopeType: 'workstation', scopeKey: 'HEAD OFFICE',
+        firstCoveredDate: '2026-10-01', lastCoveredDate: '2026-10-09',
+        nextExpectedDate: '2026-10-10', missingDates: ['2026-10-05'],
+      }]);
+    });
+
+    it('throws rather than swallowing an RPC error', async () => {
+      rpcMock.mockResolvedValue({ data: null, error: { message: 'boom' } });
+      await expect(fetchCoverageTimeline()).rejects.toBeTruthy();
+    });
+  });
+
+  describe('Stage C Step 10: fetchSiteAbsenceAlerts / acknowledgeSiteAlert', () => {
+    it('fetches alerts filtered by status and maps affected employees', async () => {
+      rpcMock.mockResolvedValue({
+        data: [{
+          id: 'a1', site: 'HEAD OFFICE', alert_date: '2026-10-01', status: 'open',
+          absent_count_at_creation: 5, current_absent_count: 6,
+          affected_employees: [{ employee_id: 'e1', full_name: 'Jane Doe' }],
+          created_at: '2026-10-01T00:00:00Z', closed_by: null, closed_at: null, closed_note: null,
+        }],
+        error: null,
+      });
+      const result = await fetchSiteAbsenceAlerts('open');
+      expect(rpcMock).toHaveBeenCalledWith('attendance_site_absence_alerts_list', { p_status: 'open' });
+      expect(result[0]).toEqual({
+        id: 'a1', site: 'HEAD OFFICE', alertDate: '2026-10-01', status: 'open',
+        absentCountAtCreation: 5, currentAbsentCount: 6,
+        affectedEmployees: [{ employeeId: 'e1', fullName: 'Jane Doe' }],
+        createdAt: '2026-10-01T00:00:00Z', closedBy: null, closedAt: null, closedNote: null,
+      });
+    });
+
+    it('acknowledgeSiteAlert passes the alert id and note, and maps the returned row', async () => {
+      rpcMock.mockResolvedValue({
+        data: {
+          id: 'a1', site: 'HEAD OFFICE', alert_date: '2026-10-01', status: 'closed',
+          absent_count_at_creation: 5, current_absent_count: 3,
+          affected_employees: [], created_at: '2026-10-01T00:00:00Z',
+          closed_by: 'admin1', closed_at: '2026-10-02T00:00:00Z', closed_note: 'Followed up.',
+        },
+        error: null,
+      });
+      const result = await acknowledgeSiteAlert('a1', 'Followed up.');
+      expect(rpcMock).toHaveBeenCalledWith('attendance_site_alert_acknowledge', { p_alert_id: 'a1', p_note: 'Followed up.' });
+      expect(result.status).toBe('closed');
+      expect(result.closedNote).toBe('Followed up.');
+    });
+
+    it('throws rather than swallowing an RPC error for either call', async () => {
+      rpcMock.mockResolvedValue({ data: null, error: { message: 'boom' } });
+      await expect(fetchSiteAbsenceAlerts()).rejects.toBeTruthy();
+      await expect(acknowledgeSiteAlert('a1', 'note')).rejects.toBeTruthy();
+    });
   });
 
   // The network-error (rejected-promise) case is covered in its own file,

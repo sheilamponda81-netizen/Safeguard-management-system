@@ -65,6 +65,11 @@ export const PERMISSIONS = {
   ATTENDANCE_AUTO_APPLY: 'attendance.auto_apply',
   ATTENDANCE_CONFIRM_COVERAGE: 'attendance.confirm_coverage',
   ATTENDANCE_RESOLVE_RECONCILIATION: 'attendance.resolve_reconciliation',
+  // Stage C Step 10 (20261017000000_hikcentral_batch_continuity_and_site_alerts.sql)
+  // -- acknowledging/closing a site absence alert. Reading alerts and the
+  // coverage timeline reuses existing attendance.view/attendance.import_hikcentral/
+  // attendance.confirm_coverage permissions -- no new read-side key needed.
+  ATTENDANCE_MANAGE_SITE_ALERTS: 'attendance.manage_site_alerts',
   USER_MANUAL_VIEW: 'user_manual.view',
   FUTURE_FEATURES_VIEW: 'future_features.view',
 } as const;

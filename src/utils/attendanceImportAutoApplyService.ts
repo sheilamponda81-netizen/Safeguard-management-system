@@ -73,6 +73,129 @@ export async function fetchDistinctWorkstations(): Promise<string[]> {
   return Array.from(values).sort();
 }
 
+// ---- Stage C Step 10: batch continuity (coverage timeline / gaps) ----
+
+export interface CoverageTimelineEntry {
+  scopeType: 'workstation' | 'access_point';
+  scopeKey: string;
+  firstCoveredDate: string;
+  lastCoveredDate: string;
+  nextExpectedDate: string;
+  missingDates: string[];
+}
+
+interface CoverageTimelineRpcRow {
+  scope_type: 'workstation' | 'access_point';
+  scope_key: string;
+  first_covered_date: string;
+  last_covered_date: string;
+  next_expected_date: string;
+  missing_dates: string[] | null;
+}
+
+/**
+ * Per declared workstation/access_point: the earliest and latest
+ * Africa/Blantyre calendar date any non-revoked coverage confirmation
+ * declares as covered, the next date to upload, and any calendar dates
+ * BETWEEN those two that no confirmation covers -- a genuine gap in the
+ * declared timeline. Never inferred from whether anyone fingerprinted;
+ * purely a readback of administrator-declared coverage confirmations
+ * (hikcentral_coverage_timeline RPC). Throws on error -- callers decide
+ * how to degrade (the import page treats "RPC not found" as "this
+ * environment predates Step 10" and simply hides the panel).
+ */
+export async function fetchCoverageTimeline(lookbackDays = 120): Promise<CoverageTimelineEntry[]> {
+  const { data, error } = await supabase.rpc('hikcentral_coverage_timeline', { p_lookback_days: lookbackDays });
+  if (error) throw error;
+  return ((data || []) as CoverageTimelineRpcRow[]).map((row) => ({
+    scopeType: row.scope_type,
+    scopeKey: row.scope_key,
+    firstCoveredDate: row.first_covered_date,
+    lastCoveredDate: row.last_covered_date,
+    nextExpectedDate: row.next_expected_date,
+    missingDates: row.missing_dates || [],
+  }));
+}
+
+// ---- Stage C Step 10: site-level absence alerts ----
+
+export interface SiteAbsenceAlertEmployee {
+  employeeId: string;
+  fullName: string;
+}
+
+export interface SiteAbsenceAlert {
+  id: string;
+  site: string;
+  alertDate: string;
+  status: 'open' | 'closed';
+  absentCountAtCreation: number;
+  currentAbsentCount: number;
+  affectedEmployees: SiteAbsenceAlertEmployee[];
+  createdAt: string;
+  closedBy: string | null;
+  closedAt: string | null;
+  closedNote: string | null;
+}
+
+interface SiteAbsenceAlertRpcRow {
+  id: string;
+  site: string;
+  alert_date: string;
+  status: 'open' | 'closed';
+  absent_count_at_creation: number;
+  current_absent_count: number;
+  affected_employees: Array<{ employee_id: string; full_name: string }> | null;
+  created_at: string;
+  closed_by: string | null;
+  closed_at: string | null;
+  closed_note: string | null;
+}
+
+function mapSiteAbsenceAlertRow(row: SiteAbsenceAlertRpcRow): SiteAbsenceAlert {
+  return {
+    id: row.id,
+    site: row.site,
+    alertDate: row.alert_date,
+    status: row.status,
+    absentCountAtCreation: row.absent_count_at_creation,
+    currentAbsentCount: row.current_absent_count,
+    affectedEmployees: (row.affected_employees || []).map((e) => ({ employeeId: e.employee_id, fullName: e.full_name })),
+    createdAt: row.created_at,
+    closedBy: row.closed_by,
+    closedAt: row.closed_at,
+    closedNote: row.closed_note,
+  };
+}
+
+/**
+ * Automatically-created alerts for 5+ employees Absent at the same
+ * SCHEDULED site on the same date (attendance_site_absence_alerts,
+ * populated by a database trigger on attendance -- never created from
+ * this client). current_absent_count/affected_employees are recomputed
+ * LIVE against today's attendance, so a later manual correction that
+ * drops the count below 5 is reflected here without deleting the
+ * alert's own audit record (created_at/absent_count_at_creation never
+ * change). Pass status to filter ('open' | 'closed'); omit for both.
+ */
+export async function fetchSiteAbsenceAlerts(status?: 'open' | 'closed'): Promise<SiteAbsenceAlert[]> {
+  const { data, error } = await supabase.rpc('attendance_site_absence_alerts_list', { p_status: status ?? null });
+  if (error) throw error;
+  return ((data || []) as SiteAbsenceAlertRpcRow[]).map(mapSiteAbsenceAlertRow);
+}
+
+/**
+ * Acknowledges (closes) a site absence alert with a required note. Never
+ * modifies attendance -- only the alert row's own status/closed_* columns.
+ * Idempotent: acknowledging an already-closed alert returns it unchanged
+ * rather than erroring.
+ */
+export async function acknowledgeSiteAlert(alertId: string, note: string): Promise<SiteAbsenceAlert> {
+  const { data, error } = await supabase.rpc('attendance_site_alert_acknowledge', { p_alert_id: alertId, p_note: note });
+  if (error) throw error;
+  return mapSiteAbsenceAlertRow(data as SiteAbsenceAlertRpcRow);
+}
+
 export type ProcessImportBatchOutcome = 'success' | 'unauthorized' | 'missing_rpc' | 'network_error' | 'unexpected_response';
 
 export interface ProcessImportBatchResult {
