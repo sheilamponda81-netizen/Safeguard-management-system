@@ -1,19 +1,32 @@
 // HikCentral Attendance MVP -- Phase 1 import, extended in Stage C Step 8
-// with automatic attendance calculation and write-through.
+// with automatic attendance calculation and write-through, and in Stage C
+// Step 11 to the centralized-terminal model.
 //
 // Select a file, parse it locally, show a validation/preview summary,
 // then -- if the caller has permission -- import the raw events AND
 // (same action, same click) automatically calculate and apply
 // Present/Late/Absent to the official Monthly Register for the declared
-// processing scope (period + workstations). There is no separate
-// confirmation screen for this normal import flow; see
-// attendanceImportAutoApplyService.ts for the write-through RPC this
-// calls and supabase/migrations/20261016000000_attendance_import_auto_apply.sql
+// processing scope (period + the file's own detected access points).
+// There is no separate confirmation screen for this normal import flow;
+// see attendanceImportAutoApplyService.ts for the write-through RPC this
+// calls and supabase/migrations/20261018000000_hikcentral_centralized_terminal_model.sql
 // for its safety guarantees (tenant/region scope, manual-correction
-// precedence, approved-payroll protection, idempotent reprocessing).
-// This page has no person-mapping UI (the schema/RPC already support
-// Phase 2 mapping without redesign; a mapping screen is a separate,
-// existing page).
+// precedence, approved-payroll protection, idempotent reprocessing,
+// per-employee terminal-coverage gating of Absent).
+//
+// Stage C Step 11: Safeguard has many employee workstations but only a
+// handful of centrally located HikCentral terminals -- guards from many
+// workstations travel to ONE central terminal to clock in/out. Requiring
+// an administrator to select employee workstations for a normal import
+// was therefore backwards: this page no longer shows a workstation
+// checklist at all. It instead shows the access points the file itself
+// declares were used, and requires an explicit confirmation that this
+// declared period is this export's complete coverage for those access
+// points. Which employees can actually become Absent is now governed
+// entirely by each employee's own assigned-terminal(s) (configured on the
+// Person Mapping page, employee_hikcentral_terminals) intersected with
+// these declared access points -- never by employees.workstation, which
+// remains reserved for HR/payroll and site-level absence alerts.
 import { useState, useCallback, useEffect } from 'react';
 import { Upload, FileSpreadsheet, AlertCircle, CheckCircle2, Fingerprint } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, EmptyState } from '../components/ui';
@@ -27,10 +40,16 @@ import {
 } from '../utils/hikcentralExcelParser';
 import { importHikCentralRawEvents, computeFileFingerprint, HikCentralImportResult } from '../utils/hikcentralImportService';
 import {
-  fetchDistinctWorkstations, processHikCentralImportBatch, isoToBlantyreDateStr,
+  processHikCentralImportBatch, isoToBlantyreDateStr,
   ProcessImportBatchResult, fetchCoverageTimeline, CoverageTimelineEntry,
   fetchSiteAbsenceAlerts, acknowledgeSiteAlert, SiteAbsenceAlert,
 } from '../utils/attendanceImportAutoApplyService';
+import { fetchActiveHikCentralPersonMappings } from '../utils/hikcentralPersonMappingService';
+
+interface PersonCoverageCounts {
+  mapped: number;
+  unmapped: number;
+}
 
 export default function HikCentralImportPage() {
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
@@ -44,28 +63,38 @@ export default function HikCentralImportPage() {
   const [summary, setSummary] = useState<HikCentralImportSummary | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
 
+  // Stage C Step 11: mapped/unmapped PERSON counts for this file -- how
+  // many of the distinct Person Nos. found in THIS export already have an
+  // active HikCentral person mapping (and are therefore eligible for
+  // automatic processing at all), vs. how many do not yet (and will be
+  // skipped until mapped on the Person Mapping page). Purely informational;
+  // computed client-side from already-fetched data, no new RPC.
+  const [personCounts, setPersonCounts] = useState<PersonCoverageCounts | null>(null);
+
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<HikCentralImportResult | null>(null);
   const [autoApplyResult, setAutoApplyResult] = useState<ProcessImportBatchResult | null>(null);
 
-  // Declared processing scope -- what period and which workstations this
-  // export covers. Asked for ONCE, on this same upload screen, as part of
-  // the one "Import Raw Events" action: these feed both the durable
-  // fingerprint coverage confirmation and the automatic P/L/A (now
-  // including a genuinely-confirmed Absent) write-through that runs
-  // immediately after a successful import -- see
-  // attendanceImportAutoApplyService.ts. This is not a second manual
-  // confirmation step; it is metadata about the file the administrator is
-  // already uploading.
-  const [workstationOptions, setWorkstationOptions] = useState<string[]>([]);
-  const [selectedWorkstations, setSelectedWorkstations] = useState<string[]>([]);
+  // Declared processing scope -- what period this export covers. Asked
+  // for ONCE, on this same upload screen, as part of the one "Import Raw
+  // Events" action: this feeds both the durable fingerprint coverage
+  // confirmation and the automatic P/L/A (including a genuinely-confirmed
+  // Absent) write-through that runs immediately after a successful import
+  // -- see attendanceImportAutoApplyService.ts. This is not a second
+  // manual confirmation step; it is metadata about the file the
+  // administrator is already uploading. The access points this scope
+  // applies to are never separately chosen here -- they are exactly what
+  // the file itself declares (summary.accessPoints), shown below for
+  // confirmation only.
   const [periodFrom, setPeriodFrom] = useState('');
   const [periodTo, setPeriodTo] = useState('');
   // Stage C Step 10: an explicit, separate affirmation -- distinct from
   // merely having picked a period above -- that the operator is declaring
   // this as the export's actual complete coverage, not just echoing the
   // file's own first/last recorded timestamps. Required to enable import;
-  // reset for every new file so it can never silently carry over.
+  // reset for every new file so it can never silently carry over. Stage C
+  // Step 11: its label now names the detected access points, since those
+  // (not a chosen workstation list) are what "complete coverage" means.
   const [confirmCoverageAccurate, setConfirmCoverageAccurate] = useState(false);
 
   // Stage C Step 10: batch continuity -- per-workstation/access-point
@@ -101,11 +130,6 @@ export default function HikCentralImportPage() {
       setCanImport(await hasPermission(PERMISSIONS.ATTENDANCE_IMPORT_HIKCENTRAL));
       setCanManageSiteAlerts(await hasPermission(PERMISSIONS.ATTENDANCE_MANAGE_SITE_ALERTS));
       setPermissionsLoaded(true);
-      try {
-        setWorkstationOptions(await fetchDistinctWorkstations());
-      } catch {
-        setWorkstationOptions([]);
-      }
       await reloadCoverageTimeline();
       await reloadSiteAlerts();
     })();
@@ -135,7 +159,7 @@ export default function HikCentralImportPage() {
     setFileError(null);
     setImportResult(null);
     setAutoApplyResult(null);
-    setSelectedWorkstations([]);
+    setPersonCounts(null);
     setPeriodFrom('');
     setPeriodTo('');
     setConfirmCoverageAccurate(false);
@@ -158,6 +182,22 @@ export default function HikCentralImportPage() {
         setPeriodFrom(isoToBlantyreDateStr(fileSummary.dateRange.earliest));
         setPeriodTo(isoToBlantyreDateStr(fileSummary.dateRange.latest));
       }
+      // Stage C Step 11: mapped/unmapped person counts for this file,
+      // computed client-side from the already-fetched active mappings --
+      // no new RPC needed for this display.
+      try {
+        const distinctPersonNos = new Set<string>();
+        result.rows.forEach((r) => {
+          if (r.hikcentralPersonNo) distinctPersonNos.add(r.hikcentralPersonNo);
+        });
+        const activeMappings = await fetchActiveHikCentralPersonMappings();
+        const mappedPersonNos = new Set(activeMappings.map((m) => m.hikcentralPersonNo));
+        let mapped = 0;
+        distinctPersonNos.forEach((p) => { if (mappedPersonNos.has(p)) mapped += 1; });
+        setPersonCounts({ mapped, unmapped: distinctPersonNos.size - mapped });
+      } catch {
+        setPersonCounts(null);
+      }
     } catch (err) {
       setFileError(err instanceof HikCentralFileError ? err.message : 'Could not read this file. Please confirm it is a valid .xlsx HikCentral export.');
     } finally {
@@ -165,14 +205,10 @@ export default function HikCentralImportPage() {
     }
   }, [resetForNewFile]);
 
-  const canProcessScope = selectedWorkstations.length > 0 && !!periodFrom && !!periodTo && periodFrom <= periodTo && confirmCoverageAccurate;
-
-  const toggleWorkstation = useCallback((ws: string) => {
-    setSelectedWorkstations((prev) => (prev.includes(ws) ? prev.filter((w) => w !== ws) : [...prev, ws]));
-  }, []);
+  const canProcessScope = !!summary && summary.accessPoints.length > 0 && !!periodFrom && !!periodTo && periodFrom <= periodTo && confirmCoverageAccurate;
 
   const handleImport = useCallback(async () => {
-    if (!parseResult || !selectedFile || !userProfile || !canProcessScope) return;
+    if (!parseResult || !selectedFile || !userProfile || !canProcessScope || !summary) return;
     setImporting(true);
     try {
       const fileFingerprint = await computeFileFingerprint(selectedFile);
@@ -189,19 +225,19 @@ export default function HikCentralImportPage() {
       // already succeeded is a separate, already-committed fact; if THIS
       // step fails, that is surfaced distinctly below, never folded into a
       // blanket "success" banner.
+      //
+      // Stage C Step 11: accessPoints -- the file's own detected access
+      // points -- is now the primary, required declaration. There is no
+      // workstation selection to pass; which employees can become Absent
+      // is gated by each employee's own assigned terminal(s), not by any
+      // list chosen here.
       const autoApply = await processHikCentralImportBatch({
         importBatchId: result.batchId,
-        workstations: selectedWorkstations,
         periodFromDate: periodFrom,
         periodToDate: periodTo,
         dateFrom: periodFrom,
         dateTo: periodTo,
-        // Stage C Step 8B: the file's own observed HikCentral access
-        // points -- already parsed, no new input needed from the admin --
-        // so a mapped employee who badged in at one of these, even if it
-        // differs from their stored home workstation (a transfer between
-        // sites), is still recognized for automatic processing.
-        accessPoints: summary?.accessPoints,
+        accessPoints: summary.accessPoints,
       });
       setAutoApplyResult(autoApply);
 
@@ -222,7 +258,7 @@ export default function HikCentralImportPage() {
     } finally {
       setImporting(false);
     }
-  }, [parseResult, selectedFile, userProfile, canProcessScope, selectedWorkstations, periodFrom, periodTo, summary, reloadCoverageTimeline, reloadSiteAlerts]);
+  }, [parseResult, selectedFile, userProfile, canProcessScope, summary, periodFrom, periodTo, reloadCoverageTimeline, reloadSiteAlerts]);
 
   const [retrying, setRetrying] = useState(false);
 
@@ -234,17 +270,16 @@ export default function HikCentralImportPage() {
   // guard), and re-declaring the identical coverage reuses the existing
   // confirmation rather than duplicating it.
   const handleRetryAutoApply = useCallback(async () => {
-    if (!importResult?.batchId) return;
+    if (!importResult?.batchId || !summary) return;
     setRetrying(true);
     try {
       const autoApply = await processHikCentralImportBatch({
         importBatchId: importResult.batchId,
-        workstations: selectedWorkstations,
         periodFromDate: periodFrom,
         periodToDate: periodTo,
         dateFrom: periodFrom,
         dateTo: periodTo,
-        accessPoints: summary?.accessPoints,
+        accessPoints: summary.accessPoints,
       });
       setAutoApplyResult(autoApply);
       if (autoApply.success) {
@@ -257,7 +292,7 @@ export default function HikCentralImportPage() {
     } finally {
       setRetrying(false);
     }
-  }, [importResult, selectedWorkstations, periodFrom, periodTo, summary, reloadCoverageTimeline, reloadSiteAlerts]);
+  }, [importResult, summary, periodFrom, periodTo, reloadCoverageTimeline, reloadSiteAlerts]);
 
   if (!permissionsLoaded) {
     return <div className="p-8 text-center text-slate-400">Loading...</div>;
@@ -267,7 +302,7 @@ export default function HikCentralImportPage() {
     <div className="space-y-6">
       <PageHeader
         title="HikCentral Attendance Import"
-        subtitle="Upload a HikCentral fingerprint export to preview, import, and automatically apply attendance for the declared period and workstations."
+        subtitle="Upload a HikCentral fingerprint export to preview, import, and automatically apply attendance for the declared period and detected access points."
       />
 
       {!canImport && (
@@ -410,17 +445,23 @@ export default function HikCentralImportPage() {
               <SummaryStat label="Without Person No." value={summary.withoutPersonNoCount} accent="amber" />
               <SummaryStat label="Unique Person Nos" value={summary.uniquePersonNoCount} />
               <SummaryStat label="Row Errors" value={summary.rowErrorCount} accent={summary.rowErrorCount > 0 ? 'red' : undefined} />
-              <SummaryStat label="Access Points" value={summary.accessPoints.length} />
+              <SummaryStat label="Detected Access Points" value={summary.accessPoints.length} />
             </div>
+            {personCounts && (
+              <div className="grid grid-cols-2 gap-4 mt-4">
+                <SummaryStat label="Mapped Persons" value={personCounts.mapped} accent="green" />
+                <SummaryStat label="Unmapped Persons" value={personCounts.unmapped} accent={personCounts.unmapped > 0 ? 'amber' : undefined} />
+              </div>
+            )}
+            {personCounts && personCounts.unmapped > 0 && (
+              <p className="text-xs text-amber-600 mt-2">
+                {personCounts.unmapped} person(s) in this file have no active mapping yet and will be skipped by automatic processing until mapped on the Person Mapping page.
+              </p>
+            )}
             {summary.dateRange && (
               <p className="text-xs text-slate-500 mt-4">
                 Date range: {new Date(summary.dateRange.earliest).toLocaleString()} &ndash; {new Date(summary.dateRange.latest).toLocaleString()}
               </p>
-            )}
-            {summary.accessPoints.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-2">
-                {summary.accessPoints.map((ap) => <Badge key={ap} color="gray">{ap}</Badge>)}
-              </div>
             )}
             <p className="text-xs text-slate-400 mt-4">
               This is a preview only. No attendance has been changed, and no data has been saved yet.
@@ -444,8 +485,18 @@ export default function HikCentralImportPage() {
               <div>
                 <p className="text-sm font-medium text-slate-800">Attendance processing scope</p>
                 <p className="text-xs text-slate-500 mt-1">
-                  What period does this export cover, and which workstation(s) is it from? Both are used immediately after import to automatically calculate and apply Present/Late/Absent to the official Monthly Register for the matching employees -- no separate confirmation step.
+                  Safeguard reads which access points this export used directly from the file -- there is nothing to select. What period does this export cover for those access points? This is used immediately after import to automatically calculate and apply Present/Late/Absent to the official Monthly Register for the matching employees -- no separate confirmation step.
                 </p>
+              </div>
+              <div>
+                <p className="text-xs font-medium text-slate-600 mb-2">Detected access point(s) in this file</p>
+                {summary.accessPoints.length === 0 ? (
+                  <p className="text-xs text-red-600">No access point was found in this file -- import cannot be processed for attendance until the export includes one.</p>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {summary.accessPoints.map((ap) => <Badge key={ap} color="gray">{ap}</Badge>)}
+                  </div>
+                )}
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <label className="text-xs text-slate-600 space-y-1">
@@ -470,28 +521,6 @@ export default function HikCentralImportPage() {
               {periodFrom && periodTo && periodFrom > periodTo && (
                 <p className="text-xs text-red-600">Period start must be on or before period end.</p>
               )}
-              <div>
-                <p className="text-xs font-medium text-slate-600 mb-2">Workstation(s) this export covers</p>
-                {workstationOptions.length === 0 ? (
-                  <p className="text-xs text-slate-400">No employee workstations found.</p>
-                ) : (
-                  <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto">
-                    {workstationOptions.map((ws) => (
-                      <label key={ws} className="flex items-center gap-1.5 text-xs bg-slate-50 border border-slate-200 rounded-full px-3 py-1 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={selectedWorkstations.includes(ws)}
-                          onChange={() => toggleWorkstation(ws)}
-                        />
-                        {ws}
-                      </label>
-                    ))}
-                  </div>
-                )}
-                {selectedWorkstations.length === 0 && (
-                  <p className="text-xs text-amber-600 mt-2">Select at least one workstation to enable import.</p>
-                )}
-              </div>
               <label className="flex items-start gap-2 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-3 cursor-pointer">
                 <input
                   type="checkbox"
@@ -500,7 +529,7 @@ export default function HikCentralImportPage() {
                   onChange={(e) => setConfirmCoverageAccurate(e.target.checked)}
                 />
                 <span>
-                  I confirm the period selected above is this export&apos;s actual, complete coverage for the selected workstation(s) -- not merely the first/last fingerprint timestamps found in the file.
+                  I confirm the period selected above is this export&apos;s actual, complete coverage for the detected access point(s) above -- not merely the first/last fingerprint timestamps found in the file.
                 </span>
               </label>
               <div className="flex items-center justify-between pt-2 border-t border-slate-100">
@@ -561,6 +590,19 @@ export default function HikCentralImportPage() {
                       <p className="text-xs text-emerald-600 mt-2">
                         Skipped covers Off/Unassigned/Pending days, manually-corrected or approved-payroll-protected records, and anything already up to date -- these are never overwritten automatically.
                       </p>
+                      {autoApplyResult.needsTerminalConfiguration && autoApplyResult.needsTerminalConfiguration.length > 0 && (
+                        <div className="mt-3 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-md p-3">
+                          <AlertCircle size={14} className="text-amber-600 shrink-0 mt-0.5" />
+                          <div>
+                            <p className="text-xs font-medium text-amber-800">
+                              {autoApplyResult.needsTerminalConfiguration.length} employee(s) need a HikCentral terminal assignment
+                            </p>
+                            <p className="text-xs text-amber-700 mt-1">
+                              These employees are mapped and in scope, but have no assigned HikCentral terminal yet, so they can never be marked Absent until one is configured on the Person Mapping page: {autoApplyResult.needsTerminalConfiguration.map((e) => e.fullName).join(', ')}.
+                            </p>
+                          </div>
+                        </div>
+                      )}
                     </>
                   ) : (
                     <>

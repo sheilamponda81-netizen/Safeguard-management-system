@@ -21,7 +21,7 @@ describe('processHikCentralImportBatch: network error', () => {
   it('never throws on a network error -- returns a discriminated failure instead', async () => {
     rpcMock.mockRejectedValue(new Error('network down'));
     const result = await processHikCentralImportBatch({
-      importBatchId: 'b1', workstations: ['Gate 1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
+      importBatchId: 'b1', accessPoints: ['Gate 1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
     });
     expect(result.success).toBe(false);
     expect(result.outcome).toBe('network_error');

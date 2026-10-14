@@ -73,6 +73,46 @@ export async function fetchDistinctWorkstations(): Promise<string[]> {
   return Array.from(values).sort();
 }
 
+// ---- Stage C Step 11: employee -> HikCentral terminal assignment ----
+
+/**
+ * Active employee_hikcentral_terminals rows, keyed by employee_id -- the
+ * expected terminal(s) each employee is genuinely associated with,
+ * completely independent of employees.workstation. An employee absent
+ * from this map has NO assigned terminal and can never resolve Absent
+ * (see the Step 11 migration's attendance_resolve_and_calculate header).
+ */
+export async function fetchEmployeeTerminalAssignments(): Promise<Map<string, string[]>> {
+  const { data, error } = await supabase
+    .from('employee_hikcentral_terminals')
+    .select('employee_id, access_point')
+    .eq('is_active', true);
+  if (error) throw error;
+  const byEmployee = new Map<string, string[]>();
+  (data || []).forEach((row: { employee_id: string; access_point: string }) => {
+    const existing = byEmployee.get(row.employee_id);
+    if (existing) existing.push(row.access_point);
+    else byEmployee.set(row.employee_id, [row.access_point]);
+  });
+  return byEmployee;
+}
+
+/**
+ * Sets one employee's COMPLETE desired set of assigned terminals in one
+ * call (an "approved terminal group" is simply this set) -- reconciles
+ * by revoking whatever's active-but-no-longer-declared and inserting
+ * whatever's newly declared. Never infers a terminal from a single
+ * observed fingerprint -- this is always an explicit administrator
+ * declaration.
+ */
+export async function setEmployeeHikCentralTerminals(employeeId: string, accessPoints: string[]): Promise<void> {
+  const { error } = await supabase.rpc('set_employee_hikcentral_terminals', {
+    p_employee_id: employeeId,
+    p_access_points: accessPoints,
+  });
+  if (error) throw error;
+}
+
 // ---- Stage C Step 10: batch continuity (coverage timeline / gaps) ----
 
 export interface CoverageTimelineEntry {
@@ -198,6 +238,11 @@ export async function acknowledgeSiteAlert(alertId: string, note: string): Promi
 
 export type ProcessImportBatchOutcome = 'success' | 'unauthorized' | 'missing_rpc' | 'network_error' | 'unexpected_response';
 
+export interface NeedsTerminalConfigurationEmployee {
+  employeeId: string;
+  fullName: string;
+}
+
 export interface ProcessImportBatchResult {
   success: boolean;
   outcome: ProcessImportBatchOutcome;
@@ -208,6 +253,14 @@ export interface ProcessImportBatchResult {
   unchangedCount?: number;
   skippedCount?: number;
   failedCount?: number;
+  /**
+   * Stage C Step 11: mapped, in-scope, rostered employees with NO active
+   * assigned HikCentral terminal -- they can never resolve Absent (see
+   * the migration's attendance_resolve_and_calculate header) and are
+   * surfaced here so an operator configures them, instead of the gap
+   * going unnoticed.
+   */
+  needsTerminalConfiguration?: NeedsTerminalConfigurationEmployee[];
 }
 
 interface ProcessImportBatchRpcResponse {
@@ -218,6 +271,7 @@ interface ProcessImportBatchRpcResponse {
   skipped_count: number;
   failed_count: number;
   rows: unknown[];
+  needs_terminal_configuration?: Array<{ employee_id: string; full_name: string }> | null;
 }
 
 function isProcessImportBatchRpcResponse(data: unknown): data is ProcessImportBatchRpcResponse {
@@ -233,43 +287,41 @@ function isProcessImportBatchRpcResponse(data: unknown): data is ProcessImportBa
  * Automatically records the declared coverage (idempotent -- reuses an
  * identical existing unrevoked confirmation rather than duplicating it)
  * and applies automatic attendance (now including a genuinely-confirmed
- * Absent) for every active employee at the declared workstations, over
- * the declared date range -- ONE call, immediately after a successful
- * import, no separate confirmation step.
+ * Absent) for every eligible employee over the declared date range --
+ * ONE call, immediately after a successful import, no separate
+ * confirmation step.
+ *
+ * Stage C Step 11: accessPoints is now the PRIMARY, required
+ * declaration -- Safeguard has many employee workstations but only a
+ * handful of centrally located HikCentral terminals, so requiring a
+ * workstation selection for a normal import was backwards. workstations
+ * is now optional, legacy, additive scope-inclusion only; it can never
+ * by itself make anyone Absent-eligible (that now flows exclusively
+ * through each employee's own assigned-terminal coverage -- see
+ * employee_hikcentral_terminals / set_employee_hikcentral_terminals).
  */
 export async function processHikCentralImportBatch(params: {
   importBatchId: string;
-  workstations: string[];
+  accessPoints: string[];
   periodFromDate: string;
   periodToDate: string;
   dateFrom: string;
   dateTo: string;
   notes?: string;
-  /**
-   * HikCentral's own access_point values this import's raw events were
-   * actually observed at (e.g. the parsed file's summary.accessPoints) --
-   * Stage C Step 8B correction. Independent of employees.workstation: an
-   * employee whose stored home workstation differs from the site they
-   * actually badged in at (a guard transferred between sites) is still
-   * recognized for automatic Present/Late, because their mapped identity
-   * is matched here by the authoritative access_point actually recorded
-   * by HikCentral, not by comparing against a free-text home-workstation
-   * field. Optional -- omitting it falls back to workstation-only scope
-   * (the pre-Step-8B behavior).
-   */
-  accessPoints?: string[];
+  /** Optional, legacy, additive scope-inclusion only -- see this function's header. */
+  workstations?: string[];
 }): Promise<ProcessImportBatchResult> {
   const { coversFromIso, coversThroughIso } = periodToCoverageWindow(params.periodFromDate, params.periodToDate);
   try {
     const { data, error } = await supabase.rpc('attendance_process_import_batch', {
       p_import_batch_id: params.importBatchId,
-      p_workstations: params.workstations,
+      p_access_points: params.accessPoints,
       p_covers_from: coversFromIso,
       p_covers_through: coversThroughIso,
       p_date_from: params.dateFrom,
       p_date_to: params.dateTo,
       p_notes: params.notes ?? null,
-      p_access_points: params.accessPoints && params.accessPoints.length > 0 ? params.accessPoints : null,
+      p_workstations: params.workstations && params.workstations.length > 0 ? params.workstations : null,
     });
 
     if (error) {
@@ -296,6 +348,7 @@ export async function processHikCentralImportBatch(params: {
       unchangedCount: data.unchanged_count,
       skippedCount: data.skipped_count,
       failedCount: data.failed_count,
+      needsTerminalConfiguration: (data.needs_terminal_configuration || []).map((e) => ({ employeeId: e.employee_id, fullName: e.full_name })),
     };
   } catch {
     return {

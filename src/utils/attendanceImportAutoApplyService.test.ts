@@ -22,6 +22,7 @@ vi.mock('../lib/supabase', () => ({
 const {
   periodToCoverageWindow, isoToBlantyreDateStr, fetchDistinctWorkstations, processHikCentralImportBatch,
   fetchCoverageTimeline, fetchSiteAbsenceAlerts, acknowledgeSiteAlert,
+  fetchEmployeeTerminalAssignments, setEmployeeHikCentralTerminals,
 } = await import('./attendanceImportAutoApplyService');
 
 describe('periodToCoverageWindow', () => {
@@ -78,17 +79,55 @@ describe('fetchDistinctWorkstations', () => {
   });
 });
 
+describe('Stage C Step 11: fetchEmployeeTerminalAssignments / setEmployeeHikCentralTerminals', () => {
+  beforeEach(() => { fromMock.mockReset(); rpcMock.mockReset(); });
+
+  it('groups active employee_hikcentral_terminals rows by employee_id', async () => {
+    fromMock.mockImplementationOnce(() => ({
+      select: () => ({ eq: () => Promise.resolve({
+        data: [
+          { employee_id: 'e1', access_point: 'GATE1' },
+          { employee_id: 'e1', access_point: 'GATE2' },
+          { employee_id: 'e2', access_point: 'GATE1' },
+        ],
+        error: null,
+      }) }),
+    }));
+    const result = await fetchEmployeeTerminalAssignments();
+    expect(result.get('e1')).toEqual(['GATE1', 'GATE2']);
+    expect(result.get('e2')).toEqual(['GATE1']);
+  });
+
+  it('fetchEmployeeTerminalAssignments propagates a query error rather than swallowing it', async () => {
+    fromMock.mockImplementationOnce(() => ({
+      select: () => ({ eq: () => Promise.resolve({ data: null, error: { message: 'boom' } }) }),
+    }));
+    await expect(fetchEmployeeTerminalAssignments()).rejects.toBeTruthy();
+  });
+
+  it('setEmployeeHikCentralTerminals calls the RPC with the employee id and desired access points', async () => {
+    rpcMock.mockResolvedValue({ data: { added_count: 1, revoked_count: 0, access_points: ['GATE1'] }, error: null });
+    await setEmployeeHikCentralTerminals('e1', ['GATE1']);
+    expect(rpcMock).toHaveBeenCalledWith('set_employee_hikcentral_terminals', { p_employee_id: 'e1', p_access_points: ['GATE1'] });
+  });
+
+  it('setEmployeeHikCentralTerminals throws rather than swallowing an RPC error', async () => {
+    rpcMock.mockResolvedValue({ data: null, error: { message: 'boom' } });
+    await expect(setEmployeeHikCentralTerminals('e1', ['GATE1'])).rejects.toBeTruthy();
+  });
+});
+
 describe('processHikCentralImportBatch', () => {
   beforeEach(() => rpcMock.mockReset());
 
-  it('calls attendance_process_import_batch with the converted coverage window and declared scope', async () => {
+  it('Stage C Step 11: calls attendance_process_import_batch with the converted coverage window and the required access points, no workstations supplied', async () => {
     rpcMock.mockResolvedValue({
-      data: { confirmation_id: 'c1', employee_count: 3, applied_count: 2, unchanged_count: 1, skipped_count: 0, failed_count: 0, rows: [] },
+      data: { confirmation_id: 'c1', employee_count: 3, applied_count: 2, unchanged_count: 1, skipped_count: 0, failed_count: 0, rows: [], needs_terminal_configuration: [] },
       error: null,
     });
     const result = await processHikCentralImportBatch({
       importBatchId: 'b1',
-      workstations: ['Gate 1'],
+      accessPoints: ['GATE1'],
       periodFromDate: '2026-10-01',
       periodToDate: '2026-10-04',
       dateFrom: '2026-10-01',
@@ -97,13 +136,13 @@ describe('processHikCentralImportBatch', () => {
 
     expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', {
       p_import_batch_id: 'b1',
-      p_workstations: ['Gate 1'],
+      p_access_points: ['GATE1'],
       p_covers_from: '2026-09-30T22:00:00.000Z',
       p_covers_through: '2026-10-04T21:59:00.000Z',
       p_date_from: '2026-10-01',
       p_date_to: '2026-10-04',
       p_notes: null,
-      p_access_points: null,
+      p_workstations: null,
     });
     expect(result).toEqual({
       success: true,
@@ -114,41 +153,57 @@ describe('processHikCentralImportBatch', () => {
       unchangedCount: 1,
       skippedCount: 0,
       failedCount: 0,
+      needsTerminalConfiguration: [],
     });
   });
 
-  it('Stage C Step 8B: passes the observed access points through to p_access_points when supplied', async () => {
+  it('Stage C Step 11: workstations remain optional, legacy, additive-only -- passed through verbatim when supplied', async () => {
     rpcMock.mockResolvedValue({
       data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
       error: null,
     });
     await processHikCentralImportBatch({
-      importBatchId: 'b1', workstations: ['Gate 1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
-      accessPoints: ['GATE1', 'LIMBE-MAIN'],
+      importBatchId: 'b1', accessPoints: ['GATE1', 'LIMBE-MAIN'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
+      workstations: ['Gate 1'],
     });
     expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
       p_access_points: ['GATE1', 'LIMBE-MAIN'],
+      p_workstations: ['Gate 1'],
     }));
   });
 
-  it('Stage C Step 8B: an empty accessPoints array is sent as null, not an empty array (no accidental all-exclude/all-include ambiguity)', async () => {
+  it('Stage C Step 11: an empty workstations array is sent as null, not an empty array (no accidental all-exclude/all-include ambiguity)', async () => {
     rpcMock.mockResolvedValue({
       data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
       error: null,
     });
     await processHikCentralImportBatch({
-      importBatchId: 'b1', workstations: ['Gate 1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
-      accessPoints: [],
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
+      workstations: [],
     });
     expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
-      p_access_points: null,
+      p_workstations: null,
     }));
+  });
+
+  it('Stage C Step 11: maps needs_terminal_configuration from the RPC response to camelCase, defaulting to an empty array', async () => {
+    rpcMock.mockResolvedValue({
+      data: {
+        confirmation_id: 'c1', employee_count: 2, applied_count: 1, unchanged_count: 0, skipped_count: 1, failed_count: 0, rows: [],
+        needs_terminal_configuration: [{ employee_id: 'e1', full_name: 'Jane Doe' }],
+      },
+      error: null,
+    });
+    const result = await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
+    });
+    expect(result.needsTerminalConfiguration).toEqual([{ employeeId: 'e1', fullName: 'Jane Doe' }]);
   });
 
   it('reports a distinct missing_rpc outcome when the migration is not yet applied', async () => {
     rpcMock.mockResolvedValue({ data: null, error: { code: 'PGRST202', message: 'not found' } });
     const result = await processHikCentralImportBatch({
-      importBatchId: 'b1', workstations: ['Gate 1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
     });
     expect(result).toEqual({ success: false, outcome: 'missing_rpc', error: expect.any(String) });
   });
@@ -156,7 +211,7 @@ describe('processHikCentralImportBatch', () => {
   it('reports a distinct unauthorized outcome for any other RPC error, never throwing', async () => {
     rpcMock.mockResolvedValue({ data: null, error: { code: '42501', message: 'Not authorized to confirm fingerprint coverage' } });
     const result = await processHikCentralImportBatch({
-      importBatchId: 'b1', workstations: ['Gate 1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
     });
     expect(result.success).toBe(false);
     expect(result.outcome).toBe('unauthorized');

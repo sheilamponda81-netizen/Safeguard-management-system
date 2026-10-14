@@ -13,7 +13,7 @@ const source = fs.readFileSync(path.resolve(__dirname, './HikCentralImport.tsx')
 
 describe('HikCentralImport: importing automatically calculates and applies attendance, no second button', () => {
   it('imports processHikCentralImportBatch from the new auto-apply service', () => {
-    expect(source).toMatch(/import \{\s*\n?\s*fetchDistinctWorkstations, processHikCentralImportBatch, isoToBlantyreDateStr,/);
+    expect(source).toMatch(/import \{\s*\n?\s*processHikCentralImportBatch, isoToBlantyreDateStr,/);
   });
 
   it('handleImport calls processHikCentralImportBatch immediately after a successful raw-event import, inside the same handler', () => {
@@ -27,11 +27,11 @@ describe('HikCentralImport: importing automatically calculates and applies atten
     expect(body.indexOf('importHikCentralRawEvents(')).toBeLessThan(body.indexOf('processHikCentralImportBatch({'));
   });
 
-  it('Stage C Step 8B: both processHikCentralImportBatch call sites pass the file\'s own parsed access points, not just employees.workstation', () => {
+  it('Stage C Step 8B/11: both processHikCentralImportBatch call sites pass the file\'s own detected access points as the required scope, not employees.workstation', () => {
     const calls = source.match(/processHikCentralImportBatch\(\{[\s\S]*?\}\);/g) || [];
     expect(calls.length).toBe(2);
     for (const call of calls) {
-      expect(call).toMatch(/accessPoints: summary\?\.accessPoints/);
+      expect(call).toMatch(/accessPoints: summary\.accessPoints/);
     }
   });
 
@@ -46,16 +46,24 @@ describe('HikCentralImport: importing automatically calculates and applies atten
     expect(source).toMatch(/Import Raw Events/);
   });
 
-  it('the Import button is gated on a declared processing scope (period + at least one workstation) as well as the existing summary checks', () => {
+  it('the Import button is gated on a declared processing scope (detected access points + period) as well as the existing summary checks', () => {
     const btnMatch = source.match(/<Button onClick=\{handleImport\} disabled=\{[^}]*\}>/);
     expect(btnMatch, 'expected to find the Import Raw Events button').toBeTruthy();
     expect(btnMatch![0]).toMatch(/!canProcessScope/);
   });
 
-  it('canProcessScope requires at least one selected workstation and a valid (start <= end) period', () => {
+  it('Stage C Step 11: canProcessScope requires at least one DETECTED access point (not a chosen workstation) and a valid (start <= end) period', () => {
     const def = source.match(/const canProcessScope =[^;]*;/)?.[0] ?? '';
-    expect(def).toMatch(/selectedWorkstations\.length > 0/);
+    expect(def).toMatch(/summary\.accessPoints\.length > 0/);
     expect(def).toMatch(/periodFrom <= periodTo/);
+    expect(def).not.toMatch(/selectedWorkstations/);
+  });
+
+  it('Stage C Step 11: there is no workstation checkbox selection anywhere in this page', () => {
+    expect(source).not.toMatch(/selectedWorkstations/);
+    expect(source).not.toMatch(/toggleWorkstation/);
+    expect(source).not.toMatch(/workstationOptions/);
+    expect(source).not.toMatch(/fetchDistinctWorkstations/);
   });
 
   it('shows a distinct failure state when raw import succeeds but automatic processing fails -- never folded into one blanket success banner', () => {
@@ -156,5 +164,34 @@ describe('Stage C Step 10A: a zero-net-new-event reimport still runs automatic a
   it('the success banner reports insertedCount honestly (e.g. 0) without ever skipping the auto-apply summary', () => {
     const importHandler = source.match(/const handleImport = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
     expect(importHandler).toMatch(/Imported \$\{result\.insertedCount\} new raw event\(s\)\. Applied \$\{autoApply\.appliedCount\}/);
+  });
+});
+
+describe('Stage C Step 11: centralized HikCentral terminal model -- simplified import UI', () => {
+  it('shows a concise detected-access-points display instead of a workstation checklist', () => {
+    expect(source).toMatch(/Detected access point\(s\) in this file/);
+    expect(source).toMatch(/summary\.accessPoints\.map\(\(ap\) => <Badge key=\{ap\}/);
+  });
+
+  it('computes and displays mapped/unmapped person counts for the file, from existing active mappings only (no new RPC)', () => {
+    expect(source).toMatch(/import \{ fetchActiveHikCentralPersonMappings \} from '\.\.\/utils\/hikcentralPersonMappingService';/);
+    expect(source).toMatch(/label="Mapped Persons"/);
+    expect(source).toMatch(/label="Unmapped Persons"/);
+    const handler = source.match(/const handleFileSelect = useCallback\(async \(file: File\) => \{[\s\S]*?\n {2}\}, \[resetForNewFile\]\);/)?.[0] ?? '';
+    expect(handler).toMatch(/fetchActiveHikCentralPersonMappings\(\)/);
+  });
+
+  it('resets personCounts for every new file, same as the other scope fields', () => {
+    const resetFn = source.match(/const resetForNewFile = useCallback\(\(\) => \{[\s\S]*?\}, \[\]\);/)?.[0] ?? '';
+    expect(resetFn).toMatch(/setPersonCounts\(null\)/);
+  });
+
+  it('surfaces employees needing a terminal assignment instead of silently never marking them Absent', () => {
+    expect(source).toMatch(/needsTerminalConfiguration/);
+    expect(source).toMatch(/need a HikCentral terminal assignment/);
+  });
+
+  it('the coverage-confirmation checkbox label now refers to detected access points, not a chosen workstation list', () => {
+    expect(source).toMatch(/complete coverage for the detected access point\(s\) above/);
   });
 });

@@ -23,6 +23,9 @@ import {
   fetchAllEmployeesById, fetchActiveHikCentralPersonMappings, fetchProfileFullNamesById,
   confirmHikCentralPersonMappings, MappingConfirmationInput,
 } from '../utils/hikcentralPersonMappingService';
+import {
+  fetchEmployeeTerminalAssignments, setEmployeeHikCentralTerminals,
+} from '../utils/attendanceImportAutoApplyService';
 
 type TabId = 'exact' | 'needs_review' | 'mapped' | 'conflict';
 
@@ -44,6 +47,18 @@ export default function HikCentralPersonMappingPage() {
   const [employeesById, setEmployeesById] = useState<Map<string, EmployeeLite>>(new Map());
   const [confirmerNamesById, setConfirmerNamesById] = useState<Map<string, string>>(new Map());
 
+  // Stage C Step 11: each mapped employee's own assigned HikCentral
+  // terminal(s) -- independent of employees.workstation, since Safeguard
+  // has many workstations but only a handful of central terminals.
+  // Loaded alongside everything else; an employee absent from this map
+  // has no assigned terminal and can never resolve Absent until one is
+  // configured here.
+  const [terminalAssignments, setTerminalAssignments] = useState<Map<string, string[]>>(new Map());
+  const [terminalModalFor, setTerminalModalFor] = useState<ClassifiedIdentity | null>(null);
+  const [terminalModalSelected, setTerminalModalSelected] = useState<Set<string>>(new Set());
+  const [terminalModalCustom, setTerminalModalCustom] = useState('');
+  const [savingTerminals, setSavingTerminals] = useState(false);
+
   const [activeTab, setActiveTab] = useState<TabId>('exact');
   const [selectedExact, setSelectedExact] = useState<Set<string>>(new Set());
   const [selectedStrongReview, setSelectedStrongReview] = useState<Set<string>>(new Set());
@@ -60,12 +75,13 @@ export default function HikCentralPersonMappingPage() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [rows, anonCount, active, allById, mappings] = await Promise.all([
+      const [rows, anonCount, active, allById, mappings, terminals] = await Promise.all([
         fetchIdentifiedRawEvents(),
         fetchAnonymousEventCount(),
         fetchActiveNonDeletedEmployees(),
         fetchAllEmployeesById(),
         fetchActiveHikCentralPersonMappings(),
+        fetchEmployeeTerminalAssignments().catch(() => new Map<string, string[]>()),
       ]);
       const profiles = profileHikCentralIdentities(rows);
       const classified = classifyHikCentralIdentities(profiles, active, mappings);
@@ -73,6 +89,7 @@ export default function HikCentralPersonMappingPage() {
       setAnonymousCount(anonCount);
       setActiveEmployees(active);
       setEmployeesById(allById);
+      setTerminalAssignments(terminals);
 
       const confirmerIds = mappings.map((m) => m.confirmedBy).filter((id): id is string => !!id);
       setConfirmerNamesById(await fetchProfileFullNamesById(confirmerIds));
@@ -250,6 +267,58 @@ export default function HikCentralPersonMappingPage() {
     },
     [confirmOne]
   );
+
+  // Stage C Step 11: opens the compact terminal-assignment modal for one
+  // mapped identity, pre-populated with whatever is currently assigned
+  // (even if it no longer appears among this identity's own observed
+  // access points -- e.g. a terminal that has since gone quiet -- so an
+  // existing assignment is never silently dropped just by opening this).
+  const openTerminalModal = useCallback((identity: ClassifiedIdentity) => {
+    const employeeId = identity.activeMapping?.employeeId;
+    const current = employeeId ? terminalAssignments.get(employeeId) || [] : [];
+    setTerminalModalFor(identity);
+    setTerminalModalSelected(new Set(current));
+    setTerminalModalCustom('');
+  }, [terminalAssignments]);
+
+  const terminalModalCandidates = useMemo(() => {
+    if (!terminalModalFor) return [];
+    const employeeId = terminalModalFor.activeMapping?.employeeId;
+    const current = employeeId ? terminalAssignments.get(employeeId) || [] : [];
+    return Array.from(new Set([...terminalModalFor.profile.accessPoints, ...current])).sort();
+  }, [terminalModalFor, terminalAssignments]);
+
+  const toggleTerminalCandidate = useCallback((ap: string) => {
+    setTerminalModalSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(ap)) next.delete(ap);
+      else next.add(ap);
+      return next;
+    });
+  }, []);
+
+  const handleAddCustomTerminal = useCallback(() => {
+    const ap = terminalModalCustom.trim();
+    if (!ap) return;
+    setTerminalModalSelected((prev) => new Set(prev).add(ap));
+    setTerminalModalCustom('');
+  }, [terminalModalCustom]);
+
+  const handleSaveTerminals = useCallback(async () => {
+    const employeeId = terminalModalFor?.activeMapping?.employeeId;
+    if (!employeeId) return;
+    setSavingTerminals(true);
+    try {
+      await setEmployeeHikCentralTerminals(employeeId, Array.from(terminalModalSelected));
+      showNotification('Terminal assignment updated.', 'success');
+      setTerminalModalFor(null);
+      await loadData();
+    } catch (err) {
+      showNotification(err instanceof Error ? err.message : 'Could not update terminal assignment.', 'error');
+    } finally {
+      setSavingTerminals(false);
+    }
+  }, [terminalModalFor, terminalModalSelected, loadData]);
 
   const pickerResults = useMemo(() => {
     const q = pickerQuery.trim().toLowerCase();
@@ -490,12 +559,14 @@ export default function HikCentralPersonMappingPage() {
                 <TH>Match Method</TH>
                 <TH>Confirmed</TH>
                 <TH>Confirmed By</TH>
+                <TH>HikCentral Terminal(s)</TH>
                 {canMap && <TH>Action</TH>}
               </TR>
             </THead>
             <TBody>
               {mapped.map((i) => {
                 const driftWarning = mappedIdentityHasNameDrift(i.profile);
+                const assignedTerminals = terminalAssignments.get(i.activeMapping!.employeeId) || [];
                 return (
                   <TR key={i.profile.hikcentralPersonNo}>
                     <TD className="font-mono">{i.profile.hikcentralPersonNo}</TD>
@@ -512,8 +583,20 @@ export default function HikCentralPersonMappingPage() {
                     <TD><Badge color="gray">{i.activeMapping!.matchMethod}</Badge></TD>
                     <TD>{i.activeMapping!.confirmedAt ? new Date(i.activeMapping!.confirmedAt as string).toLocaleDateString() : '—'}</TD>
                     <TD>{(i.activeMapping!.confirmedBy && confirmerNamesById.get(i.activeMapping!.confirmedBy)) || '—'}</TD>
+                    <TD>
+                      {assignedTerminals.length > 0 ? (
+                        <div className="flex flex-wrap gap-1">
+                          {assignedTerminals.map((ap) => <Badge key={ap} color="blue">{ap}</Badge>)}
+                        </div>
+                      ) : (
+                        <Badge color="orange">Not configured</Badge>
+                      )}
+                    </TD>
                     {canMap && (
-                      <TD>
+                      <TD className="space-x-2 whitespace-nowrap">
+                        <Button variant="outline" size="sm" onClick={() => openTerminalModal(i)}>
+                          Terminals
+                        </Button>
                         <Button variant="outline" size="sm" onClick={() => { setPickerFor(i.profile); setPickerIsRemap(true); setPickerQuery(''); }}>
                           Change
                         </Button>
@@ -596,6 +679,52 @@ export default function HikCentralPersonMappingPage() {
                 <span className="block text-xs text-slate-500">{e.employeeNumber} &middot; {e.workstation || '—'}</span>
               </button>
             ))}
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        open={!!terminalModalFor}
+        onClose={() => setTerminalModalFor(null)}
+        title={`Assign HikCentral terminal(s) for ${terminalModalFor ? displayName(terminalModalFor.profile) : ''}`}
+        size="md"
+      >
+        <div className="space-y-4">
+          <p className="text-xs text-slate-500">
+            The expected HikCentral terminal(s) this employee actually uses -- independent of their HR workstation. An employee with no terminal assigned here can never be marked Absent; one who uses more than one central terminal can be assigned all of them.
+          </p>
+          <div className="space-y-1.5">
+            {terminalModalCandidates.length === 0 && (
+              <p className="text-xs text-slate-400">No access point observed for this identity yet -- add one below.</p>
+            )}
+            {terminalModalCandidates.map((ap) => (
+              <label key={ap} className="flex items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={terminalModalSelected.has(ap)}
+                  onChange={() => toggleTerminalCandidate(ap)}
+                />
+                {ap}
+              </label>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              placeholder="Add another access point by name..."
+              value={terminalModalCustom}
+              onChange={(e) => setTerminalModalCustom(e.target.value)}
+            />
+            <Button variant="outline" size="sm" onClick={handleAddCustomTerminal} disabled={!terminalModalCustom.trim()}>
+              Add
+            </Button>
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+            <Button variant="outline" onClick={() => setTerminalModalFor(null)} disabled={savingTerminals}>
+              Cancel
+            </Button>
+            <Button onClick={handleSaveTerminals} disabled={savingTerminals}>
+              {savingTerminals ? 'Saving...' : 'Save'}
+            </Button>
           </div>
         </div>
       </Modal>
