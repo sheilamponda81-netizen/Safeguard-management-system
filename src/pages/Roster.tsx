@@ -22,9 +22,10 @@ import { showNotification } from '../utils/clickHandlers';
 import {
   resolveScheduleForDate, expandDateRange, addDays, WEEKDAY_LABELS,
   ResolvedSchedule,
-  resolveActiveOffWeekday, resolveActiveShiftType,
+  resolveActiveShiftType,
   buildTemporaryReschedulePlan, buildPermanentWeekdayTransitionPlan, explainRollingRestConflict,
-  TemporaryRescheduleWeekPlan, PermanentWeekdayTransitionPlan,
+  summarizeWeekSchedule, describeWeekOffDays, formatFriendlyWeekdayDate,
+  TemporaryRescheduleWeekPlan, PermanentWeekdayTransitionPlan, WeekScheduleSummary,
   AssignmentType, OffDayPatternRow, DateAssignmentRow, ShiftPatternRow,
 } from '../utils/rosterSchedule';
 import {
@@ -450,24 +451,18 @@ export default function RosterPage() {
   const [rescheduleIsPermanent, setRescheduleIsPermanent] = useState(false);
   const [rescheduleReason, setRescheduleReason] = useState('');
   const [rescheduleBridgeAcknowledged, setRescheduleBridgeAcknowledged] = useState(false);
+  // Stage C Step 12E: set only once the administrator has explicitly
+  // picked which Off day to reschedule, for the (uncommon) case where a
+  // week genuinely has more than one -- reset whenever the employee or
+  // selected week changes, so a stale pick from a DIFFERENT week can
+  // never silently carry over.
+  const [rescheduleMultiOffChoiceMade, setRescheduleMultiOffChoiceMade] = useState(false);
+  const [rescheduleWeekAssignments, setRescheduleWeekAssignments] = useState<DateAssignmentRow[]>([]);
 
   const rescheduleSelectedEmployee = useMemo(
     () => employees.find((e) => e.id === rescheduleEmployeeId) || null,
     [employees, rescheduleEmployeeId]
   );
-
-  // Auto-detect the employee's CURRENT recurring Off weekday and normal
-  // shift the moment they're selected, so Admin does not need to already
-  // know (or go look up) those facts -- still freely overridable below,
-  // e.g. to correct a data-entry mistake.
-  useEffect(() => {
-    if (!rescheduleEmployeeId) return;
-    const today = getBlantyreToday();
-    const detectedOff = resolveActiveOffWeekday(rescheduleEmployeeId, today, patterns);
-    if (detectedOff !== null) setRescheduleOriginalWeekday(String(detectedOff));
-    const detectedShift = resolveActiveShiftType(rescheduleEmployeeId, today, shiftPatterns);
-    if (detectedShift !== null) setRescheduleShift(detectedShift);
-  }, [rescheduleEmployeeId, patterns, shiftPatterns]);
 
   const MAX_TEMPORARY_RESCHEDULE_WEEKS = 52;
   const rescheduleDurationWeeks =
@@ -476,6 +471,69 @@ export default function RosterPage() {
   const rescheduleOriginalWeekdayNum = Number(rescheduleOriginalWeekday);
   const rescheduleNewWeekdayNum = Number(rescheduleNewWeekday);
   const rescheduleSameWeekday = rescheduleOriginalWeekdayNum === rescheduleNewWeekdayNum;
+
+  // Stage C Step 12E: the Reschedule tab's selected week is independent
+  // of the Calendar tab's own visible range (an administrator can pick
+  // ANY week here without first navigating the Calendar to it) -- the
+  // Calendar-bound `dateAssignments` state can therefore be missing
+  // dated exceptions for this exact week. Fetched separately, scoped
+  // exactly to the selected week (+/-1 day, matching loadData's own
+  // adjacency buffer), so "what is this employee's actual Off day this
+  // week" is always answered from real, complete data -- never a silent
+  // gap -- and stays consistent with what the Calendar tab shows for the
+  // same week once navigated there (both ultimately call
+  // resolveScheduleForDate/roster_resolve_schedule).
+  useEffect(() => {
+    let cancelled = false;
+    if (!rescheduleEmployeeId || !rescheduleWeekStart) {
+      setRescheduleWeekAssignments([]);
+      return;
+    }
+    fetchActiveDateAssignments(addDays(rescheduleWeekStart, -1), addDays(rescheduleWeekStart, 7))
+      .then((rows) => { if (!cancelled) setRescheduleWeekAssignments(rows); })
+      .catch(() => { if (!cancelled) setRescheduleWeekAssignments([]); });
+    return () => { cancelled = true; };
+  }, [rescheduleEmployeeId, rescheduleWeekStart]);
+
+  // Stage C Step 12E: what does this employee's schedule ACTUALLY
+  // resolve to for the selected week -- using the exact same resolver
+  // the Calendar tab uses (resolveScheduleForDate), never a guess
+  // anchored to today's date. This replaced the old "auto-detect from
+  // today's recurring pattern" effect, which was the real root cause of
+  // a live STAGING usability report: the Reschedule tab defaulted to an
+  // employee's recurring Wednesday Off even though a dated exception
+  // made that week's actual Off day Friday (which the Calendar tab,
+  // already using this same resolver, correctly showed) -- not a
+  // resolver bug, a wrong question being asked client-side.
+  const weekSummary: WeekScheduleSummary | null = useMemo(() => {
+    if (!rescheduleEmployeeId || !rescheduleWeekStart) return null;
+    return summarizeWeekSchedule(rescheduleEmployeeId, rescheduleWeekStart, rescheduleWeekAssignments, patterns, shiftPatterns);
+  }, [rescheduleEmployeeId, rescheduleWeekStart, rescheduleWeekAssignments, patterns, shiftPatterns]);
+
+  const rescheduleWeekOffDayText = useMemo(() => {
+    if (!weekSummary || !rescheduleSelectedEmployee) return null;
+    return describeWeekOffDays(rescheduleSelectedEmployee.fullName, weekSummary);
+  }, [weekSummary, rescheduleSelectedEmployee]);
+
+  // Auto-select the Original Off weekday ONLY when the week has exactly
+  // one genuine Off day -- per confirmed policy, never invented when
+  // there are zero, and never guessed when there is more than one (the
+  // administrator must explicitly choose, see rescheduleMultiOffChoiceMade
+  // below). Still freely overridable afterward, e.g. to correct a
+  // data-entry mistake. The normal shift is detected from the same week,
+  // not today, so it reflects what is actually true for the week being
+  // rescheduled.
+  useEffect(() => {
+    setRescheduleMultiOffChoiceMade(false);
+    if (!weekSummary || weekSummary.actualOffDays.length !== 1) return;
+    setRescheduleOriginalWeekday(String(weekSummary.actualOffDays[0].weekdayJs));
+  }, [weekSummary]);
+
+  useEffect(() => {
+    if (!rescheduleEmployeeId || !rescheduleWeekStart) return;
+    const detectedShift = resolveActiveShiftType(rescheduleEmployeeId, rescheduleWeekStart, shiftPatterns);
+    if (detectedShift !== null) setRescheduleShift(detectedShift);
+  }, [rescheduleEmployeeId, rescheduleWeekStart, shiftPatterns]);
 
   // Advisory preview only (one entry per affected week in Temporary mode,
   // a single bridge-aware summary for Permanent mode) -- see
@@ -487,28 +545,31 @@ export default function RosterPage() {
   // buildPermanentWeekdayTransitionPlan headers for the proof), purely
   // so the administrator sees the additional Off day in advance and can
   // explicitly confirm it -- the server independently recomputes and
-  // applies the same bridge, never trusting this preview's result.
+  // applies the same bridge, never trusting this preview's result. Uses
+  // rescheduleWeekAssignments (Step 12E), not the Calendar-bound
+  // dateAssignments, so this preview is correct regardless of what week
+  // the Calendar tab currently happens to be showing.
   const reschedulePlan: TemporaryRescheduleWeekPlan[] = useMemo(() => {
     if (!rescheduleEmployeeId || !rescheduleWeekStart || rescheduleSameWeekday || rescheduleIsPermanent) return [];
     if (!rescheduleDurationWeeks || rescheduleDurationWeeks < 1) return [];
     return buildTemporaryReschedulePlan(
       rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
-      rescheduleDurationWeeks, rescheduleShift, dateAssignments, patterns, shiftPatterns
+      rescheduleDurationWeeks, rescheduleShift, rescheduleWeekAssignments, patterns, shiftPatterns
     );
   }, [
     rescheduleEmployeeId, rescheduleWeekStart, rescheduleSameWeekday, rescheduleIsPermanent, rescheduleDurationWeeks,
-    rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, rescheduleShift, dateAssignments, patterns, shiftPatterns,
+    rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, rescheduleShift, rescheduleWeekAssignments, patterns, shiftPatterns,
   ]);
 
   const permanentPlan: PermanentWeekdayTransitionPlan | null = useMemo(() => {
     if (!rescheduleEmployeeId || !rescheduleWeekStart || rescheduleSameWeekday || !rescheduleIsPermanent) return null;
     return buildPermanentWeekdayTransitionPlan(
       rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
-      dateAssignments, patterns, shiftPatterns
+      rescheduleWeekAssignments, patterns, shiftPatterns
     );
   }, [
     rescheduleEmployeeId, rescheduleWeekStart, rescheduleSameWeekday, rescheduleIsPermanent,
-    rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, dateAssignments, patterns, shiftPatterns,
+    rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, rescheduleWeekAssignments, patterns, shiftPatterns,
   ]);
 
   // The single date (if any) that must stay an additional Off day to
@@ -533,7 +594,8 @@ export default function RosterPage() {
     rescheduleDurationWeeks <= MAX_TEMPORARY_RESCHEDULE_WEEKS &&
     (rescheduleIsPermanent ? !!permanentPlan : reschedulePlan.length > 0) &&
     (rescheduleIsPermanent || reschedulePlan.every((w) => !w.preview.blockingReason)) &&
-    (!rescheduleBridgeDate || rescheduleBridgeAcknowledged);
+    (!rescheduleBridgeDate || rescheduleBridgeAcknowledged) &&
+    (!weekSummary || weekSummary.actualOffDays.length <= 1 || rescheduleMultiOffChoiceMade);
 
   const handleSubmitReschedule = useCallback(async () => {
     if (!canSubmitReschedule) {
@@ -861,6 +923,52 @@ export default function RosterPage() {
             </label>
           </div>
 
+          <Input
+            label="Week containing (pick any date in the week the change should start)"
+            type="date"
+            value={rescheduleWeekAnchor}
+            onChange={(e) => setRescheduleWeekAnchor(e.target.value)}
+            required
+          />
+          {rescheduleWeekStart && (
+            <p className="text-xs text-slate-500">
+              That falls in the week of <strong>{rescheduleWeekStart}</strong> (Monday) to <strong>{addDays(rescheduleWeekStart, 6)}</strong> (Sunday).
+            </p>
+          )}
+
+          {rescheduleSelectedEmployee && weekSummary && rescheduleWeekOffDayText && (
+            <Card className="p-3 space-y-2 bg-blue-50 border border-blue-200">
+              <p className="text-sm text-blue-900">{rescheduleWeekOffDayText.primary}</p>
+              {rescheduleWeekOffDayText.secondary && (
+                <p className="text-xs text-blue-800">{rescheduleWeekOffDayText.secondary}</p>
+              )}
+              {weekSummary.actualOffDays.length > 1 && (
+                <div className="space-y-1.5">
+                  <p className="text-xs font-medium text-blue-900">Choose which Off day to reschedule:</p>
+                  <div className="flex flex-wrap gap-2">
+                    {weekSummary.actualOffDays.map((off) => (
+                      <button
+                        key={off.date}
+                        type="button"
+                        onClick={() => {
+                          setRescheduleOriginalWeekday(String(off.weekdayJs));
+                          setRescheduleMultiOffChoiceMade(true);
+                        }}
+                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium ${
+                          rescheduleMultiOffChoiceMade && rescheduleOriginalWeekdayNum === off.weekdayJs
+                            ? 'bg-blue-600 border-blue-600 text-white'
+                            : 'bg-white border-blue-300 text-blue-900'
+                        }`}
+                      >
+                        {formatFriendlyWeekdayDate(off.date)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </Card>
+          )}
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <Select
               label="Original Off weekday (required)"
@@ -875,18 +983,6 @@ export default function RosterPage() {
               options={WEEKDAY_OPTIONS}
             />
           </div>
-          <Input
-            label="Week containing (pick any date in the week the change should start)"
-            type="date"
-            value={rescheduleWeekAnchor}
-            onChange={(e) => setRescheduleWeekAnchor(e.target.value)}
-            required
-          />
-          {rescheduleWeekStart && (
-            <p className="text-xs text-slate-500">
-              That falls in the week of <strong>{rescheduleWeekStart}</strong> (Monday) to <strong>{addDays(rescheduleWeekStart, 6)}</strong> (Sunday).
-            </p>
-          )}
           {rescheduleSameWeekday && (
             <p className="text-xs text-red-600">The original and new Off weekday must be different.</p>
           )}

@@ -17,6 +17,9 @@ import {
   weekdayOrdinal,
   bridgeWeekIndex,
   explainRollingRestConflict,
+  summarizeWeekSchedule,
+  describeWeekOffDays,
+  formatFriendlyWeekdayDate,
   weekdayOf,
   addDays,
   expandDateRange,
@@ -612,5 +615,128 @@ describe('Stage C Step 12: explainRollingRestConflict', () => {
 
   it('returns null for a message that does not match the expected rolling-rest-violation shape', () => {
     expect(explainRollingRestConflict('Only Admin may reschedule roster Off days', 'emp-1', [], offPattern, shift)).toBeNull();
+  });
+});
+
+describe('Stage C Step 12E: formatFriendlyWeekdayDate', () => {
+  it('renders "Weekday, D Month" -- never a raw YYYY-MM-DD string', () => {
+    expect(formatFriendlyWeekdayDate('2026-10-16')).toBe('Friday, 16 October');
+    expect(formatFriendlyWeekdayDate('2026-01-01')).toBe('Thursday, 1 January');
+  });
+});
+
+// Stage C Step 12E: a live STAGING usability report found the Reschedule
+// tab defaulting to "Wednesday" for an employee whose Calendar (for the
+// selected week) correctly showed Friday as Off. Investigation (read-only,
+// against the real STAGING roster history) found NO resolver bug: the
+// employee's recurring Off weekday genuinely is Wednesday (confirmed
+// directly from the installed roster_off_day_patterns row, not assumed),
+// and a genuine dated exception for that one week converts Wednesday to a
+// working day and Friday to Off -- roster_resolve_schedule/
+// resolveScheduleForDate already returned this correctly; only the
+// Reschedule tab's old "auto-detect from today's pattern" effect asked
+// the wrong question. These tests pin the fixed behavior with the real
+// shape of that STAGING data.
+describe('Stage C Step 12E: summarizeWeekSchedule / describeWeekOffDays', () => {
+  it('reproduces the real STAGING finding: recurring Off is Wednesday, but a dated exception makes this week\'s actual Off day Friday', () => {
+    const patterns = [pattern({ weekday: 0, effectiveFrom: '2026-10-10' }), pattern({ weekday: 3, effectiveFrom: '2026-10-11' })];
+    const assignments = [
+      dated({ assignmentDate: '2026-10-12', assignmentType: 'day' }),
+      dated({ assignmentDate: '2026-10-13', assignmentType: 'day' }),
+      dated({ assignmentDate: '2026-10-14', assignmentType: 'day' }),
+      dated({ assignmentDate: '2026-10-15', assignmentType: 'day' }),
+      dated({ assignmentDate: '2026-10-16', assignmentType: 'off' }),
+    ];
+
+    const summary = summarizeWeekSchedule('emp-1', '2026-10-12', assignments, patterns, []);
+    expect(summary.recurringOffWeekday).toBe(3); // Wednesday, as of this week -- verified from the data, not assumed
+    expect(summary.actualOffDays).toEqual([{ date: '2026-10-16', weekdayJs: 5, source: 'dated_exception' }]); // Friday
+
+    const text = describeWeekOffDays('Ganizani', summary);
+    expect(text.primary).toBe("Ganizani's Off day this week is Friday, 16 October.");
+    expect(text.secondary).toBe("Normal weekly Off: Wednesday. This week's Off: Friday because of a schedule exception.");
+  });
+
+  it('plain recurring Off, no exception: the week\'s actual Off day matches the recurring pattern, and no mismatch sentence is appended', () => {
+    const patterns = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday
+    const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const summary = summarizeWeekSchedule('emp-1', '2026-10-05', [], patterns, shift);
+    expect(summary.actualOffDays).toEqual([{ date: '2026-10-07', weekdayJs: 3, source: 'recurring' }]);
+    const text = describeWeekOffDays('Asaya', summary);
+    expect(text.primary).toBe("Asaya's Off day this week is Wednesday, 7 October.");
+    expect(text.secondary).toBe('Normal weekly Off: Wednesday.');
+  });
+
+  it('permanent change already in effect: the active pattern as of the selected week is the NEW weekday, never the superseded one', () => {
+    const patterns = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' }), pattern({ weekday: 5, effectiveFrom: '2026-10-05' })]; // Wed -> Fri from week of Oct 5
+    const summary = summarizeWeekSchedule('emp-1', '2026-10-05', [], patterns, []);
+    expect(summary.recurringOffWeekday).toBe(5);
+    expect(summary.actualOffDays.map((o) => o.weekdayJs)).toEqual([5]);
+  });
+
+  it('bridge week: TWO genuine Off days (the kept recurring day plus the new dated one), reported as multiple with no auto-pick', () => {
+    const patterns = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday
+    // Bridge week: Wednesday deliberately left untouched (still off via
+    // the pattern) while Sunday is also marked off as the new date --
+    // exactly buildTemporaryReschedulePlan's own bridge-week shape.
+    const assignments = [dated({ assignmentDate: '2026-10-11', assignmentType: 'off' })]; // Sunday
+    const summary = summarizeWeekSchedule('emp-1', '2026-10-05', assignments, patterns, []);
+    expect(summary.actualOffDays).toEqual([
+      { date: '2026-10-07', weekdayJs: 3, source: 'recurring' },
+      { date: '2026-10-11', weekdayJs: 0, source: 'dated_exception' },
+    ]);
+    const text = describeWeekOffDays('Brian', summary);
+    expect(text.primary).toBe('Brian has 2 Off days this week -- choose which one to reschedule.');
+    expect(text.secondary).toBe('Normal weekly Off: Wednesday.');
+  });
+
+  it('multiple Off days from two independent dated exceptions (not a bridge week at all) are reported the same way', () => {
+    const assignments = [
+      dated({ assignmentDate: '2026-10-06', assignmentType: 'off' }), // Tuesday
+      dated({ assignmentDate: '2026-10-09', assignmentType: 'off' }), // Friday
+    ];
+    const summary = summarizeWeekSchedule('emp-1', '2026-10-05', assignments, [], []);
+    expect(summary.recurringOffWeekday).toBeNull();
+    expect(summary.actualOffDays).toHaveLength(2);
+    expect(describeWeekOffDays('Alim', summary).primary).toBe('Alim has 2 Off days this week -- choose which one to reschedule.');
+  });
+
+  it('no Off day at all: explains clearly, never invents one', () => {
+    const summary = summarizeWeekSchedule('emp-1', '2026-10-05', [], [], []);
+    expect(summary.actualOffDays).toEqual([]);
+    expect(summary.recurringOffWeekday).toBeNull();
+    const text = describeWeekOffDays('Simon', summary);
+    expect(text.primary).toBe('Simon has no Off day scheduled this week.');
+    expect(text.secondary).toBeNull();
+  });
+
+  it('no Off day this week despite a recurring pattern existing (pattern not yet effective) -- still explained clearly, not invented', () => {
+    const patterns = [pattern({ weekday: 3, effectiveFrom: '2026-11-01' })]; // not yet effective for this week
+    const summary = summarizeWeekSchedule('emp-1', '2026-10-05', [], patterns, []);
+    expect(summary.actualOffDays).toEqual([]);
+    expect(summary.recurringOffWeekday).toBeNull();
+    expect(describeWeekOffDays('Simon', summary).secondary).toBeNull();
+  });
+
+  it('week switching: recomputes independently for a different week, never reusing a stale result', () => {
+    const patterns = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
+    const assignments = [dated({ assignmentDate: '2026-10-14', assignmentType: 'day' }), dated({ assignmentDate: '2026-10-16', assignmentType: 'off' })];
+    const weekA = summarizeWeekSchedule('emp-1', '2026-10-05', assignments, patterns, []); // untouched week
+    const weekB = summarizeWeekSchedule('emp-1', '2026-10-12', assignments, patterns, []); // the exception week
+    expect(weekA.actualOffDays).toEqual([{ date: '2026-10-07', weekdayJs: 3, source: 'recurring' }]);
+    expect(weekB.actualOffDays).toEqual([{ date: '2026-10-16', weekdayJs: 5, source: 'dated_exception' }]);
+  });
+
+  it('Calendar/Reschedule consistency: every actualOffDays date independently resolves \'off\' via the exact same resolveScheduleForDate the Calendar tab calls', () => {
+    const patterns = [pattern({ weekday: 0, effectiveFrom: '2026-10-10' }), pattern({ weekday: 3, effectiveFrom: '2026-10-11' })];
+    const assignments = [dated({ assignmentDate: '2026-10-14', assignmentType: 'day' }), dated({ assignmentDate: '2026-10-16', assignmentType: 'off' })];
+    const summary = summarizeWeekSchedule('emp-1', '2026-10-12', assignments, patterns, []);
+    for (const off of summary.actualOffDays) {
+      expect(resolveScheduleForDate('emp-1', off.date, assignments, patterns, [])).toBe('off');
+    }
+    // And the non-Off days in the same week must NOT resolve 'off' either way.
+    for (const d of ['2026-10-12', '2026-10-13', '2026-10-14', '2026-10-15', '2026-10-17', '2026-10-18']) {
+      expect(resolveScheduleForDate('emp-1', d, assignments, patterns, [])).not.toBe('off');
+    }
   });
 });

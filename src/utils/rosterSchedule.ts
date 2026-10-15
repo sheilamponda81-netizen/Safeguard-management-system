@@ -540,3 +540,101 @@ export function expandDateRange(dateFrom: string, dateTo: string): string[] {
 }
 
 export const WEEKDAY_LABELS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'] as const;
+
+const MONTH_LABELS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+] as const;
+
+/** "Friday, 16 October" -- the one friendly date format the Reschedule tab uses when naming a specific Off day to the administrator, never a raw YYYY-MM-DD string. */
+export function formatFriendlyWeekdayDate(date: string): string {
+  const { m, d } = parseIsoDate(date);
+  return `${WEEKDAY_LABELS[weekdayOf(date)]}, ${d} ${MONTH_LABELS[m - 1]}`;
+}
+
+// Stage C Step 12E: "the administrator should not have to know or guess
+// the employee's current Off weekday." Investigating a real STAGING
+// usability report (Reschedule defaulted to Wednesday while the
+// Calendar correctly showed Friday as Off for the selected week) found
+// NO resolver bug -- roster_resolve_schedule/resolveScheduleForDate
+// already correctly returns 'off' for Friday that week (a genuine,
+// deliberate dated exception overrides the employee's Wednesday
+// recurring pattern for that one week) and 'day' for Wednesday (the
+// matching dated exception that converts it). The Calendar tab was
+// already showing this correctly, because it already calls
+// resolveScheduleForDate for every visible day. The bug was that the
+// Reschedule tab's old auto-detect effect asked "what is this
+// employee's recurring pattern AS OF TODAY" (resolveActiveOffWeekday
+// with today as the date) instead of "what does this employee's
+// schedule actually resolve to IN THE SELECTED WEEK" -- an entirely
+// different question whose answer happened to differ here specifically
+// because of the dated exception. This function answers the right
+// question: it resolves all seven days of the given week with the
+// SAME resolver the Calendar uses, and reports which date(s) actually
+// come out 'off' -- the recurring-pattern lookup is kept too, but only
+// as a separate, clearly labeled fact for display, never as the
+// thing auto-selected.
+export interface WeekOffDayInfo {
+  date: string;
+  weekdayJs: number;
+  /** 'dated_exception' when an active dated assignment on this exact date is what makes it resolve 'off' (whether or not that exception's weekday also matches the recurring pattern); 'recurring' when no dated assignment exists for the date and the recurring Off-day pattern is what makes it 'off'. */
+  source: 'recurring' | 'dated_exception';
+}
+
+export interface WeekScheduleSummary {
+  weekStart: string;
+  weekEnd: string;
+  /** Every date in [weekStart, weekStart+6] that actually resolves 'off', in calendar order -- never more than 7, and (per confirmed policy) never invented when empty. */
+  actualOffDays: WeekOffDayInfo[];
+  /** The employee's recurring Off weekday as of this week's Monday, or null if none is configured -- shown separately from actualOffDays, never conflated with it. */
+  recurringOffWeekday: number | null;
+}
+
+export function summarizeWeekSchedule(
+  employeeId: string,
+  weekStart: string,
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
+): WeekScheduleSummary {
+  const weekEnd = addDays(weekStart, 6);
+  const recurringOffWeekday = resolveActiveOffWeekday(employeeId, weekStart, patterns);
+  const actualOffDays: WeekOffDayInfo[] = [];
+  for (let i = 0; i < 7; i++) {
+    const date = addDays(weekStart, i);
+    const resolved = resolveScheduleForDate(employeeId, date, datedAssignments, patterns, shiftPatterns);
+    if (resolved !== 'off') continue;
+    const hasDatedException = datedAssignments.some((a) => a.employeeId === employeeId && a.assignmentDate === date && a.isActive);
+    actualOffDays.push({ date, weekdayJs: weekdayOf(date), source: hasDatedException ? 'dated_exception' : 'recurring' });
+  }
+  return { weekStart, weekEnd, actualOffDays, recurringOffWeekday };
+}
+
+/** Plain-language, SQL-free description of a week's actual Off day(s) -- `secondary` is the separate "Normal weekly Off: ..." fact (requirement: display it separately, never folded silently into the primary sentence), appended with the exception explanation only when the two genuinely differ. Either field may be null/empty exactly when there is nothing true to say (no recurring pattern configured; or, for `primary`, never -- it always states the real situation, including the no-Off-day case, rather than inventing one). */
+export interface WeekOffDaySummaryText {
+  primary: string;
+  secondary: string | null;
+}
+
+export function describeWeekOffDays(employeeName: string, summary: WeekScheduleSummary): WeekOffDaySummaryText {
+  const { actualOffDays, recurringOffWeekday } = summary;
+  const secondaryBase = recurringOffWeekday !== null ? `Normal weekly Off: ${WEEKDAY_LABELS[recurringOffWeekday]}.` : null;
+
+  if (actualOffDays.length === 0) {
+    return { primary: `${employeeName} has no Off day scheduled this week.`, secondary: secondaryBase };
+  }
+  if (actualOffDays.length > 1) {
+    return {
+      primary: `${employeeName} has ${actualOffDays.length} Off days this week -- choose which one to reschedule.`,
+      secondary: secondaryBase,
+    };
+  }
+
+  const off = actualOffDays[0];
+  const primary = `${employeeName}'s Off day this week is ${formatFriendlyWeekdayDate(off.date)}.`;
+  let secondary = secondaryBase;
+  if (secondary && off.source === 'dated_exception' && recurringOffWeekday !== off.weekdayJs) {
+    secondary += ` This week's Off: ${WEEKDAY_LABELS[off.weekdayJs]} because of a schedule exception.`;
+  }
+  return { primary, secondary };
+}

@@ -62,12 +62,12 @@ describe('Recurring Schedule tab: fetched data flows into the resolver everywher
     expect(rosterSource).toMatch(/resolveScheduleForDate\(emp\.id, d, dateAssignments, patterns, shiftPatterns\)/);
   });
 
-  it('the Temporary/Permanent Off Day preview passes shiftPatterns into buildTemporaryReschedulePlan and buildPermanentWeekdayTransitionPlan (Stage C Step 12A: the atomic-transition plan builders, one per mode)', () => {
+  it('the Temporary/Permanent Off Day preview passes shiftPatterns into buildTemporaryReschedulePlan and buildPermanentWeekdayTransitionPlan (Stage C Step 12A: the atomic-transition plan builders, one per mode; Stage C Step 12E: sourced from rescheduleWeekAssignments, a week-scoped fetch independent of the Calendar tab\'s own range, not the Calendar-bound dateAssignments)', () => {
     expect(rosterSource).toMatch(
-      /buildTemporaryReschedulePlan\(\s*\n\s*rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,\s*\n\s*rescheduleDurationWeeks, rescheduleShift, dateAssignments, patterns, shiftPatterns\s*\n\s*\)/
+      /buildTemporaryReschedulePlan\(\s*\n\s*rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,\s*\n\s*rescheduleDurationWeeks, rescheduleShift, rescheduleWeekAssignments, patterns, shiftPatterns\s*\n\s*\)/
     );
     expect(rosterSource).toMatch(
-      /buildPermanentWeekdayTransitionPlan\(\s*\n\s*rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,\s*\n\s*dateAssignments, patterns, shiftPatterns\s*\n\s*\)/
+      /buildPermanentWeekdayTransitionPlan\(\s*\n\s*rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,\s*\n\s*rescheduleWeekAssignments, patterns, shiftPatterns\s*\n\s*\)/
     );
   });
 });

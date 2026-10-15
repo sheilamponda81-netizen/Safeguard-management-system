@@ -39,10 +39,25 @@ describe('Temporary / Permanent Off Day: weekday-based fields replace the old ex
     expect(rosterSource).toMatch(/<EmployeeSingleSelect employees=\{employees\} value=\{rescheduleEmployeeId\} onChange=\{setRescheduleEmployeeId\} \/>/);
   });
 
-  it('auto-detects the employee\'s current recurring Off weekday and shift on selection, via the pure resolver helpers, never hardcoded', () => {
-    const effect = rosterSource.match(/useEffect\(\(\) => \{\s*\n\s*if \(!rescheduleEmployeeId\)[\s\S]*?\n {2}\}, \[rescheduleEmployeeId, patterns, shiftPatterns\]\);/)?.[0] ?? '';
-    expect(effect).toMatch(/resolveActiveOffWeekday\(rescheduleEmployeeId, today, patterns\)/);
-    expect(effect).toMatch(/resolveActiveShiftType\(rescheduleEmployeeId, today, shiftPatterns\)/);
+  it('Stage C Step 12E: auto-selects the Original Off weekday from the week\'s actual resolved Off day(s), never from today\'s date in isolation', () => {
+    const effect = rosterSource.match(/useEffect\(\(\) => \{\s*\n\s*setRescheduleMultiOffChoiceMade\(false\);[\s\S]*?\n {2}\}, \[weekSummary\]\);/)?.[0] ?? '';
+    expect(effect).toMatch(/if \(!weekSummary \|\| weekSummary\.actualOffDays\.length !== 1\) return;/);
+    expect(effect).toMatch(/setRescheduleOriginalWeekday\(String\(weekSummary\.actualOffDays\[0\]\.weekdayJs\)\);/);
+  });
+
+  it('Stage C Step 12E: detects the normal shift for the SELECTED WEEK, not today\'s date, via the pure resolver helper', () => {
+    const effect = rosterSource.match(/useEffect\(\(\) => \{\s*\n\s*if \(!rescheduleEmployeeId \|\| !rescheduleWeekStart\) return;[\s\S]*?\n {2}\}, \[rescheduleEmployeeId, rescheduleWeekStart, shiftPatterns\]\);/)?.[0] ?? '';
+    expect(effect).toMatch(/resolveActiveShiftType\(rescheduleEmployeeId, rescheduleWeekStart, shiftPatterns\)/);
+  });
+
+  it('Stage C Step 12E: fetches dated assignments scoped to the selected week independently of the Calendar tab\'s own range, so the week summary is never missing data', () => {
+    expect(rosterSource).toMatch(/const \[rescheduleWeekAssignments, setRescheduleWeekAssignments\] = useState<DateAssignmentRow\[\]>\(\[\]\);/);
+    expect(rosterSource).toMatch(/fetchActiveDateAssignments\(addDays\(rescheduleWeekStart, -1\), addDays\(rescheduleWeekStart, 7\)\)/);
+  });
+
+  it('Stage C Step 12E: summarizes the week\'s actual Off day(s) via summarizeWeekSchedule/describeWeekOffDays, using the same resolver the Calendar tab uses', () => {
+    expect(rosterSource).toMatch(/summarizeWeekSchedule\(rescheduleEmployeeId, rescheduleWeekStart, rescheduleWeekAssignments, patterns, shiftPatterns\)/);
+    expect(rosterSource).toMatch(/describeWeekOffDays\(rescheduleSelectedEmployee\.fullName, weekSummary\)/);
   });
 });
 
@@ -80,8 +95,8 @@ describe('Temporary / Permanent Off Day: the plan is built from the pure, indepe
 });
 
 describe('Temporary / Permanent Off Day: submission is gated on every required field, every week being clean, and any bridge day being explicitly confirmed', () => {
-  it('canSubmitReschedule requires employee, a valid week, different weekdays, a non-empty reason, a sane duration, a built plan for the active mode, every Temporary week unblocked, and bridge acknowledgment when a bridge is needed', () => {
-    const def = rosterSource.match(/const canSubmitReschedule =[\s\S]*?\(!rescheduleBridgeDate \|\| rescheduleBridgeAcknowledged\);/)?.[0] ?? '';
+  it('canSubmitReschedule requires employee, a valid week, different weekdays, a non-empty reason, a sane duration, a built plan for the active mode, every Temporary week unblocked, bridge acknowledgment when a bridge is needed, and an explicit multi-Off-day choice when the week has more than one', () => {
+    const def = rosterSource.match(/const canSubmitReschedule =[\s\S]*?\(!weekSummary \|\| weekSummary\.actualOffDays\.length <= 1 \|\| rescheduleMultiOffChoiceMade\);/)?.[0] ?? '';
     expect(def).toMatch(/!!rescheduleEmployeeId/);
     expect(def).toMatch(/!!rescheduleWeekStart/);
     expect(def).toMatch(/!rescheduleSameWeekday/);
@@ -91,6 +106,7 @@ describe('Temporary / Permanent Off Day: submission is gated on every required f
     expect(def).toMatch(/\(rescheduleIsPermanent \? !!permanentPlan : reschedulePlan\.length > 0\)/);
     expect(def).toMatch(/\(rescheduleIsPermanent \|\| reschedulePlan\.every\(\(w\) => !w\.preview\.blockingReason\)\)/);
     expect(def).toMatch(/\(!rescheduleBridgeDate \|\| rescheduleBridgeAcknowledged\)/);
+    expect(def).toMatch(/\(!weekSummary \|\| weekSummary\.actualOffDays\.length <= 1 \|\| rescheduleMultiOffChoiceMade\)/);
   });
 
   it('the submit Button is disabled whenever canSubmitReschedule is false', () => {
