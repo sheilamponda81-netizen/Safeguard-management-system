@@ -268,6 +268,66 @@ export async function rescheduleOffDay(
   }
 }
 
+export interface ApplyWeekdayTransitionResult {
+  success: boolean;
+  outcome: RosterRpcOutcome;
+  error?: string;
+  mode?: 'temporary' | 'permanent';
+  /** The one date (if any) kept Off as a bridge, to preserve the rolling seven-day rest rule across the transition -- see roster_apply_weekday_transition's migration header. */
+  bridgeDate?: string | null;
+  weeksApplied?: number;
+}
+
+/**
+ * Stage C Step 12A: the single, atomic RPC behind the Temporary/
+ * Permanent Off Day tab -- replaces Step 12's per-week loop over
+ * rescheduleOffDay. Computes and applies the ENTIRE multi-week change
+ * (every affected week, plus the one bridge week/date when the
+ * rolling-seven-day rest rule requires one) in one transaction: either
+ * every week is written, or (on any rejection) none are -- there is no
+ * partial-application outcome. See roster_apply_weekday_transition's
+ * migration header for the full bridge-day proof this wraps.
+ */
+export async function applyWeekdayTransition(
+  employeeId: string,
+  mode: 'temporary' | 'permanent',
+  originalWeekday: number,
+  newWeekday: number,
+  shiftType: 'day' | 'night',
+  weekStart: string,
+  durationWeeks: number,
+  correctionReason: string
+): Promise<ApplyWeekdayTransitionResult> {
+  try {
+    const { data, error } = await supabase.rpc('roster_apply_weekday_transition', {
+      p_employee_id: employeeId,
+      p_mode: mode,
+      p_original_weekday: originalWeekday,
+      p_new_weekday: newWeekday,
+      p_shift_type: shiftType,
+      p_week_start: weekStart,
+      p_duration_weeks: durationWeeks,
+      p_correction_reason: correctionReason,
+    });
+    if (error) {
+      if (error.code === RPC_NOT_FOUND_CODE) {
+        return { success: false, outcome: 'missing_rpc', error: 'Roster management is not available yet in this environment (database migration not applied).' };
+      }
+      return { success: false, outcome: 'unauthorized', error: error.message };
+    }
+    const result = data as { mode?: string; bridge_date?: string | null; weeks_applied?: number } | null;
+    return {
+      success: true,
+      outcome: 'success',
+      mode: result?.mode as 'temporary' | 'permanent' | undefined,
+      bridgeDate: result?.bridge_date ?? null,
+      weeksApplied: result?.weeks_applied,
+    };
+  } catch {
+    return { success: false, outcome: 'network_error', error: 'Network error while applying the weekday transition. Please try again.' };
+  }
+}
+
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
 /**

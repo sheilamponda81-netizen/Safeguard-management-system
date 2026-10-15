@@ -62,9 +62,12 @@ describe('Recurring Schedule tab: fetched data flows into the resolver everywher
     expect(rosterSource).toMatch(/resolveScheduleForDate\(emp\.id, d, dateAssignments, patterns, shiftPatterns\)/);
   });
 
-  it('the Reschedule Off Day preview passes shiftPatterns into buildRescheduleOffDayPreview', () => {
+  it('the Temporary/Permanent Off Day preview passes shiftPatterns into buildTemporaryReschedulePlan and buildPermanentWeekdayTransitionPlan (Stage C Step 12A: the atomic-transition plan builders, one per mode)', () => {
     expect(rosterSource).toMatch(
-      /buildRescheduleOffDayPreview\(rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns, shiftPatterns\)/
+      /buildTemporaryReschedulePlan\(\s*\n\s*rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,\s*\n\s*rescheduleDurationWeeks, rescheduleShift, dateAssignments, patterns, shiftPatterns\s*\n\s*\)/
+    );
+    expect(rosterSource).toMatch(
+      /buildPermanentWeekdayTransitionPlan\(\s*\n\s*rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,\s*\n\s*dateAssignments, patterns, shiftPatterns\s*\n\s*\)/
     );
   });
 });

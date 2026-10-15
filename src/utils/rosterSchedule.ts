@@ -315,14 +315,18 @@ export function buildRescheduleOffDayPreview(
   const originalResolved = resolveScheduleForDate(employeeId, originalDate, datedAssignments, patterns, shiftPatterns);
   const replacementResolved = resolveScheduleForDate(employeeId, replacementDate, datedAssignments, patterns, shiftPatterns);
   const isOriginalGenuinelyOff = originalResolved === 'off';
-  // CONFIRMED FINAL POLICY: the replacement date must resolve to EXACTLY
-  // 'unassigned' -- an already-'off' replacement is REJECTED, not merely
-  // allowed as harmless, because it would let Admin believe a genuine
-  // swap happened while the employee's real weekly rest entitlement was
+  // Stage C Step 12 CHANGE (mirrors the identical, equally-corrected check
+  // in roster_reschedule_off_day): reject the replacement date ONLY when
+  // it is already 'off' -- that would let Admin believe a genuine swap
+  // happened while the employee's real weekly rest entitlement was
   // actually reduced (the original date's rest converts to work, with no
-  // new rest gained in exchange). Mirrors the identical, equally-corrected
-  // check in the new roster_reschedule_off_day RPC.
-  const isReplacementEligible = replacementResolved === 'unassigned';
+  // new rest gained in exchange). A 'day', 'night', or 'unassigned'
+  // replacement is accepted: since Stage C Step 6B most employees carry a
+  // recurring Day/Night pattern covering every non-Off date, the
+  // realistic swap target (e.g. "Wednesday Off -> Sunday Off") resolves
+  // to a normal working day, not 'unassigned' -- requiring 'unassigned'
+  // made the common case impossible.
+  const isReplacementEligible = replacementResolved !== 'off';
   const hasAdjacencyConflict = hasNightToDayConflict(employeeId, originalDate, shiftOnOriginal, datedAssignments);
 
   let blockingReason: string | null = null;
@@ -331,12 +335,201 @@ export function buildRescheduleOffDayPreview(
   } else if (!isOriginalGenuinelyOff) {
     blockingReason = `The original date does not currently resolve to Off (it is "${originalResolved}"). Choose the employee's actual Off date.`;
   } else if (!isReplacementEligible) {
-    blockingReason = `The replacement date must be unassigned -- it currently resolves to "${replacementResolved}". Choose a different date.`;
+    blockingReason = `The replacement date is already Off. Choose a date that is not already Off -- a normal working day or an unassigned date is fine.`;
   } else if (hasAdjacencyConflict) {
     blockingReason = `A ${shiftOnOriginal} shift cannot be placed on the original date -- it conflicts with an adjacent Night/Day shift.`;
   }
 
   return { originalResolved, replacementResolved, isOriginalGenuinelyOff, isReplacementEligible, hasAdjacencyConflict, blockingReason };
+}
+
+/** The actual calendar date of `weekdayJs` (0=Sun..6=Sat) within the Mon-Sun week that starts at `weekStartMonday`. */
+export function dateForWeekdayInWeek(weekStartMonday: string, weekdayJs: number): string {
+  const offset = weekdayJs === 0 ? 6 : weekdayJs - 1;
+  return addDays(weekStartMonday, offset);
+}
+
+/** The employee's currently active recurring Off weekday as of `asOfDate` (the active pattern row with the largest effectiveFrom <= asOfDate), or null if none is configured. Used only to intelligently default a UI field -- never treated as authoritative by any write path. */
+export function resolveActiveOffWeekday(employeeId: string, asOfDate: string, patterns: OffDayPatternRow[]): number | null {
+  let latest: OffDayPatternRow | null = null;
+  for (const p of patterns) {
+    if (p.employeeId !== employeeId || !p.isActive || p.effectiveFrom > asOfDate) continue;
+    if (!latest || p.effectiveFrom > latest.effectiveFrom) latest = p;
+  }
+  return latest ? latest.weekday : null;
+}
+
+/** The employee's currently active recurring Day/Night shift type as of `asOfDate`, or null if none is configured. Symmetric to resolveActiveOffWeekday above -- used only to default a UI field. */
+export function resolveActiveShiftType(employeeId: string, asOfDate: string, shiftPatterns: ShiftPatternRow[]): 'day' | 'night' | null {
+  let latest: ShiftPatternRow | null = null;
+  for (const p of shiftPatterns) {
+    if (p.employeeId !== employeeId || !p.isActive || p.effectiveFrom > asOfDate) continue;
+    if (!latest || p.effectiveFrom > latest.effectiveFrom) latest = p;
+  }
+  return latest ? latest.shiftType : null;
+}
+
+// Stage C Step 12A: the Monday-start ordinal position of a weekday
+// (0=Monday..6=Sunday), independent of the 0=Sunday..6=Saturday JS
+// convention used for weekday/originalWeekday/newWeekday everywhere
+// else in this module. Used ONLY to determine shift DIRECTION (forward
+// = later in the week, backward = earlier) for the bridge-day
+// calculation below -- see buildTemporaryReschedulePlan's header for
+// the full proof this mirrors from roster_apply_weekday_transition's
+// migration header.
+export function weekdayOrdinal(weekdayJs: number): number {
+  return weekdayJs === 0 ? 6 : weekdayJs - 1;
+}
+
+// Stage C Step 12: a temporary, multi-week Off-day change --
+// "<original weekday> Off -> <new weekday> Off for N weeks".
+//
+// Stage C Step 12A CHANGE: testing Step 12's original design (one
+// roster_reschedule_off_day call per affected week, looped client-side)
+// against an administrator's realistic primary use case -- moving an
+// ALREADY-ESTABLISHED, indefinitely-repeating single-weekday pattern --
+// proved it ALWAYS violated the rolling-seven-day rest rule: a perfectly
+// periodic single-Off-day pattern has ZERO slack, so removing the one
+// Off day that used to cover a run of 7-day windows and placing the new
+// Off day elsewhere in the same week necessarily uncovers at least one
+// window, for ANY nonzero shift. The fix (proved in full in
+// roster_apply_weekday_transition's migration header) is to keep the
+// OLD weekday ALSO Off (instead of converting it to a working day) for
+// EXACTLY ONE transition week -- the FIRST affected week when the new
+// weekday is LATER in the Mon-Sun week than the old one, or the LAST
+// affected week when it is EARLIER -- which always suffices to bridge
+// the gap. This plan now marks that one week as `isBridgeWeek`, and the
+// actual multi-week write is now a SINGLE atomic RPC call
+// (roster_apply_weekday_transition), never a per-week loop, so a
+// mid-sequence failure can no longer leave some weeks changed and
+// others not.
+export interface TemporaryRescheduleWeekPlan {
+  weekStart: string;
+  weekEnd: string;
+  originalDate: string;
+  newOffDate: string;
+  preview: RescheduleOffDayPreview;
+  /** True for the single week (if any) that must keep the original weekday ALSO Off, instead of converting it to a working day, to preserve the rolling seven-day rest rule across the transition. */
+  isBridgeWeek: boolean;
+}
+
+/** -1 when no bridge week is needed (shift direction is a no-op, which should never actually be submitted -- see rescheduleSameWeekday gating). */
+export function bridgeWeekIndex(originalWeekday: number, newWeekday: number, durationWeeks: number): number {
+  const direction = weekdayOrdinal(newWeekday) - weekdayOrdinal(originalWeekday);
+  if (direction > 0) return 0;
+  if (direction < 0) return durationWeeks - 1;
+  return -1;
+}
+
+export function buildTemporaryReschedulePlan(
+  employeeId: string,
+  anchorWeekStart: string,
+  originalWeekday: number,
+  newWeekday: number,
+  durationWeeks: number,
+  shiftOnOriginal: 'day' | 'night',
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
+): TemporaryRescheduleWeekPlan[] {
+  const bridgeIndex = bridgeWeekIndex(originalWeekday, newWeekday, durationWeeks);
+  const weeks: TemporaryRescheduleWeekPlan[] = [];
+  for (let i = 0; i < durationWeeks; i++) {
+    const weekStart = addDays(anchorWeekStart, i * 7);
+    const weekEnd = addDays(weekStart, 6);
+    const originalDate = dateForWeekdayInWeek(weekStart, originalWeekday);
+    const newOffDate = dateForWeekdayInWeek(weekStart, newWeekday);
+    const isBridgeWeek = i === bridgeIndex;
+    // The bridge week never actually places shiftOnOriginal on
+    // originalDate (it stays Off instead -- see this function's header),
+    // so the Night/Day adjacency check (which only matters for a shift
+    // that is actually being written) does not apply to it -- only the
+    // two eligibility checks (original genuinely Off, replacement not
+    // already Off) remain meaningful for that one week.
+    const preview = isBridgeWeek
+      ? { ...buildRescheduleOffDayPreview(employeeId, originalDate, newOffDate, shiftOnOriginal, datedAssignments, patterns, shiftPatterns), hasAdjacencyConflict: false, blockingReason: (() => {
+          const originalResolved = resolveScheduleForDate(employeeId, originalDate, datedAssignments, patterns, shiftPatterns);
+          const replacementResolved = resolveScheduleForDate(employeeId, newOffDate, datedAssignments, patterns, shiftPatterns);
+          if (originalDate === newOffDate) return 'The replacement Off date must be different from the original Off date.';
+          if (originalResolved !== 'off') return `The original date does not currently resolve to Off (it is "${originalResolved}"). Choose the employee's actual Off date.`;
+          if (replacementResolved === 'off') return 'The replacement date is already Off. Choose a date that is not already Off -- a normal working day or an unassigned date is fine.';
+          return null;
+        })() }
+      : buildRescheduleOffDayPreview(employeeId, originalDate, newOffDate, shiftOnOriginal, datedAssignments, patterns, shiftPatterns);
+    weeks.push({ weekStart, weekEnd, originalDate, newOffDate, preview, isBridgeWeek });
+  }
+  return weeks;
+}
+
+// Stage C Step 12A: the Permanent-change counterpart of the bridge logic
+// above. A backward shift (new weekday earlier in the week than the
+// old one) never needs a bridge for a Permanent change -- its entry gap
+// is already <7 days, and the new pattern then repeats forever at
+// exactly 7-day spacing with no second boundary to protect (see the
+// migration header's proof). A forward shift needs exactly one bridge
+// date: the OLD weekday, in the SAME week the new pattern takes effect,
+// kept Off via one dated exception (the new pattern switches ALL of
+// that week over to the new weekday otherwise, in one atomic step).
+export interface PermanentWeekdayTransitionPlan {
+  effectiveFrom: string;
+  /** The one date that must be kept Off as a dated exception to bridge the transition, or null when no bridge is needed (backward shift). */
+  bridgeDate: string | null;
+  originalResolvedAtBridge: ResolvedSchedule | null;
+}
+
+export function buildPermanentWeekdayTransitionPlan(
+  employeeId: string,
+  effectiveFrom: string,
+  originalWeekday: number,
+  newWeekday: number,
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
+): PermanentWeekdayTransitionPlan {
+  const direction = weekdayOrdinal(newWeekday) - weekdayOrdinal(originalWeekday);
+  const bridgeDate = direction > 0 ? dateForWeekdayInWeek(effectiveFrom, originalWeekday) : null;
+  const originalResolvedAtBridge = bridgeDate
+    ? resolveScheduleForDate(employeeId, bridgeDate, datedAssignments, patterns, shiftPatterns)
+    : null;
+  return { effectiveFrom, bridgeDate, originalResolvedAtBridge };
+}
+
+// Stage C Step 12: the rolling-seven-day rest rule is NEVER replicated
+// client-side (see buildRescheduleOffDayPreview's own header/established
+// precedent -- it needs the employee's full resolved schedule across a
+// 27-day window, which this preview deliberately does not fetch). When
+// the server rejects a week for this reason, its raw message already
+// names the employee (by uuid, humanized elsewhere) and the violated
+// window's start/end dates (a plain `RAISE EXCEPTION ... between % and
+// %`, always two ISO YYYY-MM-DD dates). This helper turns that window
+// into a concrete, plain-language explanation: which specific days in it
+// are working days (the actual conflict), so Admin sees the real cause
+// rather than just two bounding dates. Returns null when the message
+// does not match the expected rolling-rest-violation shape (e.g. a
+// different kind of rejection) -- callers must fall back to showing the
+// raw (humanized) message in that case, never fabricate an explanation.
+export interface RollingRestConflictExplanation {
+  windowStart: string;
+  windowEnd: string;
+  workingDays: string[];
+}
+
+export function explainRollingRestConflict(
+  rawMessage: string,
+  employeeId: string,
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
+): RollingRestConflictExplanation | null {
+  const match = rawMessage.match(/between (\d{4}-\d{2}-\d{2}) and (\d{4}-\d{2}-\d{2})/);
+  if (!match) return null;
+  const [, windowStart, windowEnd] = match;
+  const workingDays: string[] = [];
+  for (let d = windowStart; d <= windowEnd; d = addDays(d, 1)) {
+    const resolved = resolveScheduleForDate(employeeId, d, datedAssignments, patterns, shiftPatterns);
+    if (resolved === 'day' || resolved === 'night') workingDays.push(d);
+  }
+  return { windowStart, windowEnd, workingDays };
 }
 
 /** Every date in [dateFrom, dateTo] inclusive, as plain YYYY-MM-DD strings. */

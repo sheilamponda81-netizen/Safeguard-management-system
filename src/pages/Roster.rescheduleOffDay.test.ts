@@ -2,78 +2,140 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-// Phase 2B.2C: Reschedule Off Day, Policy Option A UI. Same established
-// precedent as this directory's other Roster.*.test.ts files (no
-// component-test harness in this repo -- see Roster.employeeSearch.test.ts's
-// own header) -- these pin how Roster.tsx wires the new mandatory-swap
-// workflow: required fields, the removed optional checkbox, the
-// before/after preview, and submit-button gating.
+// Stage C Step 12A: the Temporary / Permanent Off Day tab's write path is
+// now ONE atomic RPC call (applyWeekdayTransition -> roster_apply_weekday_transition)
+// covering every affected week plus the single "bridge" week/date the
+// rolling-seven-day rest rule sometimes requires -- replacing Step 12's
+// per-week loop over rescheduleOffDay (which risked a partial outcome)
+// and its direct assignRecurringPattern call in the Permanent branch.
+// Same established precedent as this directory's other Roster.*.test.ts
+// files (no component-test harness in this repo -- see
+// Roster.employeeSearch.test.ts's own header) -- these pin how Roster.tsx
+// wires the weekday+duration workflow: required fields, the
+// Temporary/Permanent mode toggle, the multi-week/bridge-aware plan, the
+// single atomic submission call, the bridge-day confirmation gate, and
+// the plain-language rolling-rest-conflict explanation.
 const rosterSource = fs.readFileSync(path.resolve(__dirname, './Roster.tsx'), 'utf-8');
 
-describe('Reschedule Off Day: the old optional "also assign work on the vacated date" design is gone', () => {
-  it('no checkbox, vacated-date, or vacated-type state remains', () => {
-    expect(rosterSource).not.toMatch(/rescheduleAssignVacated/);
-    expect(rosterSource).not.toMatch(/rescheduleVacatedDate/);
-    expect(rosterSource).not.toMatch(/rescheduleVacatedType/);
-    expect(rosterSource).not.toMatch(/Also assign work on the vacated date/);
+describe('Temporary / Permanent Off Day: weekday-based fields replace the old exact-date-pair form', () => {
+  it('no longer asks for two exact calendar dates -- original/replacement are weekday selects, not date inputs', () => {
+    expect(rosterSource).not.toMatch(/const \[rescheduleOriginalDate, setRescheduleOriginalDate\]/);
+    expect(rosterSource).not.toMatch(/const \[rescheduleReplacementDate, setRescheduleReplacementDate\]/);
+    expect(rosterSource).toMatch(/const \[rescheduleOriginalWeekday, setRescheduleOriginalWeekday\] = useState\('3'\);/);
+    expect(rosterSource).toMatch(/const \[rescheduleNewWeekday, setRescheduleNewWeekday\] = useState\('0'\);/);
   });
 
-  it('no longer calls rescheduleOffDay with the old 5-argument (employeeId, newOffDate, reason, vacatedDate?, vacatedType?) shape', () => {
-    expect(rosterSource).not.toMatch(/rescheduleNewOffDate/);
-  });
-});
-
-describe('Reschedule Off Day: the new mandatory fields all exist as required state', () => {
-  it('has original date, replacement date, shift, and reason state', () => {
-    expect(rosterSource).toMatch(/const \[rescheduleOriginalDate, setRescheduleOriginalDate\] = useState\(''\);/);
-    expect(rosterSource).toMatch(/const \[rescheduleReplacementDate, setRescheduleReplacementDate\] = useState\(''\);/);
+  it('has a single "week containing" date anchor, a shift selector, a duration control, a Permanent toggle, a reason, and a bridge-acknowledgment flag', () => {
+    expect(rosterSource).toMatch(/const \[rescheduleWeekAnchor, setRescheduleWeekAnchor\] = useState\(defaults\.today\);/);
     expect(rosterSource).toMatch(/const \[rescheduleShift, setRescheduleShift\] = useState<'day' \| 'night'>\('day'\);/);
+    expect(rosterSource).toMatch(/const \[rescheduleDurationMode, setRescheduleDurationMode\] = useState<'1' \| '2' \| '3' \| 'custom'>\('1'\);/);
+    expect(rosterSource).toMatch(/const \[rescheduleCustomWeeks, setRescheduleCustomWeeks\] = useState\('4'\);/);
+    expect(rosterSource).toMatch(/const \[rescheduleIsPermanent, setRescheduleIsPermanent\] = useState\(false\);/);
     expect(rosterSource).toMatch(/const \[rescheduleReason, setRescheduleReason\] = useState\(''\);/);
-  });
-
-  it('calls rescheduleOffDay with the new 5-argument (employeeId, originalDate, replacementDate, shift, reason) shape', () => {
-    expect(rosterSource).toMatch(
-      /rescheduleOffDay\(\s*\n\s*rescheduleEmployeeId,\s*\n\s*rescheduleOriginalDate,\s*\n\s*rescheduleReplacementDate,\s*\n\s*rescheduleShift,\s*\n\s*rescheduleReason\s*\n\s*\)/
-    );
+    expect(rosterSource).toMatch(/const \[rescheduleBridgeAcknowledged, setRescheduleBridgeAcknowledged\] = useState\(false\);/);
   });
 
   it('still uses the searchable EmployeeSingleSelect combobox, unchanged from Phase 2B.2C\'s employee-search work', () => {
     expect(rosterSource).toMatch(/<EmployeeSingleSelect employees=\{employees\} value=\{rescheduleEmployeeId\} onChange=\{setRescheduleEmployeeId\} \/>/);
   });
+
+  it('auto-detects the employee\'s current recurring Off weekday and shift on selection, via the pure resolver helpers, never hardcoded', () => {
+    const effect = rosterSource.match(/useEffect\(\(\) => \{\s*\n\s*if \(!rescheduleEmployeeId\)[\s\S]*?\n {2}\}, \[rescheduleEmployeeId, patterns, shiftPatterns\]\);/)?.[0] ?? '';
+    expect(effect).toMatch(/resolveActiveOffWeekday\(rescheduleEmployeeId, today, patterns\)/);
+    expect(effect).toMatch(/resolveActiveShiftType\(rescheduleEmployeeId, today, shiftPatterns\)/);
+  });
 });
 
-describe('Reschedule Off Day: submission is gated on every required field and the advisory preview having no blocking issue', () => {
-  it('canSubmitReschedule requires employee, both dates, a non-empty reason, and an unblocked preview', () => {
-    const def = rosterSource.match(/const canSubmitReschedule =[\s\S]*?;/)?.[0] ?? '';
+describe('Temporary / Permanent Off Day: the plan is built from the pure, independently-tested plan-builder helpers, one per mode', () => {
+  it('imports buildTemporaryReschedulePlan, buildPermanentWeekdayTransitionPlan, applyWeekdayTransition and explainRollingRestConflict', () => {
+    expect(rosterSource).toMatch(/buildTemporaryReschedulePlan/);
+    expect(rosterSource).toMatch(/buildPermanentWeekdayTransitionPlan/);
+    expect(rosterSource).toMatch(/applyWeekdayTransition/);
+    expect(rosterSource).toMatch(/explainRollingRestConflict/);
+  });
+
+  it('reschedulePlan is built ONLY for Temporary mode -- it returns [] when rescheduleIsPermanent is true, one week per unit of duration otherwise', () => {
+    const def = rosterSource.match(/const reschedulePlan: TemporaryRescheduleWeekPlan\[\] = useMemo\(\(\) => \{[\s\S]*?\n {2}\}, \[[\s\S]*?\]\);/)?.[0] ?? '';
+    expect(def).toMatch(/if \(!rescheduleEmployeeId \|\| !rescheduleWeekStart \|\| rescheduleSameWeekday \|\| rescheduleIsPermanent\) return \[\];/);
+    expect(def).toMatch(/buildTemporaryReschedulePlan\(/);
+  });
+
+  it('permanentPlan is built ONLY for Permanent mode, using buildPermanentWeekdayTransitionPlan', () => {
+    const def = rosterSource.match(/const permanentPlan: PermanentWeekdayTransitionPlan \| null = useMemo\(\(\) => \{[\s\S]*?\n {2}\}, \[[\s\S]*?\]\);/)?.[0] ?? '';
+    expect(def).toMatch(/if \(!rescheduleEmployeeId \|\| !rescheduleWeekStart \|\| rescheduleSameWeekday \|\| !rescheduleIsPermanent\) return null;/);
+    expect(def).toMatch(/buildPermanentWeekdayTransitionPlan\(/);
+  });
+
+  it('rescheduleBridgeDate is derived uniformly from whichever plan is active for the current mode', () => {
+    expect(rosterSource).toMatch(
+      /const rescheduleBridgeDate: string \| null = rescheduleIsPermanent\s*\n\s*\? permanentPlan\?\.bridgeDate \?\? null\s*\n\s*: reschedulePlan\.find\(\(w\) => w\.isBridgeWeek\)\?\.originalDate \?\? null;/
+    );
+  });
+
+  it('resets the bridge-day acknowledgment whenever the bridge date itself changes, so a stale confirmation can never carry over to a different plan', () => {
+    expect(rosterSource).toMatch(
+      /useEffect\(\(\) => \{\s*\n\s*setRescheduleBridgeAcknowledged\(false\);\s*\n\s*\}, \[rescheduleBridgeDate\]\);/
+    );
+  });
+});
+
+describe('Temporary / Permanent Off Day: submission is gated on every required field, every week being clean, and any bridge day being explicitly confirmed', () => {
+  it('canSubmitReschedule requires employee, a valid week, different weekdays, a non-empty reason, a sane duration, a built plan for the active mode, every Temporary week unblocked, and bridge acknowledgment when a bridge is needed', () => {
+    const def = rosterSource.match(/const canSubmitReschedule =[\s\S]*?\(!rescheduleBridgeDate \|\| rescheduleBridgeAcknowledged\);/)?.[0] ?? '';
     expect(def).toMatch(/!!rescheduleEmployeeId/);
-    expect(def).toMatch(/!!rescheduleOriginalDate/);
-    expect(def).toMatch(/!!rescheduleReplacementDate/);
+    expect(def).toMatch(/!!rescheduleWeekStart/);
+    expect(def).toMatch(/!rescheduleSameWeekday/);
     expect(def).toMatch(/!!rescheduleReason\.trim\(\)/);
-    expect(def).toMatch(/!reschedulePreview\.blockingReason/);
+    expect(def).toMatch(/rescheduleDurationWeeks >= 1/);
+    expect(def).toMatch(/rescheduleDurationWeeks <= MAX_TEMPORARY_RESCHEDULE_WEEKS/);
+    expect(def).toMatch(/\(rescheduleIsPermanent \? !!permanentPlan : reschedulePlan\.length > 0\)/);
+    expect(def).toMatch(/\(rescheduleIsPermanent \|\| reschedulePlan\.every\(\(w\) => !w\.preview\.blockingReason\)\)/);
+    expect(def).toMatch(/\(!rescheduleBridgeDate \|\| rescheduleBridgeAcknowledged\)/);
   });
 
   it('the submit Button is disabled whenever canSubmitReschedule is false', () => {
     expect(rosterSource).toMatch(/<Button onClick=\{handleSubmitReschedule\} disabled=\{submitting \|\| !canSubmitReschedule\}>/);
   });
 
-  it('handleSubmitReschedule refuses to call the RPC at all when canSubmitReschedule is false (defense in depth beyond the disabled button)', () => {
+  it('handleSubmitReschedule refuses to call any RPC at all when canSubmitReschedule is false (defense in depth beyond the disabled button)', () => {
     const fn = rosterSource.match(/const handleSubmitReschedule = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[/)?.[0] ?? '';
     expect(fn).toMatch(/if \(!canSubmitReschedule\) \{/);
   });
 });
 
-describe('Reschedule Off Day: the Before/After preview is wired from the pure, independently-tested buildRescheduleOffDayPreview helper', () => {
-  it('imports buildRescheduleOffDayPreview from rosterSchedule', () => {
-    expect(rosterSource).toMatch(/buildRescheduleOffDayPreview/);
+describe('Temporary / Permanent Off Day: a single atomic applyWeekdayTransition call handles BOTH modes -- no per-week loop, no direct assignRecurringPattern/rescheduleOffDay call', () => {
+  it('calls applyWeekdayTransition exactly once, passing mode, both weekdays, shift, week start, duration, and reason', () => {
+    const fn = rosterSource.match(/const handleSubmitReschedule = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[/)?.[0] ?? '';
+    expect(fn).toMatch(
+      /applyWeekdayTransition\(\s*\n\s*rescheduleEmployeeId,\s*\n\s*rescheduleIsPermanent \? 'permanent' : 'temporary',\s*\n\s*rescheduleOriginalWeekdayNum,\s*\n\s*rescheduleNewWeekdayNum,\s*\n\s*rescheduleShift,\s*\n\s*rescheduleWeekStart,\s*\n\s*rescheduleIsPermanent \? 1 : rescheduleDurationWeeks,\s*\n\s*rescheduleReason\s*\n\s*\);/
+    );
   });
 
-  it('computes the preview from employee id, both dates, and the chosen shift, fed by the already-loaded dateAssignments/patterns/shiftPatterns state', () => {
-    // Stage C Step 6B added shiftPatterns as a 7th argument so the preview
-    // correctly accounts for a recurring Day/Night baseline, not just the
-    // recurring Off-day pattern -- see Roster.recurringSchedule.test.ts.
-    expect(rosterSource).toMatch(
-      /buildRescheduleOffDayPreview\(rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns, shiftPatterns\)/
-    );
+  it('never calls assignRecurringPattern or rescheduleOffDay directly from this handler', () => {
+    const fn = rosterSource.match(/const handleSubmitReschedule = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[/)?.[0] ?? '';
+    expect(fn).not.toMatch(/assignRecurringPattern\(/);
+    expect(fn).not.toMatch(/rescheduleOffDay\(/);
+  });
+
+  it('reports any server-confirmed bridge date back to the administrator in the success notification, for both modes', () => {
+    const fn = rosterSource.match(/const handleSubmitReschedule = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[/)?.[0] ?? '';
+    expect(fn).toMatch(/const bridgeNote = result\.bridgeDate/);
+    expect(fn).toMatch(/kept as an additional Off day to preserve the mandatory rolling seven-day rest requirement/);
+  });
+
+  it('composes a plain-language explanation (employee, why, which working days, what to try) when the server rejects the whole transition for the rolling-rest rule', () => {
+    const fn = rosterSource.match(/const handleSubmitReschedule = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[/)?.[0] ?? '';
+    expect(fn).toMatch(/explainRollingRestConflict\(rawMessage, rescheduleEmployeeId, dateAssignments, patterns, shiftPatterns\)/);
+    expect(fn).toMatch(/every day from \$\{explanation\.windowStart\} to \$\{explanation\.windowEnd\} is already a working day/);
+    expect(fn).toMatch(/Try a shorter duration, or choose a different pair of weekdays/);
+  });
+});
+
+describe('Temporary / Permanent Off Day: the preview shows Before/After, the bridge week/date distinctly, and flags only the specific weeks with an issue', () => {
+  it('renders one preview row per week with the computed dates and resolved Before state', () => {
+    expect(rosterSource).toMatch(/\{reschedulePlan\.map\(\(week\) => \(/);
+    expect(rosterSource).toMatch(/week\.preview\.originalResolved/);
+    expect(rosterSource).toMatch(/week\.preview\.replacementResolved/);
   });
 
   it('shows the employee\'s name AND employee number in the preview heading, not only an internal id', () => {
@@ -81,31 +143,34 @@ describe('Reschedule Off Day: the Before/After preview is wired from the pure, i
     expect(rosterSource).toMatch(/\(\{rescheduleSelectedEmployee\.employeeNumber\}\)/);
   });
 
-  it('the preview shows the ACTUAL resolved state for both dates in "Before" -- never hardcodes the original date as Off', () => {
-    const beforeBlock = rosterSource.match(/Before<\/p>[\s\S]*?After<\/p>/)?.[0] ?? '';
-    expect(beforeBlock).toMatch(/\{reschedulePreview\.originalResolved\}/);
-    expect(beforeBlock).toMatch(/\{reschedulePreview\.replacementResolved\}/);
+  it('a week-specific blockingReason is shown only for that week\'s own card', () => {
+    expect(rosterSource).toMatch(/\{week\.preview\.blockingReason && \(/);
   });
 
-  it('the preview shows the chosen shift for the original date and "off" for the replacement date in "After"', () => {
-    const afterBlock = rosterSource.slice(rosterSource.indexOf('After</p>'));
-    expect(afterBlock.slice(0, 600)).toMatch(/\{rescheduleShift\}/);
-    expect(afterBlock.slice(0, 600)).toMatch(/>off<\/Badge>/);
+  it('renders the bridge week distinctly, explaining that its original weekday stays Off rather than being converted', () => {
+    expect(rosterSource).toMatch(/week\.isBridgeWeek \? \(/);
+    expect(rosterSource).toMatch(/stays <Badge color="gold">off<\/Badge> \(not converted to \{rescheduleShift\}\)/);
   });
 
-  it('surfaces the preview\'s blockingReason to the Admin when present, and otherwise states the preview is advisory', () => {
-    expect(rosterSource).toMatch(/\{reschedulePreview\.blockingReason\}/);
-    expect(rosterSource).toMatch(/This preview is advisory\. The database independently re-verifies every rule/);
+  it('Permanent mode\'s preview explicitly states historical dates before the effective date are never rewritten, and names the bridge date when one applies', () => {
+    const permanentPreview = rosterSource.slice(rosterSource.indexOf('rescheduleIsPermanent && permanentPlan ? (\n'));
+    expect(permanentPreview.slice(0, 700)).toMatch(/This never rewrites any date before/);
+    expect(permanentPreview.slice(0, 1500)).toMatch(/permanentPlan\.bridgeDate && \(/);
+  });
+
+  it('shows one confirmation checkbox, gated on rescheduleBridgeDate, bound to rescheduleBridgeAcknowledged, shared by both modes', () => {
+    expect(rosterSource).toMatch(/\{rescheduleBridgeDate && \(/);
+    expect(rosterSource).toMatch(/checked=\{rescheduleBridgeAcknowledged\}/);
+    expect(rosterSource).toMatch(/onChange=\{\(e\) => setRescheduleBridgeAcknowledged\(e\.target\.checked\)\}/);
   });
 });
 
-describe('Reschedule Off Day: all three roster forms humanize RPC error messages (employee UUID -> name/number)', () => {
+describe('Temporary / Permanent Off Day: all roster forms humanize RPC error messages (employee UUID -> name/number)', () => {
   it('imports humanizeRosterError from rosterService', () => {
     expect(rosterSource).toMatch(/humanizeRosterError/);
   });
 
-  it('every showNotification(..., \'error\') call that surfaces an RPC result.error passes it through humanizeRosterError', () => {
-    const matches = rosterSource.match(/showNotification\(humanizeRosterError\(result\.error \|\| '[^']*', employees\), 'error'\)/g) || [];
-    expect(matches.length).toBe(3); // off-pattern, assign-dates, reschedule
+  it('the Temporary/Permanent form\'s own error path passes the result through humanizeRosterError', () => {
+    expect(rosterSource).toMatch(/humanizeRosterError\(rawMessage, employees\)/);
   });
 });

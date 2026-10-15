@@ -21,7 +21,10 @@ import { isBusinessAdmin } from '../utils/permissions';
 import { showNotification } from '../utils/clickHandlers';
 import {
   resolveScheduleForDate, expandDateRange, addDays, WEEKDAY_LABELS,
-  buildRescheduleOffDayPreview, ResolvedSchedule,
+  ResolvedSchedule,
+  resolveActiveOffWeekday, resolveActiveShiftType,
+  buildTemporaryReschedulePlan, buildPermanentWeekdayTransitionPlan, explainRollingRestConflict,
+  TemporaryRescheduleWeekPlan, PermanentWeekdayTransitionPlan,
   AssignmentType, OffDayPatternRow, DateAssignmentRow, ShiftPatternRow,
 } from '../utils/rosterSchedule';
 import {
@@ -31,7 +34,7 @@ import {
 import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import {
   fetchActiveOffDayPatterns, fetchActiveShiftPatterns, fetchActiveDateAssignments, fetchActiveEmployeesForRoster,
-  assignRecurringPattern, assignDates, rescheduleOffDay, humanizeRosterError,
+  assignRecurringPattern, assignDates, applyWeekdayTransition, humanizeRosterError,
   filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex,
 } from '../utils/rosterService';
 
@@ -419,70 +422,164 @@ export default function RosterPage() {
     }
   }, [assignEmployeeIds, assignDateFrom, assignDateTo, assignType, assignReason, employees, loadData]);
 
-  // --- Reschedule Off day (atomic composite) form -- Phase 2B.2C, Policy
-  // Option A: a mandatory symmetric swap. There is no longer an "also
-  // assign work on the vacated date" checkbox -- converting the original
-  // date into a real shift is now always part of the same call (see the
-  // reschedule service wrapper's own header and the new migration's own
-  // header for why the old optional-checkbox design was replaced).
+  // --- Stage C Step 12: Temporary / Permanent Off-day change, expressed
+  // in the weekday vocabulary administrators actually think in ("Wednesday
+  // Off -> Sunday Off for three weeks") instead of requiring two exact
+  // calendar dates to be typed in. Safeguard computes every actual date
+  // automatically.
+  //
+  // Stage C Step 12A CHANGE: the write path is now ONE atomic RPC call
+  // (roster_apply_weekday_transition) covering every affected week (plus
+  // the one "bridge" week/date the rolling-seven-day rest rule sometimes
+  // requires -- see rosterSchedule.ts's buildTemporaryReschedulePlan and
+  // buildPermanentWeekdayTransitionPlan headers for the full proof) --
+  // never a per-week loop calling roster_reschedule_off_day, which risked
+  // a partial, some-weeks-changed-others-not outcome on a mid-sequence
+  // rejection. The bridge day, when one is needed, is always shown in the
+  // preview and requires an explicit confirmation checkbox before
+  // submission is enabled -- Safeguard never silently keeps an extra Off
+  // day (or, equally, never silently removes one) without the
+  // administrator seeing exactly which date and why.
   const [rescheduleEmployeeId, setRescheduleEmployeeId] = useState('');
-  const [rescheduleOriginalDate, setRescheduleOriginalDate] = useState('');
-  const [rescheduleReplacementDate, setRescheduleReplacementDate] = useState('');
+  const [rescheduleWeekAnchor, setRescheduleWeekAnchor] = useState(defaults.today);
+  const [rescheduleOriginalWeekday, setRescheduleOriginalWeekday] = useState('3');
+  const [rescheduleNewWeekday, setRescheduleNewWeekday] = useState('0');
   const [rescheduleShift, setRescheduleShift] = useState<'day' | 'night'>('day');
+  const [rescheduleDurationMode, setRescheduleDurationMode] = useState<'1' | '2' | '3' | 'custom'>('1');
+  const [rescheduleCustomWeeks, setRescheduleCustomWeeks] = useState('4');
+  const [rescheduleIsPermanent, setRescheduleIsPermanent] = useState(false);
   const [rescheduleReason, setRescheduleReason] = useState('');
+  const [rescheduleBridgeAcknowledged, setRescheduleBridgeAcknowledged] = useState(false);
 
   const rescheduleSelectedEmployee = useMemo(
     () => employees.find((e) => e.id === rescheduleEmployeeId) || null,
     [employees, rescheduleEmployeeId]
   );
 
-  // Advisory preview only -- see buildRescheduleOffDayPreview's own header.
-  // The database independently re-verifies everything, including the
-  // rolling seven-day rest rule, which this preview deliberately does not
-  // replicate.
-  const reschedulePreview = useMemo(
-    () =>
-      rescheduleEmployeeId && rescheduleOriginalDate && rescheduleReplacementDate
-        ? buildRescheduleOffDayPreview(rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns, shiftPatterns)
-        : null,
-    [rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, dateAssignments, patterns, shiftPatterns]
-  );
+  // Auto-detect the employee's CURRENT recurring Off weekday and normal
+  // shift the moment they're selected, so Admin does not need to already
+  // know (or go look up) those facts -- still freely overridable below,
+  // e.g. to correct a data-entry mistake.
+  useEffect(() => {
+    if (!rescheduleEmployeeId) return;
+    const today = getBlantyreToday();
+    const detectedOff = resolveActiveOffWeekday(rescheduleEmployeeId, today, patterns);
+    if (detectedOff !== null) setRescheduleOriginalWeekday(String(detectedOff));
+    const detectedShift = resolveActiveShiftType(rescheduleEmployeeId, today, shiftPatterns);
+    if (detectedShift !== null) setRescheduleShift(detectedShift);
+  }, [rescheduleEmployeeId, patterns, shiftPatterns]);
+
+  const MAX_TEMPORARY_RESCHEDULE_WEEKS = 52;
+  const rescheduleDurationWeeks =
+    rescheduleDurationMode === 'custom' ? Number(rescheduleCustomWeeks) || 0 : Number(rescheduleDurationMode);
+  const rescheduleWeekStart = rescheduleWeekAnchor ? startOfWeek(rescheduleWeekAnchor) : '';
+  const rescheduleOriginalWeekdayNum = Number(rescheduleOriginalWeekday);
+  const rescheduleNewWeekdayNum = Number(rescheduleNewWeekday);
+  const rescheduleSameWeekday = rescheduleOriginalWeekdayNum === rescheduleNewWeekdayNum;
+
+  // Advisory preview only (one entry per affected week in Temporary mode,
+  // a single bridge-aware summary for Permanent mode) -- see
+  // buildRescheduleOffDayPreview's own header. The database independently
+  // re-verifies everything, including the rolling seven-day rest rule,
+  // which this preview deliberately does not replicate -- EXCEPT the
+  // bridge-day calculation itself (Stage C Step 12A), which IS mirrored
+  // here exactly (see rosterSchedule.ts's bridgeWeekIndex /
+  // buildPermanentWeekdayTransitionPlan headers for the proof), purely
+  // so the administrator sees the additional Off day in advance and can
+  // explicitly confirm it -- the server independently recomputes and
+  // applies the same bridge, never trusting this preview's result.
+  const reschedulePlan: TemporaryRescheduleWeekPlan[] = useMemo(() => {
+    if (!rescheduleEmployeeId || !rescheduleWeekStart || rescheduleSameWeekday || rescheduleIsPermanent) return [];
+    if (!rescheduleDurationWeeks || rescheduleDurationWeeks < 1) return [];
+    return buildTemporaryReschedulePlan(
+      rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
+      rescheduleDurationWeeks, rescheduleShift, dateAssignments, patterns, shiftPatterns
+    );
+  }, [
+    rescheduleEmployeeId, rescheduleWeekStart, rescheduleSameWeekday, rescheduleIsPermanent, rescheduleDurationWeeks,
+    rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, rescheduleShift, dateAssignments, patterns, shiftPatterns,
+  ]);
+
+  const permanentPlan: PermanentWeekdayTransitionPlan | null = useMemo(() => {
+    if (!rescheduleEmployeeId || !rescheduleWeekStart || rescheduleSameWeekday || !rescheduleIsPermanent) return null;
+    return buildPermanentWeekdayTransitionPlan(
+      rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
+      dateAssignments, patterns, shiftPatterns
+    );
+  }, [
+    rescheduleEmployeeId, rescheduleWeekStart, rescheduleSameWeekday, rescheduleIsPermanent,
+    rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, dateAssignments, patterns, shiftPatterns,
+  ]);
+
+  // The single date (if any) that must stay an additional Off day to
+  // bridge the transition -- unified across both modes so one
+  // confirmation checkbox covers either case.
+  const rescheduleBridgeDate: string | null = rescheduleIsPermanent
+    ? permanentPlan?.bridgeDate ?? null
+    : reschedulePlan.find((w) => w.isBridgeWeek)?.originalDate ?? null;
+
+  // A stale confirmation from a DIFFERENT plan (e.g. after changing the
+  // employee or weekdays) must never silently carry over.
+  useEffect(() => {
+    setRescheduleBridgeAcknowledged(false);
+  }, [rescheduleBridgeDate]);
 
   const canSubmitReschedule =
     !!rescheduleEmployeeId &&
-    !!rescheduleOriginalDate &&
-    !!rescheduleReplacementDate &&
+    !!rescheduleWeekStart &&
+    !rescheduleSameWeekday &&
     !!rescheduleReason.trim() &&
-    !!reschedulePreview &&
-    !reschedulePreview.blockingReason;
+    rescheduleDurationWeeks >= 1 &&
+    rescheduleDurationWeeks <= MAX_TEMPORARY_RESCHEDULE_WEEKS &&
+    (rescheduleIsPermanent ? !!permanentPlan : reschedulePlan.length > 0) &&
+    (rescheduleIsPermanent || reschedulePlan.every((w) => !w.preview.blockingReason)) &&
+    (!rescheduleBridgeDate || rescheduleBridgeAcknowledged);
 
   const handleSubmitReschedule = useCallback(async () => {
     if (!canSubmitReschedule) {
-      showNotification('Complete all required fields and resolve the issue shown in the preview before submitting.', 'error');
+      showNotification('Complete all required fields, resolve every issue shown in the preview, and confirm any additional Off day before submitting.', 'error');
       return;
     }
     setSubmitting(true);
     try {
-      const result = await rescheduleOffDay(
+      const result = await applyWeekdayTransition(
         rescheduleEmployeeId,
-        rescheduleOriginalDate,
-        rescheduleReplacementDate,
+        rescheduleIsPermanent ? 'permanent' : 'temporary',
+        rescheduleOriginalWeekdayNum,
+        rescheduleNewWeekdayNum,
         rescheduleShift,
+        rescheduleWeekStart,
+        rescheduleIsPermanent ? 1 : rescheduleDurationWeeks,
         rescheduleReason
       );
       if (result.success) {
-        showNotification('Off day rescheduled.', 'success');
-        setRescheduleOriginalDate('');
-        setRescheduleReplacementDate('');
+        const bridgeNote = result.bridgeDate
+          ? ` ${WEEKDAY_LABELS[rescheduleOriginalWeekdayNum]} ${result.bridgeDate} was kept as an additional Off day to preserve the mandatory rolling seven-day rest requirement during the transition.`
+          : '';
+        const message = rescheduleIsPermanent
+          ? `Permanent Off-day change saved: ${WEEKDAY_LABELS[rescheduleNewWeekdayNum]} is now the recurring Off day from ${rescheduleWeekStart}.${bridgeNote}`
+          : `Rescheduled ${result.weeksApplied ?? rescheduleDurationWeeks} week(s) successfully. The Off day automatically returns to normal afterward -- no further action needed.${bridgeNote}`;
+        showNotification(message, 'success');
         setRescheduleReason('');
+        setRescheduleBridgeAcknowledged(false);
         await loadData();
       } else {
-        showNotification(humanizeRosterError(result.error || 'Could not reschedule the Off day.', employees), 'error');
+        const rawMessage = result.error || 'Could not apply this weekday transition.';
+        const explanation = explainRollingRestConflict(rawMessage, rescheduleEmployeeId, dateAssignments, patterns, shiftPatterns);
+        const humanized = humanizeRosterError(rawMessage, employees);
+        const fullMessage = explanation
+          ? `${humanized} Specifically, every day from ${explanation.windowStart} to ${explanation.windowEnd} is already a working day (${explanation.workingDays.join(', ')}) -- there is no rest day anywhere in that window. Try a shorter duration, or choose a different pair of weekdays so at least one day in that window stays Off.`
+          : humanized;
+        showNotification(fullMessage, 'error');
       }
     } finally {
       setSubmitting(false);
     }
-  }, [canSubmitReschedule, rescheduleEmployeeId, rescheduleOriginalDate, rescheduleReplacementDate, rescheduleShift, rescheduleReason, employees, loadData]);
+  }, [
+    canSubmitReschedule, rescheduleEmployeeId, rescheduleIsPermanent, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
+    rescheduleShift, rescheduleWeekStart, rescheduleDurationWeeks, rescheduleReason, dateAssignments, patterns, shiftPatterns,
+    employees, loadData,
+  ]);
 
   const toggleInSet = (set: Set<string>, setSet: (s: Set<string>) => void, id: string) => {
     const next = new Set(set);
@@ -527,7 +624,7 @@ export default function RosterPage() {
           { id: 'calendar', label: 'Calendar', icon: CalendarDays },
           { id: 'off-pattern', label: 'Recurring Schedule', icon: UsersIcon },
           { id: 'assign-dates', label: 'Assign Dates', icon: CalendarDays },
-          { id: 'reschedule', label: 'Reschedule Off Day', icon: AlertTriangle },
+          { id: 'reschedule', label: 'Temporary / Permanent Off Day', icon: AlertTriangle },
         ]}
         active={activeTab}
         onChange={(id) => setActiveTab(id as TabId)}
@@ -642,8 +739,11 @@ export default function RosterPage() {
           <div>
             <p className="text-sm text-slate-600">
               Set an employee's normal recurring shift and/or weekly Off day once -- the schedule repeats automatically every
-              week from the effective date <strong>until changed</strong>, with no need to re-assign it. An explicit dated
-              assignment (Assign Dates tab) always overrides this for that one date only.
+              week from the effective date <strong>until changed</strong>, with no need to re-assign it. This is also how to make
+              a <strong>permanent</strong> weekday change (e.g. moving the Off day from Wednesday to Sunday for good) -- the
+              Temporary / Permanent Off Day tab offers the identical permanent action in weekday-swap language, for convenience.
+              For a time-limited change that should revert automatically, use that tab's Temporary option instead. An explicit
+              dated assignment (Assign Dates tab) always overrides this for that one date only.
             </p>
           </div>
           <Input icon={Search} placeholder="Search employee by name or number..." value={offPatternSearch} onChange={(e) => setOffPatternSearch(e.target.value)} />
@@ -699,9 +799,16 @@ export default function RosterPage() {
       ) : activeTab === 'assign-dates' ? (
         <Card className="p-5 space-y-4">
           <p className="text-sm text-slate-600">Assign Day, Night, or a dated Off exception across a date range for one or more employees.</p>
+          <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+            Use this tab only for genuinely <strong>exceptional, one-off dated</strong> shifts -- a single public holiday, a one-time
+            special assignment, a specific day that needs correcting. It is <strong>not</strong> for normal repeating weekly schedules
+            (use the <strong>Recurring Schedule</strong> tab) or for moving an Off day, temporarily or permanently
+            (use the <strong>Temporary / Permanent Off Day</strong> tab) -- those tabs compute the right dates automatically and keep
+            the rolling seven-day rest rule and historical schedules intact in ways a plain dated assignment does not.
+          </p>
           <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
             A working assignment cannot be placed on a date an employee is already scheduled Off -- this is always blocked, with no override.
-            To work a normally-Off date, use the <strong>Reschedule Off Day</strong> tab, which moves the Off day and assigns the vacated date atomically.
+            To work a normally-Off date, use the <strong>Temporary / Permanent Off Day</strong> tab, which moves the Off day and assigns the vacated date atomically.
           </p>
           <Input icon={Search} placeholder="Search employee by name or number..." value={assignSearch} onChange={(e) => setAssignSearch(e.target.value)} />
           <div className="flex items-center justify-between text-xs text-slate-500">
@@ -733,51 +840,175 @@ export default function RosterPage() {
       ) : (
         <Card className="p-5 space-y-4">
           <p className="text-sm text-slate-600">
-            Move one employee's genuine, currently-Off original date to a different replacement date. The original date
-            becomes a real Day or Night shift and the replacement date becomes Off -- both changes are validated and
-            committed together, atomically. The database independently re-verifies every rule shown in the preview
-            below, including the rolling seven-day rest window.
+            Change an employee's weekly Off day by <strong>weekday</strong>, not by calculating calendar dates yourself --
+            e.g. "Wednesday Off → Sunday Off for three weeks." Safeguard works out every actual date automatically. Choose{' '}
+            <strong>Temporary</strong> for a time-limited change that reverts to the normal Off day by itself once the
+            duration ends (no further action needed), or <strong>Permanent</strong> to change the recurring pattern itself
+            from the selected week onward (equivalent to the Recurring Schedule tab's Off-day half, offered here too for
+            convenience). Historical schedules before the effective date are never silently modified either way.
           </p>
+
           <EmployeeSingleSelect employees={employees} value={rescheduleEmployeeId} onChange={setRescheduleEmployeeId} />
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Input label="Original Off date (required)" type="date" value={rescheduleOriginalDate} onChange={(e) => setRescheduleOriginalDate(e.target.value)} required />
-            <Input label="Replacement Off date (required)" type="date" value={rescheduleReplacementDate} onChange={(e) => setRescheduleReplacementDate(e.target.value)} required />
+
+          <div className="flex items-center gap-4 rounded-lg border border-slate-200 p-3">
+            <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+              <input type="radio" name="reschedule-mode" checked={!rescheduleIsPermanent} onChange={() => setRescheduleIsPermanent(false)} />
+              Temporary
+            </label>
+            <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+              <input type="radio" name="reschedule-mode" checked={rescheduleIsPermanent} onChange={() => setRescheduleIsPermanent(true)} />
+              Permanent
+            </label>
           </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Select
+              label="Original Off weekday (required)"
+              value={rescheduleOriginalWeekday}
+              onChange={(e) => setRescheduleOriginalWeekday(e.target.value)}
+              options={WEEKDAY_OPTIONS}
+            />
+            <Select
+              label="New Off weekday (required)"
+              value={rescheduleNewWeekday}
+              onChange={(e) => setRescheduleNewWeekday(e.target.value)}
+              options={WEEKDAY_OPTIONS}
+            />
+          </div>
+          <Input
+            label="Week containing (pick any date in the week the change should start)"
+            type="date"
+            value={rescheduleWeekAnchor}
+            onChange={(e) => setRescheduleWeekAnchor(e.target.value)}
+            required
+          />
+          {rescheduleWeekStart && (
+            <p className="text-xs text-slate-500">
+              That falls in the week of <strong>{rescheduleWeekStart}</strong> (Monday) to <strong>{addDays(rescheduleWeekStart, 6)}</strong> (Sunday).
+            </p>
+          )}
+          {rescheduleSameWeekday && (
+            <p className="text-xs text-red-600">The original and new Off weekday must be different.</p>
+          )}
+
           <Select
-            label="Shift on original date (required)"
+            label="Normal shift on the vacated weekday (required)"
             value={rescheduleShift}
             onChange={(e) => setRescheduleShift(e.target.value as 'day' | 'night')}
             options={[{ label: 'Day shift', value: 'day' }, { label: 'Night shift', value: 'night' }]}
           />
-          <Input label="Reason (required)" value={rescheduleReason} onChange={(e) => setRescheduleReason(e.target.value)} placeholder="e.g. Operations requested swap for this week only" required />
 
-          {rescheduleSelectedEmployee && rescheduleOriginalDate && rescheduleReplacementDate && reschedulePreview && (
-            <Card className={`p-4 space-y-3 border ${reschedulePreview.blockingReason ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
+          {!rescheduleIsPermanent && (
+            <div className="space-y-1.5">
+              <label className="block text-sm font-medium text-slate-700">Duration</label>
+              <div className="flex flex-wrap items-center gap-3">
+                {(['1', '2', '3'] as const).map((n) => (
+                  <label key={n} className="flex items-center gap-1.5 text-sm text-slate-700">
+                    <input type="radio" name="reschedule-duration" checked={rescheduleDurationMode === n} onChange={() => setRescheduleDurationMode(n)} />
+                    {n} week{n === '1' ? '' : 's'}
+                  </label>
+                ))}
+                <label className="flex items-center gap-1.5 text-sm text-slate-700">
+                  <input type="radio" name="reschedule-duration" checked={rescheduleDurationMode === 'custom'} onChange={() => setRescheduleDurationMode('custom')} />
+                  Custom:
+                  <input
+                    type="number"
+                    min={1}
+                    max={MAX_TEMPORARY_RESCHEDULE_WEEKS}
+                    value={rescheduleCustomWeeks}
+                    disabled={rescheduleDurationMode !== 'custom'}
+                    onChange={(e) => setRescheduleCustomWeeks(e.target.value)}
+                    className="w-20 rounded-lg border border-slate-200 px-2 py-1 text-sm disabled:opacity-50"
+                  />
+                  week(s)
+                </label>
+              </div>
+              <p className="text-xs text-slate-500">
+                After {rescheduleDurationWeeks || '?'} week{rescheduleDurationWeeks === 1 ? '' : 's'}, {rescheduleOriginalWeekday !== '' ? WEEKDAY_LABELS[rescheduleOriginalWeekdayNum] : 'the original weekday'} automatically becomes the normal Off day again -- nothing further to do.
+              </p>
+            </div>
+          )}
+
+          <Input
+            label="Reason (required)"
+            value={rescheduleReason}
+            onChange={(e) => setRescheduleReason(e.target.value)}
+            placeholder={rescheduleIsPermanent ? 'e.g. Site reassignment, permanent schedule change' : 'e.g. Operations requested swap for these weeks'}
+            required
+          />
+
+          {rescheduleSelectedEmployee && (rescheduleIsPermanent ? !!permanentPlan : reschedulePlan.length > 0) && (
+            <Card className="p-4 space-y-3 bg-slate-50 border border-slate-200">
               <p className="text-sm font-semibold text-slate-800">
                 Preview for {rescheduleSelectedEmployee.fullName} <span className="text-slate-500 font-normal">({rescheduleSelectedEmployee.employeeNumber})</span>
               </p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-                <div className="space-y-1">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Before</p>
-                  <p>Original date ({rescheduleOriginalDate}): <Badge color={scheduleBadgeColor(reschedulePreview.originalResolved)}>{reschedulePreview.originalResolved}</Badge></p>
-                  <p>Replacement date ({rescheduleReplacementDate}): <Badge color={scheduleBadgeColor(reschedulePreview.replacementResolved)}>{reschedulePreview.replacementResolved}</Badge></p>
+              {rescheduleIsPermanent && permanentPlan ? (
+                <div className="space-y-2">
+                  <p className="text-sm text-slate-700">
+                    From <strong>{rescheduleWeekStart}</strong> onward, <strong>{WEEKDAY_LABELS[rescheduleNewWeekdayNum]}</strong> becomes the recurring
+                    Off day (replacing {WEEKDAY_LABELS[rescheduleOriginalWeekdayNum]}), every week, until changed again. This never rewrites any date before {rescheduleWeekStart}.
+                  </p>
+                  {permanentPlan.bridgeDate && (
+                    <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900 flex items-start gap-2">
+                      <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
+                      <p>
+                        To keep at least one rest day in every rolling seven-day window during the transition, <strong>{WEEKDAY_LABELS[rescheduleOriginalWeekdayNum]} {permanentPlan.bridgeDate}</strong> will
+                        <strong> also</strong> remain an Off day -- a one-time addition for this single date only, even though it falls on or after the effective date. No other date is affected.
+                      </p>
+                    </div>
+                  )}
                 </div>
-                <div className="space-y-1">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">After</p>
-                  <p>Original date ({rescheduleOriginalDate}): <Badge color={scheduleBadgeColor(rescheduleShift)}>{rescheduleShift}</Badge></p>
-                  <p>Replacement date ({rescheduleReplacementDate}): <Badge color="gold">off</Badge></p>
-                </div>
-              </div>
-              {reschedulePreview.blockingReason ? (
-                <p className="text-sm text-red-700 flex items-start gap-1.5"><AlertTriangle size={15} className="mt-0.5 flex-shrink-0" /> {reschedulePreview.blockingReason}</p>
               ) : (
-                <p className="text-xs text-slate-500">This preview is advisory. The database independently re-verifies every rule (including the rolling seven-day rest window) before committing.</p>
+                <div className="space-y-2">
+                  {reschedulePlan.map((week) => (
+                    <div
+                      key={week.weekStart}
+                      className={`rounded-lg border p-3 text-sm ${
+                        week.preview.blockingReason ? 'bg-red-50 border-red-200' : week.isBridgeWeek ? 'bg-blue-50 border-blue-200' : 'bg-white border-slate-200'
+                      }`}
+                    >
+                      <p className="font-medium text-slate-700">Week of {week.weekStart} – {week.weekEnd}</p>
+                      {week.isBridgeWeek ? (
+                        <div className="mt-1 space-y-1">
+                          <p>
+                            {week.originalDate} stays <Badge color="gold">off</Badge> (not converted to {rescheduleShift}) -- an additional rest day needed to protect the
+                            rolling seven-day rule during this transition.
+                          </p>
+                          <p>{week.newOffDate} (was <Badge color={scheduleBadgeColor(week.preview.replacementResolved)}>{week.preview.replacementResolved}</Badge>) → <Badge color="gold">off</Badge></p>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-3 mt-1">
+                          <p>{week.originalDate} (was <Badge color={scheduleBadgeColor(week.preview.originalResolved)}>{week.preview.originalResolved}</Badge>) → <Badge color={scheduleBadgeColor(rescheduleShift)}>{rescheduleShift}</Badge></p>
+                          <p>{week.newOffDate} (was <Badge color={scheduleBadgeColor(week.preview.replacementResolved)}>{week.preview.replacementResolved}</Badge>) → <Badge color="gold">off</Badge></p>
+                        </div>
+                      )}
+                      {week.preview.blockingReason && (
+                        <p className="text-xs text-red-700 mt-1.5 flex items-start gap-1.5"><AlertTriangle size={13} className="mt-0.5 flex-shrink-0" /> {week.preview.blockingReason}</p>
+                      )}
+                    </div>
+                  ))}
+                  <p className="text-xs text-slate-500">
+                    This preview is advisory. The database independently re-verifies every rule, including the rolling seven-day rest
+                    window across the preceding and following weeks, and applies every week atomically -- all weeks succeed together, or none change.
+                  </p>
+                </div>
+              )}
+              {rescheduleBridgeDate && (
+                <label className="flex items-start gap-2 text-sm text-slate-800 rounded-lg border border-blue-200 bg-white p-3">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={rescheduleBridgeAcknowledged}
+                    onChange={(e) => setRescheduleBridgeAcknowledged(e.target.checked)}
+                  />
+                  I understand and approve keeping {WEEKDAY_LABELS[rescheduleOriginalWeekdayNum]} {rescheduleBridgeDate} as an additional Off day to maintain the mandatory rest requirement.
+                </label>
               )}
             </Card>
           )}
 
           <Button onClick={handleSubmitReschedule} disabled={submitting || !canSubmitReschedule}>
-            {submitting ? 'Saving...' : 'Reschedule Off Day'}
+            {submitting ? 'Saving...' : rescheduleIsPermanent ? 'Save Permanent Off-Day Change' : `Reschedule ${reschedulePlan.length || ''} Week(s)`}
           </Button>
         </Card>
       )}

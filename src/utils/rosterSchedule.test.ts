@@ -9,6 +9,14 @@ import {
   isOffPatternNoOp,
   isShiftPatternNoOp,
   buildRescheduleOffDayPreview,
+  dateForWeekdayInWeek,
+  resolveActiveOffWeekday,
+  resolveActiveShiftType,
+  buildTemporaryReschedulePlan,
+  buildPermanentWeekdayTransitionPlan,
+  weekdayOrdinal,
+  bridgeWeekIndex,
+  explainRollingRestConflict,
   weekdayOf,
   addDays,
   expandDateRange,
@@ -361,11 +369,10 @@ describe('buildRescheduleOffDayPreview (Phase 2B.2C, Policy Option A -- advisory
     const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'night', d, p);
     expect(preview.replacementResolved).toBe('off');
     expect(preview.isReplacementEligible).toBe(false);
-    expect(preview.blockingReason).toMatch(/must be unassigned/);
-    expect(preview.blockingReason).toMatch(/"off"/);
+    expect(preview.blockingReason).toMatch(/already Off/);
   });
 
-  it('only a replacement date that resolves to exactly "unassigned" is eligible', () => {
+  it('a replacement date that resolves to "unassigned" is eligible', () => {
     const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
     const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'day', [], p); // Wed off, Thu unassigned
     expect(preview.replacementResolved).toBe('unassigned');
@@ -379,13 +386,13 @@ describe('buildRescheduleOffDayPreview (Phase 2B.2C, Policy Option A -- advisory
     expect(preview.blockingReason).toMatch(/must be different/);
   });
 
-  it('Stage C Step 6B: a replacement date that a recurring Shift pattern resolves to Day/Night is correctly rejected as ineligible, not mistaken for "unassigned"', () => {
+  it('Stage C Step 12: a replacement date that a recurring Shift pattern resolves to Day/Night is ELIGIBLE, not rejected -- the realistic swap target (e.g. "Wednesday Off -> Sunday Off") is a normal working day under the employee\'s own recurring pattern, not "unassigned"', () => {
     const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday off
     const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })]; // every other day is a normal Day shift
     const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'night', [], p, shift); // Wed -> Thu (a Day under the recurring pattern)
     expect(preview.replacementResolved).toBe('day');
-    expect(preview.isReplacementEligible).toBe(false);
-    expect(preview.blockingReason).toMatch(/must be unassigned/);
+    expect(preview.isReplacementEligible).toBe(true);
+    expect(preview.blockingReason).toBeNull();
   });
 
   it('an original date that does not genuinely resolve Off is blocked, naming its actual resolved state', () => {
@@ -395,13 +402,12 @@ describe('buildRescheduleOffDayPreview (Phase 2B.2C, Policy Option A -- advisory
     expect(preview.blockingReason).toMatch(/unassigned/);
   });
 
-  it('a replacement date that already has a working shift is blocked as a silent-overwrite risk, naming the conflicting state', () => {
+  it('Stage C Step 12: a replacement date that already has a dated working shift is also ELIGIBLE (not a silent-overwrite risk) -- converting it to the new Off day for this week is exactly the intended operation', () => {
     const p = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
     const d = [dated({ assignmentDate: '2026-10-08', assignmentType: 'night' })];
     const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-08', 'day', d, p);
-    expect(preview.isReplacementEligible).toBe(false);
-    expect(preview.blockingReason).toMatch(/must be unassigned/);
-    expect(preview.blockingReason).toMatch(/"night"/);
+    expect(preview.isReplacementEligible).toBe(true);
+    expect(preview.blockingReason).toBeNull();
   });
 
   it('a Day shift on the original date conflicting with an active Night the day before is blocked', () => {
@@ -416,5 +422,195 @@ describe('buildRescheduleOffDayPreview (Phase 2B.2C, Policy Option A -- advisory
   it('checks run in a stable priority order: identical-dates is reported even when the original is also not Off', () => {
     const preview = buildRescheduleOffDayPreview('emp-1', '2026-10-07', '2026-10-07', 'day', [], []);
     expect(preview.blockingReason).toMatch(/must be different/);
+  });
+});
+
+describe('Stage C Step 12: dateForWeekdayInWeek', () => {
+  // 2026-10-05 is a Monday (2026-10-07 is confirmed Wednesday above).
+  const monday = '2026-10-05';
+
+  it('returns the Monday itself for weekday 1', () => {
+    expect(dateForWeekdayInWeek(monday, 1)).toBe('2026-10-05');
+  });
+
+  it('returns the correct midweek date for weekday 3 (Wednesday)', () => {
+    expect(dateForWeekdayInWeek(monday, 3)).toBe('2026-10-07');
+  });
+
+  it('returns the correct Sunday for weekday 0 -- the LAST day of the Mon-Sun week, not the first', () => {
+    expect(dateForWeekdayInWeek(monday, 0)).toBe('2026-10-11');
+  });
+
+  it('returns the correct Saturday for weekday 6', () => {
+    expect(dateForWeekdayInWeek(monday, 6)).toBe('2026-10-10');
+  });
+});
+
+describe('Stage C Step 12: resolveActiveOffWeekday / resolveActiveShiftType (UI-default helpers only, never authoritative)', () => {
+  it('resolveActiveOffWeekday returns the latest-effective active pattern\'s weekday as of the given date', () => {
+    const p = [
+      pattern({ weekday: 3, effectiveFrom: '2026-01-01' }),
+      pattern({ weekday: 0, effectiveFrom: '2026-09-01' }),
+    ];
+    expect(resolveActiveOffWeekday('emp-1', '2026-10-01', p)).toBe(0);
+    expect(resolveActiveOffWeekday('emp-1', '2026-02-01', p)).toBe(3);
+  });
+
+  it('resolveActiveOffWeekday returns null when no pattern is configured', () => {
+    expect(resolveActiveOffWeekday('emp-1', '2026-10-01', [])).toBeNull();
+  });
+
+  it('resolveActiveOffWeekday ignores a different employee\'s pattern', () => {
+    const p = [pattern({ employeeId: 'emp-2', weekday: 3, effectiveFrom: '2026-01-01' })];
+    expect(resolveActiveOffWeekday('emp-1', '2026-10-01', p)).toBeNull();
+  });
+
+  it('resolveActiveShiftType returns the latest-effective active shift pattern\'s type as of the given date', () => {
+    const s = [
+      shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' }),
+      shiftPattern({ shiftType: 'night', effectiveFrom: '2026-09-01' }),
+    ];
+    expect(resolveActiveShiftType('emp-1', '2026-10-01', s)).toBe('night');
+    expect(resolveActiveShiftType('emp-1', '2026-02-01', s)).toBe('day');
+  });
+
+  it('resolveActiveShiftType returns null when no shift pattern is configured', () => {
+    expect(resolveActiveShiftType('emp-1', '2026-10-01', [])).toBeNull();
+  });
+});
+
+describe('Stage C Step 12: buildTemporaryReschedulePlan ("Wednesday Off -> Sunday Off for N weeks")', () => {
+  const offPattern = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday off
+  const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })]; // every other day is Day
+
+  it('computes one week\'s real dates correctly and finds no blocking issue for the realistic case', () => {
+    const weeks = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 3, 0, 1, 'day', [], offPattern, shift);
+    expect(weeks).toHaveLength(1);
+    expect(weeks[0].weekStart).toBe('2026-10-05');
+    expect(weeks[0].weekEnd).toBe('2026-10-11');
+    expect(weeks[0].originalDate).toBe('2026-10-07'); // Wednesday
+    expect(weeks[0].newOffDate).toBe('2026-10-11'); // Sunday
+    expect(weeks[0].preview.blockingReason).toBeNull();
+  });
+
+  it('computes 3 consecutive weeks, each shifted by exactly 7 days, for a 3-week duration', () => {
+    const weeks = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 3, 0, 3, 'day', [], offPattern, shift);
+    expect(weeks).toHaveLength(3);
+    expect(weeks.map((w) => w.originalDate)).toEqual(['2026-10-07', '2026-10-14', '2026-10-21']);
+    expect(weeks.map((w) => w.newOffDate)).toEqual(['2026-10-11', '2026-10-18', '2026-10-25']);
+    expect(weeks.every((w) => w.preview.blockingReason === null)).toBe(true);
+  });
+
+  it('the SAME weekday for both original and new is caught as identical-dates, every week', () => {
+    const weeks = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 3, 3, 2, 'day', [], offPattern, shift);
+    expect(weeks.every((w) => w.originalDate === w.newOffDate)).toBe(true);
+    expect(weeks.every((w) => w.preview.blockingReason?.match(/must be different/))).toBeTruthy();
+  });
+
+  it('flags only the specific week where a dated exception breaks eligibility, leaving the other weeks clean', () => {
+    // Week 2's Sunday (2026-10-18) is already an explicit dated Off exception.
+    const d = [dated({ assignmentDate: '2026-10-18', assignmentType: 'off' })];
+    const weeks = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 3, 0, 3, 'day', d, offPattern, shift);
+    expect(weeks[0].preview.blockingReason).toBeNull();
+    expect(weeks[1].preview.blockingReason).toMatch(/already Off/);
+    expect(weeks[2].preview.blockingReason).toBeNull();
+  });
+});
+
+describe('Stage C Step 12A: weekdayOrdinal and bridgeWeekIndex (the rest-preserving bridge-day proof)', () => {
+  const offPattern = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday off
+  const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+
+  it('weekdayOrdinal maps JS 0=Sun..6=Sat onto a Monday-start 0..6 ordinal', () => {
+    expect(weekdayOrdinal(1)).toBe(0); // Monday
+    expect(weekdayOrdinal(2)).toBe(1); // Tuesday
+    expect(weekdayOrdinal(3)).toBe(2); // Wednesday
+    expect(weekdayOrdinal(5)).toBe(4); // Friday
+    expect(weekdayOrdinal(6)).toBe(5); // Saturday
+    expect(weekdayOrdinal(0)).toBe(6); // Sunday
+  });
+
+  it('a forward shift (new weekday later in the week) needs a bridge at the FIRST affected week', () => {
+    expect(bridgeWeekIndex(3, 0, 3)).toBe(0); // Wed -> Sun, 3 weeks
+    expect(bridgeWeekIndex(1, 5, 1)).toBe(0); // Mon -> Fri, 1 week
+  });
+
+  it('a backward shift (new weekday earlier in the week) needs a bridge at the LAST affected week', () => {
+    expect(bridgeWeekIndex(0, 1, 3)).toBe(2); // Sun -> Mon, 3 weeks -- bridge on week index 2 (the last)
+    expect(bridgeWeekIndex(5, 1, 1)).toBe(0); // Fri -> Mon, 1 week -- first week is also the last week
+  });
+
+  it('no shift at all (same weekday) needs no bridge', () => {
+    expect(bridgeWeekIndex(3, 3, 3)).toBe(-1);
+  });
+
+  it('buildTemporaryReschedulePlan marks exactly the bridge week, for both shift directions', () => {
+    const forward = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 3, 0, 3, 'day', [], offPattern, shift); // Wed -> Sun
+    expect(forward.map((w) => w.isBridgeWeek)).toEqual([true, false, false]);
+
+    const sundayOffPattern = [pattern({ weekday: 0, effectiveFrom: '2026-01-01' })];
+    const backward = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 0, 1, 3, 'day', [], sundayOffPattern, shift); // Sun -> Mon
+    expect(backward.map((w) => w.isBridgeWeek)).toEqual([false, false, true]);
+  });
+
+  it('the bridge week\'s preview never flags a Night/Day adjacency conflict for the shift that is never actually placed there', () => {
+    // A Night shift resolved the day before the bridge week's original
+    // (Wednesday) date would normally conflict with a Day conversion --
+    // but the bridge week never converts that date at all, so the
+    // conflict must not be flagged.
+    const d = [dated({ assignmentDate: '2026-10-06', assignmentType: 'night' })]; // Tuesday night
+    const weeks = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 3, 0, 1, 'day', d, offPattern, shift);
+    expect(weeks[0].isBridgeWeek).toBe(true);
+    expect(weeks[0].preview.hasAdjacencyConflict).toBe(false);
+    expect(weeks[0].preview.blockingReason).toBeNull();
+  });
+
+  it('the bridge week\'s preview still flags the original date not genuinely being Off, or the replacement already being Off', () => {
+    const notOff = [dated({ assignmentDate: '2026-10-07', assignmentType: 'day' })]; // original date overridden to a working day
+    const weeksA = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 3, 0, 1, 'day', notOff, offPattern, shift);
+    expect(weeksA[0].isBridgeWeek).toBe(true);
+    expect(weeksA[0].preview.blockingReason).toMatch(/does not currently resolve to Off/);
+
+    const alreadyOff = [dated({ assignmentDate: '2026-10-11', assignmentType: 'off' })]; // replacement already Off
+    const weeksB = buildTemporaryReschedulePlan('emp-1', '2026-10-05', 3, 0, 1, 'day', alreadyOff, offPattern, shift);
+    expect(weeksB[0].isBridgeWeek).toBe(true);
+    expect(weeksB[0].preview.blockingReason).toMatch(/already Off/);
+  });
+});
+
+describe('Stage C Step 12A: buildPermanentWeekdayTransitionPlan', () => {
+  const offPattern = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday off
+  const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+
+  it('a forward shift (Wed -> Fri) needs one bridge date: the original weekday, in the same week the new pattern takes effect', () => {
+    const result = buildPermanentWeekdayTransitionPlan('emp-1', '2026-10-05', 3, 5, [], offPattern, shift);
+    expect(result.effectiveFrom).toBe('2026-10-05');
+    expect(result.bridgeDate).toBe('2026-10-07'); // Wednesday of that week
+    expect(result.originalResolvedAtBridge).toBe('off');
+  });
+
+  it('a backward shift (Wed -> Mon) needs no bridge at all', () => {
+    const result = buildPermanentWeekdayTransitionPlan('emp-1', '2026-10-05', 3, 1, [], offPattern, shift);
+    expect(result.bridgeDate).toBeNull();
+    expect(result.originalResolvedAtBridge).toBeNull();
+  });
+});
+
+describe('Stage C Step 12: explainRollingRestConflict', () => {
+  const offPattern = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday off
+  const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+
+  it('extracts the window and lists exactly the working days within it', () => {
+    const msg = 'This reschedule would leave employee 11111111-1111-1111-1111-111111111111 with no Off day between 2026-10-05 and 2026-10-11 -- rolling seven-day rest violations cannot be overridden';
+    const result = explainRollingRestConflict(msg, 'emp-1', [], offPattern, shift);
+    expect(result).not.toBeNull();
+    expect(result!.windowStart).toBe('2026-10-05');
+    expect(result!.windowEnd).toBe('2026-10-11');
+    // Every day in this window resolves 'day' except Wednesday ('off'), so 6 working days.
+    expect(result!.workingDays).toEqual(['2026-10-05', '2026-10-06', '2026-10-08', '2026-10-09', '2026-10-10', '2026-10-11']);
+  });
+
+  it('returns null for a message that does not match the expected rolling-rest-violation shape', () => {
+    expect(explainRollingRestConflict('Only Admin may reschedule roster Off days', 'emp-1', [], offPattern, shift)).toBeNull();
   });
 });

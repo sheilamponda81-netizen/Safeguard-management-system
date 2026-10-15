@@ -21,7 +21,7 @@ import path from 'node:path';
 // combined into one atomic save -- see Roster.recurringSchedule.test.ts.)
 const rosterSource = fs.readFileSync(path.resolve(__dirname, './Roster.tsx'), 'utf-8');
 
-const WRITE_RPC_NAMES = ['assignRecurringPattern(', 'assignDates(', 'rescheduleOffDay('];
+const WRITE_RPC_NAMES = ['assignRecurringPattern(', 'assignDates(', 'applyWeekdayTransition('];
 
 function getHandlerBody(name: string): string {
   // Each handler is declared as `const <name> = useCallback(<fn>, [deps]);`
@@ -51,7 +51,7 @@ describe('Roster calendar navigation: no handler ever calls a roster write RPC',
     }
   });
 
-  it('handleCalendarNav only ever sets calendarFrom/calendarTo via shiftCalendarRange -- never calls loadData, assignRecurringPattern, assignDates, or rescheduleOffDay directly', () => {
+  it('handleCalendarNav only ever sets calendarFrom/calendarTo via shiftCalendarRange -- never calls loadData, assignRecurringPattern, assignDates, or applyWeekdayTransition directly', () => {
     const body = getHandlerBody('handleCalendarNav');
     expect(body).toMatch(/shiftCalendarRange\(calendarFrom, calendarTo, calendarViewMode, direction\)/);
     expect(body).toMatch(/setCalendarFrom\(next\.from\)/);
@@ -75,26 +75,44 @@ describe('Roster calendar navigation: no handler ever calls a roster write RPC',
 
   it('the three roster write RPCs are called ONLY from the pre-existing form-submission handlers, never from any Calendar-tab code', () => {
     const submitHandlerNames = ['handleSubmitRecurringPattern', 'handleSubmitAssignDates', 'handleSubmitReschedule'];
-    const rpcToOwner: Record<string, string> = {
-      'assignRecurringPattern(': 'handleSubmitRecurringPattern',
-      'assignDates(': 'handleSubmitAssignDates',
-      'rescheduleOffDay(': 'handleSubmitReschedule',
+    // Stage C Step 12A: the Temporary/Permanent Off Day tab now calls ONE
+    // atomic RPC, applyWeekdayTransition, for BOTH modes (replacing the
+    // old per-week rescheduleOffDay loop and the old direct
+    // assignRecurringPattern call in the Permanent branch) -- every RPC
+    // below is single-owner again.
+    const rpcToOwners: Record<string, string[]> = {
+      'assignRecurringPattern(': ['handleSubmitRecurringPattern'],
+      'assignDates(': ['handleSubmitAssignDates'],
+      'applyWeekdayTransition(': ['handleSubmitReschedule'],
     };
 
     // Collect every occurrence's containing handler by scanning each known
     // submit handler's own body for its RPC, and asserting the RPC name
     // appears in the WHOLE FILE exactly as many times as expected: once in
-    // its import line, once in its owning submit handler's body, and never
-    // anywhere else (in particular, never inside a Calendar-tab handler or
+    // its import line, once per owning submit handler's body, and never
+    // anywhere else EXCEPT inside this file's own prose comments explaining
+    // the reuse (in particular, never inside a Calendar-tab handler or
     // inside the JSX navigation controls).
-    for (const [rpcCall, ownerName] of Object.entries(rpcToOwner)) {
-      const ownerBody = getHandlerBody(ownerName);
-      expect(ownerBody).toContain(rpcCall);
+    for (const [rpcCall, ownerNames] of Object.entries(rpcToOwners)) {
+      for (const ownerName of ownerNames) {
+        const ownerBody = getHandlerBody(ownerName);
+        expect(ownerBody).toContain(rpcCall);
+      }
 
       const rpcBareName = rpcCall.slice(0, -1); // strip the trailing '('
-      const totalOccurrences = (rosterSource.match(new RegExp(`\\b${rpcBareName}\\b`, 'g')) || []).length;
-      // Exactly 2: once in the `import { ... } from '../utils/rosterService'` line, once as the actual call inside its owning submit handler.
-      expect(totalOccurrences).toBe(2);
+      const codeOccurrences = (rosterSource.match(new RegExp(`\\b${rpcBareName}\\(`, 'g')) || []).length;
+      // Exactly one call site per declared owner, with no call sites outside those owners.
+      expect(codeOccurrences).toBe(ownerNames.length);
+    }
+
+    for (const [rpcCall, ownerNames] of Object.entries(rpcToOwners)) {
+      for (const navName of navigationHandlers) {
+        expect(getHandlerBody(navName)).not.toContain(rpcCall);
+      }
+      // No other handler among the three submit handlers calls an RPC it does not own.
+      for (const otherOwner of submitHandlerNames.filter((n) => !ownerNames.includes(n))) {
+        expect(getHandlerBody(otherOwner)).not.toContain(rpcCall);
+      }
     }
 
     // Sanity: every submit handler named above actually exists and is distinct from every navigation handler.
