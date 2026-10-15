@@ -77,11 +77,26 @@ describe('Calendar tab: recurring-vs-exception visual distinction', () => {
     expect(rosterSource).toMatch(/isExplicitException/);
   });
 
-  it('renders a visible marker only for explicit exceptions, not for recurring-rule results', () => {
-    expect(rosterSource).toMatch(/\{isExplicitException && \(/);
+  // Stage C Step 14: upgraded from a near-invisible dot to an explicit
+  // text label ("(special)") plus a tooltip, so Normal recurring Off and
+  // Special dated Off are never visually indistinguishable at a glance
+  // -- a real STAGING-adjacent business requirement (4E), not merely a
+  // cosmetic change.
+  it('renders an explicit "(special)" text label only for explicit exceptions, not for recurring-rule results', () => {
+    expect(rosterSource).toMatch(/\{resolved\}\{isExplicitException \? ' \(special\)' : ''\}/);
   });
 
-  it('does not accidentally overwrite dated assignments -- the marker is purely additive to the existing Badge, never replacing it', () => {
+  it('gives each cell a tooltip distinguishing a one-off dated exception from the normal recurring pattern', () => {
+    expect(rosterSource).toMatch(/One-off dated exception -- the recurring pattern resumes once this is cancelled/);
+    expect(rosterSource).toMatch(/From the normal recurring pattern/);
+  });
+
+  it('does not accidentally overwrite dated assignments -- the label is purely additive to the existing Badge, never replacing it', () => {
     expect(rosterSource).toMatch(/<Badge color=\{color\}>\s*\{resolved\}/);
+  });
+
+  it('explains, in the Calendar tab itself, that Unassigned is never shown as Day or Off, and that Leave/Sick Leave live in Attendance instead', () => {
+    expect(rosterSource).toMatch(/"Unassigned" means no schedule has been set for that date at all -- it is never shown as/);
+    expect(rosterSource).toMatch(/Approved Leave and Sick Leave are tracked separately in the Attendance module/);
   });
 });

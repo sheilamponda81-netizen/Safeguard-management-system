@@ -25,8 +25,9 @@ import {
   resolveActiveShiftType, wouldOverrideRecurringOffDay,
   buildTemporaryReschedulePlan, buildPermanentWeekdayTransitionPlan, explainRollingRestConflict,
   summarizeWeekSchedule, describeWeekOffDays, formatFriendlyWeekdayDate,
-  summarizeDateRangeAssignments,
+  summarizeDateRangeAssignments, evaluateCancellationSafety, describeCancellationSafety,
   TemporaryRescheduleWeekPlan, PermanentWeekdayTransitionPlan, WeekScheduleSummary, DateAssignmentStatus,
+  CancellationSafetyResult,
   AssignmentType, OffDayPatternRow, DateAssignmentRow, ShiftPatternRow,
 } from '../utils/rosterSchedule';
 import {
@@ -494,16 +495,35 @@ export default function RosterPage() {
     [correctAction, correctCancellableCount, correctPreviewRows]
   );
 
+  // Stage C Step 14: real STAGING finding (LUCIOUS LIGOMERA, SFG-S-469) --
+  // cancelling a mistaken special Off across several dates can genuinely
+  // leave no rest day in a rolling seven-day window (Malawi Employment
+  // Act s.36(4)). The server (roster_cancel_date_assignments) already
+  // hard-blocks this correctly with no override; this preview mirrors
+  // that same check ADVISORY-only, so the Admin sees a plain, weekday-
+  // phrased explanation and a concrete safe alternative BEFORE
+  // submitting, instead of only a technical rejection afterward.
+  const correctCancellationSafety: CancellationSafetyResult | null = useMemo(() => {
+    if (correctAction !== 'cancel' || !correctEmployeeId || !isCorrectRangeValid || correctCancellableCount === 0) return null;
+    return evaluateCancellationSafety(correctEmployeeId, correctDateFrom, correctDateTo, correctRangeAssignments, patterns, shiftPatterns);
+  }, [correctAction, correctEmployeeId, isCorrectRangeValid, correctCancellableCount, correctDateFrom, correctDateTo, correctRangeAssignments, patterns, shiftPatterns]);
+
+  const correctCancellationDescription = useMemo(() => {
+    if (!correctCancellationSafety || !correctSelectedEmployee) return null;
+    return describeCancellationSafety(correctSelectedEmployee.fullName, correctCancellationSafety);
+  }, [correctCancellationSafety, correctSelectedEmployee]);
+
   const canSubmitCorrect =
     !!correctEmployeeId &&
     isCorrectRangeValid &&
     !!correctReason.trim() &&
     correctSummary.length > 0 &&
-    correctChangeableCount > 0;
+    correctChangeableCount > 0 &&
+    (!correctCancellationSafety || correctCancellationSafety.safe);
 
   const handleSubmitCorrect = useCallback(async () => {
     if (!canSubmitCorrect) {
-      showNotification('Select an employee, a valid date range, and a reason -- and make sure at least one date in range can actually be changed.', 'error');
+      showNotification('Select an employee, a valid date range, and a reason -- and make sure at least one date in range can actually be changed without an unresolved rest conflict.', 'error');
       return;
     }
     setSubmitting(true);
@@ -521,12 +541,21 @@ export default function RosterPage() {
         setCorrectReason('');
         await loadData();
       } else {
-        showNotification(humanizeRosterError(result.error || 'Could not apply this correction.', employees), 'error');
+        const rawMessage = result.error || 'Could not apply this correction.';
+        const explanation = correctEmployeeId
+          ? explainRollingRestConflict(rawMessage, correctEmployeeId, correctRangeAssignments, patterns, shiftPatterns)
+          : null;
+        showNotification(
+          explanation
+            ? `${humanizeRosterError(rawMessage, employees)} ${explanation.summary}`
+            : humanizeRosterError(rawMessage, employees),
+          'error'
+        );
       }
     } finally {
       setSubmitting(false);
     }
-  }, [canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, employees, loadData]);
+  }, [canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, correctRangeAssignments, patterns, shiftPatterns, employees, loadData]);
 
   // --- Stage C Step 12: Temporary / Permanent Off-day change, expressed
   // in the weekday vocabulary administrators actually think in ("Wednesday
@@ -735,7 +764,7 @@ export default function RosterPage() {
         const explanation = explainRollingRestConflict(rawMessage, rescheduleEmployeeId, dateAssignments, patterns, shiftPatterns);
         const humanized = humanizeRosterError(rawMessage, employees);
         const fullMessage = explanation
-          ? `${humanized} Specifically, every day from ${explanation.windowStart} to ${explanation.windowEnd} is already a working day (${explanation.workingDays.join(', ')}) -- there is no rest day anywhere in that window. Try a shorter duration, or choose a different pair of weekdays so at least one day in that window stays Off.`
+          ? `${humanized} ${explanation.summary}`
           : humanized;
         showNotification(fullMessage, 'error');
       }
@@ -857,45 +886,54 @@ export default function RosterPage() {
           ) : filteredEmployees.length === 0 ? (
             <EmptyState icon={UsersIcon} title="No employees match your search" description="Adjust the search above." />
           ) : (
-            <Table>
-              <THead>
-                <TR hover={false}>
-                  <TH className="sticky left-0 z-10 bg-[#F8FAFC]">Employee</TH>
-                  {calendarDates.map((d) => (
-                    <TH key={d}>{formatDayHeading(d)}</TH>
-                  ))}
-                </TR>
-              </THead>
-              <TBody>
-                {filteredEmployees.slice(0, 100).map((emp) => (
-                  <TR key={emp.id}>
-                    <TD className="sticky left-0 z-10 bg-white font-medium text-slate-800">{emp.fullName}<span className="block text-xs text-slate-500 font-normal">{emp.employeeNumber}</span></TD>
-                    {calendarDates.map((d) => {
-                      const resolved = resolveScheduleForDate(emp.id, d, dateAssignments, patterns, shiftPatterns);
-                      const color = scheduleBadgeColor(resolved);
-                      // Stage C Step 6B: a dated row for this exact
-                      // (employee, date) means the Calendar is showing an
-                      // explicit exception, not a recurring-rule result,
-                      // surfaced as a small dot so Admin can tell the two
-                      // apart at a glance without opening either tab.
-                      const isExplicitException = dateAssignments.some(
-                        (a) => a.employeeId === emp.id && a.assignmentDate === d && a.isActive
-                      );
-                      return (
-                        <TD key={d}>
-                          <Badge color={color}>
-                            {resolved}
-                            {isExplicitException && (
-                              <span className="ml-1 inline-block w-1.5 h-1.5 rounded-full bg-current align-middle" title="Explicit dated exception (overrides any recurring pattern)" />
-                            )}
-                          </Badge>
-                        </TD>
-                      );
-                    })}
+            <>
+              <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                "Off" alone is the employee's <strong>normal recurring</strong> weekly Off day. "Off (special)" is a one-off dated
+                exception made in Assign Dates / Correct-Cancel -- it never changes the recurring pattern, which resumes once the
+                exception is cancelled. "Unassigned" means no schedule has been set for that date at all -- it is never shown as
+                Day or Off. Approved Leave and Sick Leave are tracked separately in the Attendance module and are intentionally
+                not duplicated on this roster calendar, to avoid two different places disagreeing about an employee's status.
+              </p>
+              <Table>
+                <THead>
+                  <TR hover={false}>
+                    <TH className="sticky left-0 z-10 bg-[#F8FAFC]">Employee</TH>
+                    {calendarDates.map((d) => (
+                      <TH key={d}>{formatDayHeading(d)}</TH>
+                    ))}
                   </TR>
-                ))}
-              </TBody>
-            </Table>
+                </THead>
+                <TBody>
+                  {filteredEmployees.slice(0, 100).map((emp) => (
+                    <TR key={emp.id}>
+                      <TD className="sticky left-0 z-10 bg-white font-medium text-slate-800">{emp.fullName}<span className="block text-xs text-slate-500 font-normal">{emp.employeeNumber}</span></TD>
+                      {calendarDates.map((d) => {
+                        const resolved = resolveScheduleForDate(emp.id, d, dateAssignments, patterns, shiftPatterns);
+                        const color = scheduleBadgeColor(resolved);
+                        // Stage C Step 6B/14: a dated row for this exact
+                        // (employee, date) means the Calendar is showing an
+                        // explicit, one-off exception, not a recurring-rule
+                        // result. Labeled in text ("(special)"), not only a
+                        // dot, so Normal recurring Off and Special dated Off
+                        // are never visually indistinguishable at a glance.
+                        const isExplicitException = dateAssignments.some(
+                          (a) => a.employeeId === emp.id && a.assignmentDate === d && a.isActive
+                        );
+                        return (
+                          <TD key={d}>
+                            <span title={isExplicitException ? 'One-off dated exception -- the recurring pattern resumes once this is cancelled' : 'From the normal recurring pattern'}>
+                              <Badge color={color}>
+                                {resolved}{isExplicitException ? ' (special)' : ''}
+                              </Badge>
+                            </span>
+                          </TD>
+                        );
+                      })}
+                    </TR>
+                  ))}
+                </TBody>
+              </Table>
+            </>
           )}
           {isCalendarRangeValid && !calendarRangeTooLarge && filteredEmployees.length > 100 && (
             <p className="text-xs text-slate-500">Showing the first 100 of {filteredEmployees.length} matching employees. Narrow your search to see the rest.</p>
@@ -1106,6 +1144,16 @@ export default function RosterPage() {
                       );
                     })}
                   </div>
+                </Card>
+              )}
+
+              {correctCancellationDescription && (
+                <Card className="p-4 space-y-2 bg-red-50 border border-red-200">
+                  <p className="text-sm font-semibold text-red-800 flex items-center gap-1.5"><AlertTriangle size={14} /> This would leave no rest day</p>
+                  <p className="text-sm text-red-700">{correctCancellationDescription.primary}</p>
+                  {correctCancellationDescription.suggestion && (
+                    <p className="text-sm text-red-700">{correctCancellationDescription.suggestion}</p>
+                  )}
                 </Card>
               )}
 

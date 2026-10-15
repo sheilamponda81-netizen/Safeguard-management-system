@@ -20,6 +20,8 @@ import {
   summarizeWeekSchedule,
   describeWeekOffDays,
   summarizeDateRangeAssignments,
+  evaluateCancellationSafety,
+  describeCancellationSafety,
   formatFriendlyWeekdayDate,
   weekdayOf,
   addDays,
@@ -794,5 +796,130 @@ describe('Stage C Step 13: summarizeDateRangeAssignments (Correct or Cancel Spec
     const summary = summarizeDateRangeAssignments('emp-1', '2026-10-07', '2026-10-07', assignments, [], []);
     expect(summary[0].hasDatedException).toBe(false);
     expect(summary[0].resolved).toBe('unassigned');
+  });
+});
+
+describe('Stage C Step 14: evaluateCancellationSafety / describeCancellationSafety (real STAGING finding: LUCIOUS LIGOMERA, SFG-S-469)', () => {
+  // Reproduces the exact real-world shape: recurring Day shift + recurring
+  // Sunday Off effective 2026-10-15; five immovable dated Day overrides
+  // Oct 10-14 (Sat-Wed, a separate, already-settled correction); a mistaken
+  // special Off Oct 15-17 (Thu-Sat) about to be cancelled. Oct 10 2026 is a
+  // Saturday, Oct 15 a Thursday, Oct 18 a Sunday (confirmed against STAGING
+  // directly before writing this test).
+  const luciousPatterns = [pattern({ employeeId: 'lucious', weekday: 0, effectiveFrom: '2026-10-15' })]; // Sunday
+  const luciousShift = [shiftPattern({ employeeId: 'lucious', shiftType: 'day', effectiveFrom: '2026-10-15' })];
+  const luciousDated = [
+    ...['2026-10-10', '2026-10-11', '2026-10-12', '2026-10-13', '2026-10-14'].map((d) => dated({ employeeId: 'lucious', assignmentDate: d, assignmentType: 'day' })),
+    ...['2026-10-15', '2026-10-16', '2026-10-17'].map((d) => dated({ employeeId: 'lucious', assignmentDate: d, assignmentType: 'off' })),
+  ];
+
+  it('flags the full Oct 15-17 cancellation as unsafe: it would leave no rest day in the Oct 10-16 window (confirmed_violation, not merely incomplete)', () => {
+    const safety = evaluateCancellationSafety('lucious', '2026-10-15', '2026-10-17', luciousDated, luciousPatterns, luciousShift);
+    expect(safety.safe).toBe(false);
+    expect(safety.adjacencyConflictDates).toEqual([]);
+    expect(safety.restViolations).toEqual(expect.arrayContaining([expect.objectContaining({ windowStart: '2026-10-10', windowEnd: '2026-10-16', status: 'confirmed_violation' })]));
+  });
+
+  it('finds the genuine safe alternative: cancel only Oct 16-17 (Fri-Sat), keeping Oct 15 (Thursday) Off as the rest day for the Oct 10-16 window', () => {
+    const safety = evaluateCancellationSafety('lucious', '2026-10-15', '2026-10-17', luciousDated, luciousPatterns, luciousShift);
+    expect(safety.safeSuffixRange).toEqual({ dateFrom: '2026-10-16', dateTo: '2026-10-17' });
+  });
+
+  it('also finds a safe prefix alternative: cancelling ONLY Oct 15 (Thursday) is safe too, since Oct 16 (Friday) then stays Off and still covers the Oct 10-16 window -- but cancelling Oct 15 AND 16 together is not, since that empties the window entirely', () => {
+    const safety = evaluateCancellationSafety('lucious', '2026-10-15', '2026-10-17', luciousDated, luciousPatterns, luciousShift);
+    expect(safety.safePrefixRange).toEqual({ dateFrom: '2026-10-15', dateTo: '2026-10-15' });
+  });
+
+  it('confirms the suffix alternative is independently safe when actually evaluated as its own request (what submitting it would re-check)', () => {
+    const safety = evaluateCancellationSafety('lucious', '2026-10-16', '2026-10-17', luciousDated, luciousPatterns, luciousShift);
+    expect(safety.safe).toBe(true);
+  });
+
+  it('reports the full range as safe (zero violations, both alternative fields null) once Oct 10-14 are no longer immovable -- i.e. the conflict is a genuine data-dependent fact, not a hardcoded rejection', () => {
+    const lighterDated = luciousDated.filter((a) => a.assignmentDate >= '2026-10-15'); // drop the five immovable Day overrides
+    const safety = evaluateCancellationSafety('lucious', '2026-10-15', '2026-10-17', lighterDated, luciousPatterns, luciousShift);
+    expect(safety.safe).toBe(true);
+    expect(safety.safePrefixRange).toBeNull();
+    expect(safety.safeSuffixRange).toBeNull();
+  });
+
+  it('describeCancellationSafety explains the conflict in weekdays (not raw ISO dates) and names the real suggestion', () => {
+    const safety = evaluateCancellationSafety('lucious', '2026-10-15', '2026-10-17', luciousDated, luciousPatterns, luciousShift);
+    const description = describeCancellationSafety('Lucious Ligomera', safety);
+    expect(description).not.toBeNull();
+    expect(description!.primary).toContain('Lucious Ligomera');
+    expect(description!.primary).toContain('Saturday, 10 October');
+    expect(description!.primary).toContain('Friday, 16 October');
+    expect(description!.primary).toContain('Malawi Employment Act');
+    expect(description!.suggestion).toContain('keep Thursday, 15 October Off');
+    expect(description!.suggestion).toContain('cancel only from Friday, 16 October to Saturday, 17 October');
+  });
+
+  it('describeCancellationSafety returns null when the result is already safe -- never invents a conflict', () => {
+    expect(describeCancellationSafety('Anyone', { safe: true, adjacencyConflictDates: [], restViolations: [], safePrefixRange: null, safeSuffixRange: null })).toBeNull();
+  });
+
+  it('is never fooled by an immovable working day replaced by an UNASSIGNED gap -- an unassigned day makes the window merely "incomplete", not a hard violation, exactly mirroring the server (roster_rolling_rest_windows) which never hard-blocks on missing data', () => {
+    // Same shape, but Oct 10-14 have no dated rows at all (nothing assigned, not even patterns before Oct 15).
+    const safety = evaluateCancellationSafety(
+      'lucious', '2026-10-15', '2026-10-17',
+      luciousDated.filter((a) => a.assignmentDate >= '2026-10-15'),
+      luciousPatterns, luciousShift
+    );
+    expect(safety.safe).toBe(true);
+  });
+
+  it('detects a Night-to-Day adjacency conflict a cancellation would create, independent of any rolling-rest violation', () => {
+    // Night baseline with an UNTOUCHED recurring Sunday Off (so every
+    // 7-day window structurally contains one Sunday -- by the pigeonhole
+    // principle any 7 consecutive calendar days span every weekday
+    // exactly once -- and can never be a confirmed_violation here,
+    // isolating this test to adjacency only). Oct 13 (Tue) has a mistaken
+    // dated Day override; Oct 14 (Wed) separately has an active dated Day
+    // assignment that is NOT part of this cancellation request. Cancelling
+    // Oct 13 alone would reveal Night immediately before Oct 14's
+    // still-active Day.
+    const nightPatterns = [pattern({ employeeId: 'adj', weekday: 0, effectiveFrom: '2026-01-01' })]; // Sunday, never overridden
+    const nightShift = [shiftPattern({ employeeId: 'adj', shiftType: 'night', effectiveFrom: '2026-01-01' })];
+    const nightDated = [
+      dated({ employeeId: 'adj', assignmentDate: '2026-10-13', assignmentType: 'day' }),
+      dated({ employeeId: 'adj', assignmentDate: '2026-10-14', assignmentType: 'day' }),
+    ];
+    const safety = evaluateCancellationSafety('adj', '2026-10-13', '2026-10-13', nightDated, nightPatterns, nightShift);
+    expect(safety.safe).toBe(false);
+    expect(safety.adjacencyConflictDates).toEqual(['2026-10-13']);
+    expect(safety.restViolations).toEqual([]);
+  });
+
+  it('a partial-range correction that is already safe reports safe=true with no alternative fields populated', () => {
+    const safety = evaluateCancellationSafety('lucious', '2026-10-16', '2026-10-16', luciousDated, luciousPatterns, luciousShift);
+    // Cancelling only Friday leaves Thursday AND Saturday still dated Off -- always safe regardless of the immovable days before it.
+    expect(safety.safe).toBe(true);
+    expect(safety.safePrefixRange).toBeNull();
+    expect(safety.safeSuffixRange).toBeNull();
+  });
+
+  it('a range with no active dated exception anywhere in it is trivially safe (nothing to cancel, matching roster_cancel_date_assignments’s own no-op/skip behavior)', () => {
+    const safety = evaluateCancellationSafety('lucious', '2026-01-01', '2026-01-02', luciousDated, luciousPatterns, luciousShift);
+    expect(safety.safe).toBe(true);
+    expect(safety.adjacencyConflictDates).toEqual([]);
+    expect(safety.restViolations).toEqual([]);
+  });
+
+  it('generalizes across every weekday, not just Sunday: a Monday recurring Off produces the same safe-suffix shape when the mistaken special Off lands on the days right after it', () => {
+    // Monday Off, Day baseline, both effective from day 1. Five immovable
+    // Day days Sat-Wed (weekday 6,0,1,2,3 -- note Monday itself, weekday 1,
+    // is skipped here because it's already genuinely off), then a mistaken
+    // special Off Thu-Sat.
+    const mondayPatterns = [pattern({ employeeId: 'mon', weekday: 1, effectiveFrom: '2026-01-01' })]; // Monday
+    const mondayShift = [shiftPattern({ employeeId: 'mon', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const mondayDated = [
+      ...['2026-10-10', '2026-10-11', '2026-10-13', '2026-10-14'].map((d) => dated({ employeeId: 'mon', assignmentDate: d, assignmentType: 'day' })), // Sat,Sun,Tue,Wed (Mon the 12th stays genuinely off, untouched)
+      ...['2026-10-15', '2026-10-16', '2026-10-17'].map((d) => dated({ employeeId: 'mon', assignmentDate: d, assignmentType: 'off' })),
+    ];
+    const safety = evaluateCancellationSafety('mon', '2026-10-15', '2026-10-17', mondayDated, mondayPatterns, mondayShift);
+    // Oct 10-16 window: Sat,Sun,Mon(off, recurring),Tue,Wed,Thu,Fri -- has an off day (Monday) already, so this window is fine either way.
+    // Oct 11-17: Sun,Mon(off),Tue,Wed,Thu,Fri,Sat -- also has Monday off. So the full range is actually already safe here.
+    expect(safety.safe).toBe(true);
   });
 });

@@ -512,6 +512,12 @@ export interface RollingRestConflictExplanation {
   windowStart: string;
   windowEnd: string;
   workingDays: string[];
+  /** Stage C Step 14: the same window/working-days data, phrased in weekdays ("Saturday, 10 October") rather than raw ISO dates -- per the business requirement that an Admin-facing conflict explanation must speak in weekdays, with exact dates only as supporting detail. */
+  windowStartLabel: string;
+  windowEndLabel: string;
+  workingDaysLabel: string;
+  /** One ready-to-show sentence combining the above -- the preferred way for a handler to render this explanation. */
+  summary: string;
 }
 
 export function explainRollingRestConflict(
@@ -529,7 +535,11 @@ export function explainRollingRestConflict(
     const resolved = resolveScheduleForDate(employeeId, d, datedAssignments, patterns, shiftPatterns);
     if (resolved === 'day' || resolved === 'night') workingDays.push(d);
   }
-  return { windowStart, windowEnd, workingDays };
+  const windowStartLabel = formatFriendlyWeekdayDate(windowStart);
+  const windowEndLabel = formatFriendlyWeekdayDate(windowEnd);
+  const workingDaysLabel = workingDays.map((d) => WEEKDAY_LABELS[weekdayOf(d)]).join(', ');
+  const summary = `This would leave no rest day between ${windowStartLabel} and ${windowEndLabel} -- every day in that span (${workingDaysLabel}) is a working day. Malawi's Employment Act requires at least 24 consecutive hours of rest after no more than six consecutive working days. Try a shorter change, a different pair of weekdays, or keep one of those days Off so at least one rest day remains in that span.`;
+  return { windowStart, windowEnd, workingDays, windowStartLabel, windowEndLabel, workingDaysLabel, summary };
 }
 
 /** Every date in [dateFrom, dateTo] inclusive, as plain YYYY-MM-DD strings. */
@@ -674,4 +684,147 @@ export function summarizeDateRangeAssignments(
       : resolved;
     return { date, weekdayJs: weekdayOf(date), resolved, hasDatedException, underlyingResolved };
   });
+}
+
+// ============================================================
+// Stage C Step 14: "Complete Roster Scheduling Alignment."
+// Real STAGING finding (LUCIOUS LIGOMERA, SFG-S-469): cancelling a
+// mistaken special Off across Thu-Sat was correctly REJECTED by
+// roster_cancel_date_assignments -- it is a genuine Malawi Employment
+// Act s.36(4) rest conflict (revealing Day on all three dates leaves a
+// 7-day window, Sat-Fri, with no rest day at all), not a resolver bug.
+// The gap is UX, not validation: the Correct/Cancel tab had no
+// proactive, weekday-phrased warning and no safe-alternative
+// suggestion before submitting, unlike the Temporary/Permanent Off Day
+// tab's bridge-day handling. This is an ADVISORY, read-only mirror of
+// the server's own two checks (Night-to-Day adjacency + rolling
+// seven-day rest, exactly as roster_cancel_date_assignments's Pass 2
+// re-resolves them) -- it never grants an override; a conflict it
+// finds safe is still independently re-validated and enforced by the
+// database on submit, and a conflict it flags can only be resolved by
+// cancelling fewer dates (or leaving more untouched), never bypassed.
+// ============================================================
+
+export interface CancellationSafetyResult {
+  safe: boolean;
+  /** Dates (within the requested range) whose cancellation would create a Night-to-Day adjacency conflict. */
+  adjacencyConflictDates: string[];
+  /** Rolling seven-day rest windows that would have no Off day at all if every date in the requested range were cancelled. */
+  restViolations: RollingRestWindowResult[];
+  /** The largest safe alternative obtained by cancelling only a leading sub-range (dateFrom through some earlier end date) -- null when none exists or the full range is already safe. */
+  safePrefixRange: { dateFrom: string; dateTo: string } | null;
+  /** The largest safe alternative obtained by cancelling only a trailing sub-range (some later start date through dateTo) -- null when none exists or the full range is already safe. */
+  safeSuffixRange: { dateFrom: string; dateTo: string } | null;
+}
+
+/**
+ * Advisory preview of whether cancelling every active dated exception
+ * for employeeId across [dateFrom, dateTo] would be safe -- mirrors
+ * roster_cancel_date_assignments's own Pass 2 exactly (resolve each
+ * touched date against the simulated post-cancellation state, then
+ * check Night-to-Day adjacency and the rolling seven-day rest rule),
+ * so the UI can warn BEFORE submitting instead of only after a server
+ * rejection. When unsafe, also searches for the largest safe leading
+ * or trailing sub-range of the SAME requested dates, so the Admin can
+ * be offered a concrete, safe alternative in weekday language rather
+ * than a dead end.
+ */
+export function evaluateCancellationSafety(
+  employeeId: string,
+  dateFrom: string,
+  dateTo: string,
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
+): CancellationSafetyResult {
+  const check = (cancelFrom: string, cancelTo: string): { safe: boolean; adjacencyConflictDates: string[]; restViolations: RollingRestWindowResult[] } => {
+    const touchedDates = expandDateRange(cancelFrom, cancelTo).filter((d) =>
+      datedAssignments.some((a) => a.employeeId === employeeId && a.assignmentDate === d && a.isActive)
+    );
+    if (touchedDates.length === 0) return { safe: true, adjacencyConflictDates: [], restViolations: [] };
+
+    const simulated = datedAssignments.filter(
+      (a) => !(a.employeeId === employeeId && a.isActive && touchedDates.includes(a.assignmentDate))
+    );
+
+    const adjacencyConflictDates: string[] = [];
+    const restViolationKeys = new Set<string>();
+    const restViolations: RollingRestWindowResult[] = [];
+    for (const date of touchedDates) {
+      const resolved = resolveScheduleForDate(employeeId, date, simulated, patterns, shiftPatterns);
+      if (resolved === 'day' && resolveScheduleForDate(employeeId, addDays(date, -1), simulated, patterns, shiftPatterns) === 'night') {
+        adjacencyConflictDates.push(date);
+      } else if (resolved === 'night' && resolveScheduleForDate(employeeId, addDays(date, 1), simulated, patterns, shiftPatterns) === 'day') {
+        adjacencyConflictDates.push(date);
+      }
+      for (const violation of findConfirmedRollingRestViolations(employeeId, date, simulated, patterns, shiftPatterns)) {
+        const key = `${violation.windowStart}:${violation.windowEnd}`;
+        if (!restViolationKeys.has(key)) {
+          restViolationKeys.add(key);
+          restViolations.push(violation);
+        }
+      }
+    }
+    return { safe: adjacencyConflictDates.length === 0 && restViolations.length === 0, adjacencyConflictDates, restViolations };
+  };
+
+  const full = check(dateFrom, dateTo);
+  if (full.safe) {
+    return { ...full, safePrefixRange: null, safeSuffixRange: null };
+  }
+
+  let safePrefixRange: { dateFrom: string; dateTo: string } | null = null;
+  for (let end = addDays(dateTo, -1); end >= dateFrom; end = addDays(end, -1)) {
+    if (check(dateFrom, end).safe) {
+      safePrefixRange = { dateFrom, dateTo: end };
+      break;
+    }
+  }
+
+  let safeSuffixRange: { dateFrom: string; dateTo: string } | null = null;
+  for (let start = addDays(dateFrom, 1); start <= dateTo; start = addDays(start, 1)) {
+    if (check(start, dateTo).safe) {
+      safeSuffixRange = { dateFrom: start, dateTo };
+      break;
+    }
+  }
+
+  return { ...full, safePrefixRange, safeSuffixRange };
+}
+
+export interface CancellationSafetyDescription {
+  /** The conflict explanation, in weekdays, with exact dates as supporting detail -- never a raw technical message. */
+  primary: string;
+  /** A concrete, safe alternative the Admin can take instead, or null when evaluateCancellationSafety found none. Never an override of the conflict -- only a smaller/different selection that the server will independently re-validate and accept. */
+  suggestion: string | null;
+}
+
+/** Turns a CancellationSafetyResult into the plain-weekday explanation + safe-alternative text the Correct/Cancel tab shows before submitting. Returns null when safety.safe is true (nothing to explain). */
+export function describeCancellationSafety(employeeName: string, safety: CancellationSafetyResult): CancellationSafetyDescription | null {
+  if (safety.safe) return null;
+
+  const sentences: string[] = [];
+  if (safety.restViolations.length > 0) {
+    const v = safety.restViolations[0];
+    const windowDays: string[] = [];
+    for (let d = v.windowStart; d <= v.windowEnd; d = addDays(d, 1)) windowDays.push(WEEKDAY_LABELS[weekdayOf(d)]);
+    sentences.push(
+      `Cancelling all of these would leave ${employeeName} with no rest day between ${formatFriendlyWeekdayDate(v.windowStart)} and ${formatFriendlyWeekdayDate(v.windowEnd)} -- every day in that span (${windowDays.join(', ')}) would be a working day, which exceeds the maximum six consecutive working days before 24 hours of rest is required (Malawi Employment Act s.36(4)).`
+    );
+  }
+  if (safety.adjacencyConflictDates.length > 0) {
+    const dayLabels = safety.adjacencyConflictDates.map((d) => formatFriendlyWeekdayDate(d)).join(', ');
+    sentences.push(`Cancelling ${dayLabels} would also put ${employeeName} on a Day shift immediately after, or a Night shift immediately before, another working day with no break between them.`);
+  }
+
+  let suggestion: string | null = null;
+  if (safety.safeSuffixRange) {
+    suggestion = `Safe alternative: keep ${formatFriendlyWeekdayDate(addDays(safety.safeSuffixRange.dateFrom, -1))} Off, and cancel only from ${formatFriendlyWeekdayDate(safety.safeSuffixRange.dateFrom)} to ${formatFriendlyWeekdayDate(safety.safeSuffixRange.dateTo)}.`;
+  } else if (safety.safePrefixRange) {
+    suggestion = `Safe alternative: cancel only from ${formatFriendlyWeekdayDate(safety.safePrefixRange.dateFrom)} to ${formatFriendlyWeekdayDate(safety.safePrefixRange.dateTo)}, and keep ${formatFriendlyWeekdayDate(addDays(safety.safePrefixRange.dateTo, 1))} Off.`;
+  } else {
+    suggestion = `No sub-range of these exact dates is safe to cancel together. Try a narrower or different range, or use the Temporary / Permanent Off Day tool to plan a compliant change.`;
+  }
+
+  return { primary: sentences.join(' '), suggestion };
 }

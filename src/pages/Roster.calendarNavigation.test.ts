@@ -137,11 +137,14 @@ function getCalendarTabJsx(): string {
 describe('Roster calendar UX polish: date-range separator, invalid-range heading, oversized-range navigation', () => {
   it('never renders the old double-hyphen "--" as a date-range separator anywhere in the Calendar tab', () => {
     const jsx = getCalendarTabJsx();
-    // The page subtitle and the unrelated Assign Dates tab's own prose
-    // both legitimately use "--" as a sentence dash elsewhere in this
-    // file -- scoping this check to the Calendar tab's own JSX block
-    // keeps it from false-failing on that unrelated, out-of-scope text.
-    expect(jsx).not.toContain('--');
+    // Stage C Step 14 added a legitimate explanatory paragraph to the
+    // Calendar tab (distinguishing recurring vs special Off, Unassigned,
+    // and Leave/Sick Leave) that, like the page subtitle and the Assign
+    // Dates tab's own prose, uses "--" as an ordinary sentence dash --
+    // that is not what this test guards against. The actual anti-pattern
+    // is two raw ISO dates stitched together with "--" as a range
+    // separator (e.g. "2026-10-01--2026-10-07"), which must never appear.
+    expect(jsx).not.toMatch(/\d{4}-\d{2}-\d{2}\s*--\s*\d{4}-\d{2}-\d{2}/);
   });
 
   it('formatPeriodHeading\'s en dash is actually what the heading element renders (calendarPeriodHeading, not a second copy of the separator logic in the component)', () => {

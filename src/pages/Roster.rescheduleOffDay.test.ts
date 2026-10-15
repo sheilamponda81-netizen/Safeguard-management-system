@@ -142,8 +142,11 @@ describe('Temporary / Permanent Off Day: a single atomic applyWeekdayTransition 
   it('composes a plain-language explanation (employee, why, which working days, what to try) when the server rejects the whole transition for the rolling-rest rule', () => {
     const fn = rosterSource.match(/const handleSubmitReschedule = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[/)?.[0] ?? '';
     expect(fn).toMatch(/explainRollingRestConflict\(rawMessage, rescheduleEmployeeId, dateAssignments, patterns, shiftPatterns\)/);
-    expect(fn).toMatch(/every day from \$\{explanation\.windowStart\} to \$\{explanation\.windowEnd\} is already a working day/);
-    expect(fn).toMatch(/Try a shorter duration, or choose a different pair of weekdays/);
+    // Stage C Step 14: the explanation is now a single ready-made,
+    // weekday-phrased sentence (explanation.summary) rather than the
+    // handler composing raw ISO dates inline -- see rosterSchedule.ts's
+    // explainRollingRestConflict and its own tests for the exact wording.
+    expect(fn).toMatch(/\$\{humanized\} \$\{explanation\.summary\}/);
   });
 });
 

@@ -99,13 +99,14 @@ describe('Correct / Cancel Special Assignment: the before/after preview never fo
 });
 
 describe('Correct / Cancel Special Assignment: submission requires employee, valid range, reason, and at least one actionable date, and is atomic per action', () => {
-  it('canSubmitCorrect requires all of: employee, valid range, non-empty reason, a non-empty summary, and at least one changeable date', () => {
-    const def = rosterSource.match(/const canSubmitCorrect =[\s\S]*?correctChangeableCount > 0;/)?.[0] ?? '';
+  it('canSubmitCorrect requires all of: employee, valid range, non-empty reason, a non-empty summary, at least one changeable date, and no known-unsafe rest conflict', () => {
+    const def = rosterSource.match(/const canSubmitCorrect =[\s\S]*?correctCancellationSafety\.safe\);/)?.[0] ?? '';
     expect(def).toMatch(/!!correctEmployeeId/);
     expect(def).toMatch(/isCorrectRangeValid/);
     expect(def).toMatch(/!!correctReason\.trim\(\)/);
     expect(def).toMatch(/correctSummary\.length > 0/);
     expect(def).toMatch(/correctChangeableCount > 0/);
+    expect(def).toMatch(/\(!correctCancellationSafety \|\| correctCancellationSafety\.safe\)/);
   });
 
   it('the submit Button is disabled whenever canSubmitCorrect is false', () => {
@@ -113,23 +114,58 @@ describe('Correct / Cancel Special Assignment: submission requires employee, val
   });
 
   it('handleSubmitCorrect refuses to call any RPC at all when canSubmitCorrect is false (defense in depth beyond the disabled button)', () => {
-    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, employees, loadData\]\);/)?.[0] ?? '';
+    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, correctRangeAssignments, patterns, shiftPatterns, employees, loadData\]\);/)?.[0] ?? '';
     expect(fn).toMatch(/if \(!canSubmitCorrect\) \{/);
   });
 
   it('cancel mode calls the new cancelDateAssignments wrapper (one atomic RPC call), never a per-date loop', () => {
-    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, employees, loadData\]\);/)?.[0] ?? '';
+    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, correctRangeAssignments, patterns, shiftPatterns, employees, loadData\]\);/)?.[0] ?? '';
     expect(fn).toMatch(/correctAction === 'cancel'\s*\n\s*\? await cancelDateAssignments\(\[correctEmployeeId\], correctDateFrom, correctDateTo, correctReason\)/);
   });
 
   it('correct-to-type mode reuses the existing, unmodified assignDates RPC wrapper -- no new write path for this direction', () => {
-    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, employees, loadData\]\);/)?.[0] ?? '';
+    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, correctRangeAssignments, patterns, shiftPatterns, employees, loadData\]\);/)?.[0] ?? '';
     expect(fn).toMatch(/: await assignDates\(\[correctEmployeeId\], correctDateFrom, correctDateTo, correctAction, correctReason\);/);
   });
 
   it('a failed correction is humanized through humanizeRosterError, same as every other roster form', () => {
-    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, employees, loadData\]\);/)?.[0] ?? '';
-    expect(fn).toMatch(/humanizeRosterError\(result\.error \|\| 'Could not apply this correction\.', employees\)/);
+    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, correctRangeAssignments, patterns, shiftPatterns, employees, loadData\]\);/)?.[0] ?? '';
+    expect(fn).toMatch(/humanizeRosterError\(rawMessage, employees\)/);
+  });
+
+  // Stage C Step 14: real STAGING finding (LUCIOUS LIGOMERA, SFG-S-469) --
+  // a rolling-rest rejection from the server must ALSO get the same
+  // weekday-phrased explanation the Temporary/Permanent Off Day tab
+  // already gives, not just a raw humanized string, even though the
+  // proactive preview below should normally catch this before submit.
+  it('falls back to a weekday-phrased rolling-rest explanation (defense in depth) when the server still rejects the submission', () => {
+    const fn = rosterSource.match(/const handleSubmitCorrect = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, correctRangeAssignments, patterns, shiftPatterns, employees, loadData\]\);/)?.[0] ?? '';
+    expect(fn).toMatch(/explainRollingRestConflict\(rawMessage, correctEmployeeId, correctRangeAssignments, patterns, shiftPatterns\)/);
+    expect(fn).toMatch(/\$\{humanizeRosterError\(rawMessage, employees\)\} \$\{explanation\.summary\}/);
+  });
+});
+
+describe('Correct / Cancel Special Assignment: Stage C Step 14 -- proactive rest-conflict preview before submitting', () => {
+  it('computes an advisory cancellation-safety preview only in cancel mode, only once an employee, a valid range, and at least one cancellable date are selected', () => {
+    const def = rosterSource.match(/const correctCancellationSafety: CancellationSafetyResult \| null = useMemo\(\(\) => \{[\s\S]*?\n {2}\}, \[[\s\S]*?\]\);/)?.[0] ?? '';
+    expect(def).toMatch(/if \(correctAction !== 'cancel' \|\| !correctEmployeeId \|\| !isCorrectRangeValid \|\| correctCancellableCount === 0\) return null;/);
+    expect(def).toMatch(/evaluateCancellationSafety\(correctEmployeeId, correctDateFrom, correctDateTo, correctRangeAssignments, patterns, shiftPatterns\)/);
+  });
+
+  it('turns the safety result into weekday-phrased text via describeCancellationSafety', () => {
+    expect(rosterSource).toMatch(/describeCancellationSafety\(correctSelectedEmployee\.fullName, correctCancellationSafety\)/);
+  });
+
+  it('blocks submission while the full requested range is known-unsafe, exactly like the Temporary/Permanent Off Day tab blocks an unsafe plan', () => {
+    const def = rosterSource.match(/const canSubmitCorrect =[\s\S]*?correctCancellationSafety\.safe\);/)?.[0] ?? '';
+    expect(def).toMatch(/\(!correctCancellationSafety \|\| correctCancellationSafety\.safe\)/);
+  });
+
+  it('renders the conflict explanation and safe-alternative suggestion in a dedicated warning card', () => {
+    expect(rosterSource).toMatch(/\{correctCancellationDescription && \(/);
+    expect(rosterSource).toMatch(/This would leave no rest day/);
+    expect(rosterSource).toMatch(/\{correctCancellationDescription\.primary\}/);
+    expect(rosterSource).toMatch(/\{correctCancellationDescription\.suggestion\}/);
   });
 });
 
