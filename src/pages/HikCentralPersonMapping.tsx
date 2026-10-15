@@ -35,6 +35,29 @@ function displayName(profile: HikCentralIdentityProfile): string {
   return [firstName, lastName].filter(Boolean).join(' ') || '(no name)';
 }
 
+// Step 11F: one search predicate reused across all four tabs -- matches
+// on the Safeguard employee's name/number (via matchedEmployee, which is
+// already populated for 'exact' and 'mapped' categories, or via Needs
+// Review's own candidate suggestions), the HikCentral name (every
+// observed name variant, not just the first -- relevant for Conflicts),
+// and the HikCentral Person No. Case-insensitive, partial match.
+// `query` is expected pre-trimmed and lower-cased by the caller.
+function identityMatchesSearch(identity: ClassifiedIdentity, query: string): boolean {
+  if (!query) return true;
+  if (identity.profile.hikcentralPersonNo.toLowerCase().includes(query)) return true;
+  if (identity.profile.observedNamePairs.some(
+    (n) => [n.firstName, n.lastName].filter(Boolean).join(' ').toLowerCase().includes(query)
+  )) return true;
+  if (identity.matchedEmployee && (
+    identity.matchedEmployee.fullName.toLowerCase().includes(query)
+    || identity.matchedEmployee.employeeNumber.toLowerCase().includes(query)
+  )) return true;
+  if (identity.suggestions.some(
+    (s) => s.employee.fullName.toLowerCase().includes(query) || s.employee.employeeNumber.toLowerCase().includes(query)
+  )) return true;
+  return false;
+}
+
 export default function HikCentralPersonMappingPage() {
   const [canMap, setCanMap] = useState(false);
   const [permissionsLoaded, setPermissionsLoaded] = useState(false);
@@ -60,6 +83,19 @@ export default function HikCentralPersonMappingPage() {
   const [savingTerminals, setSavingTerminals] = useState(false);
 
   const [activeTab, setActiveTab] = useState<TabId>('exact');
+
+  // Step 11F: a single search box shared by all four tabs -- its text is
+  // never reset on tab switch (it simply isn't tied to activeTab at all).
+  // searchInput updates the input instantly for responsiveness;
+  // debouncedSearch (what filtering actually uses) lags by 150ms so that
+  // re-filtering thousands of rows never runs on every keystroke.
+  const [searchInput, setSearchInput] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  useEffect(() => {
+    const handle = setTimeout(() => setDebouncedSearch(searchInput.trim().toLowerCase()), 150);
+    return () => clearTimeout(handle);
+  }, [searchInput]);
+
   const [selectedExact, setSelectedExact] = useState<Set<string>>(new Set());
   const [selectedStrongReview, setSelectedStrongReview] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState(false);
@@ -126,6 +162,28 @@ export default function HikCentralPersonMappingPage() {
   const strongReviewIdentities = useMemo(
     () => needsReview.filter((i) => i.suggestions[0]?.label === 'Strong suggestion'),
     [needsReview]
+  );
+
+  // Step 11F: search only narrows which rows are RENDERED in the
+  // currently active tab -- bulk-select/confirm actions below still
+  // operate on the full, unfiltered exactMatches/needsReview/
+  // strongReviewIdentities arrays exactly as before, so an existing
+  // selection is never silently affected by typing a search query.
+  const filteredExactMatches = useMemo(
+    () => (debouncedSearch ? exactMatches.filter((i) => identityMatchesSearch(i, debouncedSearch)) : exactMatches),
+    [exactMatches, debouncedSearch]
+  );
+  const filteredNeedsReview = useMemo(
+    () => (debouncedSearch ? needsReview.filter((i) => identityMatchesSearch(i, debouncedSearch)) : needsReview),
+    [needsReview, debouncedSearch]
+  );
+  const filteredMapped = useMemo(
+    () => (debouncedSearch ? mapped.filter((i) => identityMatchesSearch(i, debouncedSearch)) : mapped),
+    [mapped, debouncedSearch]
+  );
+  const filteredConflicts = useMemo(
+    () => (debouncedSearch ? conflicts.filter((i) => identityMatchesSearch(i, debouncedSearch)) : conflicts),
+    [conflicts, debouncedSearch]
   );
 
   useEffect(() => {
@@ -391,9 +449,18 @@ export default function HikCentralPersonMappingPage() {
         onChange={(id) => setActiveTab(id as TabId)}
       />
 
+      <Input
+        icon={Search}
+        placeholder="Search by employee name, employee number, HikCentral name, or Person No..."
+        value={searchInput}
+        onChange={(e) => setSearchInput(e.target.value)}
+      />
+
       {activeTab === 'exact' && (
         exactMatches.length === 0 ? (
           <EmptyState icon={CheckCircle2} title="No exact matches pending" description="Every identity with a single, exact, active-employee name match has already been mapped or there are none right now." />
+        ) : filteredExactMatches.length === 0 ? (
+          <EmptyState icon={Search} title="No matching results" description={`No exact matches match "${searchInput.trim()}". Try a different name, employee number, or Person No.`} />
         ) : (
           <div className="space-y-3">
             {canMap && (
@@ -427,7 +494,7 @@ export default function HikCentralPersonMappingPage() {
                 </TR>
               </THead>
               <TBody>
-                {exactMatches.map((i) => (
+                {filteredExactMatches.map((i) => (
                   <TR key={i.profile.hikcentralPersonNo}>
                     {canMap && (
                       <TD>
@@ -457,6 +524,8 @@ export default function HikCentralPersonMappingPage() {
       {activeTab === 'needs_review' && (
         needsReview.length === 0 ? (
           <EmptyState icon={Search} title="Nothing needs review" description="Every remaining identity is either already mapped, an exact match, or blocked as a conflict." />
+        ) : filteredNeedsReview.length === 0 ? (
+          <EmptyState icon={Search} title="No matching results" description={`No identities needing review match "${searchInput.trim()}". Try a different name, employee number, or Person No.`} />
         ) : (
           <div className="space-y-3">
             <p className="text-sm text-slate-600">
@@ -479,7 +548,7 @@ export default function HikCentralPersonMappingPage() {
                 </Button>
               </div>
             )}
-            {needsReview.map((i) => {
+            {filteredNeedsReview.map((i) => {
               const topIsStrong = i.suggestions[0]?.label === 'Strong suggestion';
               const otherSuggestions = topIsStrong ? i.suggestions.slice(1) : i.suggestions;
               return (
@@ -548,6 +617,8 @@ export default function HikCentralPersonMappingPage() {
       {activeTab === 'mapped' && (
         mapped.length === 0 ? (
           <EmptyState icon={UserCheck} title="No confirmed mappings yet" description="Mappings you confirm from the Exact Matches or Needs Review tabs will appear here." />
+        ) : filteredMapped.length === 0 ? (
+          <EmptyState icon={Search} title="No matching results" description={`No mapped employees match "${searchInput.trim()}". Try a different name, employee number, or Person No.`} />
         ) : (
           <Table>
             <THead>
@@ -564,7 +635,7 @@ export default function HikCentralPersonMappingPage() {
               </TR>
             </THead>
             <TBody>
-              {mapped.map((i) => {
+              {filteredMapped.map((i) => {
                 const driftWarning = mappedIdentityHasNameDrift(i.profile);
                 const assignedTerminals = terminalAssignments.get(i.activeMapping!.employeeId) || [];
                 return (
@@ -613,6 +684,8 @@ export default function HikCentralPersonMappingPage() {
       {activeTab === 'conflict' && (
         conflicts.length === 0 ? (
           <EmptyState icon={AlertTriangle} title="No conflicts" description="No Person No. currently has more than one conflicting name in the raw data." />
+        ) : filteredConflicts.length === 0 ? (
+          <EmptyState icon={Search} title="No matching results" description={`No conflicts match "${searchInput.trim()}". Try a different name, employee number, or Person No.`} />
         ) : (
           <Table>
             <THead>
@@ -625,7 +698,7 @@ export default function HikCentralPersonMappingPage() {
               </TR>
             </THead>
             <TBody>
-              {conflicts.map((i) => (
+              {filteredConflicts.map((i) => (
                 <TR key={i.profile.hikcentralPersonNo}>
                   <TD className="font-mono">{i.profile.hikcentralPersonNo}</TD>
                   <TD>
