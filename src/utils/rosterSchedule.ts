@@ -638,3 +638,40 @@ export function describeWeekOffDays(employeeName: string, summary: WeekScheduleS
   }
   return { primary, secondary };
 }
+
+// Stage C Step 13: "Correct or Cancel Special Roster Assignments."
+// Generalizes the Step 12E week-summary idea (show the ACTUAL resolved
+// schedule, distinguished from its source) to an arbitrary date range
+// and every resolved value, not only 'off' -- what the Correct Special
+// Assignment workflow needs to show a before/after preview for
+// cancelling a mistaken dated exception (Day, Night, or Off) and
+// revealing whatever the employee's underlying recurring pattern says
+// instead, never forcing a specific value onto it.
+export interface DateAssignmentStatus {
+  date: string;
+  weekdayJs: number;
+  /** What this date currently resolves to -- identical to what the Calendar tab shows. */
+  resolved: ResolvedSchedule;
+  /** True when an active dated row exists for this exact date -- the only thing roster_cancel_date_assignments will ever touch; false means this date's value comes directly from the recurring pattern (or is unassigned) and is therefore protected -- changing it requires Temporary/Permanent Off Day or Recurring Schedule instead. */
+  hasDatedException: boolean;
+  /** What this date would resolve to with no dated exception in effect at all -- i.e. the "after" value a cancellation would reveal. Equal to `resolved` whenever hasDatedException is false. */
+  underlyingResolved: ResolvedSchedule;
+}
+
+export function summarizeDateRangeAssignments(
+  employeeId: string,
+  dateFrom: string,
+  dateTo: string,
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
+): DateAssignmentStatus[] {
+  return expandDateRange(dateFrom, dateTo).map((date) => {
+    const resolved = resolveScheduleForDate(employeeId, date, datedAssignments, patterns, shiftPatterns);
+    const hasDatedException = datedAssignments.some((a) => a.employeeId === employeeId && a.assignmentDate === date && a.isActive);
+    const underlyingResolved = hasDatedException
+      ? resolveScheduleForDate(employeeId, date, [], patterns, shiftPatterns)
+      : resolved;
+    return { date, weekdayJs: weekdayOf(date), resolved, hasDatedException, underlyingResolved };
+  });
+}

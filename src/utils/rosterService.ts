@@ -222,6 +222,32 @@ export async function assignDates(
   });
 }
 
+/**
+ * Stage C Step 13: cancels a mistaken dated exception across a date
+ * range, restoring whatever the employee's underlying recurring
+ * Off-day/shift pattern says for each date (Day, Night, Off, or
+ * unassigned) -- never forcing a specific value. A date with no active
+ * dated exception (already governed directly by the recurring pattern)
+ * is left untouched and simply counted as skipped -- this is how
+ * genuine recurring Off/working days stay protected from this tool.
+ * Shares roster_assign_dates' own response shape (assigned_count here
+ * means "cancelled", already_set_count means "skipped, nothing to
+ * cancel") so the existing callCountedRpc wrapper applies unchanged.
+ */
+export async function cancelDateAssignments(
+  employeeIds: string[],
+  dateFrom: string,
+  dateTo: string,
+  correctionReason: string
+): Promise<RosterRpcResult> {
+  return callCountedRpc('roster_cancel_date_assignments', {
+    p_employee_ids: employeeIds,
+    p_date_from: dateFrom,
+    p_date_to: dateTo,
+    p_correction_reason: correctionReason,
+  });
+}
+
 export interface RescheduleOffDayResult {
   success: boolean;
   outcome: RosterRpcOutcome;

@@ -19,6 +19,7 @@ import {
   explainRollingRestConflict,
   summarizeWeekSchedule,
   describeWeekOffDays,
+  summarizeDateRangeAssignments,
   formatFriendlyWeekdayDate,
   weekdayOf,
   addDays,
@@ -738,5 +739,60 @@ describe('Stage C Step 12E: summarizeWeekSchedule / describeWeekOffDays', () => 
     for (const d of ['2026-10-12', '2026-10-13', '2026-10-14', '2026-10-15', '2026-10-17', '2026-10-18']) {
       expect(resolveScheduleForDate('emp-1', d, assignments, patterns, [])).not.toBe('off');
     }
+  });
+});
+
+describe('Stage C Step 13: summarizeDateRangeAssignments (Correct or Cancel Special Assignment -- before/after cancellation preview)', () => {
+  it('reproduces the business example: October 4-12 mistakenly marked special Off; cancelling reveals the recurring Wednesday Off on the 7th and the recurring Day shift on every other date, never Day everywhere', () => {
+    const patterns = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday
+    const shift = [shiftPattern({ shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const assignments = ['2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09', '2026-10-10', '2026-10-11', '2026-10-12']
+      .map((d) => dated({ assignmentDate: d, assignmentType: 'off' }));
+
+    const summary = summarizeDateRangeAssignments('emp-1', '2026-10-04', '2026-10-12', assignments, patterns, shift);
+
+    expect(summary).toHaveLength(9);
+    for (const day of summary) {
+      expect(day.resolved).toBe('off'); // currently -- the mistaken special assignment
+      expect(day.hasDatedException).toBe(true);
+    }
+    const wednesday = summary.find((d) => d.date === '2026-10-07')!;
+    expect(wednesday.underlyingResolved).toBe('off'); // genuinely off, via the recurring pattern -- NOT via the mistaken dated exception
+    for (const d of summary.filter((d) => d.date !== '2026-10-07')) {
+      expect(d.underlyingResolved).toBe('day'); // revealed from the recurring shift pattern, never forced
+    }
+  });
+
+  it('a date with no dated exception is reported as protected: hasDatedException is false and underlyingResolved equals resolved exactly', () => {
+    const patterns = [pattern({ weekday: 3, effectiveFrom: '2026-01-01' })];
+    const summary = summarizeDateRangeAssignments('emp-1', '2026-10-05', '2026-10-06', [], patterns, []);
+    for (const day of summary) {
+      expect(day.hasDatedException).toBe(false);
+      expect(day.underlyingResolved).toBe(day.resolved);
+    }
+  });
+
+  it('correcting a special Day to Night mid-range: underlyingResolved still reflects what cancelling (not correcting) would reveal, independent of the requested correction type', () => {
+    const patterns: OffDayPatternRow[] = [];
+    const shift = [shiftPattern({ shiftType: 'night', effectiveFrom: '2026-01-01' })];
+    const assignments = [dated({ assignmentDate: '2026-10-07', assignmentType: 'day' })];
+    const summary = summarizeDateRangeAssignments('emp-1', '2026-10-07', '2026-10-07', assignments, patterns, shift);
+    expect(summary[0].resolved).toBe('day');
+    expect(summary[0].hasDatedException).toBe(true);
+    expect(summary[0].underlyingResolved).toBe('night'); // what cancellation reveals -- the recurring Night pattern
+  });
+
+  it('an unassigned date (no dated exception, no pattern at all) resolves and reveals the same \'unassigned\' value, never invented', () => {
+    const summary = summarizeDateRangeAssignments('emp-1', '2026-10-07', '2026-10-07', [], [], []);
+    expect(summary[0].resolved).toBe('unassigned');
+    expect(summary[0].hasDatedException).toBe(false);
+    expect(summary[0].underlyingResolved).toBe('unassigned');
+  });
+
+  it('only cancels/inspects the named employee -- another employee\'s dated assignment on the same date is ignored entirely', () => {
+    const assignments = [dated({ employeeId: 'emp-2', assignmentDate: '2026-10-07', assignmentType: 'off' })];
+    const summary = summarizeDateRangeAssignments('emp-1', '2026-10-07', '2026-10-07', assignments, [], []);
+    expect(summary[0].hasDatedException).toBe(false);
+    expect(summary[0].resolved).toBe('unassigned');
   });
 });
