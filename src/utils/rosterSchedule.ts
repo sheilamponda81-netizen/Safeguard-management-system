@@ -705,6 +705,132 @@ export function summarizeDateRangeAssignments(
 // cancelling fewer dates (or leaving more untouched), never bypassed.
 // ============================================================
 
+// ============================================================
+// Stage C Step 16: "Smart Off-Day Change Start Week." A Temporary/
+// Permanent Off-day change submitted for the CURRENT Monday-to-Sunday
+// week (the week containing today) can be asked, in effect, to change
+// something that has already partly happened: if the employee's
+// original Off day for this week has already gone by, converting it to
+// a working day would retroactively rewrite a day that is already in
+// the past, and simply adding the new Off day on top of it would give
+// the employee two Off days in the same week neither of which the
+// policy intends. Symmetrically, if the NEW Off day for this week has
+// already gone by (even though the original one has not), writing it
+// would backdate an Off day that administratively never happened. This
+// function decides -- purely from the roster's own resolved schedule
+// and today's date, never from attendance/check-in records, per the
+// explicit instruction that a scheduled Off day is never conclusive
+// proof rest was actually taken -- whether the requested week is safe
+// to use as-is, must be deferred to the following week, or is too
+// ambiguous (an incomplete schedule, more than one actual Off day this
+// week, a historical one-off exception standing in for the normal
+// pattern, or a stated "original weekday" that does not match what the
+// week actually resolves to) to decide automatically at all. A request
+// for a genuinely FUTURE week (one that has not started yet as of
+// todayDate) is always 'ok' as requested -- nothing in it has happened
+// yet, so this rule only ever activates for the current week or an
+// (unexpected) past one, keeping the whole rule strictly prospective:
+// it only ever changes where a NEW submission starts, never reinterprets
+// or reverses a transition already recorded in the database.
+export interface TransitionStartWeekDecision {
+  status: 'ok' | 'deferred' | 'ambiguous';
+  /** The week (a Monday) to actually use as the transition's effective start. Equals requestedWeekStart for 'ok', the suggested following week for 'deferred', and null for 'ambiguous' -- nothing can be safely chosen without the administrator resolving the ambiguity first (e.g. by correcting the original weekday, or by choosing a different, unambiguous week). */
+  weekStart: string | null;
+  requestedWeekStart: string;
+  /** Null only for 'ok'. Always phrased in weekdays, with exact dates as supporting detail -- never a raw technical message. */
+  reason: string | null;
+}
+
+export function determineTransitionStartWeek(
+  employeeId: string,
+  requestedWeekStart: string,
+  originalWeekday: number,
+  newWeekday: number,
+  todayDate: string,
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
+): TransitionStartWeekDecision {
+  if (requestedWeekStart > todayDate) {
+    return { status: 'ok', weekStart: requestedWeekStart, requestedWeekStart, reason: null };
+  }
+
+  const weekEnd = addDays(requestedWeekStart, 6);
+  const daysSinceMondayOfToday = (weekdayOf(todayDate) + 6) % 7;
+  const todayWeekStart = addDays(todayDate, -daysSinceMondayOfToday);
+  const nextEligibleWeekStart = addDays(todayWeekStart, 7);
+  const nextEligibleWeekEnd = addDays(nextEligibleWeekStart, 6);
+
+  const weekResolved = expandDateRange(requestedWeekStart, weekEnd).map((d) =>
+    resolveScheduleForDate(employeeId, d, datedAssignments, patterns, shiftPatterns)
+  );
+  if (weekResolved.includes('unassigned')) {
+    return {
+      status: 'ambiguous',
+      weekStart: null,
+      requestedWeekStart,
+      reason: `Part of the week of ${formatFriendlyWeekdayDate(requestedWeekStart)} to ${formatFriendlyWeekdayDate(weekEnd)} has no recorded schedule at all -- Safeguard cannot confirm whether this week's Off day has already occurred. Confirm the schedule for this week manually, or choose a future week instead.`,
+    };
+  }
+
+  const summary = summarizeWeekSchedule(employeeId, requestedWeekStart, datedAssignments, patterns, shiftPatterns);
+  if (summary.actualOffDays.length === 0) {
+    return {
+      status: 'ambiguous',
+      weekStart: null,
+      requestedWeekStart,
+      reason: `No Off day currently resolves for this employee in the week of ${formatFriendlyWeekdayDate(requestedWeekStart)} to ${formatFriendlyWeekdayDate(weekEnd)} -- Safeguard will not guess whether an Off day has already occurred. Confirm the schedule manually, or choose a future week instead.`,
+    };
+  }
+  if (summary.actualOffDays.length > 1) {
+    return {
+      status: 'ambiguous',
+      weekStart: null,
+      requestedWeekStart,
+      reason: `This employee has more than one Off day in the week of ${formatFriendlyWeekdayDate(requestedWeekStart)} to ${formatFriendlyWeekdayDate(weekEnd)} -- Safeguard will not guess which one this change concerns. Choose the actual Off day above, or choose a future week instead.`,
+    };
+  }
+
+  const off = summary.actualOffDays[0];
+  if (off.source === 'dated_exception') {
+    return {
+      status: 'ambiguous',
+      weekStart: null,
+      requestedWeekStart,
+      reason: `This week's Off day, ${formatFriendlyWeekdayDate(off.date)}, comes from a historical one-off schedule exception rather than the normal recurring pattern -- Safeguard will not guess whether this change should treat it as the normal weekday. Confirm manually, or choose a future week instead.`,
+    };
+  }
+  if (off.weekdayJs !== originalWeekday) {
+    return {
+      status: 'ambiguous',
+      weekStart: null,
+      requestedWeekStart,
+      reason: `The selected original weekday (${WEEKDAY_LABELS[originalWeekday]}) does not match this week's actual Off day (${formatFriendlyWeekdayDate(off.date)}) -- Safeguard will not guess which one is intended. Correct the original weekday above, or choose a future week instead.`,
+    };
+  }
+
+  if (off.date < todayDate) {
+    return {
+      status: 'deferred',
+      weekStart: nextEligibleWeekStart,
+      requestedWeekStart,
+      reason: `This week's Off day, ${formatFriendlyWeekdayDate(off.date)}, has already occurred -- Safeguard will not convert a day that has passed into a working day, or add a second Off day in the same week. The change will start the following week instead, ${formatFriendlyWeekdayDate(nextEligibleWeekStart)} to ${formatFriendlyWeekdayDate(nextEligibleWeekEnd)}.`,
+    };
+  }
+
+  const newOffDateThisWeek = dateForWeekdayInWeek(requestedWeekStart, newWeekday);
+  if (newOffDateThisWeek < todayDate) {
+    return {
+      status: 'deferred',
+      weekStart: nextEligibleWeekStart,
+      requestedWeekStart,
+      reason: `The new Off day for this week, ${formatFriendlyWeekdayDate(newOffDateThisWeek)}, has already passed -- Safeguard will not backdate a new Off day. The change will start the following week instead, ${formatFriendlyWeekdayDate(nextEligibleWeekStart)} to ${formatFriendlyWeekdayDate(nextEligibleWeekEnd)}.`,
+    };
+  }
+
+  return { status: 'ok', weekStart: requestedWeekStart, requestedWeekStart, reason: null };
+}
+
 export interface CancellationSafetyResult {
   safe: boolean;
   /** Dates (within the requested range) whose cancellation would create a Night-to-Day adjacency conflict. */

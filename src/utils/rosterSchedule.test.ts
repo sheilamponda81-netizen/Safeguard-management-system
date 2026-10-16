@@ -22,6 +22,7 @@ import {
   summarizeDateRangeAssignments,
   evaluateCancellationSafety,
   describeCancellationSafety,
+  determineTransitionStartWeek,
   formatFriendlyWeekdayDate,
   weekdayOf,
   addDays,
@@ -921,5 +922,136 @@ describe('Stage C Step 14: evaluateCancellationSafety / describeCancellationSafe
     // Oct 10-16 window: Sat,Sun,Mon(off, recurring),Tue,Wed,Thu,Fri -- has an off day (Monday) already, so this window is fine either way.
     // Oct 11-17: Sun,Mon(off),Tue,Wed,Thu,Fri,Sat -- also has Monday off. So the full range is actually already safe here.
     expect(safety.safe).toBe(true);
+  });
+});
+
+// 2026-10-05 is a Monday (established throughout this file's Step 12/12A
+// fixtures). Every employee id below is a fresh synthetic id -- never
+// Lucius Ligomera/SFG-S-469 or Christopher John/SFG-S-466, both of
+// which are closed, real STAGING test cases that must never be reused
+// as fixtures.
+describe('Stage C Step 16: determineTransitionStartWeek (prospective-only -- a genuinely future week is always "ok" as requested)', () => {
+  it('a week that has not started yet (requestedWeekStart after todayDate) is always "ok", with no schedule check performed at all', () => {
+    // Deliberately gives this employee NO patterns of any kind -- if the
+    // function looked at the schedule here, every check (incomplete,
+    // zero Off days) would fire. It must not, because the whole week is
+    // still in the future.
+    const decision = determineTransitionStartWeek('sw-emp-a', '2026-10-19', 0, 3, '2026-10-05', [], [], []);
+    expect(decision).toEqual({ status: 'ok', weekStart: '2026-10-19', requestedWeekStart: '2026-10-19', reason: null });
+  });
+
+  it('current week, neither the original nor the new Off day has occurred yet (today is the Monday itself) -- "ok" as requested', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-b', weekday: 5, effectiveFrom: '2026-01-01' })]; // Friday
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-b', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const decision = determineTransitionStartWeek('sw-emp-b', '2026-10-05', 5, 0, '2026-10-05', [], patterns, shiftPatterns);
+    expect(decision.status).toBe('ok');
+    expect(decision.weekStart).toBe('2026-10-05');
+    expect(decision.reason).toBeNull();
+  });
+
+  it('current week, the original Off day has already occurred -- deferred to the following week, never converted or doubled up', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-c', weekday: 5, effectiveFrom: '2026-01-01' })]; // Friday, 2026-10-09
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-c', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const decision = determineTransitionStartWeek('sw-emp-c', '2026-10-05', 5, 0, '2026-10-10', [], patterns, shiftPatterns);
+    expect(decision.status).toBe('deferred');
+    expect(decision.weekStart).toBe('2026-10-12'); // the following Monday-to-Sunday week
+    expect(decision.reason).toMatch(/already occurred/);
+    expect(decision.reason).toMatch(/following week/);
+    expect(decision.reason).not.toMatch(/already passed/); // distinct wording from the "new day passed" case below
+  });
+
+  it('current week, the original Off day has not occurred but the proposed new Off day already has -- deferred, never backdated', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-d', weekday: 0, effectiveFrom: '2026-01-01' })]; // Sunday, 2026-10-11 (week's last day -- never "occurred" yet this early in the week)
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-d', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const decision = determineTransitionStartWeek('sw-emp-d', '2026-10-05', 0, 2, '2026-10-07', [], patterns, shiftPatterns); // new weekday = Tuesday, 2026-10-06
+    expect(decision.status).toBe('deferred');
+    expect(decision.weekStart).toBe('2026-10-12');
+    expect(decision.reason).toMatch(/new Off day for this week.*already passed/);
+  });
+
+  it('today IS the original Off day itself -- not yet "occurred" (still the current day), but still deferred because the new weekday this week falls earlier and would be backdated', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-k', weekday: 0, effectiveFrom: '2026-01-01' })]; // Sunday, 2026-10-11
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-k', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const decision = determineTransitionStartWeek('sw-emp-k', '2026-10-05', 0, 3, '2026-10-11', [], patterns, shiftPatterns); // new weekday = Wednesday, 2026-10-07
+    expect(decision.status).toBe('deferred');
+    expect(decision.reason).toMatch(/new Off day for this week.*already passed/);
+    expect(decision.reason).not.toMatch(/original.*already occurred/i);
+  });
+
+  it('today IS the proposed new Off day itself -- not yet "passed" (still the current day), so the change proceeds "ok" this week', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-l', weekday: 0, effectiveFrom: '2026-01-01' })]; // Sunday, 2026-10-11 -- not yet occurred relative to Thursday
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-l', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const decision = determineTransitionStartWeek('sw-emp-l', '2026-10-05', 0, 4, '2026-10-08', [], patterns, shiftPatterns); // new weekday = Thursday, 2026-10-08 == today
+    expect(decision.status).toBe('ok');
+    expect(decision.weekStart).toBe('2026-10-05');
+  });
+
+  it('an entirely past week (selected long after it ended) is deferred relative to TODAY\'s week, never relative to the stale selected week', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-j', weekday: 5, effectiveFrom: '2026-01-01' })]; // Friday
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-j', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const decision = determineTransitionStartWeek('sw-emp-j', '2026-09-28', 5, 0, '2026-10-20', [], patterns, shiftPatterns);
+    expect(decision.status).toBe('deferred');
+    // NOT '2026-10-05' (which a naive "requestedWeekStart + 7" would give) -- the following week relative to today's own week (2026-10-19 to 2026-10-25).
+    expect(decision.weekStart).toBe('2026-10-26');
+  });
+
+  it('ambiguous: the week has at least one date with no recorded schedule at all (incomplete) -- never guessed', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-e', weekday: 3, effectiveFrom: '2026-01-01' })]; // Wednesday Off, but no shift pattern at all -- every other day is unassigned
+    const decision = determineTransitionStartWeek('sw-emp-e', '2026-10-05', 3, 0, '2026-10-05', [], patterns, []);
+    expect(decision.status).toBe('ambiguous');
+    expect(decision.weekStart).toBeNull();
+    expect(decision.reason).toMatch(/no recorded schedule at all/);
+  });
+
+  it('ambiguous: no Off day resolves for this employee in the selected week at all', () => {
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-f', shiftType: 'day', effectiveFrom: '2026-01-01' })]; // Day every day, no Off pattern configured
+    const decision = determineTransitionStartWeek('sw-emp-f', '2026-10-05', 3, 0, '2026-10-05', [], [], shiftPatterns);
+    expect(decision.status).toBe('ambiguous');
+    expect(decision.reason).toMatch(/No Off day currently resolves/);
+  });
+
+  it('ambiguous: more than one actual Off day this week (recurring Wednesday plus a separate dated Friday exception)', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-g', weekday: 3, effectiveFrom: '2026-01-01' })];
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-g', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const datedAssignments = [dated({ employeeId: 'sw-emp-g', assignmentDate: '2026-10-09', assignmentType: 'off' })];
+    const decision = determineTransitionStartWeek('sw-emp-g', '2026-10-05', 3, 0, '2026-10-05', datedAssignments, patterns, shiftPatterns);
+    expect(decision.status).toBe('ambiguous');
+    expect(decision.reason).toMatch(/more than one Off day/);
+  });
+
+  it('ambiguous: this week\'s sole Off day comes from a historical one-off dated exception, not the normal recurring pattern -- respected, never silently treated as the normal weekday', () => {
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-h', shiftType: 'day', effectiveFrom: '2026-01-01' })]; // Day every day, no recurring Off pattern at all
+    const datedAssignments = [dated({ employeeId: 'sw-emp-h', assignmentDate: '2026-10-08', assignmentType: 'off' })]; // Thursday, historical one-off
+    const decision = determineTransitionStartWeek('sw-emp-h', '2026-10-05', 4, 0, '2026-10-05', datedAssignments, [], shiftPatterns);
+    expect(decision.status).toBe('ambiguous');
+    expect(decision.reason).toMatch(/historical one-off schedule exception/);
+  });
+
+  it('ambiguous: the stated original weekday does not match what this week actually resolves to -- never guessed', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-i', weekday: 3, effectiveFrom: '2026-01-01' })]; // actual Off day is Wednesday
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-i', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const decision = determineTransitionStartWeek('sw-emp-i', '2026-10-05', 5, 0, '2026-10-05', [], patterns, shiftPatterns); // claims Friday, wrongly
+    expect(decision.status).toBe('ambiguous');
+    expect(decision.reason).toMatch(/does not match this week's actual Off day/);
+  });
+
+  it('composes correctly with buildTemporaryReschedulePlan: the suggested deferred week still gets the correct full-duration plan and bridge-week handling, unaffected by the start-week adjustment', () => {
+    const patterns = [pattern({ employeeId: 'sw-emp-c2', weekday: 5, effectiveFrom: '2026-01-01' })]; // Friday, already occurred
+    const shiftPatterns = [shiftPattern({ employeeId: 'sw-emp-c2', shiftType: 'day', effectiveFrom: '2026-01-01' })];
+    const decision = determineTransitionStartWeek('sw-emp-c2', '2026-10-05', 5, 0, '2026-10-10', [], patterns, shiftPatterns);
+    expect(decision.status).toBe('deferred');
+    expect(decision.weekStart).toBe('2026-10-12');
+
+    const plan = buildTemporaryReschedulePlan(
+      'sw-emp-c2', decision.weekStart!, 5, 0, 2, 'day', [], patterns, shiftPatterns
+    );
+    // Full 2-week duration preserved -- the deferral shifts WHERE the
+    // transition starts, never how long it lasts.
+    expect(plan.length).toBe(2);
+    expect(plan[0].weekStart).toBe('2026-10-12');
+    expect(plan[1].weekStart).toBe('2026-10-19');
+    // Forward shift (Friday -> Sunday): bridge week is the first one, exactly as bridgeWeekIndex proves independently of this start-week logic.
+    expect(plan[0].isBridgeWeek).toBe(true);
+    expect(plan[1].isBridgeWeek).toBe(false);
   });
 });

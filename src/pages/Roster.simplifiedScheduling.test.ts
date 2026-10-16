@@ -6,13 +6,16 @@ import path from 'node:path';
 // Scheduling." The business owner finalized a simpler model and asked
 // to REMOVE the user-facing Correct / Cancel Special Assignment
 // workflow and the ability to create additional dated Off assignments
-// from the Assign Dates tab -- both added in Stage C Steps 13-15. These
-// tests pin the REMOVAL from the UI (no component-test harness in this
-// repo, same source-pinned convention as every other Roster.*.test.ts
-// file) while confirming the underlying database capability
-// (roster_cancel_date_assignments, and the pure helpers that back it)
-// was NOT dropped -- it remains available as a dormant,
-// administrator-only historical-correction path, per the explicit
+// from the Assign Dates tab -- both added in Stage C Steps 13-15.
+// Stage C Step 16A went further and removed the Assign Dates tab
+// itself entirely, leaving three production tabs (Calendar, Recurring
+// Schedule, Temporary / Permanent Off Day). These tests pin both
+// REMOVALS from the UI (no component-test harness in this repo, same
+// source-pinned convention as every other Roster.*.test.ts file) while
+// confirming the underlying database capabilities (roster_assign_dates,
+// roster_cancel_date_assignments, and the pure helpers that back them)
+// were NOT dropped -- they remain available as dormant,
+// administrator-only historical-correction paths, per the explicit
 // instruction "do not drop database tables or RPCs merely because a UI
 // feature is removed."
 const rosterSource = fs.readFileSync(path.resolve(__dirname, './Roster.tsx'), 'utf-8');
@@ -46,25 +49,57 @@ describe('Correct / Cancel Special Assignment: fully removed from the UI', () =>
   });
 });
 
-describe('Assign Dates: can no longer create an additional dated Off assignment', () => {
-  it('ASSIGNMENT_TYPE_OPTIONS offers only Day and Night, never Off', () => {
-    const def = rosterSource.match(/const ASSIGNMENT_TYPE_OPTIONS = \[[\s\S]*?\];/)?.[0] ?? '';
-    expect(def).toMatch(/\{ label: 'Day shift', value: 'day' \}/);
-    expect(def).toMatch(/\{ label: 'Night shift', value: 'night' \}/);
-    expect(def).not.toMatch(/value: 'off'/);
+// Stage C Step 16A: "Simplify Production Roster to Three Tabs." The
+// Assign Dates tab (ad hoc dated Day/Night overrides) was removed
+// entirely from the production interface -- the business primarily
+// uses recurring Day/Night schedules and weekly Off-day changes, and
+// temporary individual shift overrides are not required for the
+// initial production release. Same policy as Step 15B's Correct/Cancel
+// removal: the UI feature is gone, but roster_assign_dates, its
+// rosterService.ts wrapper, and every historical dated assignment it
+// already wrote are NOT dropped -- they remain a dormant,
+// administrator-reachable-only-via-future-UI capability, and every
+// historical dated exception stays fully readable on the Calendar tab.
+describe('Assign Dates: fully removed from the UI (Stage C Step 16A)', () => {
+  it('no tab id, label, state, handler, or local search for Assign Dates remains in Roster.tsx', () => {
+    expect(rosterSource).not.toMatch(/'assign-dates'/);
+    expect(rosterSource).not.toMatch(/label: 'Assign Dates'/);
+    expect(rosterSource).not.toMatch(/ASSIGNMENT_TYPE_OPTIONS/);
+    for (const symbol of [
+      'assignEmployeeIds', 'assignType', 'assignDateFrom', 'assignDateTo', 'assignReason',
+      'assignSearch', 'assignFilteredEmployees', 'handleSubmitAssignDates',
+    ]) {
+      expect(rosterSource).not.toContain(symbol);
+    }
   });
 
-  it('the Assign Dates tab\'s own explanatory text confirms it can no longer create a dated Off exception', () => {
-    expect(rosterSource).toMatch(/this tab can no longer create a dated Off exception either/);
+  it('Roster.tsx no longer imports the assignDates RPC wrapper or the AssignmentType type', () => {
+    expect(rosterSource).not.toMatch(/\bassignDates\b/);
+    expect(rosterSource).not.toMatch(/\bAssignmentType\b/);
   });
 
-  it('still describes the hard block on placing a working assignment over a protected Off date, with no override', () => {
-    expect(rosterSource).toMatch(/A working assignment cannot be placed on a date an employee is already scheduled Off -- this is always blocked, with no override/);
+  it('only three tabs remain: Calendar, Recurring Schedule, and Temporary / Permanent Off Day', () => {
+    const tabsDef = rosterSource.match(/tabs=\{\[[\s\S]*?\]\}/)?.[0] ?? '';
+    expect(tabsDef).toMatch(/id: 'calendar', label: 'Calendar'/);
+    expect(tabsDef).toMatch(/id: 'off-pattern', label: 'Recurring Schedule'/);
+    expect(tabsDef).toMatch(/id: 'reschedule', label: 'Temporary \/ Permanent Off Day'/);
+    expect((tabsDef.match(/id: '/g) || []).length).toBe(3);
+  });
+
+  it("the TabId type itself only allows the three remaining tabs", () => {
+    expect(rosterSource).toMatch(/type TabId = 'calendar' \| 'off-pattern' \| 'reschedule';/);
+  });
+
+  it('the Recurring Schedule tab\'s own explanatory text no longer references the removed Assign Dates tab by name, but still explains that a dated exception overrides the recurring pattern for one date only', () => {
+    expect(rosterSource).toMatch(/A historical\s*\n\s*dated exception always overrides this for that one date only, and remains visible on the Calendar tab\./);
+    expect(rosterSource).not.toMatch(/\(Assign Dates tab\)/);
   });
 });
 
 describe('Database layer: the capability is retained, not dropped, even though no UI control reaches it', () => {
-  it('rosterService.ts still exports cancelDateAssignments, a thin wrapper around the unmodified roster_cancel_date_assignments RPC', () => {
+  it('rosterService.ts still exports assignDates and cancelDateAssignments, thin wrappers around their unmodified RPCs', () => {
+    expect(rosterServiceSource).toMatch(/export async function assignDates\(/);
+    expect(rosterServiceSource).toMatch(/roster_assign_dates/);
     expect(rosterServiceSource).toMatch(/export async function cancelDateAssignments\(/);
     expect(rosterServiceSource).toMatch(/roster_cancel_date_assignments/);
   });

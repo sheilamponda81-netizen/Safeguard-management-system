@@ -123,7 +123,7 @@ describe('Temporary / Permanent Off Day: a single atomic applyWeekdayTransition 
   it('calls applyWeekdayTransition exactly once, passing mode, both weekdays, shift, week start, duration, and reason', () => {
     const fn = rosterSource.match(/const handleSubmitReschedule = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[/)?.[0] ?? '';
     expect(fn).toMatch(
-      /applyWeekdayTransition\(\s*\n\s*rescheduleEmployeeId,\s*\n\s*rescheduleIsPermanent \? 'permanent' : 'temporary',\s*\n\s*rescheduleOriginalWeekdayNum,\s*\n\s*rescheduleNewWeekdayNum,\s*\n\s*rescheduleShift,\s*\n\s*rescheduleWeekStart,\s*\n\s*rescheduleIsPermanent \? 1 : rescheduleDurationWeeks,\s*\n\s*rescheduleReason\s*\n\s*\);/
+      /applyWeekdayTransition\(\s*\n\s*rescheduleEmployeeId,\s*\n\s*rescheduleIsPermanent \? 'permanent' : 'temporary',\s*\n\s*rescheduleOriginalWeekdayNum,\s*\n\s*rescheduleNewWeekdayNum,\s*\n\s*rescheduleShift,\s*\n\s*rescheduleEffectiveWeekStart,\s*\n\s*rescheduleIsPermanent \? 1 : rescheduleDurationWeeks,\s*\n\s*rescheduleReason\s*\n\s*\);/
     );
   });
 

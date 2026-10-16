@@ -24,9 +24,9 @@ import {
   ResolvedSchedule,
   resolveActiveShiftType,
   buildTemporaryReschedulePlan, buildPermanentWeekdayTransitionPlan, explainRollingRestConflict,
-  summarizeWeekSchedule, describeWeekOffDays, formatFriendlyWeekdayDate,
-  TemporaryRescheduleWeekPlan, PermanentWeekdayTransitionPlan, WeekScheduleSummary,
-  AssignmentType, OffDayPatternRow, DateAssignmentRow, ShiftPatternRow,
+  summarizeWeekSchedule, describeWeekOffDays, formatFriendlyWeekdayDate, determineTransitionStartWeek,
+  TemporaryRescheduleWeekPlan, PermanentWeekdayTransitionPlan, WeekScheduleSummary, TransitionStartWeekDecision,
+  OffDayPatternRow, DateAssignmentRow, ShiftPatternRow,
 } from '../utils/rosterSchedule';
 import {
   CalendarViewMode, getBlantyreToday, startOfWeek, endOfWeek, startOfMonth, endOfMonth,
@@ -35,7 +35,7 @@ import {
 import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import {
   fetchActiveOffDayPatterns, fetchActiveShiftPatterns, fetchActiveDateAssignments, fetchActiveEmployeesForRoster,
-  assignRecurringPattern, assignDates, applyWeekdayTransition, humanizeRosterError,
+  assignRecurringPattern, applyWeekdayTransition, humanizeRosterError,
   filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex,
 } from '../utils/rosterService';
 
@@ -176,18 +176,17 @@ function EmployeeSingleSelect({ employees, value, onChange, placeholder }: {
   );
 }
 
-type TabId = 'calendar' | 'off-pattern' | 'assign-dates' | 'reschedule';
-
-// Stage C Step 15B: Day/Night only -- Assign Dates can no longer create
-// a dated Off exception (removed along with the Correct/Cancel Special
-// Assignment workflow, per the business owner's simplified design).
-// roster_assign_dates itself still accepts 'off' (never narrowed at the
-// database layer, since existing historical Off exceptions must remain
-// valid and readable) -- this is a UI-only restriction.
-const ASSIGNMENT_TYPE_OPTIONS = [
-  { label: 'Day shift', value: 'day' },
-  { label: 'Night shift', value: 'night' },
-];
+// Stage C Step 16A: the Assign Dates tab (ad hoc dated Day/Night
+// overrides) was removed from the production interface -- the business
+// primarily uses recurring Day/Night schedules and weekly Off-day
+// changes, and temporary individual shift overrides are not required
+// for the initial production release. roster_assign_dates itself (and
+// the dated exceptions it already wrote historically) is untouched --
+// see rosterService.ts/this file's own regression tests for the
+// dormant-capability precedent this follows (same policy as Stage C
+// Step 15B's Correct/Cancel removal: a UI feature being removed is never
+// a reason to drop the underlying database capability or data).
+type TabId = 'calendar' | 'off-pattern' | 'reschedule';
 
 const WEEKDAY_OPTIONS = WEEKDAY_LABELS.map((label, value) => ({ label, value: String(value) }));
 
@@ -327,10 +326,6 @@ export default function RosterPage() {
   const [offPatternSearch, setOffPatternSearch] = useState('');
   const offPatternFilteredEmployees = useMemo(() => filterEmployeesForSearch(employees, offPatternSearch), [employees, offPatternSearch]);
 
-  // --- Assign Dates: its own local search, decoupled from the page-level one above ---
-  const [assignSearch, setAssignSearch] = useState('');
-  const assignFilteredEmployees = useMemo(() => filterEmployeesForSearch(employees, assignSearch), [employees, assignSearch]);
-
   const calendarDates = useMemo(() => {
     if (!isCalendarRangeValid || calendarRangeTooLarge) return [];
     return expandDateRange(calendarFrom, calendarTo);
@@ -391,43 +386,6 @@ export default function RosterPage() {
     offPatternEffectiveFrom, offPatternReason, employees, loadData,
   ]);
 
-  // --- Assign Day/Night/Off for a date range form ---
-  const [assignEmployeeIds, setAssignEmployeeIds] = useState<Set<string>>(new Set());
-  const [assignType, setAssignType] = useState<AssignmentType>('day');
-  const [assignDateFrom, setAssignDateFrom] = useState(defaults.today);
-  const [assignDateTo, setAssignDateTo] = useState(defaults.today);
-  const [assignReason, setAssignReason] = useState('');
-
-  const handleSubmitAssignDates = useCallback(async () => {
-    if (assignEmployeeIds.size === 0) {
-      showNotification('Select at least one employee.', 'error');
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const result = await assignDates(
-        Array.from(assignEmployeeIds),
-        assignDateFrom,
-        assignDateTo,
-        assignType,
-        assignReason || undefined
-      );
-      if (result.success) {
-        showNotification(
-          `Assigned ${result.assignedCount} day(s).${result.alreadySetCount ? ` ${result.alreadySetCount} already set.` : ''}`,
-          'success'
-        );
-        setAssignEmployeeIds(new Set());
-        setAssignReason('');
-        await loadData();
-      } else {
-        showNotification(humanizeRosterError(result.error || 'Could not assign the selected dates.', employees), 'error');
-      }
-    } finally {
-      setSubmitting(false);
-    }
-  }, [assignEmployeeIds, assignDateFrom, assignDateTo, assignType, assignReason, employees, loadData]);
-
   // --- Stage C Step 12: Temporary / Permanent Off-day change, expressed
   // in the weekday vocabulary administrators actually think in ("Wednesday
   // Off -> Sunday Off for three weeks") instead of requiring two exact
@@ -463,6 +421,13 @@ export default function RosterPage() {
   // never silently carry over.
   const [rescheduleMultiOffChoiceMade, setRescheduleMultiOffChoiceMade] = useState(false);
   const [rescheduleWeekAssignments, setRescheduleWeekAssignments] = useState<DateAssignmentRow[]>([]);
+  // Stage C Step 16: a separate confirmation from the bridge-day
+  // checkbox below -- this one acknowledges that the EFFECTIVE START
+  // WEEK itself was moved (never the additional bridge-rest day, which
+  // is a distinct concern with its own checkbox). Reset whenever the
+  // decision itself changes, so a stale confirmation from a different
+  // week/weekday combination can never silently carry over.
+  const [rescheduleStartWeekAcknowledged, setRescheduleStartWeekAcknowledged] = useState(false);
 
   const rescheduleSelectedEmployee = useMemo(
     () => employees.find((e) => e.id === rescheduleEmployeeId) || null,
@@ -540,6 +505,43 @@ export default function RosterPage() {
     if (detectedShift !== null) setRescheduleShift(detectedShift);
   }, [rescheduleEmployeeId, rescheduleWeekStart, shiftPatterns]);
 
+  // Stage C Step 16: "Smart Off-Day Change Start Week." Decides, purely
+  // from the roster's own resolved schedule and today's date (never
+  // attendance/check-in records -- a scheduled Off day is never
+  // conclusive proof rest was actually taken), whether the selected
+  // week is safe to use as the transition's effective start exactly as
+  // requested, must be deferred to the following week (the original or
+  // the new Off day for this week has already gone by), or is too
+  // ambiguous to decide automatically at all (see
+  // determineTransitionStartWeek's own header for the full rule). This
+  // only ever activates for the current (or an unexpected past) week --
+  // a genuinely future week is always returned 'ok' unchanged, keeping
+  // the rule strictly prospective and never reinterpreting a transition
+  // already recorded in the database.
+  const rescheduleStartWeekDecision: TransitionStartWeekDecision | null = useMemo(() => {
+    if (!rescheduleEmployeeId || !rescheduleWeekStart || rescheduleSameWeekday) return null;
+    return determineTransitionStartWeek(
+      rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
+      getBlantyreToday(), rescheduleWeekAssignments, patterns, shiftPatterns
+    );
+  }, [
+    rescheduleEmployeeId, rescheduleWeekStart, rescheduleSameWeekday, rescheduleOriginalWeekdayNum,
+    rescheduleNewWeekdayNum, rescheduleWeekAssignments, patterns, shiftPatterns,
+  ]);
+
+  // The week actually used to build the plan and submitted to the RPC --
+  // equal to rescheduleWeekStart unless the decision above deferred it
+  // to the following week. Falls back to rescheduleWeekStart when the
+  // decision is 'ambiguous' (null weekStart), but that case never
+  // reaches the RPC: canSubmitReschedule below blocks it outright.
+  const rescheduleEffectiveWeekStart: string = rescheduleStartWeekDecision?.weekStart ?? rescheduleWeekStart;
+
+  // A stale confirmation from a DIFFERENT decision (e.g. after changing
+  // the employee, week, or weekdays) must never silently carry over.
+  useEffect(() => {
+    setRescheduleStartWeekAcknowledged(false);
+  }, [rescheduleStartWeekDecision?.status, rescheduleStartWeekDecision?.weekStart]);
+
   // Advisory preview only (one entry per affected week in Temporary mode,
   // a single bridge-aware summary for Permanent mode) -- see
   // buildRescheduleOffDayPreview's own header. The database independently
@@ -556,25 +558,28 @@ export default function RosterPage() {
   // the Calendar tab currently happens to be showing.
   const reschedulePlan: TemporaryRescheduleWeekPlan[] = useMemo(() => {
     if (!rescheduleEmployeeId || !rescheduleWeekStart || rescheduleSameWeekday || rescheduleIsPermanent) return [];
+    if (rescheduleStartWeekDecision?.status === 'ambiguous') return [];
     if (!rescheduleDurationWeeks || rescheduleDurationWeeks < 1) return [];
     return buildTemporaryReschedulePlan(
-      rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
+      rescheduleEmployeeId, rescheduleEffectiveWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
       rescheduleDurationWeeks, rescheduleShift, rescheduleWeekAssignments, patterns, shiftPatterns
     );
   }, [
-    rescheduleEmployeeId, rescheduleWeekStart, rescheduleSameWeekday, rescheduleIsPermanent, rescheduleDurationWeeks,
+    rescheduleEmployeeId, rescheduleWeekStart, rescheduleEffectiveWeekStart, rescheduleSameWeekday, rescheduleIsPermanent,
+    rescheduleStartWeekDecision, rescheduleDurationWeeks,
     rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, rescheduleShift, rescheduleWeekAssignments, patterns, shiftPatterns,
   ]);
 
   const permanentPlan: PermanentWeekdayTransitionPlan | null = useMemo(() => {
     if (!rescheduleEmployeeId || !rescheduleWeekStart || rescheduleSameWeekday || !rescheduleIsPermanent) return null;
+    if (rescheduleStartWeekDecision?.status === 'ambiguous') return null;
     return buildPermanentWeekdayTransitionPlan(
-      rescheduleEmployeeId, rescheduleWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
+      rescheduleEmployeeId, rescheduleEffectiveWeekStart, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
       rescheduleWeekAssignments, patterns, shiftPatterns
     );
   }, [
-    rescheduleEmployeeId, rescheduleWeekStart, rescheduleSameWeekday, rescheduleIsPermanent,
-    rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, rescheduleWeekAssignments, patterns, shiftPatterns,
+    rescheduleEmployeeId, rescheduleWeekStart, rescheduleEffectiveWeekStart, rescheduleSameWeekday, rescheduleIsPermanent,
+    rescheduleStartWeekDecision, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum, rescheduleWeekAssignments, patterns, shiftPatterns,
   ]);
 
   // The single date (if any) that must stay an additional Off day to
@@ -597,6 +602,9 @@ export default function RosterPage() {
     !!rescheduleReason.trim() &&
     rescheduleDurationWeeks >= 1 &&
     rescheduleDurationWeeks <= MAX_TEMPORARY_RESCHEDULE_WEEKS &&
+    !!rescheduleStartWeekDecision &&
+    rescheduleStartWeekDecision.status !== 'ambiguous' &&
+    (rescheduleStartWeekDecision.status !== 'deferred' || rescheduleStartWeekAcknowledged) &&
     (rescheduleIsPermanent ? !!permanentPlan : reschedulePlan.length > 0) &&
     (rescheduleIsPermanent || reschedulePlan.every((w) => !w.preview.blockingReason)) &&
     (!rescheduleBridgeDate || rescheduleBridgeAcknowledged) &&
@@ -604,7 +612,7 @@ export default function RosterPage() {
 
   const handleSubmitReschedule = useCallback(async () => {
     if (!canSubmitReschedule) {
-      showNotification('Complete all required fields, resolve every issue shown in the preview, and confirm any additional Off day before submitting.', 'error');
+      showNotification('Complete all required fields, resolve every issue shown in the preview, and confirm any additional Off day or start-week change before submitting.', 'error');
       return;
     }
     setSubmitting(true);
@@ -615,7 +623,7 @@ export default function RosterPage() {
         rescheduleOriginalWeekdayNum,
         rescheduleNewWeekdayNum,
         rescheduleShift,
-        rescheduleWeekStart,
+        rescheduleEffectiveWeekStart,
         rescheduleIsPermanent ? 1 : rescheduleDurationWeeks,
         rescheduleReason
       );
@@ -624,11 +632,12 @@ export default function RosterPage() {
           ? ` ${WEEKDAY_LABELS[rescheduleOriginalWeekdayNum]} ${result.bridgeDate} was kept as an additional Off day to preserve the mandatory rolling seven-day rest requirement during the transition.`
           : '';
         const message = rescheduleIsPermanent
-          ? `Permanent Off-day change saved: ${WEEKDAY_LABELS[rescheduleNewWeekdayNum]} is now the recurring Off day from ${rescheduleWeekStart}.${bridgeNote}`
+          ? `Permanent Off-day change saved: ${WEEKDAY_LABELS[rescheduleNewWeekdayNum]} is now the recurring Off day from ${rescheduleEffectiveWeekStart}.${bridgeNote}`
           : `Rescheduled ${result.weeksApplied ?? rescheduleDurationWeeks} week(s) successfully. The Off day automatically returns to normal afterward -- no further action needed.${bridgeNote}`;
         showNotification(message, 'success');
         setRescheduleReason('');
         setRescheduleBridgeAcknowledged(false);
+        setRescheduleStartWeekAcknowledged(false);
         await loadData();
       } else {
         const rawMessage = result.error || 'Could not apply this weekday transition.';
@@ -644,7 +653,7 @@ export default function RosterPage() {
     }
   }, [
     canSubmitReschedule, rescheduleEmployeeId, rescheduleIsPermanent, rescheduleOriginalWeekdayNum, rescheduleNewWeekdayNum,
-    rescheduleShift, rescheduleWeekStart, rescheduleDurationWeeks, rescheduleReason, dateAssignments, patterns, shiftPatterns,
+    rescheduleShift, rescheduleEffectiveWeekStart, rescheduleDurationWeeks, rescheduleReason, dateAssignments, patterns, shiftPatterns,
     employees, loadData,
   ]);
 
@@ -690,7 +699,6 @@ export default function RosterPage() {
         tabs={[
           { id: 'calendar', label: 'Calendar', icon: CalendarDays },
           { id: 'off-pattern', label: 'Recurring Schedule', icon: UsersIcon },
-          { id: 'assign-dates', label: 'Assign Dates', icon: CalendarDays },
           { id: 'reschedule', label: 'Temporary / Permanent Off Day', icon: AlertTriangle },
         ]}
         active={activeTab}
@@ -759,9 +767,9 @@ export default function RosterPage() {
           ) : (
             <>
               <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-                "Off" alone is the employee's <strong>normal recurring</strong> weekly Off day. "Off (special)" is a one-off dated
-                exception made in Assign Dates / Correct-Cancel -- it never changes the recurring pattern, which resumes once the
-                exception is cancelled. "Unassigned" means no schedule has been set for that date at all -- it is never shown as
+                "Off" alone is the employee's <strong>normal recurring</strong> weekly Off day. "Off (special)" is a historical one-off
+                dated exception -- it never changes the recurring pattern, which resumes once the exception is cancelled.
+                "Unassigned" means no schedule has been set for that date at all -- it is never shown as
                 Day or Off. Approved Leave and Sick Leave are tracked separately in the Attendance module and are intentionally
                 not duplicated on this roster calendar, to avoid two different places disagreeing about an employee's status.
               </p>
@@ -818,8 +826,8 @@ export default function RosterPage() {
               week from the effective date <strong>until changed</strong>, with no need to re-assign it. This is also how to make
               a <strong>permanent</strong> weekday change (e.g. moving the Off day from Wednesday to Sunday for good) -- the
               Temporary / Permanent Off Day tab offers the identical permanent action in weekday-swap language, for convenience.
-              For a time-limited change that should revert automatically, use that tab's Temporary option instead. An explicit
-              dated assignment (Assign Dates tab) always overrides this for that one date only.
+              For a time-limited change that should revert automatically, use that tab's Temporary option instead. A historical
+              dated exception always overrides this for that one date only, and remains visible on the Calendar tab.
             </p>
           </div>
           <Input icon={Search} placeholder="Search employee by name or number..." value={offPatternSearch} onChange={(e) => setOffPatternSearch(e.target.value)} />
@@ -872,49 +880,6 @@ export default function RosterPage() {
             {submitting ? 'Saving...' : `Save Recurring Pattern for ${offPatternEmployeeIds.size} Employee(s)`}
           </Button>
         </Card>
-      ) : activeTab === 'assign-dates' ? (
-        <Card className="p-5 space-y-4">
-          <p className="text-sm text-slate-600">Assign an exceptional Day or Night shift across a date range for one or more employees.</p>
-          <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-            Use this tab only for genuinely <strong>exceptional, one-off dated</strong> working shifts -- a single public holiday
-            covered as a working day, a one-time special assignment. It is <strong>not</strong> for normal repeating weekly schedules
-            (use the <strong>Recurring Schedule</strong> tab) or for moving an Off day, temporarily or permanently
-            (use the <strong>Temporary / Permanent Off Day</strong> tab) -- those tabs compute the right dates automatically and keep
-            the rolling seven-day rest rule and historical schedules intact in ways a plain dated assignment does not.
-          </p>
-          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-            A working assignment cannot be placed on a date an employee is already scheduled Off -- this is always blocked, with no override,
-            and this tab can no longer create a dated Off exception either. To work a normally-Off date, use the
-            <strong> Temporary / Permanent Off Day</strong> tab, which moves the Off day and assigns the vacated date atomically.
-          </p>
-
-          <Input icon={Search} placeholder="Search employee by name or number..." value={assignSearch} onChange={(e) => setAssignSearch(e.target.value)} />
-          <div className="flex items-center justify-between text-xs text-slate-500">
-            <span>{assignFilteredEmployees.length} of {employees.length} employee(s) shown</span>
-            <span className="font-medium text-slate-700">{assignEmployeeIds.size} selected</span>
-          </div>
-          {assignFilteredEmployees.length === 0 ? (
-            <EmptyState icon={UsersIcon} title="No employees match your search" description="Adjust the search above. Any employees already selected remain selected." />
-          ) : (
-            <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
-              {assignFilteredEmployees.map((emp) => (
-                <label key={emp.id} className="flex items-center gap-2 px-3 py-2 text-sm">
-                  <input type="checkbox" checked={assignEmployeeIds.has(emp.id)} onChange={() => toggleInSet(assignEmployeeIds, setAssignEmployeeIds, emp.id)} />
-                  {emp.fullName} <span className="text-xs text-slate-500">{emp.employeeNumber}</span>
-                </label>
-              ))}
-            </div>
-          )}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <Input label="From" type="date" value={assignDateFrom} onChange={(e) => setAssignDateFrom(e.target.value)} />
-            <Input label="To" type="date" value={assignDateTo} onChange={(e) => setAssignDateTo(e.target.value)} />
-            <Select label="Assignment" value={assignType} onChange={(e) => setAssignType(e.target.value as AssignmentType)} options={ASSIGNMENT_TYPE_OPTIONS} />
-          </div>
-          <Input label="Reason (required for a change to an existing assignment)" value={assignReason} onChange={(e) => setAssignReason(e.target.value)} />
-          <Button onClick={handleSubmitAssignDates} disabled={submitting || assignEmployeeIds.size === 0}>
-            {submitting ? 'Saving...' : `Assign ${assignType} to ${assignEmployeeIds.size} Employee(s)`}
-          </Button>
-        </Card>
       ) : (
         <Card className="p-5 space-y-4">
           <p className="text-sm text-slate-600">
@@ -950,6 +915,35 @@ export default function RosterPage() {
             <p className="text-xs text-slate-500">
               That falls in the week of <strong>{rescheduleWeekStart}</strong> (Monday) to <strong>{addDays(rescheduleWeekStart, 6)}</strong> (Sunday).
             </p>
+          )}
+
+          {/* Stage C Step 16: the start-week decision is reported and
+              confirmed SEPARATELY from the bridge-rest-day banner further
+              below -- one explains which week the change actually starts
+              in, the other explains an additional Off day within that
+              week; they are never merged into one message or checkbox. */}
+          {rescheduleStartWeekDecision?.status === 'ambiguous' && (
+            <Card className="p-3 bg-red-50 border border-red-200">
+              <p className="text-sm text-red-800 flex items-start gap-2">
+                <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" /> {rescheduleStartWeekDecision.reason}
+              </p>
+            </Card>
+          )}
+          {rescheduleStartWeekDecision?.status === 'deferred' && (
+            <Card className="p-3 space-y-2 bg-amber-50 border border-amber-200">
+              <p className="text-sm text-amber-900 flex items-start gap-2">
+                <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" /> {rescheduleStartWeekDecision.reason}
+              </p>
+              <label className="flex items-start gap-2 text-sm text-amber-900">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={rescheduleStartWeekAcknowledged}
+                  onChange={(e) => setRescheduleStartWeekAcknowledged(e.target.checked)}
+                />
+                I understand this change will start {formatFriendlyWeekdayDate(rescheduleStartWeekDecision.weekStart!)} instead of the originally selected week.
+              </label>
+            </Card>
           )}
 
           {rescheduleSelectedEmployee && weekSummary && rescheduleWeekOffDayText && (
@@ -1057,8 +1051,8 @@ export default function RosterPage() {
               {rescheduleIsPermanent && permanentPlan ? (
                 <div className="space-y-2">
                   <p className="text-sm text-slate-700">
-                    From <strong>{rescheduleWeekStart}</strong> onward, <strong>{WEEKDAY_LABELS[rescheduleNewWeekdayNum]}</strong> becomes the recurring
-                    Off day (replacing {WEEKDAY_LABELS[rescheduleOriginalWeekdayNum]}), every week, until changed again. This never rewrites any date before {rescheduleWeekStart}.
+                    From <strong>{permanentPlan.effectiveFrom}</strong> onward, <strong>{WEEKDAY_LABELS[rescheduleNewWeekdayNum]}</strong> becomes the recurring
+                    Off day (replacing {WEEKDAY_LABELS[rescheduleOriginalWeekdayNum]}), every week, until changed again. This never rewrites any date before {permanentPlan.effectiveFrom}.
                   </p>
                   {permanentPlan.bridgeDate && (
                     <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900 flex items-start gap-2">

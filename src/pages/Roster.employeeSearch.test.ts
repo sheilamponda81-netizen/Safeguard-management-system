@@ -26,11 +26,6 @@ describe('Roster employee search: each tab has its own independent search state'
     expect(rosterSource).toMatch(/const offPatternFilteredEmployees = useMemo\(\(\) => filterEmployeesForSearch\(employees, offPatternSearch\)/);
   });
 
-  it('Assign Dates has its own local search state, decoupled from employeeSearch', () => {
-    expect(rosterSource).toMatch(/const \[assignSearch, setAssignSearch\] = useState\(''\);/);
-    expect(rosterSource).toMatch(/const assignFilteredEmployees = useMemo\(\(\) => filterEmployeesForSearch\(employees, assignSearch\)/);
-  });
-
   it('Reschedule Off Day uses the EmployeeSingleSelect combobox, fed the full, unfiltered employees array (the combobox owns its own search internally)', () => {
     expect(rosterSource).toMatch(/<EmployeeSingleSelect employees=\{employees\} value=\{rescheduleEmployeeId\} onChange=\{setRescheduleEmployeeId\} \/>/);
   });
@@ -43,12 +38,7 @@ describe('Roster employee search: selection state is never cleared by a search c
     expect(match).toBeTruthy();
   });
 
-  it('the only setters assignSearch\'s input onChange ever calls are search setters -- never setAssignEmployeeIds', () => {
-    const match = rosterSource.match(/value=\{assignSearch\} onChange=\{\(e\) => setAssignSearch\(e\.target\.value\)\}/);
-    expect(match).toBeTruthy();
-  });
-
-  it('checkbox selection for both multi-select tabs still goes exclusively through the pre-existing toggleInSet helper, which this phase did not modify', () => {
+  it('checkbox selection for the multi-select tab still goes exclusively through the pre-existing toggleInSet helper, which this phase did not modify', () => {
     const toggleInSetDef = rosterSource.match(/const toggleInSet = \(set: Set<string>, setSet: \(s: Set<string>\) => void, id: string\) => \{[\s\S]*?\n {2}\};/);
     expect(toggleInSetDef).toBeTruthy();
     expect(toggleInSetDef![0]).toMatch(/const next = new Set\(set\);/);
@@ -56,15 +46,14 @@ describe('Roster employee search: selection state is never cleared by a search c
   });
 });
 
-describe('Roster employee search: single-select (Reschedule Off Day) and multi-select (Recurring Off Day, Assign Dates) use genuinely different data structures', () => {
+describe('Roster employee search: single-select (Reschedule Off Day) and multi-select (Recurring Off Day) use genuinely different data structures', () => {
   it('rescheduleEmployeeId is a plain string (zero or one selection) -- never a Set', () => {
     expect(rosterSource).toMatch(/const \[rescheduleEmployeeId, setRescheduleEmployeeId\] = useState\(''\);/);
     expect(rosterSource).not.toMatch(/rescheduleEmployeeId.*Set</);
   });
 
-  it('offPatternEmployeeIds and assignEmployeeIds are both Set<string> (any number of selections)', () => {
+  it('offPatternEmployeeIds is a Set<string> (any number of selections)', () => {
     expect(rosterSource).toMatch(/const \[offPatternEmployeeIds, setOffPatternEmployeeIds\] = useState<Set<string>>\(new Set\(\)\);/);
-    expect(rosterSource).toMatch(/const \[assignEmployeeIds, setAssignEmployeeIds\] = useState<Set<string>>\(new Set\(\)\);/);
   });
 
   it('EmployeeSingleSelect\'s onChange prop type takes exactly one employeeId (string), never an array or Set -- confirming its contract is genuinely single-select', () => {
@@ -80,16 +69,8 @@ describe('Roster employee search: selected-count visibility and empty-results me
     expect(rosterSource).toMatch(/\{offPatternEmployeeIds\.size\} selected<\/span>/);
   });
 
-  it('Assign Dates shows a visible selected count above its checkbox list, not only on the submit button', () => {
-    expect(rosterSource).toMatch(/\{assignEmployeeIds\.size\} selected<\/span>/);
-  });
-
   it('Recurring Off Day shows an explicit empty-results message when its local search matches nobody', () => {
     expect(rosterSource).toMatch(/offPatternFilteredEmployees\.length === 0 \? \(\s*\n\s*<EmptyState/);
-  });
-
-  it('Assign Dates shows an explicit empty-results message when its local search matches nobody', () => {
-    expect(rosterSource).toMatch(/assignFilteredEmployees\.length === 0 \? \(\s*\n\s*<EmptyState/);
   });
 
   it('EmployeeSingleSelect shows an explicit empty-results message when nothing matches', () => {

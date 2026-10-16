@@ -74,7 +74,7 @@ describe('Roster calendar navigation: no handler ever calls a roster write RPC',
   });
 
   it('the roster write RPCs are called ONLY from the pre-existing/declared form-submission handlers, never from any Calendar-tab code', () => {
-    const submitHandlerNames = ['handleSubmitRecurringPattern', 'handleSubmitAssignDates', 'handleSubmitReschedule'];
+    const submitHandlerNames = ['handleSubmitRecurringPattern', 'handleSubmitReschedule'];
     // Stage C Step 12A: the Temporary/Permanent Off Day tab calls ONE
     // atomic RPC, applyWeekdayTransition, for BOTH modes (replacing the
     // old per-week rescheduleOffDay loop and the old direct
@@ -87,9 +87,15 @@ describe('Roster calendar navigation: no handler ever calls a roster write RPC',
     // itself was NOT dropped (see Roster.simplifiedScheduling.test.ts)
     // -- it simply has no UI call site anymore, so it is intentionally
     // absent from this map.
+    // Stage C Step 16A: the Assign Dates tab itself (and its own
+    // assignDates call site/handleSubmitAssignDates handler) was removed
+    // from the production interface entirely -- assignDates is likewise
+    // intentionally absent from this map and from submitHandlerNames.
+    // assignDates() itself was NOT dropped from rosterService.ts/the
+    // database (see Roster.simplifiedScheduling.test.ts) -- it simply
+    // has no UI call site anymore.
     const rpcToOwners: Record<string, string[]> = {
       'assignRecurringPattern(': ['handleSubmitRecurringPattern'],
-      'assignDates(': ['handleSubmitAssignDates'],
       'applyWeekdayTransition(': ['handleSubmitReschedule'],
     };
 
