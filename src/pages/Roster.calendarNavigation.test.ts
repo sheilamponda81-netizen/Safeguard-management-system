@@ -21,7 +21,7 @@ import path from 'node:path';
 // combined into one atomic save -- see Roster.recurringSchedule.test.ts.)
 const rosterSource = fs.readFileSync(path.resolve(__dirname, './Roster.tsx'), 'utf-8');
 
-const WRITE_RPC_NAMES = ['assignRecurringPattern(', 'assignDates(', 'applyWeekdayTransition(', 'cancelDateAssignments('];
+const WRITE_RPC_NAMES = ['assignRecurringPattern(', 'assignDates(', 'applyWeekdayTransition('];
 
 function getHandlerBody(name: string): string {
   // Each handler is declared as `const <name> = useCallback(<fn>, [deps]);`
@@ -74,21 +74,23 @@ describe('Roster calendar navigation: no handler ever calls a roster write RPC',
   });
 
   it('the roster write RPCs are called ONLY from the pre-existing/declared form-submission handlers, never from any Calendar-tab code', () => {
-    const submitHandlerNames = ['handleSubmitRecurringPattern', 'handleSubmitAssignDates', 'handleSubmitReschedule', 'handleSubmitCorrect'];
+    const submitHandlerNames = ['handleSubmitRecurringPattern', 'handleSubmitAssignDates', 'handleSubmitReschedule'];
     // Stage C Step 12A: the Temporary/Permanent Off Day tab calls ONE
     // atomic RPC, applyWeekdayTransition, for BOTH modes (replacing the
     // old per-week rescheduleOffDay loop and the old direct
     // assignRecurringPattern call in the Permanent branch).
-    // Stage C Step 13: assignDates gains a SECOND legitimate owner --
-    // handleSubmitCorrect's "correct to a different type" branch reuses
-    // the existing, unmodified assignDates RPC wholesale -- and the new
-    // cancelDateAssignments RPC is owned solely by handleSubmitCorrect's
-    // "cancel" branch. Neither is reachable from any Calendar-tab code.
+    // Stage C Step 15B: the Correct/Cancel Special Assignment workflow
+    // (and its second assignDates call site, and its sole ownership of
+    // cancelDateAssignments) was REMOVED from the UI per the business
+    // owner's simplified design -- every write RPC is single-owner
+    // again, exactly as before Stage C Step 13. cancelDateAssignments
+    // itself was NOT dropped (see Roster.simplifiedScheduling.test.ts)
+    // -- it simply has no UI call site anymore, so it is intentionally
+    // absent from this map.
     const rpcToOwners: Record<string, string[]> = {
       'assignRecurringPattern(': ['handleSubmitRecurringPattern'],
-      'assignDates(': ['handleSubmitAssignDates', 'handleSubmitCorrect'],
+      'assignDates(': ['handleSubmitAssignDates'],
       'applyWeekdayTransition(': ['handleSubmitReschedule'],
-      'cancelDateAssignments(': ['handleSubmitCorrect'],
     };
 
     // Collect every occurrence's containing handler by scanning each known

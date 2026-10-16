@@ -709,7 +709,7 @@ export interface CancellationSafetyResult {
   safe: boolean;
   /** Dates (within the requested range) whose cancellation would create a Night-to-Day adjacency conflict. */
   adjacencyConflictDates: string[];
-  /** Rolling seven-day rest windows that would have no Off day at all if every date in the requested range were cancelled. */
+  /** Rolling seven-day rest windows that would have no Off day at all if every date in the requested range were cancelled. This is the STATUTORY rest check (Malawi Employment Act s.36(4)) -- a rolling window, never aligned to calendar-week boundaries. */
   restViolations: RollingRestWindowResult[];
   /** The largest safe alternative obtained by cancelling only a leading sub-range (dateFrom through some earlier end date) -- null when none exists or the full range is already safe. */
   safePrefixRange: { dateFrom: string; dateTo: string } | null;

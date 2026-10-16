@@ -22,12 +22,10 @@ import { showNotification } from '../utils/clickHandlers';
 import {
   resolveScheduleForDate, expandDateRange, addDays, WEEKDAY_LABELS,
   ResolvedSchedule,
-  resolveActiveShiftType, wouldOverrideRecurringOffDay,
+  resolveActiveShiftType,
   buildTemporaryReschedulePlan, buildPermanentWeekdayTransitionPlan, explainRollingRestConflict,
   summarizeWeekSchedule, describeWeekOffDays, formatFriendlyWeekdayDate,
-  summarizeDateRangeAssignments, evaluateCancellationSafety, describeCancellationSafety,
-  TemporaryRescheduleWeekPlan, PermanentWeekdayTransitionPlan, WeekScheduleSummary, DateAssignmentStatus,
-  CancellationSafetyResult,
+  TemporaryRescheduleWeekPlan, PermanentWeekdayTransitionPlan, WeekScheduleSummary,
   AssignmentType, OffDayPatternRow, DateAssignmentRow, ShiftPatternRow,
 } from '../utils/rosterSchedule';
 import {
@@ -37,7 +35,7 @@ import {
 import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import {
   fetchActiveOffDayPatterns, fetchActiveShiftPatterns, fetchActiveDateAssignments, fetchActiveEmployeesForRoster,
-  assignRecurringPattern, assignDates, cancelDateAssignments, applyWeekdayTransition, humanizeRosterError,
+  assignRecurringPattern, assignDates, applyWeekdayTransition, humanizeRosterError,
   filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex,
 } from '../utils/rosterService';
 
@@ -180,10 +178,15 @@ function EmployeeSingleSelect({ employees, value, onChange, placeholder }: {
 
 type TabId = 'calendar' | 'off-pattern' | 'assign-dates' | 'reschedule';
 
+// Stage C Step 15B: Day/Night only -- Assign Dates can no longer create
+// a dated Off exception (removed along with the Correct/Cancel Special
+// Assignment workflow, per the business owner's simplified design).
+// roster_assign_dates itself still accepts 'off' (never narrowed at the
+// database layer, since existing historical Off exceptions must remain
+// valid and readable) -- this is a UI-only restriction.
 const ASSIGNMENT_TYPE_OPTIONS = [
   { label: 'Day shift', value: 'day' },
   { label: 'Night shift', value: 'night' },
-  { label: 'Off (dated exception)', value: 'off' },
 ];
 
 const WEEKDAY_OPTIONS = WEEKDAY_LABELS.map((label, value) => ({ label, value: String(value) }));
@@ -424,138 +427,6 @@ export default function RosterPage() {
       setSubmitting(false);
     }
   }, [assignEmployeeIds, assignDateFrom, assignDateTo, assignType, assignReason, employees, loadData]);
-
-  // --- Stage C Step 13: Correct or Cancel a mistaken dated (special)
-  // assignment for ONE employee over a date range -- a distinct mode
-  // within this same tab from the bulk "assign new dates" form above.
-  // "Cancel" reveals whatever the employee's underlying recurring
-  // Off-day/shift pattern says for each date (Day, Night, Off, or
-  // unassigned) by closing out the dated exception and writing NOTHING
-  // in its place -- never forcing a specific value (see
-  // roster_cancel_date_assignments' migration header for the full
-  // reasoning). "Correct to Day/Night/Off" reuses the exact same
-  // assignDates RPC the form above uses, scoped to one employee with a
-  // before/after preview. A date with NO dated exception (its value
-  // comes straight from the recurring pattern) is never touched by
-  // either action -- changing a genuine recurring Off/working day
-  // requires the Temporary/Permanent Off Day or Recurring Schedule tab
-  // instead, exactly as this tab's existing amber warning already says.
-  const [assignTabMode, setAssignTabMode] = useState<'new' | 'correct'>('new');
-  const [correctEmployeeId, setCorrectEmployeeId] = useState('');
-  const [correctDateFrom, setCorrectDateFrom] = useState(defaults.today);
-  const [correctDateTo, setCorrectDateTo] = useState(defaults.today);
-  const [correctAction, setCorrectAction] = useState<'cancel' | AssignmentType>('cancel');
-  const [correctReason, setCorrectReason] = useState('');
-  const [correctRangeAssignments, setCorrectRangeAssignments] = useState<DateAssignmentRow[]>([]);
-
-  const correctSelectedEmployee = useMemo(
-    () => employees.find((e) => e.id === correctEmployeeId) || null,
-    [employees, correctEmployeeId]
-  );
-
-  const isCorrectRangeValid = isValidDateRange(correctDateFrom, correctDateTo);
-
-  // Fetched independently of the Calendar tab's own visible range (the
-  // same reasoning as Step 12E's rescheduleWeekAssignments) -- this tool
-  // must never silently show stale or missing dated-exception data for
-  // whatever range the administrator picks here.
-  useEffect(() => {
-    let cancelled = false;
-    if (!correctEmployeeId || !isCorrectRangeValid) {
-      setCorrectRangeAssignments([]);
-      return;
-    }
-    fetchActiveDateAssignments(correctDateFrom, correctDateTo)
-      .then((rows) => { if (!cancelled) setCorrectRangeAssignments(rows); })
-      .catch(() => { if (!cancelled) setCorrectRangeAssignments([]); });
-    return () => { cancelled = true; };
-  }, [correctEmployeeId, correctDateFrom, correctDateTo, isCorrectRangeValid]);
-
-  const correctSummary: DateAssignmentStatus[] = useMemo(() => {
-    if (!correctEmployeeId || !isCorrectRangeValid) return [];
-    return summarizeDateRangeAssignments(correctEmployeeId, correctDateFrom, correctDateTo, correctRangeAssignments, patterns, shiftPatterns);
-  }, [correctEmployeeId, correctDateFrom, correctDateTo, isCorrectRangeValid, correctRangeAssignments, patterns, shiftPatterns]);
-
-  const correctCancellableCount = useMemo(() => correctSummary.filter((d) => d.hasDatedException).length, [correctSummary]);
-
-  // Per-date before/after preview, computed once and reused by both the
-  // summary counts and the render -- never recomputed inline in JSX.
-  const correctPreviewRows = useMemo(() => {
-    return correctSummary.map((d) => {
-      if (correctAction === 'cancel') {
-        return { ...d, after: d.hasDatedException ? d.underlyingResolved : null, blocked: false };
-      }
-      const blocked = wouldOverrideRecurringOffDay(correctEmployeeId, d.date, correctAction, correctRangeAssignments, patterns, shiftPatterns);
-      return { ...d, after: blocked ? null : correctAction, blocked };
-    });
-  }, [correctSummary, correctAction, correctEmployeeId, correctRangeAssignments, patterns, shiftPatterns]);
-
-  const correctChangeableCount = useMemo(
-    () => (correctAction === 'cancel' ? correctCancellableCount : correctPreviewRows.filter((r) => !r.blocked).length),
-    [correctAction, correctCancellableCount, correctPreviewRows]
-  );
-
-  // Stage C Step 14: real STAGING finding (LUCIOUS LIGOMERA, SFG-S-469) --
-  // cancelling a mistaken special Off across several dates can genuinely
-  // leave no rest day in a rolling seven-day window (Malawi Employment
-  // Act s.36(4)). The server (roster_cancel_date_assignments) already
-  // hard-blocks this correctly with no override; this preview mirrors
-  // that same check ADVISORY-only, so the Admin sees a plain, weekday-
-  // phrased explanation and a concrete safe alternative BEFORE
-  // submitting, instead of only a technical rejection afterward.
-  const correctCancellationSafety: CancellationSafetyResult | null = useMemo(() => {
-    if (correctAction !== 'cancel' || !correctEmployeeId || !isCorrectRangeValid || correctCancellableCount === 0) return null;
-    return evaluateCancellationSafety(correctEmployeeId, correctDateFrom, correctDateTo, correctRangeAssignments, patterns, shiftPatterns);
-  }, [correctAction, correctEmployeeId, isCorrectRangeValid, correctCancellableCount, correctDateFrom, correctDateTo, correctRangeAssignments, patterns, shiftPatterns]);
-
-  const correctCancellationDescription = useMemo(() => {
-    if (!correctCancellationSafety || !correctSelectedEmployee) return null;
-    return describeCancellationSafety(correctSelectedEmployee.fullName, correctCancellationSafety);
-  }, [correctCancellationSafety, correctSelectedEmployee]);
-
-  const canSubmitCorrect =
-    !!correctEmployeeId &&
-    isCorrectRangeValid &&
-    !!correctReason.trim() &&
-    correctSummary.length > 0 &&
-    correctChangeableCount > 0 &&
-    (!correctCancellationSafety || correctCancellationSafety.safe);
-
-  const handleSubmitCorrect = useCallback(async () => {
-    if (!canSubmitCorrect) {
-      showNotification('Select an employee, a valid date range, and a reason -- and make sure at least one date in range can actually be changed without an unresolved rest conflict.', 'error');
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const result = correctAction === 'cancel'
-        ? await cancelDateAssignments([correctEmployeeId], correctDateFrom, correctDateTo, correctReason)
-        : await assignDates([correctEmployeeId], correctDateFrom, correctDateTo, correctAction, correctReason);
-      if (result.success) {
-        showNotification(
-          correctAction === 'cancel'
-            ? `Cancelled ${result.assignedCount} special assignment(s).${result.alreadySetCount ? ` ${result.alreadySetCount} date(s) had nothing to cancel.` : ''} The employee's normal recurring schedule now applies for those dates.`
-            : `Corrected ${result.assignedCount} date(s).${result.alreadySetCount ? ` ${result.alreadySetCount} already set.` : ''}`,
-          'success'
-        );
-        setCorrectReason('');
-        await loadData();
-      } else {
-        const rawMessage = result.error || 'Could not apply this correction.';
-        const explanation = correctEmployeeId
-          ? explainRollingRestConflict(rawMessage, correctEmployeeId, correctRangeAssignments, patterns, shiftPatterns)
-          : null;
-        showNotification(
-          explanation
-            ? `${humanizeRosterError(rawMessage, employees)} ${explanation.summary}`
-            : humanizeRosterError(rawMessage, employees),
-          'error'
-        );
-      }
-    } finally {
-      setSubmitting(false);
-    }
-  }, [canSubmitCorrect, correctAction, correctEmployeeId, correctDateFrom, correctDateTo, correctReason, correctRangeAssignments, patterns, shiftPatterns, employees, loadData]);
 
   // --- Stage C Step 12: Temporary / Permanent Off-day change, expressed
   // in the weekday vocabulary administrators actually think in ("Wednesday
@@ -1003,176 +874,46 @@ export default function RosterPage() {
         </Card>
       ) : activeTab === 'assign-dates' ? (
         <Card className="p-5 space-y-4">
-          <p className="text-sm text-slate-600">Assign Day, Night, or a dated Off exception across a date range for one or more employees.</p>
+          <p className="text-sm text-slate-600">Assign an exceptional Day or Night shift across a date range for one or more employees.</p>
           <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-            Use this tab only for genuinely <strong>exceptional, one-off dated</strong> shifts -- a single public holiday, a one-time
-            special assignment, a specific day that needs correcting. It is <strong>not</strong> for normal repeating weekly schedules
+            Use this tab only for genuinely <strong>exceptional, one-off dated</strong> working shifts -- a single public holiday
+            covered as a working day, a one-time special assignment. It is <strong>not</strong> for normal repeating weekly schedules
             (use the <strong>Recurring Schedule</strong> tab) or for moving an Off day, temporarily or permanently
             (use the <strong>Temporary / Permanent Off Day</strong> tab) -- those tabs compute the right dates automatically and keep
             the rolling seven-day rest rule and historical schedules intact in ways a plain dated assignment does not.
           </p>
           <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-            A working assignment cannot be placed on a date an employee is already scheduled Off -- this is always blocked, with no override.
-            To work a normally-Off date, use the <strong>Temporary / Permanent Off Day</strong> tab, which moves the Off day and assigns the vacated date atomically.
+            A working assignment cannot be placed on a date an employee is already scheduled Off -- this is always blocked, with no override,
+            and this tab can no longer create a dated Off exception either. To work a normally-Off date, use the
+            <strong> Temporary / Permanent Off Day</strong> tab, which moves the Off day and assigns the vacated date atomically.
           </p>
 
-          <div className="flex items-center gap-4 rounded-lg border border-slate-200 p-3">
-            <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
-              <input type="radio" name="assign-dates-mode" checked={assignTabMode === 'new'} onChange={() => setAssignTabMode('new')} />
-              Assign New Dates
-            </label>
-            <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
-              <input type="radio" name="assign-dates-mode" checked={assignTabMode === 'correct'} onChange={() => setAssignTabMode('correct')} />
-              Correct / Cancel Special Assignment
-            </label>
+          <Input icon={Search} placeholder="Search employee by name or number..." value={assignSearch} onChange={(e) => setAssignSearch(e.target.value)} />
+          <div className="flex items-center justify-between text-xs text-slate-500">
+            <span>{assignFilteredEmployees.length} of {employees.length} employee(s) shown</span>
+            <span className="font-medium text-slate-700">{assignEmployeeIds.size} selected</span>
           </div>
-
-          {assignTabMode === 'new' ? (
-            <>
-              <Input icon={Search} placeholder="Search employee by name or number..." value={assignSearch} onChange={(e) => setAssignSearch(e.target.value)} />
-              <div className="flex items-center justify-between text-xs text-slate-500">
-                <span>{assignFilteredEmployees.length} of {employees.length} employee(s) shown</span>
-                <span className="font-medium text-slate-700">{assignEmployeeIds.size} selected</span>
-              </div>
-              {assignFilteredEmployees.length === 0 ? (
-                <EmptyState icon={UsersIcon} title="No employees match your search" description="Adjust the search above. Any employees already selected remain selected." />
-              ) : (
-                <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
-                  {assignFilteredEmployees.map((emp) => (
-                    <label key={emp.id} className="flex items-center gap-2 px-3 py-2 text-sm">
-                      <input type="checkbox" checked={assignEmployeeIds.has(emp.id)} onChange={() => toggleInSet(assignEmployeeIds, setAssignEmployeeIds, emp.id)} />
-                      {emp.fullName} <span className="text-xs text-slate-500">{emp.employeeNumber}</span>
-                    </label>
-                  ))}
-                </div>
-              )}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                <Input label="From" type="date" value={assignDateFrom} onChange={(e) => setAssignDateFrom(e.target.value)} />
-                <Input label="To" type="date" value={assignDateTo} onChange={(e) => setAssignDateTo(e.target.value)} />
-                <Select label="Assignment" value={assignType} onChange={(e) => setAssignType(e.target.value as AssignmentType)} options={ASSIGNMENT_TYPE_OPTIONS} />
-              </div>
-              <Input label="Reason (required for a change to an existing assignment)" value={assignReason} onChange={(e) => setAssignReason(e.target.value)} />
-              <Button onClick={handleSubmitAssignDates} disabled={submitting || assignEmployeeIds.size === 0}>
-                {submitting ? 'Saving...' : `Assign ${assignType} to ${assignEmployeeIds.size} Employee(s)`}
-              </Button>
-            </>
+          {assignFilteredEmployees.length === 0 ? (
+            <EmptyState icon={UsersIcon} title="No employees match your search" description="Adjust the search above. Any employees already selected remain selected." />
           ) : (
-            <div className="space-y-3">
-              <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-                Undo or fix a mistaken one-off Day, Night, or Off assignment for <strong>one employee</strong> -- e.g. a special Off
-                accidentally applied across a whole week. <strong>Cancel</strong> restores the employee's normal recurring schedule for
-                each affected date (never forcing Day -- it reveals whatever that date's real underlying pattern says). This only ever
-                changes <strong>roster</strong> scheduling -- it never touches attendance records, approved Leave or Sick Leave, and
-                never changes payroll.
-              </p>
-
-              <EmployeeSingleSelect employees={employees} value={correctEmployeeId} onChange={setCorrectEmployeeId} />
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <Input label="From" type="date" value={correctDateFrom} onChange={(e) => setCorrectDateFrom(e.target.value)} />
-                <Input label="To" type="date" value={correctDateTo} onChange={(e) => setCorrectDateTo(e.target.value)} />
-              </div>
-              {!isCorrectRangeValid && (
-                <p className="text-xs text-red-600">The To date must be on or after the From date.</p>
-              )}
-
-              {correctSelectedEmployee && correctSummary.length > 0 && (
-                <Card className="p-4 space-y-2 bg-slate-50 border border-slate-200">
-                  <p className="text-sm font-semibold text-slate-800">
-                    {correctSelectedEmployee.fullName}'s schedule, {correctDateFrom} to {correctDateTo}
-                  </p>
-                  <div className="space-y-1.5 max-h-56 overflow-y-auto">
-                    {correctSummary.map((d) => (
-                      <div key={d.date} className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm">
-                        <span>{formatFriendlyWeekdayDate(d.date)}</span>
-                        <div className="flex items-center gap-2">
-                          <Badge color={scheduleBadgeColor(d.resolved)}>{d.resolved}</Badge>
-                          <span className="text-xs text-slate-500">{d.hasDatedException ? 'Special (dated)' : 'Recurring'}</span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <p className="text-xs text-slate-500">
-                    {correctCancellableCount} of {correctSummary.length} date(s) have a special dated assignment that can be corrected or
-                    cancelled here. Dates marked "Recurring" are the employee's normal weekly pattern -- protected here; use
-                    Temporary / Permanent Off Day or Recurring Schedule to change those instead.
-                  </p>
-                </Card>
-              )}
-
-              <div className="space-y-1.5">
-                <label className="block text-sm font-medium text-slate-700">Action</label>
-                <div className="flex flex-wrap items-center gap-3">
-                  <label className="flex items-center gap-1.5 text-sm text-slate-700">
-                    <input type="radio" name="correct-action" checked={correctAction === 'cancel'} onChange={() => setCorrectAction('cancel')} />
-                    Cancel (restore normal recurring schedule)
-                  </label>
-                  {(['day', 'night', 'off'] as const).map((t) => (
-                    <label key={t} className="flex items-center gap-1.5 text-sm text-slate-700">
-                      <input type="radio" name="correct-action" checked={correctAction === t} onChange={() => setCorrectAction(t)} />
-                      Correct to {t}
-                    </label>
-                  ))}
-                </div>
-              </div>
-
-              {correctSelectedEmployee && correctPreviewRows.length > 0 && (
-                <Card className="p-4 space-y-2 bg-blue-50 border border-blue-200">
-                  <p className="text-sm font-semibold text-blue-900">Preview</p>
-                  <div className="space-y-1.5 max-h-56 overflow-y-auto">
-                    {correctPreviewRows.map((row) => {
-                      if (correctAction === 'cancel' && !row.hasDatedException) {
-                        return (
-                          <div key={row.date} className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-500">
-                            <span>{formatFriendlyWeekdayDate(row.date)}</span>
-                            <span>No special assignment -- protected, nothing to cancel</span>
-                          </div>
-                        );
-                      }
-                      return (
-                        <div key={row.date} className={`flex items-center justify-between rounded-lg border px-3 py-1.5 text-sm ${row.blocked ? 'bg-red-50 border-red-200' : 'bg-white border-blue-200'}`}>
-                          <span>{formatFriendlyWeekdayDate(row.date)}</span>
-                          <div className="flex items-center gap-2">
-                            <Badge color={scheduleBadgeColor(row.resolved)}>{row.resolved}</Badge>
-                            <span>→</span>
-                            {row.blocked || row.after === null ? (
-                              <span className="text-xs text-red-700 flex items-center gap-1"><AlertTriangle size={12} /> blocked -- already Off</span>
-                            ) : (
-                              <Badge color={scheduleBadgeColor(row.after)}>{row.after}</Badge>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </Card>
-              )}
-
-              {correctCancellationDescription && (
-                <Card className="p-4 space-y-2 bg-red-50 border border-red-200">
-                  <p className="text-sm font-semibold text-red-800 flex items-center gap-1.5"><AlertTriangle size={14} /> This would leave no rest day</p>
-                  <p className="text-sm text-red-700">{correctCancellationDescription.primary}</p>
-                  {correctCancellationDescription.suggestion && (
-                    <p className="text-sm text-red-700">{correctCancellationDescription.suggestion}</p>
-                  )}
-                </Card>
-              )}
-
-              <Input
-                label="Correction reason (required)"
-                value={correctReason}
-                onChange={(e) => setCorrectReason(e.target.value)}
-                placeholder="e.g. Special Off was applied by mistake"
-                required
-              />
-              <Button onClick={handleSubmitCorrect} disabled={submitting || !canSubmitCorrect}>
-                {submitting
-                  ? 'Saving...'
-                  : correctAction === 'cancel'
-                    ? `Cancel ${correctChangeableCount} Special Assignment(s)`
-                    : `Correct to ${correctAction} (${correctChangeableCount} date(s))`}
-              </Button>
+            <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+              {assignFilteredEmployees.map((emp) => (
+                <label key={emp.id} className="flex items-center gap-2 px-3 py-2 text-sm">
+                  <input type="checkbox" checked={assignEmployeeIds.has(emp.id)} onChange={() => toggleInSet(assignEmployeeIds, setAssignEmployeeIds, emp.id)} />
+                  {emp.fullName} <span className="text-xs text-slate-500">{emp.employeeNumber}</span>
+                </label>
+              ))}
             </div>
           )}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <Input label="From" type="date" value={assignDateFrom} onChange={(e) => setAssignDateFrom(e.target.value)} />
+            <Input label="To" type="date" value={assignDateTo} onChange={(e) => setAssignDateTo(e.target.value)} />
+            <Select label="Assignment" value={assignType} onChange={(e) => setAssignType(e.target.value as AssignmentType)} options={ASSIGNMENT_TYPE_OPTIONS} />
+          </div>
+          <Input label="Reason (required for a change to an existing assignment)" value={assignReason} onChange={(e) => setAssignReason(e.target.value)} />
+          <Button onClick={handleSubmitAssignDates} disabled={submitting || assignEmployeeIds.size === 0}>
+            {submitting ? 'Saving...' : `Assign ${assignType} to ${assignEmployeeIds.size} Employee(s)`}
+          </Button>
         </Card>
       ) : (
         <Card className="p-5 space-y-4">
