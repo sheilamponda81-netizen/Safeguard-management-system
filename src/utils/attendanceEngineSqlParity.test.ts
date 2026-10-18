@@ -82,7 +82,6 @@ const dbAvailable = databaseReachable();
 describe.skipIf(!dbAvailable)('attendance_engine_calculate() SQL/TypeScript parity', () => {
   beforeAll(() => {
     if (!dbAvailable) {
-      // eslint-disable-next-line no-console
       console.warn('attendanceEngineSqlParity.test.ts: no reachable Postgres -- skipping (see this file\'s header for setup).');
     }
   });
