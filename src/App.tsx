@@ -42,6 +42,14 @@ const Dashboard = safeLazy(() => import("./pages/Dashboard"));
 const EmployeesPage = safeLazy(() => import("./pages/Employees"));
 const RecruitmentPage = safeLazy(() => import("./pages/Recruitment"));
 const AttendancePage = safeLazy(() => import("./pages/Attendance"));
+const HikCentralImportPage = safeLazy(() => import("./pages/HikCentralImport"));
+const HikCentralPersonMappingPage = safeLazy(() => import("./pages/HikCentralPersonMapping"));
+// Attendance Interface Consolidation: the former standalone "Attendance
+// Preview" and "Attendance Calculation Preview" top-level pages are now
+// tabs INSIDE AttendancePage (src/pages/Attendance.tsx's "Attendance
+// Review" tab, itself lazy-loaded from there only when opened) -- no
+// separate top-level route/nav entry for either one anymore.
+const RosterPage = safeLazy(() => import("./pages/Roster"));
 const PayrollPage = safeLazy(() => import("./pages/Payroll"));
 const PayslipsPage = safeLazy(() => import("./pages/Payslips"));
 const PaymentsPage = safeLazy(() => import("./pages/Payments"));
@@ -69,6 +77,8 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
   employees: EmployeesPage,
   recruitment: RecruitmentPage,
   attendance: AttendancePage,
+  "hikcentral-import": HikCentralImportPage,
+  "hikcentral-mapping": HikCentralPersonMappingPage,
   payroll: PayrollPage,
   payslips: PayslipsPage,
   payments: PaymentsPage,
@@ -80,18 +90,21 @@ const pageComponents: Record<NavKey, React.LazyExoticComponent<React.ComponentTy
   features: FeaturesPage,
   auditlogs: AuditLogsPage,
   "user-manual": UserManualPage,
+  roster: RosterPage,
 };
 
 // ===== ROLE CONFIGURATION =====
 const rolePages: Record<number, NavKey[]> = {
   1: [
-    "dashboard", "employees", "recruitment", "attendance",
+    "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
+    "hikcentral-mapping", "roster",
     "payroll", "payslips", "payments", "terminal-dues", "salary-advances",
     "reports", "settings", "security", "features", "auditlogs",
     "user-manual",
   ],
   2: [
-    "dashboard", "employees", "recruitment", "attendance",
+    "dashboard", "employees", "recruitment", "attendance", "hikcentral-import",
+    "hikcentral-mapping",
     "payments", "terminal-dues", "salary-advances", "reports", "security",
     "user-manual",
   ],
@@ -113,6 +126,9 @@ const titles: Record<NavKey, { title: string; breadcrumb: string }> = {
   employees: { title: "Employee Management", breadcrumb: "Employees" },
   recruitment: { title: "Recruitment Pipeline", breadcrumb: "Recruitment" },
   attendance: { title: "Attendance Management", breadcrumb: "Attendance" },
+  "hikcentral-import": { title: "HikCentral Attendance Import", breadcrumb: "HikCentral Import" },
+  "hikcentral-mapping": { title: "HikCentral Person Mapping", breadcrumb: "Person Mapping" },
+  roster: { title: "Roster Management", breadcrumb: "Roster" },
   payroll: { title: "Payroll Management", breadcrumb: "Payroll" },
   payslips: { title: "Payslips", breadcrumb: "Payslips" },
   payments: { title: "Payment Management", breadcrumb: "Payments" },

@@ -49,6 +49,27 @@ export const PERMISSIONS = {
   ATTENDANCE_VIEW: 'attendance.view',
   ATTENDANCE_CREATE: 'attendance.create',
   ATTENDANCE_EDIT: 'attendance.edit',
+  // HikCentral Attendance MVP Phase 1 (20260929000000_hikcentral_attendance_ingestion_foundation.sql)
+  // -- import/preview/mapping only, no "apply attendance" permission yet.
+  ATTENDANCE_IMPORT_HIKCENTRAL: 'attendance.import_hikcentral',
+  ATTENDANCE_MAP_HIKCENTRAL_PERSONS: 'attendance.map_hikcentral_persons',
+  // Attendance Automation, Stage C Step 1 (20261012000000_attendance_automation_foundation.sql)
+  // -- deliberately separate from ATTENDANCE_CREATE/EDIT: running the
+  // automatic engine over many rows, confirming fingerprint coverage,
+  // and resolving a payroll reconciliation flag are each a materially
+  // different level of authority than editing one attendance box. Not
+  // wired to any UI yet -- no page/route checks these -- the migration
+  // itself is additive-only this round (see that file's header); these
+  // constants exist only so Step 2+ frontend work has a single, named
+  // source of truth to reference instead of a hardcoded string.
+  ATTENDANCE_AUTO_APPLY: 'attendance.auto_apply',
+  ATTENDANCE_CONFIRM_COVERAGE: 'attendance.confirm_coverage',
+  ATTENDANCE_RESOLVE_RECONCILIATION: 'attendance.resolve_reconciliation',
+  // Stage C Step 10 (20261017000000_hikcentral_batch_continuity_and_site_alerts.sql)
+  // -- acknowledging/closing a site absence alert. Reading alerts and the
+  // coverage timeline reuses existing attendance.view/attendance.import_hikcentral/
+  // attendance.confirm_coverage permissions -- no new read-side key needed.
+  ATTENDANCE_MANAGE_SITE_ALERTS: 'attendance.manage_site_alerts',
   USER_MANUAL_VIEW: 'user_manual.view',
   FUTURE_FEATURES_VIEW: 'future_features.view',
 } as const;

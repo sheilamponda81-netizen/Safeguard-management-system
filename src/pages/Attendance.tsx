@@ -1,9 +1,10 @@
-﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, ChevronLeft, ChevronRight } from '../utils/icons';
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
+﻿import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
+import { Search, Calendar, CheckCircle2, XCircle, Clock, Plane, FileText, RefreshCw, Scissors, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Eye, CalendarCheck } from '../utils/icons';
+import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs } from '../components/ui';
+import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
-import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
+import { getAvailableMonthsFromSystem, getActualCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
 import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
 import { sanitizeInput } from '../utils/securityHeaders';
@@ -515,7 +516,13 @@ async function fetchAttendanceInBatches(
   return dedupeById(records);
 }
 
-export function AttendancePage() {
+// The official monthly attendance register -- unchanged from the
+// original AttendancePage (renamed only, as part of the Attendance
+// Interface Consolidation). Every write path, permission check, and
+// payroll-deduction calculation below is byte-for-byte the same as
+// before; only the exported wrapper around it changed (see
+// AttendancePage at the bottom of this file).
+function MonthlyRegisterTab() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
@@ -568,7 +575,10 @@ export function AttendancePage() {
   useEffect(() => { getDefaultPageSize().then(setAttendanceItemsPerPage); }, []);
 
   // ===== REFS =====
-  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string }>>(new Map());
+  // previousStatus is carried alongside the queued write so a failed RPC
+  // call can revert the optimistic UI change it caused -- the grid applies
+  // the new status immediately on click, before the write is confirmed.
+  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string; previousStatus: string }>>(new Map());
   const isProcessingUpdate = useRef(false);
 
   // ===== HELPER FUNCTIONS =====
@@ -656,13 +666,19 @@ export function AttendancePage() {
   // ===== INITIALIZATION =====
   useEffect(() => {
     const init = async () => {
-      const month = await getSystemCurrentMonth();
+      // The ACTUAL current calendar month (Africa/Blantyre) -- NOT the
+      // admin-advanced payroll-processing cursor getSystemCurrentMonth
+      // returns, which can legitimately lag behind the calendar and
+      // previously left this page treating July 2026 as "current" well
+      // into October. See getActualCurrentMonth's own comment in
+      // currentMonth.ts.
+      const month = getActualCurrentMonth();
       setSystemMonth(month);
       setSelectedMonth(month);
-      
+
       const months = getAvailableMonthsFromSystem(month);
       setAvailableMonths(months);
-      
+
       await fetchUserProfile();
     };
     init();
@@ -706,44 +722,46 @@ export function AttendancePage() {
   }, [selectedMonth]);
 
   // ===== PROCESS SINGLE UPDATE =====
-  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string) => {
+  // Routed through the protected attendance_correct RPC (Stage C) instead of
+  // a direct table SELECT-then-INSERT/UPDATE: the server resolves insert vs.
+  // update itself, re-checks the same permission/region boundary server-side
+  // (defense in depth beyond the client-side gates above), and -- in the
+  // same transaction as the attendance write -- records old/new status into
+  // attendance_audit_log and raises a payroll reconciliation flag if this
+  // month already has a payroll record. On failure, the optimistic UI
+  // change made in updateAttendance is reverted back to previousStatus so
+  // the grid never shows an edit that didn't actually save.
+  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string, previousStatus: string) => {
     try {
-      const { data: existingRecord, error: checkError } = await supabase
-        .from('attendance')
-        .select('id')
-        .eq('employee_id', employeeId)
-        .eq('date', date)
-        .maybeSingle();
+      const { data, error } = await supabase.rpc('attendance_correct', {
+        p_employee_id: employeeId,
+        p_date: date,
+        p_status: nextStatus,
+      });
 
-      if (checkError) throw checkError;
+      if (error) throw error;
 
-      let result;
-      if (existingRecord) {
-        result = await supabase
-          .from('attendance')
-          .update({ status: nextStatus })
-          .eq('id', existingRecord.id);
-      } else {
-        // tenant_id is omitted -- it defaults to the current user's own
-        // tenant via the DB column default, same convention used by
-        // positions/regions inserts elsewhere in the app. Explicitly
-        // passing `tenant_id: null` here previously (when userProfile
-        // hadn't finished loading yet) would override that default and
-        // violate the NOT NULL constraint, silently failing every insert.
-        result = await supabase
-          .from('attendance')
-          .insert({
-            employee_id: employeeId,
-            date: date,
-            status: nextStatus,
-          });
+      const outcome = Array.isArray(data) ? data[0] : data;
+      if (outcome?.payroll_flag) {
+        showNotification(
+          outcome.payroll_flag === 'approved'
+            ? 'Attendance updated. Payroll for this month is already approved -- flagged for reconciliation review.'
+            : 'Attendance updated. Payroll for this month has already been processed -- flagged for reconciliation review.',
+          'info'
+        );
       }
-
-      if (result.error) throw result.error;
-
     } catch (err) {
       console.error('Error processing update:', err);
       showNotification(`Failed to save attendance: ${getErrorMessage(err)}`, 'error');
+      setAttendance(prev => {
+        const existingIndex = prev.findIndex(a => a.employee_id === employeeId && a.date === date);
+        if (existingIndex >= 0) {
+          const reverted = [...prev];
+          reverted[existingIndex] = { ...reverted[existingIndex], status: previousStatus };
+          return reverted;
+        }
+        return prev;
+      });
     }
   }, []);
 
@@ -758,7 +776,7 @@ export function AttendancePage() {
       updateQueue.current.clear();
 
       // Group updates by employee for efficiency
-      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string }[]> = {};
+      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string; previousStatus: string }[]> = {};
       for (const entry of entries) {
         if (!groupedUpdates[entry.employeeId]) {
           groupedUpdates[entry.employeeId] = [];
@@ -769,7 +787,7 @@ export function AttendancePage() {
       // Process each employee's updates
       for (const updates of Object.values(groupedUpdates)) {
         for (const update of updates) {
-          await processSingleUpdate(update.employeeId, update.date, update.status);
+          await processSingleUpdate(update.employeeId, update.date, update.status, update.previousStatus);
         }
       }
     } catch (err) {
@@ -831,7 +849,7 @@ export function AttendancePage() {
     });
     
     // Queue the update for background processing
-    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus });
+    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus, previousStatus: currentStatus });
     
     // Trigger queue processing
     if (!isProcessingUpdate.current) {
@@ -1063,8 +1081,6 @@ export function AttendancePage() {
     }
 
     if (sourceData && sourceData.length > 0) {
-      // tenant_id is omitted -- it defaults to the current user's own tenant
-      // via the DB column default, same convention as processSingleUpdate.
       const newRecords = sourceData.map(record => {
         const originalDate = new Date(record.date);
         const dayOfMonth = originalDate.getDate();
@@ -1075,28 +1091,58 @@ export function AttendancePage() {
         };
       }).filter(record => record.date);
 
-      const { error: insertError } = await supabase
-        .from('attendance')
-        .insert(newRecords);
+      // Routed through attendance_correct (Stage C), one call per record,
+      // rather than attendance_bulk_correct: that RPC applies a single
+      // status across a whole employee x date range, but a copied day can
+      // carry a DIFFERENT status per employee per day (whatever the source
+      // day actually was) -- its uniform-status shape doesn't fit this
+      // operation. Per-call also gives genuine partial-failure isolation:
+      // attendance_bulk_correct runs its whole employee loop inside ONE
+      // function call/transaction, so a single out-of-region employee
+      // would abort every other employee's copy along with it; separate
+      // RPC calls let the rest continue and succeed independently.
+      let succeeded = 0;
+      const failures: { employee_id: string; date: string; message: string }[] = [];
+      for (const record of newRecords) {
+        try {
+          const { error } = await supabase.rpc('attendance_correct', {
+            p_employee_id: record.employee_id,
+            p_date: record.date,
+            p_status: record.status,
+            p_reason: `Copied from ${getMonthLabel(sourceMonth)}`,
+          });
+          if (error) throw error;
+          succeeded++;
+        } catch (err) {
+          console.error('Error copying attendance record:', record, err);
+          failures.push({ employee_id: record.employee_id, date: record.date, message: getErrorMessage(err) });
+        }
+      }
 
-      if (insertError) {
-        console.error('Error copying data:', insertError);
-        showNotification('Failed to copy data: ' + insertError.message, 'error');
-      } else {
+      if (succeeded > 0) {
         await logAudit({
           action: 'CREATE',
           entity_type: 'attendance',
           new_data: {
             sourceMonth: sourceMonth,
             targetMonth: selectedMonth,
-            recordsCopied: newRecords.length
+            recordsCopied: succeeded,
+            recordsFailed: failures.length
           },
           region_id: userProfile?.region_id
         });
 
         await fetchData();
+      }
+
+      if (failures.length === 0) {
         showNotification(`Attendance data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}`, 'success');
         setShowCopyModal(false);
+      } else if (succeeded > 0) {
+        showNotification(`Copied ${succeeded} of ${newRecords.length} records. ${failures.length} failed (${failures[0].message}) -- check permissions or region scope and retry for those employees.`, 'error');
+        setShowCopyModal(false);
+      } else {
+        showNotification(`Failed to copy data: ${failures[0].message}`, 'error');
       }
     } else {
       showNotification('No attendance data found in the source month.', 'error');
@@ -1386,4 +1432,141 @@ export function AttendancePage() {
   );
 }
 
-export default AttendancePage;
+// Lazy, loaded only when the Attendance Review tab is actually opened --
+// same "no preloading" discipline App.tsx's own top-level pages follow.
+// Each of these already does its own permission check, its own loading
+// state, and its own read-only data fetching -- mounted here exactly as
+// they were as standalone pages, so none of their existing behavior
+// (including the roster-first fix and the mapping-vs-absence distinction)
+// changes by being nested instead of top-level.
+const AttendanceCalculationPreviewPage = lazy(() => import('./AttendanceCalculationPreview'));
+const HikCentralAttendancePreviewPage = lazy(() => import('./HikCentralAttendancePreview'));
+const AttendanceServerCalculationPreviewPage = lazy(() => import('./AttendanceServerCalculationPreview'));
+const AttendanceWhatIfSimulationPage = lazy(() => import('./AttendanceWhatIfSimulation'));
+
+function PreviewLoadingFallback() {
+  return <div className="p-8 text-center text-slate-400">Loading...</div>;
+}
+
+/**
+ * Attendance Interface Consolidation: the calculated/provisional/Pending
+ * review (Stage B's former standalone "Attendance Calculation Preview"
+ * page), plus the older raw-scan diagnostics (the former standalone
+ * "HikCentral Attendance Preview" page) folded in as a collapsed,
+ * opt-in secondary view rather than deleted -- it still shows every
+ * observed scan, review flag (single scan / 3+ scans / multiple sites /
+ * potential overnight / duplicate timestamp), and the identified-
+ * unmapped/anonymous event counts it always has. Strictly read-only:
+ * neither sub-page has ever had a write action.
+ */
+function AttendanceReviewTab() {
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [showServerPreview, setShowServerPreview] = useState(false);
+  const [showWhatIf, setShowWhatIf] = useState(false);
+  return (
+    <div className="space-y-4">
+      <Suspense fallback={<PreviewLoadingFallback />}>
+        <AttendanceCalculationPreviewPage />
+      </Suspense>
+      <Card className="p-4">
+        <button
+          onClick={() => setShowDiagnostics((v) => !v)}
+          className="text-sm font-medium text-slate-700 flex items-center gap-2 w-full"
+        >
+          {showDiagnostics ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          Raw fingerprint diagnostics (advanced)
+        </button>
+        {showDiagnostics && (
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <Suspense fallback={<PreviewLoadingFallback />}>
+              <HikCentralAttendancePreviewPage />
+            </Suspense>
+          </div>
+        )}
+      </Card>
+      <Card className="p-4">
+        <button
+          onClick={() => setShowServerPreview((v) => !v)}
+          className="text-sm font-medium text-slate-700 flex items-center gap-2 w-full"
+        >
+          {showServerPreview ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          Server calculation preview (Stage C, advanced)
+        </button>
+        {showServerPreview && (
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <Suspense fallback={<PreviewLoadingFallback />}>
+              <AttendanceServerCalculationPreviewPage />
+            </Suspense>
+          </div>
+        )}
+      </Card>
+      <Card className="p-4">
+        <button
+          onClick={() => setShowWhatIf((v) => !v)}
+          className="text-sm font-medium text-slate-700 flex items-center gap-2 w-full"
+        >
+          {showWhatIf ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          What-if simulation (advanced)
+        </button>
+        {showWhatIf && (
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <Suspense fallback={<PreviewLoadingFallback />}>
+              <AttendanceWhatIfSimulationPage />
+            </Suspense>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+type AttendanceTabId = 'register' | 'review';
+
+/**
+ * Attendance Interface Consolidation: the single sidebar entry point for
+ * everything attendance-related. "Monthly Register" is the existing
+ * official page (MonthlyRegisterTab, unchanged) -- every Admin/HR/
+ * Accountant/Operations user who could already reach Attendance still
+ * lands here first, with identical editing behavior and permissions.
+ * "Attendance Review" (AttendanceReviewTab, read-only) is gated on the
+ * SAME permission its two constituent pages already required
+ * (attendance.map_hikcentral_persons) -- a user without it never even
+ * sees the tab, and MonthlyRegisterTab's own write permissions
+ * (attendance.create/attendance.edit) are completely untouched by any
+ * of this, so this consolidation neither widens nor narrows any
+ * existing access.
+ */
+export default function AttendancePage() {
+  const [activeTab, setActiveTab] = useState<AttendanceTabId>('register');
+  const [canReview, setCanReview] = useState(false);
+  const [reviewPermissionChecked, setReviewPermissionChecked] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      setCanReview(await hasPermission(PERMISSIONS.ATTENDANCE_MAP_HIKCENTRAL_PERSONS));
+      setReviewPermissionChecked(true);
+    })();
+  }, []);
+
+  // Never render the Review tab's content for a user who lacks the
+  // permission, even if `activeTab` were somehow already 'review' (e.g.
+  // a stale value from before a permission change) -- the tab button
+  // itself is also simply absent below for the same user.
+  const effectiveTab: AttendanceTabId = canReview ? activeTab : 'register';
+
+  return (
+    <div className="space-y-4">
+      {reviewPermissionChecked && canReview && (
+        <Tabs
+          tabs={[
+            { id: 'register', label: 'Monthly Register', icon: CalendarCheck },
+            { id: 'review', label: 'Attendance Review', icon: Eye },
+          ]}
+          active={effectiveTab}
+          onChange={(id) => setActiveTab(id as AttendanceTabId)}
+        />
+      )}
+      {effectiveTab === 'register' ? <MonthlyRegisterTab /> : <AttendanceReviewTab />}
+    </div>
+  );
+}

@@ -1,4 +1,5 @@
 import { supabase } from '../lib/supabase';
+import { getBlantyreToday } from './rosterCalendarNav';
 
 // ===== CONSTANTS: System start date =====
 const SYSTEM_START_YEAR = 2026;
@@ -78,6 +79,23 @@ export const getSystemCurrentMonth = async (): Promise<string> => {
     console.error('❌ Unexpected error in getSystemCurrentMonth:', error);
     return `${SYSTEM_START_YEAR}-${String(SYSTEM_START_MONTH).padStart(2, '0')}`;
   }
+};
+
+// The ACTUAL current calendar month in Africa/Blantyre -- deliberately
+// independent of `current_payroll_month` above. That setting is an
+// admin-advanced payroll-PROCESSING cursor (legitimately allowed to lag
+// behind the calendar, e.g. still finalizing a prior pay period), which is
+// why it defaults to and floors at the system's start month rather than
+// tracking today. Attendance's Monthly Register records what happened on
+// an actual calendar day, so it must never defer to that processing
+// cursor -- confirmed by a real bug: with `current_payroll_month` left at
+// its default (2026-07) well into October, Monthly Register treated July
+// as "current," so a manual attendance edit on 12 Oct 2026 silently saved
+// against 1 July 2026 instead. Reuses the already-established Blantyre-
+// today helper (rosterCalendarNav.ts) rather than a second copy of the
+// fixed UTC+02:00 offset.
+export const getActualCurrentMonth = (): string => {
+  return getBlantyreToday().slice(0, 7);
 };
 
 // Set the system current month (admin only)

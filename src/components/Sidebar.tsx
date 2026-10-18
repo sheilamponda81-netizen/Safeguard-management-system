@@ -5,7 +5,7 @@ import {
   Wallet,
   Calculator, ClipboardList,
   CalendarCheck, BarChart3, BookOpen,
-  Banknote
+  Banknote, Fingerprint, UserCheck, CalendarClock
 } from 'lucide-react';  // <-- Import directly from lucide-react
 import { cn } from "../utils/cn";
 import { supabase } from "../lib/supabase";
@@ -23,6 +23,9 @@ export type NavKey =
   | "employees"
   | "recruitment"
   | "attendance"
+  | "hikcentral-import"
+  | "hikcentral-mapping"
+  | "roster"
   | "payroll"
   | "payslips"
   | "payments"
@@ -43,6 +46,9 @@ const allNavItems: { id: NavKey; label: string; icon: any }[] = [
   { id: "salary-advances", label: "Salary Advances", icon: Banknote },
   { id: "recruitment", label: "Recruitment", icon: ClipboardList },
   { id: "attendance", label: "Attendance", icon: CalendarCheck },
+  { id: "hikcentral-import", label: "HikCentral Import", icon: Fingerprint },
+  { id: "hikcentral-mapping", label: "Person Mapping", icon: UserCheck },
+  { id: "roster", label: "Roster Management", icon: CalendarClock },
   { id: "payroll", label: "Payroll", icon: Wallet },
   { id: "payslips", label: "Payslips", icon: FileText },
   { id: "payments", label: "Payments", icon: DollarSign },
@@ -59,6 +65,9 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "employees",
     "recruitment",
     "attendance",
+    "hikcentral-import",
+    "hikcentral-mapping",
+    "roster",
     "payroll",
     "payslips",
     "payments",
@@ -76,6 +85,8 @@ const roleMenuItems: Record<number, NavKey[]> = {
     "employees",
     "recruitment",
     "attendance",
+    "hikcentral-import",
+    "hikcentral-mapping",
     "payments",
     "terminal-dues",
     "salary-advances",
@@ -118,7 +129,19 @@ export const NAV_PERMISSIONS: Partial<Record<NavKey, PermissionKey[]>> = {
   dashboard: [PERMISSIONS.DASHBOARD_VIEW],
   employees: [PERMISSIONS.EMPLOYEES_VIEW],
   recruitment: [PERMISSIONS.RECRUITMENT_VIEW],
-  attendance: [PERMISSIONS.ATTENDANCE_VIEW],
+  // Attendance Interface Consolidation: the former standalone "Attendance
+  // Preview" and "Attendance Calculation Preview" nav items (each
+  // reachable on attendance.map_hikcentral_persons alone) are now tabs
+  // INSIDE this same page (see Attendance.tsx's AttendancePage wrapper,
+  // which gates its own "Attendance Review" tab on that exact
+  // permission). Reachable on EITHER permission -- same "any one"
+  // pattern as `reports` below -- so a functional-role account holding
+  // only attendance.map_hikcentral_persons (and not attendance.view)
+  // does not lose sidebar access to the Review tab it already had via
+  // its own nav entry before this consolidation.
+  attendance: [PERMISSIONS.ATTENDANCE_VIEW, PERMISSIONS.ATTENDANCE_MAP_HIKCENTRAL_PERSONS],
+  "hikcentral-import": [PERMISSIONS.ATTENDANCE_IMPORT_HIKCENTRAL],
+  "hikcentral-mapping": [PERMISSIONS.ATTENDANCE_MAP_HIKCENTRAL_PERSONS],
   payroll: [PERMISSIONS.PAYROLL_VIEW],
   payslips: [PERMISSIONS.PAYSLIPS_VIEW],
   payments: [PERMISSIONS.PAYMENTS_VIEW],
