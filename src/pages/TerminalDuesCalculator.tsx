@@ -1,8 +1,11 @@
-// Terminal Dues Modernization -- Phase 1: the new Calculator and Settled
-// tabs for the Terminal Dues page. Deliberately isolated from the existing
-// pending/approved/paid `terminal_dues` workflow (see the migration's
-// header for why) -- everything here reads/writes only
-// `historical_employees` and `terminal_due_calculations`.
+// Terminal Dues Modernization -- Phase 1/1.5: the new Calculator and
+// Submitted tabs for the Terminal Dues page. The draft workbench
+// (`historical_employees`, `terminal_due_calculations`) is isolated from
+// the existing pending/approved/paid `terminal_dues` workflow, but a
+// submitted calculation is promoted into it via submit_terminal_due_calculation()
+// -- see that function's migration comment for why. This file never
+// marks a case financially settled itself; the Submitted tab always
+// shows the linked terminal_dues row's own live status.
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Plus, Search, Save, CheckCircle, RotateCcw, ChevronDown, ChevronUp, Trash2, AlertTriangle, X } from '../utils/icons';
 import { Card, Button, Badge, EmptyState, Modal } from '../components/ui';
@@ -56,14 +59,20 @@ interface CalculationRow {
   subject_name: string;
   subject_number: string | null;
   position: string | null;
-  status: 'draft' | 'settled';
+  // 'submitted' means HR has locked this calculation and promoted it into
+  // the existing terminal_dues approval workflow (see
+  // submitted_terminal_due_id) -- it is NOT financial settlement. Whether
+  // it has actually been paid is tracked exclusively by that linked row's
+  // own status, fetched separately for display (see SubmittedRow below).
+  status: 'draft' | 'submitted';
   calculation_version: number;
   inputs: CalculationInputsSnapshot;
   breakdown: TerminalDuesBreakdown;
   total_payable: number;
   revision_history: unknown[];
-  settled_by: string | null;
-  settled_at: string | null;
+  submitted_terminal_due_id: string | null;
+  submitted_by: string | null;
+  submitted_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -377,13 +386,18 @@ export function TerminalDuesCalculatorTab({
     }
   };
 
-  const settleDraft = async (id: string) => {
-    const { error } = await supabase.rpc('settle_terminal_due_calculation', { p_id: id });
+  // Submits the draft for Admin approval -- this promotes it into the
+  // existing, hardened terminal_dues pending/approved/paid workflow
+  // (see submit_terminal_due_calculation()'s migration comment). It is
+  // NOT financial settlement: HR has no action anywhere that marks a
+  // case paid.
+  const submitDraft = async (id: string) => {
+    const { error } = await supabase.rpc('submit_terminal_due_calculation', { p_id: id });
     if (error) {
-      showNotification('Error settling calculation: ' + getErrorMessage(error), 'error');
+      showNotification('Error submitting calculation: ' + getErrorMessage(error), 'error');
       return;
     }
-    showNotification('Calculation marked settled', 'success');
+    showNotification('Calculation submitted for Admin approval', 'success');
     await fetchDrafts();
   };
 
@@ -648,7 +662,7 @@ export function TerminalDuesCalculatorTab({
         {loading ? (
           <p className="text-sm text-slate-400">Loading...</p>
         ) : drafts.length === 0 ? (
-          <EmptyState title="No draft calculations" description="New calculations appear here before being settled." />
+          <EmptyState title="No draft calculations" description="New calculations appear here before being submitted for Admin approval." />
         ) : (
           <div className="space-y-2">
             {drafts.map(row => (
@@ -664,8 +678,8 @@ export function TerminalDuesCalculatorTab({
                   {canEdit && (
                     <div className="flex gap-1">
                       <Button variant="outline" size="sm" onClick={() => loadDraftForEditing(row)}>Edit</Button>
-                      <Button variant="secondary" size="sm" onClick={() => settleDraft(row.id)}>
-                        <CheckCircle size={14} className="mr-1" /> Settle
+                      <Button variant="secondary" size="sm" onClick={() => submitDraft(row.id)}>
+                        <CheckCircle size={14} className="mr-1" /> Submit for Approval
                       </Button>
                     </div>
                   )}
@@ -698,32 +712,46 @@ export function TerminalDuesCalculatorTab({
 }
 
 // ---------------------------------------------------------------------------
-// Settled tab (foundation only -- no payroll/payment meaning yet)
+// Submitted tab -- calculations promoted into the existing terminal_dues
+// approval workflow. Shows that linked row's OWN live status
+// (pending/approved/paid), never a self-reported "Settled" label, so this
+// view can never show an unpaid case as though it were financially done.
 // ---------------------------------------------------------------------------
 
-export function TerminalDuesSettledTab({ canEdit }: { canEdit: boolean }) {
-  const [settled, setSettled] = useState<CalculationRow[]>([]);
+interface SubmittedRow extends CalculationRow {
+  terminal_dues: { status: 'pending' | 'approved' | 'paid' } | null;
+}
+
+function linkedStatusBadgeColor(status: string | undefined): 'gray' | 'yellow' | 'green' | 'blue' {
+  if (status === 'paid') return 'green';
+  if (status === 'approved') return 'blue';
+  if (status === 'pending') return 'yellow';
+  return 'gray';
+}
+
+export function TerminalDuesSubmittedTab({ canEdit }: { canEdit: boolean }) {
+  const [submitted, setSubmitted] = useState<SubmittedRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const fetchSettled = useCallback(async () => {
+  const fetchSubmitted = useCallback(async () => {
     setLoading(true);
     const { data, error } = await supabase
       .from('terminal_due_calculations')
-      .select('*')
-      .eq('status', 'settled')
-      .order('settled_at', { ascending: false });
+      .select('*, terminal_dues:submitted_terminal_due_id(status)')
+      .eq('status', 'submitted')
+      .order('submitted_at', { ascending: false });
     if (error) {
-      console.error('Error fetching settled calculations:', error);
+      console.error('Error fetching submitted calculations:', error);
     } else {
-      setSettled((data as CalculationRow[]) || []);
+      setSubmitted((data as SubmittedRow[]) || []);
     }
     setLoading(false);
   }, []);
 
   useEffect(() => {
-    fetchSettled();
-  }, [fetchSettled]);
+    fetchSubmitted();
+  }, [fetchSubmitted]);
 
   const reopen = async (id: string) => {
     const { error } = await supabase.rpc('reopen_terminal_due_calculation', { p_id: id });
@@ -732,32 +760,35 @@ export function TerminalDuesSettledTab({ canEdit }: { canEdit: boolean }) {
       return;
     }
     showNotification('Calculation reopened as a draft', 'success');
-    await fetchSettled();
+    await fetchSubmitted();
   };
 
   if (loading) return <p className="text-sm text-slate-400">Loading...</p>;
 
-  if (settled.length === 0) {
+  if (submitted.length === 0) {
     return (
       <EmptyState
-        title="No settled calculations yet"
-        description="A draft calculation marked Settled from the Calculator tab appears here. This is a Phase 1 foundation only -- it is not an approval or a payment record."
+        title="No submitted calculations yet"
+        description="A draft calculation submitted for Admin approval from the Calculator tab appears here, showing its real status in the existing Terminal Dues approval workflow -- this is never a payment record itself."
       />
     );
   }
 
   return (
     <div className="space-y-2">
-      {settled.map(row => (
+      {submitted.map(row => (
         <Card key={row.id} className="p-0">
           <div className="flex items-center justify-between p-3">
             <button onClick={() => setExpandedId(expandedId === row.id ? null : row.id)} className="flex items-center gap-2 text-left flex-1">
               {expandedId === row.id ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
               <span className="font-medium text-sm">{row.subject_name}</span>
               {row.subject_number && <span className="text-xs text-slate-400">({row.subject_number})</span>}
+              <Badge color={linkedStatusBadgeColor(row.terminal_dues?.status)}>
+                {row.terminal_dues?.status ? `Records: ${row.terminal_dues.status}` : 'Status unavailable'}
+              </Badge>
             </button>
             <span className="font-semibold text-sm text-[#081C3A] mr-3">{formatKwacha(row.total_payable)}</span>
-            {canEdit && (
+            {canEdit && row.terminal_dues?.status === 'pending' && (
               <Button variant="outline" size="sm" onClick={() => reopen(row.id)}>
                 <RotateCcw size={14} className="mr-1" /> Reopen
               </Button>

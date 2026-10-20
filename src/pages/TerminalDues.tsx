@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, EmptyState } from '../components/ui';
-import { TerminalDuesCalculatorTab, TerminalDuesSettledTab } from './TerminalDuesCalculator';
+import { TerminalDuesCalculatorTab, TerminalDuesSubmittedTab } from './TerminalDuesCalculator';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
@@ -169,10 +169,13 @@ export function TerminalDuesPage() {
   const [canApproveTerminalDue, setCanApproveTerminalDue] = useState(false);
   const [canPayTerminalDue, setCanPayTerminalDue] = useState(false);
 
-  // Terminal Dues Modernization -- Phase 1: Calculator/Settled/Leave tabs,
-  // fully additive alongside the existing Records view below (which is
-  // preserved unchanged as the default tab).
-  const [activeTab, setActiveTab] = useState<'records' | 'calculator' | 'settled' | 'leave'>('records');
+  // Terminal Dues Modernization -- Phase 1/1.5: Calculator/Submitted/Leave
+  // tabs, fully additive alongside the existing Records view below (which
+  // is preserved unchanged as the default tab). "Submitted" shows
+  // calculations promoted into the existing approval workflow via their
+  // linked terminal_dues row's own live status -- never a self-reported
+  // "Settled" state.
+  const [activeTab, setActiveTab] = useState<'records' | 'calculator' | 'submitted' | 'leave'>('records');
   
   // ===== PAGINATION STATES =====
   const [duesPage, setDuesPage] = useState(1);
@@ -758,7 +761,7 @@ export function TerminalDuesPage() {
         tabs={[
           { id: 'records', label: 'Records', icon: Wallet },
           { id: 'calculator', label: 'Calculator', icon: Calculator },
-          { id: 'settled', label: 'Settled', icon: CheckCircle },
+          { id: 'submitted', label: 'Submitted', icon: CheckCircle },
           { id: 'leave', label: 'Leave', icon: ClipboardList },
         ]}
         active={activeTab}
@@ -782,7 +785,7 @@ export function TerminalDuesPage() {
         />
       )}
 
-      {activeTab === 'settled' && <TerminalDuesSettledTab canEdit={canEditTerminalDue} />}
+      {activeTab === 'submitted' && <TerminalDuesSubmittedTab canEdit={canEditTerminalDue} />}
 
       {activeTab === 'leave' && (
         <EmptyState
