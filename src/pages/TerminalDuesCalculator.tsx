@@ -77,7 +77,7 @@ interface CalculationRow {
   updated_at: string;
 }
 
-interface CalculationInputsSnapshot {
+export interface CalculationInputsSnapshot {
   dateJoined: string;
   dateLeft: string;
   finalSalary: number;
@@ -809,7 +809,7 @@ export function TerminalDuesSubmittedTab({ canEdit }: { canEdit: boolean }) {
 // Shared breakdown preview
 // ---------------------------------------------------------------------------
 
-function BreakdownPreview({ breakdown }: { breakdown: TerminalDuesBreakdown }) {
+export function BreakdownPreview({ breakdown }: { breakdown: TerminalDuesBreakdown }) {
   return (
     <div className="space-y-2 text-sm">
       <Row label={`Pension Arrears (${breakdown.effectiveMonths} months x 10%)`} value={breakdown.pensionArrears} />

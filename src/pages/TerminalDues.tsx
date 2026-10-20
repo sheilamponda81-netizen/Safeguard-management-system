@@ -3,6 +3,7 @@ import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, C
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, EmptyState } from '../components/ui';
 import { TerminalDuesCalculatorTab, TerminalDuesSubmittedTab } from './TerminalDuesCalculator';
 import { TerminalDuesAllocationsTab } from './TerminalDuesAllocations';
+import { EntitlementRevisionPanel } from './TerminalDuesRevision';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
@@ -1399,6 +1400,21 @@ export function TerminalDuesPage() {
                   </>
                 )}
               </div>
+            )}
+
+            {showDetailModal.status === 'approved' && (canCreateTerminalDue || canEditTerminalDue || canApproveTerminalDue) && (
+              <EntitlementRevisionPanel
+                terminalDue={{
+                  id: showDetailModal.id,
+                  status: showDetailModal.status,
+                  total_payable: showDetailModal.total_payable,
+                  date_joined: showDetailModal.date_joined,
+                  date_left: showDetailModal.date_left,
+                  basic_salary: showDetailModal.basic_salary,
+                }}
+                canPropose={canCreateTerminalDue || canEditTerminalDue}
+                canApprove={canApproveTerminalDue}
+              />
             )}
 
             <div className="flex justify-end gap-2 pt-4 border-t">
