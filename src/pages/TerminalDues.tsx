@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown } from '../utils/icons';
-import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
+import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList } from '../utils/icons';
+import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, EmptyState } from '../components/ui';
+import { TerminalDuesCalculatorTab, TerminalDuesSettledTab } from './TerminalDuesCalculator';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
@@ -167,6 +168,11 @@ export function TerminalDuesPage() {
   const [canEditTerminalDue, setCanEditTerminalDue] = useState(false);
   const [canApproveTerminalDue, setCanApproveTerminalDue] = useState(false);
   const [canPayTerminalDue, setCanPayTerminalDue] = useState(false);
+
+  // Terminal Dues Modernization -- Phase 1: Calculator/Settled/Leave tabs,
+  // fully additive alongside the existing Records view below (which is
+  // preserved unchanged as the default tab).
+  const [activeTab, setActiveTab] = useState<'records' | 'calculator' | 'settled' | 'leave'>('records');
   
   // ===== PAGINATION STATES =====
   const [duesPage, setDuesPage] = useState(1);
@@ -748,6 +754,46 @@ export function TerminalDuesPage() {
         }
       />
 
+      <Tabs
+        tabs={[
+          { id: 'records', label: 'Records', icon: Wallet },
+          { id: 'calculator', label: 'Calculator', icon: Calculator },
+          { id: 'settled', label: 'Settled', icon: CheckCircle },
+          { id: 'leave', label: 'Leave', icon: ClipboardList },
+        ]}
+        active={activeTab}
+        onChange={id => setActiveTab(id as typeof activeTab)}
+      />
+
+      {activeTab === 'calculator' && (
+        <TerminalDuesCalculatorTab
+          employees={employees.map(e => ({
+            id: e.id,
+            employeeNumber: e.employeeNumber,
+            fullName: e.fullName,
+            position: e.position,
+            basicSalary: e.basicSalary,
+            hire_date: e.hire_date,
+            region_id: e.region_id,
+            uniform_deduction: e.uniform_deduction,
+          }))}
+          canCreate={canCreateTerminalDue}
+          canEdit={canEditTerminalDue}
+        />
+      )}
+
+      {activeTab === 'settled' && <TerminalDuesSettledTab canEdit={canEditTerminalDue} />}
+
+      {activeTab === 'leave' && (
+        <EmptyState
+          icon={ClipboardList}
+          title="Leave -- coming in a future phase"
+          description="This tab is a placeholder reserved for upcoming leave-management functionality. No leave functionality exists here yet."
+        />
+      )}
+
+      {activeTab === 'records' && (
+      <>
       {!isSuperAdmin && userRegion && (
         <Card className="p-3 bg-gradient-to-r from-[#081C3A]/5 to-transparent border-[#081C3A]/20">
           <p className="text-sm text-slate-600">
@@ -1510,6 +1556,8 @@ export function TerminalDuesPage() {
           </div>
         )}
       </Modal>
+      </>
+      )}
     </div>
   );
 }
