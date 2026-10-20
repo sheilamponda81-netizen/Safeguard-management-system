@@ -56,7 +56,11 @@ interface EmployeeRow {
 
 interface TerminalDue {
   id: string;
-  employee_id: string;
+  // Nullable since Phase 1.6: exactly one of employee_id/historical_employee_id
+  // is set (enforced by a DB CHECK) -- a historical former employee has no
+  // `employees` row and is referenced via historical_employee_id instead.
+  employee_id: string | null;
+  historical_employee_id: string | null;
   employee_name: string;
   employee_number: string;
   position: string;
@@ -304,11 +308,29 @@ export function TerminalDuesPage() {
           .eq('region_id', userProfile.region_id)
           .eq('is_deleted', false);
         const employeeIds = regionEmployees?.map(e => e.id) || [];
-        // A region with zero active employees must return zero terminal-dues
-        // records for a non-super-admin -- never fall through to an
-        // unfiltered, cross-region query.
+
+        // Historical-employee-linked rows are tenant-wide, not region-scoped
+        // (same policy as historical_employees/terminal_due_calculations
+        // themselves) -- fetched separately because `.in('employee_id', ids)`
+        // below would otherwise silently exclude every one of them: a NULL
+        // employee_id never matches an `IN` list, so a regional,
+        // non-super-admin user would see zero historical entitlements with
+        // no error at all. Tenant isolation for this query is already
+        // enforced by terminal_dues' own (unchanged) SELECT RLS policy.
+        const { data: historicalRows, error: historicalError } = await supabase
+          .from('terminal_dues')
+          .select('*')
+          .not('historical_employee_id', 'is', null);
+        if (historicalError) throw historicalError;
+
+        // A region with zero active employees must still show any
+        // historical-employee entitlements (they are not region-scoped) --
+        // never fall through to an unfiltered, cross-region query for the
+        // existing-employee side, but don't drop historical rows either.
         if (employeeIds.length === 0) {
-          setCalculations([]);
+          const deduped = dedupeById(historicalRows || []);
+          deduped.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+          setCalculations(deduped);
           setLoading(false);
           return;
         }
@@ -325,7 +347,7 @@ export function TerminalDuesPage() {
               .in('employee_id', batch)
               .range(from, to)
         );
-        const deduped = dedupeById(rows);
+        const deduped = dedupeById([...rows, ...(historicalRows || [])]);
         deduped.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
         setCalculations(deduped);
         return;
@@ -431,6 +453,7 @@ export function TerminalDuesPage() {
     const calculation: TerminalDue = {
       id: '',
       employee_id: selectedEmployee.id,
+      historical_employee_id: null,
       employee_name: selectedEmployee.fullName || 'Unknown',
       employee_number: selectedEmployee.employeeNumber || 'N/A',
       position: selectedEmployee.position || 'N/A',
@@ -909,7 +932,10 @@ export function TerminalDuesPage() {
                   <TR key={calc.id} className="hover:bg-slate-50">
                     <TD>
                       <div>
-                        <p className="font-medium text-slate-800">{calc.employee_name}</p>
+                        <p className="font-medium text-slate-800 flex items-center gap-1.5">
+                          {calc.employee_name}
+                          {calc.historical_employee_id && <Badge color="gray">Historical</Badge>}
+                        </p>
                         <p className="text-xs text-slate-500">{calc.employee_number}</p>
                       </div>
                     </TD>
@@ -1263,7 +1289,13 @@ export function TerminalDuesPage() {
         {showDetailModal && (
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3 text-sm">
-              <div><p className="text-slate-500">Employee</p><p className="font-semibold">{showDetailModal.employee_name}</p></div>
+              <div>
+                <p className="text-slate-500">Employee</p>
+                <p className="font-semibold flex items-center gap-1.5">
+                  {showDetailModal.employee_name}
+                  {showDetailModal.historical_employee_id && <Badge color="gray">Historical</Badge>}
+                </p>
+              </div>
               <div><p className="text-slate-500">Employee #</p><p className="font-semibold">{showDetailModal.employee_number}</p></div>
               <div><p className="text-slate-500">Position</p><p className="font-semibold">{showDetailModal.position}</p></div>
               <div><p className="text-slate-500">Status</p><Badge color={getStatusColor(showDetailModal.status)}>{showDetailModal.status.toUpperCase()}</Badge></div>
