@@ -15,6 +15,27 @@ import { PayrollRecordInput, TerminalDuesBatchSummary } from './payrollProcessin
 
 export type PayrollProcessingRequestStatus = 'pending' | 'approved' | 'rejected' | 'processed';
 
+// The authoritative, server-computed snapshot captured once at submission
+// by compute_payroll_request_snapshot() (see
+// supabase/migrations/20261030000000_payroll_request_financial_snapshot.sql)
+// and re-compared against a live recomputation at both approval and
+// processing time. `null` means the request predates snapshot tracking
+// (submitted before this migration) and must be rejected/resubmitted
+// before it can be approved or processed.
+export interface PayrollRequestFinancialSnapshot {
+  employee_ids: string[];
+  employee_count: number;
+  ordinary_gross_total: number;
+  ordinary_deductions_total: number;
+  ordinary_net_total: number;
+  eligible_td_allocation_ids: string[];
+  eligible_td_count: number;
+  eligible_td_total: number;
+  td_excluded_ids: string[];
+  inactive_employee_ids: string[];
+  captured_at: string;
+}
+
 export interface PayrollProcessingRequest {
   id: string;
   tenant_id: string;
@@ -27,6 +48,9 @@ export interface PayrollProcessingRequest {
   rejection_reason: string | null;
   processing_reference: string | null;
   created_at: string;
+  financial_snapshot: PayrollRequestFinancialSnapshot | null;
+  td_excluded_ids: string[];
+  td_exclusion_reason: string | null;
 }
 
 // Every outcome these RPCs can produce -- named explicitly, same pattern
@@ -41,6 +65,7 @@ export type PayrollProcessingRequestOutcome =
   | 'wrong_status'             // the request is no longer in the state this action requires (already decided/processed)
   | 'self_approval'            // caller is the same person who initiated the request
   | 'terminal_dues_validation_failed' // an included Terminal Dues allocation failed re-validation during actual processing
+  | 'snapshot_mismatch'        // the request's financial snapshot is missing (pre-dates snapshot tracking) or no longer matches a live recomputation -- reject and resubmit
   | 'missing_rpc'
   | 'network_error'
   | 'unexpected_response';
@@ -59,6 +84,8 @@ export interface PayrollProcessingRequestResult {
   ordinaryPayrollTotal?: number;
   terminalDuesTotal?: number;
   combinedTotal?: number;
+  /** The snapshot captured (submit) or compared (approve/reject/process) by this call. */
+  financialSnapshot?: PayrollRequestFinancialSnapshot;
 }
 
 const RPC_NOT_FOUND_CODE = 'PGRST202';
@@ -92,6 +119,14 @@ function classifyOutcome(message: string): PayrollProcessingRequestOutcome {
   ) {
     return 'terminal_dues_validation_failed';
   }
+  if (
+    message.includes('submitted before financial snapshots were tracked') ||
+    message.includes('approved before financial snapshots were tracked') ||
+    message.includes('no longer active -- reject this request') ||
+    message.includes('Terminal Dues allocations for this month have changed')
+  ) {
+    return 'snapshot_mismatch';
+  }
   return 'validation_failed';
 }
 
@@ -111,6 +146,20 @@ interface PayrollRequestRpcSuccess {
   ordinary_payroll_total?: number;
   terminal_dues_total?: number;
   combined_total?: number;
+  // Spread in flat (not nested) by submit/approve/reject/process via
+  // `|| v_snapshot` / `|| v_request.financial_snapshot` -- see
+  // compute_payroll_request_snapshot()'s own RETURN shape.
+  employee_ids?: string[];
+  employee_count?: number;
+  ordinary_gross_total?: number;
+  ordinary_deductions_total?: number;
+  ordinary_net_total?: number;
+  eligible_td_allocation_ids?: string[];
+  eligible_td_count?: number;
+  eligible_td_total?: number;
+  td_excluded_ids?: string[];
+  inactive_employee_ids?: string[];
+  captured_at?: string;
 }
 
 function isPayrollRequestRpcSuccess(data: unknown): data is PayrollRequestRpcSuccess {
@@ -158,6 +207,22 @@ async function callRequestRpc(
       ordinaryPayrollTotal: data.ordinary_payroll_total,
       terminalDuesTotal: data.terminal_dues_total,
       combinedTotal: data.combined_total,
+      financialSnapshot:
+        data.captured_at !== undefined
+          ? {
+              employee_ids: data.employee_ids ?? [],
+              employee_count: data.employee_count ?? 0,
+              ordinary_gross_total: data.ordinary_gross_total ?? 0,
+              ordinary_deductions_total: data.ordinary_deductions_total ?? 0,
+              ordinary_net_total: data.ordinary_net_total ?? 0,
+              eligible_td_allocation_ids: data.eligible_td_allocation_ids ?? [],
+              eligible_td_count: data.eligible_td_count ?? 0,
+              eligible_td_total: data.eligible_td_total ?? 0,
+              td_excluded_ids: data.td_excluded_ids ?? [],
+              inactive_employee_ids: data.inactive_employee_ids ?? [],
+              captured_at: data.captured_at,
+            }
+          : undefined,
     };
   } catch (err) {
     return { success: false, outcome: 'network_error', error: err instanceof Error ? err.message : 'Unknown error' };

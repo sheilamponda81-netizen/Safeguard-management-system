@@ -221,6 +221,9 @@ export function PayrollPage() {
   const [requestActionBusy, setRequestActionBusy] = useState(false);
   const [rejectRequestTarget, setRejectRequestTarget] = useState<PayrollProcessingRequest | null>(null);
   const [rejectRequestReason, setRejectRequestReason] = useState('');
+  // initiated_by -> full_name, so the Admin review card can show who
+  // submitted a request rather than a bare profile id.
+  const [requestSubmitterNames, setRequestSubmitterNames] = useState<Record<string, string>>({});
 
   // ===== PAGINATION STATES =====
   const [payrollPage, setPayrollPage] = useState(1);
@@ -382,7 +385,26 @@ export function PayrollPage() {
       console.error('Error fetching payroll processing requests:', error);
       return;
     }
-    setLiveRequestsForMonth((data as PayrollProcessingRequest[]) || []);
+    const requests = (data as PayrollProcessingRequest[]) || [];
+    setLiveRequestsForMonth(requests);
+
+    const submitterIds = [...new Set(requests.map(r => r.initiated_by))].filter(
+      id => id && !(id in requestSubmitterNames)
+    );
+    if (submitterIds.length > 0) {
+      const { data: submitterProfiles } = await supabase
+        .from('profiles')
+        .select('id, full_name')
+        .in('id', submitterIds);
+      if (submitterProfiles) {
+        setRequestSubmitterNames(prev => {
+          const next = { ...prev };
+          for (const p of submitterProfiles) next[p.id] = p.full_name;
+          return next;
+        });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedMonth]);
 
   useEffect(() => { fetchPayrollRequests(); }, [fetchPayrollRequests]);
@@ -751,13 +773,16 @@ export function PayrollPage() {
     }
   }, [selectedMonth, systemMonth, userProfile]);
 
-  const approveAndProcessRequest = useCallback(async (requestId: string) => {
+  const approveAndProcessRequest = useCallback(async (requestId: string, alreadyApproved: boolean = false) => {
     setRequestActionBusy(true);
     try {
-      const approveResult = await approvePayrollProcessingRequest(requestId);
-      if (!approveResult.success) {
-        showNotification('Failed to approve payroll request: ' + approveResult.error, 'error');
-        return;
+      if (!alreadyApproved) {
+        const approveResult = await approvePayrollProcessingRequest(requestId);
+        if (!approveResult.success) {
+          showNotification('Failed to approve payroll request: ' + approveResult.error, 'error');
+          await fetchPayrollRequests();
+          return;
+        }
       }
       const processResult = await processApprovedPayrollRequest(requestId);
       if (!processResult.success) {
@@ -1904,40 +1929,81 @@ export function PayrollPage() {
       {(pendingRequest || approvedRequest || (!isAdminClass && myOwnLatestRequest)) && (
         <Card className="p-4 border-l-4 border-l-[#D4A017]">
           <h3 className="text-sm font-semibold text-slate-700 mb-3">Payroll Processing Request -- {getMonthLabel(selectedMonth)}</h3>
-          {[pendingRequest, approvedRequest].filter((r): r is PayrollProcessingRequest => r !== null).map(request => (
-            <div key={request.id} className="flex flex-wrap items-center justify-between gap-3 border border-slate-200 rounded-lg p-3 mb-2 last:mb-0">
-              <div>
-                <p className="text-sm">
-                  <Badge color={request.status === 'approved' ? 'blue' : 'yellow'} className="mr-2">
-                    {request.status === 'approved' ? 'Approved -- awaiting processing' : 'Pending Admin review'}
-                  </Badge>
-                  Submitted {new Date(request.initiated_at).toLocaleString()}
-                </p>
-                {request.status === 'approved' && request.reviewed_by && (
-                  <p className="text-xs text-slate-500 mt-1">Approved by an Admin -- click Process to commit this payroll run.</p>
-                )}
-              </div>
-              {isAdminClass && (
-                <div className="flex gap-2">
-                  {request.status === 'pending' && (
-                    <>
-                      <Button variant="secondary" size="sm" disabled={requestActionBusy} onClick={() => approveAndProcessRequest(request.id)}>
-                        <Check size={14} className="mr-1" /> Approve & Process
-                      </Button>
-                      <Button variant="outline" size="sm" disabled={requestActionBusy} onClick={() => setRejectRequestTarget(request)}>
-                        <XCircle size={14} className="mr-1" /> Reject
-                      </Button>
-                    </>
-                  )}
-                  {request.status === 'approved' && (
-                    <Button variant="secondary" size="sm" disabled={requestActionBusy} onClick={() => approveAndProcessRequest(request.id)}>
-                      <Check size={14} className="mr-1" /> Process
-                    </Button>
+          {[pendingRequest, approvedRequest].filter((r): r is PayrollProcessingRequest => r !== null).map(request => {
+            const snapshot = request.financial_snapshot;
+            const submitterName = requestSubmitterNames[request.initiated_by] || `${request.initiated_by.slice(0, 8)}...`;
+            const combinedTotal = snapshot ? snapshot.ordinary_net_total + snapshot.eligible_td_total : null;
+            return (
+              <div key={request.id} className="border border-slate-200 rounded-lg p-3 mb-2 last:mb-0">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm">
+                      <Badge color={request.status === 'approved' ? 'blue' : 'yellow'} className="mr-2">
+                        {request.status === 'approved' ? 'Approved -- awaiting processing' : 'Pending Admin review'}
+                      </Badge>
+                      Submitted by {submitterName} at {new Date(request.initiated_at).toLocaleString()}
+                    </p>
+                    {request.status === 'approved' && request.reviewed_by && (
+                      <p className="text-xs text-slate-500 mt-1">Approved by an Admin -- click Process to commit this payroll run.</p>
+                    )}
+                  </div>
+                  {isAdminClass && (
+                    <div className="flex gap-2">
+                      {request.status === 'pending' && (
+                        <>
+                          <Button variant="secondary" size="sm" disabled={requestActionBusy} onClick={() => approveAndProcessRequest(request.id)}>
+                            <Check size={14} className="mr-1" /> Approve & Process
+                          </Button>
+                          <Button variant="outline" size="sm" disabled={requestActionBusy} onClick={() => setRejectRequestTarget(request)}>
+                            <XCircle size={14} className="mr-1" /> Reject
+                          </Button>
+                        </>
+                      )}
+                      {request.status === 'approved' && (
+                        <>
+                          <Button variant="secondary" size="sm" disabled={requestActionBusy} onClick={() => approveAndProcessRequest(request.id, true)}>
+                            <Check size={14} className="mr-1" /> Process
+                          </Button>
+                          <Button variant="outline" size="sm" disabled={requestActionBusy} onClick={() => setRejectRequestTarget(request)}>
+                            <XCircle size={14} className="mr-1" /> Reject
+                          </Button>
+                        </>
+                      )}
+                    </div>
                   )}
                 </div>
-              )}
-            </div>
-          ))}
+                {snapshot ? (
+                  <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1.5 text-xs border-t border-slate-100 pt-3">
+                    <div><span className="text-slate-500">Payroll month:</span> <span className="font-medium">{getMonthLabel(request.month)}</span></div>
+                    <div><span className="text-slate-500">Employees (ordinary payroll):</span> <span className="font-medium">{snapshot.employee_count}</span></div>
+                    <div><span className="text-slate-500">Ordinary gross:</span> <span className="font-medium">{formatKwacha(snapshot.ordinary_gross_total)}</span></div>
+                    <div><span className="text-slate-500">Ordinary deductions:</span> <span className="font-medium">{formatKwacha(snapshot.ordinary_deductions_total)}</span></div>
+                    <div><span className="text-slate-500">Ordinary net:</span> <span className="font-medium">{formatKwacha(snapshot.ordinary_net_total)}</span></div>
+                    <div><span className="text-slate-500">Terminal Dues allocations:</span> <span className="font-medium">{snapshot.eligible_td_count}</span></div>
+                    <div><span className="text-slate-500">Terminal Dues subtotal:</span> <span className="font-medium">{formatKwacha(snapshot.eligible_td_total)}</span></div>
+                    <div className="col-span-2 sm:col-span-1"><span className="text-slate-500">Combined total:</span> <span className="font-semibold text-slate-800">{formatKwacha(combinedTotal ?? 0)}</span></div>
+                    {(request.td_excluded_ids.length > 0 || snapshot.inactive_employee_ids.length > 0) && (
+                      <div className="col-span-2 sm:col-span-3 text-amber-700">
+                        {request.td_excluded_ids.length > 0 && (
+                          <span className="mr-3">
+                            {request.td_excluded_ids.length} Terminal Dues allocation(s) explicitly excluded
+                            {request.td_exclusion_reason ? ` -- ${request.td_exclusion_reason}` : ''}.
+                          </span>
+                        )}
+                        {snapshot.inactive_employee_ids.length > 0 && (
+                          <span>{snapshot.inactive_employee_ids.length} employee(s) in this request are no longer active -- this request needs to be rejected and resubmitted.</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="mt-3 text-xs text-amber-700 border-t border-slate-100 pt-3">
+                    This request was submitted before financial-snapshot tracking was added -- its totals cannot be shown or verified reliably. Reject it and ask for a fresh submission before approving.
+                  </p>
+                )}
+              </div>
+            );
+          })}
           {!isAdminClass && myOwnLatestRequest && !pendingRequest && !approvedRequest && (
             <div className="border border-slate-200 rounded-lg p-3">
               <Badge color={myOwnLatestRequest.status === 'processed' ? 'green' : 'red'}>

@@ -85,6 +85,39 @@ describe('submitPayrollProcessingRequest', () => {
     expect(result.outcome).toBe('unauthorized');
   });
 
+  it('classifies the submission-time inactive-employee exception as validation_failed, not snapshot_mismatch -- nothing was approved yet to have drifted', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Refusing to submit: this request includes 2 employee(s) who are no longer active -- refresh the page and try again' } });
+    const result = await submitPayrollProcessingRequest('2026-11', [sampleRecord]);
+    expect(result.outcome).toBe('validation_failed');
+  });
+
+  it('reconstructs the financial snapshot from the flat fields the RPC spreads onto its response', async () => {
+    rpcMock.mockResolvedValueOnce({
+      data: {
+        success: true, request_id: 'req-1', status: 'pending', month: '2026-11',
+        employee_ids: ['emp-1'], employee_count: 1,
+        ordinary_gross_total: 100000, ordinary_deductions_total: 30000, ordinary_net_total: 70000,
+        eligible_td_allocation_ids: ['alloc-9'], eligible_td_count: 1, eligible_td_total: 50000,
+        td_excluded_ids: [], inactive_employee_ids: [], captured_at: '2026-11-01T00:00:00Z',
+      },
+      error: null,
+    });
+    const result = await submitPayrollProcessingRequest('2026-11', [sampleRecord]);
+    expect(result.financialSnapshot).toEqual({
+      employee_ids: ['emp-1'],
+      employee_count: 1,
+      ordinary_gross_total: 100000,
+      ordinary_deductions_total: 30000,
+      ordinary_net_total: 70000,
+      eligible_td_allocation_ids: ['alloc-9'],
+      eligible_td_count: 1,
+      eligible_td_total: 50000,
+      td_excluded_ids: [],
+      inactive_employee_ids: [],
+      captured_at: '2026-11-01T00:00:00Z',
+    });
+  });
+
   it('classifies a PGRST202 (function not found) error as missing_rpc', async () => {
     rpcMock.mockResolvedValueOnce({ data: null, error: { code: 'PGRST202', message: 'Could not find the function' } });
     const result = await submitPayrollProcessingRequest('2026-11', [sampleRecord]);
@@ -127,6 +160,24 @@ describe('approvePayrollProcessingRequest', () => {
     rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Payroll processing request not found' } });
     const result = await approvePayrollProcessingRequest('req-1');
     expect(result.outcome).toBe('not_found');
+  });
+
+  it('classifies a pre-snapshot-tracking request as snapshot_mismatch', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Refusing to approve: this request was submitted before financial snapshots were tracked -- reject it and ask for a fresh submission' } });
+    const result = await approvePayrollProcessingRequest('req-1');
+    expect(result.outcome).toBe('snapshot_mismatch');
+  });
+
+  it('classifies an employee-scope-changed-since-submission exception as snapshot_mismatch', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Refusing to approve: one or more employees in this request are no longer active -- reject this request and ask for a fresh submission' } });
+    const result = await approvePayrollProcessingRequest('req-1');
+    expect(result.outcome).toBe('snapshot_mismatch');
+  });
+
+  it('classifies a Terminal Dues allocation drift exception as snapshot_mismatch -- the core new feature', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Refusing to approve: the approved Terminal Dues allocations for this month have changed since this request was submitted (an allocation was approved, held, revised, or excluded) -- reject this request and ask for a fresh submission' } });
+    const result = await approvePayrollProcessingRequest('req-1');
+    expect(result.outcome).toBe('snapshot_mismatch');
   });
 });
 
@@ -202,5 +253,23 @@ describe('processApprovedPayrollRequest', () => {
     const result = await processApprovedPayrollRequest('req-1');
     expect(result.success).toBe(false);
     expect(result.outcome).toBe('unexpected_response');
+  });
+
+  it('classifies a pre-snapshot-tracking approved request as snapshot_mismatch', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Refusing to process: this request was approved before financial snapshots were tracked -- reject it and ask for a fresh submission' } });
+    const result = await processApprovedPayrollRequest('req-1');
+    expect(result.outcome).toBe('snapshot_mismatch');
+  });
+
+  it('classifies a Terminal Dues allocation drift discovered at processing time as snapshot_mismatch -- an Admin must never unknowingly commit a changed amount', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Refusing to process: the approved Terminal Dues allocations for this month have changed since this request was submitted (an allocation was approved, held, revised, or excluded) -- reject this request and ask for a fresh submission' } });
+    const result = await processApprovedPayrollRequest('req-1');
+    expect(result.outcome).toBe('snapshot_mismatch');
+  });
+
+  it('classifies an employee-scope drift discovered at processing time as snapshot_mismatch', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Refusing to process: one or more employees in this request are no longer active -- reject this request and ask for a fresh submission' } });
+    const result = await processApprovedPayrollRequest('req-1');
+    expect(result.outcome).toBe('snapshot_mismatch');
   });
 });
