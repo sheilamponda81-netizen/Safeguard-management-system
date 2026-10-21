@@ -24,7 +24,14 @@ import {
   canApprovePayroll as canApprovePayrollFor,
   isPendingApproval as computeIsPendingApproval,
 } from '../utils/payrollPermissions';
-import { canAccess, hasExplicitPermission, PERMISSIONS } from '../utils/permissions';
+import { canAccess, hasExplicitPermission, isBusinessAdmin, PERMISSIONS } from '../utils/permissions';
+import {
+  submitPayrollProcessingRequest,
+  approvePayrollProcessingRequest,
+  rejectPayrollProcessingRequest,
+  processApprovedPayrollRequest,
+  PayrollProcessingRequest,
+} from '../utils/payrollApprovalWorkflow';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { approvePayrollRun } from '../utils/payrollApproval';
 import { buildPayrollReportCsv } from '../utils/payrollExport';
@@ -197,6 +204,24 @@ export function PayrollPage() {
   const [excludedAllocationIds, setExcludedAllocationIds] = useState<Set<string>>(new Set());
   const [exclusionReason, setExclusionReason] = useState('');
 
+  // ===== ACCOUNTANT-INITIATED PAYROLL WITH ADMIN APPROVAL (Phase 3D) =====
+  // Both Admin and Accountant hold payroll.process (canProcessPayroll
+  // above is unchanged and still true for both) -- but only an Admin-
+  // class caller (super admin, legacy role_level=1, or functional
+  // role='admin') may commit payroll processing directly; everyone else
+  // authorized to click "Process Payroll" instead submits a request that
+  // an Admin must separately approve. Mirrors is_business_admin() exactly
+  // (see isBusinessAdmin's own doc comment) -- deliberately NOT
+  // canApprovePayroll (legacy role_level===1 only, misses a functional
+  // Admin) and NOT has_permission('payroll.approve') (an Accountant
+  // already holds THAT permission for the unrelated, existing post-
+  // commit "Review & Approve" feature -- using it here would let an
+  // Accountant approve their own processing request).
+  const [liveRequestsForMonth, setLiveRequestsForMonth] = useState<PayrollProcessingRequest[]>([]);
+  const [requestActionBusy, setRequestActionBusy] = useState(false);
+  const [rejectRequestTarget, setRejectRequestTarget] = useState<PayrollProcessingRequest | null>(null);
+  const [rejectRequestReason, setRejectRequestReason] = useState('');
+
   // ===== PAGINATION STATES =====
   const [payrollPage, setPayrollPage] = useState(1);
   const [payrollItemsPerPage, setPayrollItemsPerPage] = useState(20);
@@ -208,6 +233,12 @@ export function PayrollPage() {
   const isMonthProcessed = useMemo(() => processedMonths.includes(selectedMonth), [processedMonths, selectedMonth]);
 
   const isPendingApproval = useMemo(() => computeIsPendingApproval(payrollRecords), [payrollRecords]);
+
+  // Admin-class: may commit payroll processing directly. Anyone else who
+  // can click "Process Payroll" (e.g. an Accountant) instead submits a
+  // request for an Admin to approve -- see the state block above for why
+  // this specific check (not canApprovePayroll, not payroll.approve).
+  const isAdminClass = useMemo(() => userProfile?.is_super_admin === true || isBusinessAdmin(userProfile), [userProfile]);
 
   // ===== FILTER EMPLOYEES =====
   const filteredEmployees = useMemo(() => {
@@ -338,6 +369,36 @@ export function PayrollPage() {
       console.error('Error fetching processed months:', err);
     }
   }, [userProfile]);
+
+  // ===== PAYROLL PROCESSING REQUESTS (Phase 3D) =====
+  const fetchPayrollRequests = useCallback(async () => {
+    if (!selectedMonth) return;
+    const { data, error } = await supabase
+      .from('payroll_processing_requests')
+      .select('*')
+      .eq('month', selectedMonth)
+      .order('created_at', { ascending: false });
+    if (error) {
+      console.error('Error fetching payroll processing requests:', error);
+      return;
+    }
+    setLiveRequestsForMonth((data as PayrollProcessingRequest[]) || []);
+  }, [selectedMonth]);
+
+  useEffect(() => { fetchPayrollRequests(); }, [fetchPayrollRequests]);
+
+  const pendingRequest = useMemo(
+    () => liveRequestsForMonth.find(r => r.status === 'pending') || null,
+    [liveRequestsForMonth]
+  );
+  const approvedRequest = useMemo(
+    () => liveRequestsForMonth.find(r => r.status === 'approved') || null,
+    [liveRequestsForMonth]
+  );
+  const myOwnLatestRequest = useMemo(
+    () => liveRequestsForMonth.find(r => r.initiated_by === userProfile?.id) || null,
+    [liveRequestsForMonth, userProfile]
+  );
 
   // ===== FETCH DATA =====
   const fetchData = useCallback(async () => {
@@ -689,6 +750,61 @@ export function PayrollPage() {
       setLoading(false);
     }
   }, [selectedMonth, systemMonth, userProfile]);
+
+  const approveAndProcessRequest = useCallback(async (requestId: string) => {
+    setRequestActionBusy(true);
+    try {
+      const approveResult = await approvePayrollProcessingRequest(requestId);
+      if (!approveResult.success) {
+        showNotification('Failed to approve payroll request: ' + approveResult.error, 'error');
+        return;
+      }
+      const processResult = await processApprovedPayrollRequest(requestId);
+      if (!processResult.success) {
+        showNotification(
+          'Request approved, but processing failed: ' + processResult.error + ' -- the request remains approved; fix the issue and try processing again.',
+          'error'
+        );
+        await fetchPayrollRequests();
+        return;
+      }
+      await fetchData();
+      await fetchProcessedMonths();
+      await fetchPayrollRequests();
+      const tdMessage = processResult.terminalDues
+        ? ` Terminal Dues: ${processResult.terminalDues.processedCount} payment(s) totaling ${formatKwacha(processResult.terminalDues.totalAmount)} processed${processResult.terminalDues.excludedCount > 0 ? `, ${processResult.terminalDues.excludedCount} excluded` : ''}.`
+        : '';
+      showNotification(`Payroll request approved and processed! ${processResult.insertedCount ?? ''} employees processed.${tdMessage}`, 'success');
+    } catch (err) {
+      showNotification('Error approving/processing payroll request: ' + getErrorMessage(err), 'error');
+    } finally {
+      setRequestActionBusy(false);
+    }
+  }, [fetchData, fetchProcessedMonths, fetchPayrollRequests]);
+
+  const confirmRejectRequest = useCallback(async () => {
+    if (!rejectRequestTarget) return;
+    if (!rejectRequestReason.trim()) {
+      showNotification('A reason is required to reject a payroll processing request', 'error');
+      return;
+    }
+    setRequestActionBusy(true);
+    try {
+      const result = await rejectPayrollProcessingRequest(rejectRequestTarget.id, rejectRequestReason);
+      if (!result.success) {
+        showNotification('Failed to reject payroll request: ' + result.error, 'error');
+        return;
+      }
+      showNotification('Payroll processing request rejected', 'success');
+      setRejectRequestTarget(null);
+      setRejectRequestReason('');
+      await fetchPayrollRequests();
+    } catch (err) {
+      showNotification('Error rejecting payroll request: ' + getErrorMessage(err), 'error');
+    } finally {
+      setRequestActionBusy(false);
+    }
+  }, [rejectRequestTarget, rejectRequestReason, fetchPayrollRequests]);
 
   // ===== Shared payroll rates (PAYE rate/threshold, pension rate) from Settings =====
   useEffect(() => {
@@ -1055,6 +1171,25 @@ export function PayrollPage() {
       // (outcome 'terminal_dues_validation_failed') rather than silently
       // skipping it -- the Admin is directed to the Process Payroll
       // modal's own Terminal Dues summary instead.
+      //
+      // Phase 3D: same Admin-class gate as processPayroll() -- an
+      // Accountant copying forward cannot commit directly either; this
+      // submits a request for Admin approval instead.
+      if (!isAdminClass) {
+        const submitResult = await submitPayrollProcessingRequest(selectedMonth, newRecords, {
+          sourceMonth,
+          targetMonth: selectedMonth,
+        }, [], null);
+        if (!submitResult.success) {
+          showNotification('Failed to submit copied payroll for approval: ' + submitResult.error, 'error');
+          return;
+        }
+        setShowCopyModal(false);
+        await fetchPayrollRequests();
+        showNotification(`Payroll copied from ${getMonthLabel(sourceMonth)} submitted for Admin approval. ${newRecords.length} records included. Nothing will be processed until an Admin approves it.`, 'success');
+        return;
+      }
+
       const result = await processPayrollWithTerminalDues(selectedMonth, newRecords, {
         sourceMonth,
         targetMonth: selectedMonth,
@@ -1088,7 +1223,7 @@ export function PayrollPage() {
     } finally {
       setProcessingStatus('');
     }
-  }, [canProcessPayroll, attendanceCountsUnavailable, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths]);
+  }, [canProcessPayroll, attendanceCountsUnavailable, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths, isAdminClass, fetchPayrollRequests]);
 
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
@@ -1514,6 +1649,39 @@ export function PayrollPage() {
       // Terminal Dues obligation silently failed to commit. Both inner
       // RPCs are no longer directly callable by this app at all (revoked
       // at the database level) -- this is now the only entry point.
+      // ===== ACCOUNTANT-INITIATED PAYROLL WITH ADMIN APPROVAL (Phase 3D) =====
+      // Only an Admin-class caller may commit directly -- anyone else
+      // authorized to process payroll (e.g. an Accountant) submits a
+      // request instead; process_payroll_with_terminal_dues() itself now
+      // enforces this same boundary database-side (see
+      // 20261028000000_payroll_accountant_admin_approval_workflow.sql), so
+      // this branch is the UX path, not the actual safety boundary.
+      if (!isAdminClass) {
+        setProcessingStatus('Submitting payroll for Admin approval...');
+        const submitResult = await submitPayrollProcessingRequest(
+          selectedMonth,
+          payrollToSave,
+          { totalGross, totalNet, totalDeductions },
+          Array.from(excludedAllocationIds),
+          excludedAllocationIds.size > 0 ? exclusionReason.trim() : null
+        );
+        if (!submitResult.success) {
+          showNotification('Failed to submit payroll for approval: ' + submitResult.error, 'error');
+          setProcessing(false);
+          setProcessingStatus('');
+          return;
+        }
+        setTerminalDuesSummary(null);
+        setExcludedAllocationIds(new Set());
+        setExclusionReason('');
+        setShowConfirmModal(false);
+        await fetchPayrollRequests();
+        showNotification(`Payroll for ${getMonthLabel(selectedMonth)} submitted for Admin approval. ${payrollToSave.length} employees included. Nothing will be processed until an Admin approves it.`, 'success');
+        setProcessing(false);
+        setProcessingStatus('');
+        return;
+      }
+
       if (canProcessTerminalDues) {
         setProcessingStatus('Processing payroll and Terminal Dues together...');
       }
@@ -1573,7 +1741,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason, isAdminClass, fetchPayrollRequests]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -1725,6 +1893,64 @@ export function PayrollPage() {
             <div className="w-5 h-5 border-2 border-[#D4A017] border-t-transparent rounded-full animate-spin" />
             <span className="text-sm text-slate-700">{processingStatus}</span>
           </div>
+        </Card>
+      )}
+
+      {/* ===== Payroll Processing Requests (Phase 3D) ===== */}
+      {/* An Accountant's own submitted request sits here awaiting Admin
+          review; an Admin sees it too, with Approve/Reject actions. Never
+          shown for a month with no live/recent request, so this stays out
+          of the way for the common Admin-direct-process case. */}
+      {(pendingRequest || approvedRequest || (!isAdminClass && myOwnLatestRequest)) && (
+        <Card className="p-4 border-l-4 border-l-[#D4A017]">
+          <h3 className="text-sm font-semibold text-slate-700 mb-3">Payroll Processing Request -- {getMonthLabel(selectedMonth)}</h3>
+          {[pendingRequest, approvedRequest].filter((r): r is PayrollProcessingRequest => r !== null).map(request => (
+            <div key={request.id} className="flex flex-wrap items-center justify-between gap-3 border border-slate-200 rounded-lg p-3 mb-2 last:mb-0">
+              <div>
+                <p className="text-sm">
+                  <Badge color={request.status === 'approved' ? 'blue' : 'yellow'} className="mr-2">
+                    {request.status === 'approved' ? 'Approved -- awaiting processing' : 'Pending Admin review'}
+                  </Badge>
+                  Submitted {new Date(request.initiated_at).toLocaleString()}
+                </p>
+                {request.status === 'approved' && request.reviewed_by && (
+                  <p className="text-xs text-slate-500 mt-1">Approved by an Admin -- click Process to commit this payroll run.</p>
+                )}
+              </div>
+              {isAdminClass && (
+                <div className="flex gap-2">
+                  {request.status === 'pending' && (
+                    <>
+                      <Button variant="secondary" size="sm" disabled={requestActionBusy} onClick={() => approveAndProcessRequest(request.id)}>
+                        <Check size={14} className="mr-1" /> Approve & Process
+                      </Button>
+                      <Button variant="outline" size="sm" disabled={requestActionBusy} onClick={() => setRejectRequestTarget(request)}>
+                        <XCircle size={14} className="mr-1" /> Reject
+                      </Button>
+                    </>
+                  )}
+                  {request.status === 'approved' && (
+                    <Button variant="secondary" size="sm" disabled={requestActionBusy} onClick={() => approveAndProcessRequest(request.id)}>
+                      <Check size={14} className="mr-1" /> Process
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+          {!isAdminClass && myOwnLatestRequest && !pendingRequest && !approvedRequest && (
+            <div className="border border-slate-200 rounded-lg p-3">
+              <Badge color={myOwnLatestRequest.status === 'processed' ? 'green' : 'red'}>
+                {myOwnLatestRequest.status === 'processed' ? 'Processed' : 'Rejected'}
+              </Badge>
+              {myOwnLatestRequest.status === 'rejected' && myOwnLatestRequest.rejection_reason && (
+                <p className="text-xs text-red-600 mt-2">Reason: {myOwnLatestRequest.rejection_reason}</p>
+              )}
+              {myOwnLatestRequest.status === 'processed' && myOwnLatestRequest.processing_reference && (
+                <p className="text-xs text-slate-500 mt-2">Processing reference: {myOwnLatestRequest.processing_reference}</p>
+              )}
+            </div>
+          )}
         </Card>
       )}
 
@@ -2215,13 +2441,20 @@ export function PayrollPage() {
             <CheckCircle2 size={18} className={`shrink-0 mt-0.5 ${isMonthProcessed ? 'text-amber-600' : 'text-[#081C3A]'}`} />
             <div>
               <strong>{isMonthProcessed ? '⚠️ Warning: Reprocessing' : 'Confirmation:'}</strong> 
-              {isMonthProcessed 
+              {isMonthProcessed
                 ? ` You are about to reprocess payroll for ${getMonthLabel(selectedMonth)}. This will overwrite all existing payroll data for this month.`
-                : ` You are about to process payroll for ${employees.length} employees for the period ${getMonthLabel(selectedMonth)}.`
+                : !isAdminClass
+                  ? ` You are about to submit payroll for ${employees.length} employees for the period ${getMonthLabel(selectedMonth)} for Admin approval.`
+                  : ` You are about to process payroll for ${employees.length} employees for the period ${getMonthLabel(selectedMonth)}.`
               }
-              {!isMonthProcessed && (
+              {!isMonthProcessed && isAdminClass && (
                 <p className="mt-2 text-sm text-amber-600">
                   ⚠️ After processing, the payroll will be pending approval by a manager or admin.
+                </p>
+              )}
+              {!isMonthProcessed && !isAdminClass && (
+                <p className="mt-2 text-sm text-amber-600">
+                  ⚠️ This submits a request only -- nothing is processed or committed until an Admin reviews and approves it.
                 </p>
               )}
             </div>
@@ -2351,7 +2584,11 @@ export function PayrollPage() {
             <Button variant="outline" onClick={() => setShowConfirmModal(false)}>Cancel</Button>
             <Button variant="secondary" onClick={processPayroll} disabled={processing || terminalDuesLoading}>
               <Save size={14} />
-              {processing ? 'Processing...' : isMonthProcessed ? 'Reprocess Payroll' : 'Process & Save Payroll'}
+              {processing
+                ? (isAdminClass ? 'Processing...' : 'Submitting...')
+                : !isAdminClass
+                  ? 'Submit for Admin Approval'
+                  : isMonthProcessed ? 'Reprocess Payroll' : 'Process & Save Payroll'}
             </Button>
           </div>
         </div>
@@ -2449,13 +2686,31 @@ export function PayrollPage() {
             >
               <XCircle size={14} className="mr-1" /> Reject
             </Button>
-            <Button 
-              variant="secondary" 
-              onClick={() => approvePayroll('approved')} 
+            <Button
+              variant="secondary"
+              onClick={() => approvePayroll('approved')}
               disabled={processing}
             >
               <CheckCircle2 size={14} className="mr-1" /> Approve Payroll
             </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Reject Payroll Processing Request Modal (Phase 3D) */}
+      <Modal open={!!rejectRequestTarget} onClose={() => setRejectRequestTarget(null)} title="Reject Payroll Processing Request">
+        <div className="space-y-3">
+          <p className="text-sm text-slate-600">A reason is required and will be visible to whoever submitted this request.</p>
+          <textarea
+            value={rejectRequestReason}
+            onChange={e => setRejectRequestReason(e.target.value)}
+            rows={3}
+            className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+            placeholder="Reason for rejection..."
+          />
+          <div className="flex justify-end gap-2 pt-2 border-t">
+            <Button variant="outline" onClick={() => setRejectRequestTarget(null)}>Cancel</Button>
+            <Button onClick={confirmRejectRequest} disabled={requestActionBusy}>Reject</Button>
           </div>
         </div>
       </Modal>
