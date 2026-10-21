@@ -13,7 +13,7 @@ import { Pagination } from '../components/Pagination';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll, getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
 import { calculatePooledAllocation } from '../utils/salaryAdvanceCalculations';
-import { processPayrollBatch, describeProcessPayrollBatchError } from '../utils/payrollProcessing';
+import { processPayrollWithTerminalDues, describeProcessPayrollBatchError } from '../utils/payrollProcessing';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { UserProfile } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
@@ -1045,15 +1045,34 @@ export function PayrollPage() {
         return;
       }
 
-      const result = await processPayrollBatch(selectedMonth, newRecords, {
+      // Terminal Dues Phase 3B: this one atomic call now covers BOTH
+      // ordinary payroll AND (if this caller holds terminal_dues.approve
+      // and there's anything eligible) Terminal Dues in a single Postgres
+      // transaction -- see process_payroll_with_terminal_dues()'s own
+      // migration header. This modal has no exception-resolution UI of
+      // its own, so it never excludes anything (empty list below); if a
+      // Terminal Dues allocation needs resolving, this call fails loudly
+      // (outcome 'terminal_dues_validation_failed') rather than silently
+      // skipping it -- the Admin is directed to the Process Payroll
+      // modal's own Terminal Dues summary instead.
+      const result = await processPayrollWithTerminalDues(selectedMonth, newRecords, {
         sourceMonth,
         targetMonth: selectedMonth,
-      });
+      }, [], null);
 
       if (!result.success) {
         console.error('Error copying data:', result.error);
-        const message = result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error;
+        const message = result.outcome === 'terminal_dues_validation_failed'
+          ? `${result.error} -- resolve or exclude this in the Terminal Dues summary on the Process Payroll screen, then copy again.`
+          : (result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error);
         showNotification('Failed to copy data: ' + message, 'error');
+        if (result.outcome === 'network_error') {
+          // A network interruption's outcome is unknown -- refresh so the
+          // UI reflects reality (possibly already committed) rather than
+          // staying stale on an assumed failure.
+          await fetchData();
+          await fetchProcessedMonths();
+        }
         return;
       }
 
@@ -1062,7 +1081,7 @@ export function PayrollPage() {
       setHasData(true);
       setIsApproved(false);
       setShowCopyModal(false);
-      showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${result.insertedCount ?? newRecords.length} records copied.`, 'success');
+      showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${result.insertedCount ?? newRecords.length} records copied.${result.terminalDues ? ` Terminal Dues: ${result.terminalDues.processedCount} payment(s) totaling ${formatKwacha(result.terminalDues.totalAmount)}.` : ''}`, 'success');
     } catch (err) {
       console.error('Error copying data:', err);
       showNotification('Failed to copy data: ' + getErrorMessage(err), 'error');
@@ -1405,12 +1424,13 @@ export function PayrollPage() {
       return;
     }
 
-    // Terminal Dues pre-checks run BEFORE ordinary payroll is touched, so a
-    // blocked Terminal Dues run never leaves ordinary payroll processed
-    // with Terminal Dues silently left half-wired. The RPC itself
-    // re-validates everything server-side regardless (never rely on this
-    // frontend check as authority) -- this only avoids a confusing partial
-    // outcome and gives a clearer message than the server's own exception.
+    // Terminal Dues pre-checks, run BEFORE even calling the RPC. As of
+    // Phase 3B these are advisory/UX-only, not the actual safety boundary
+    // -- process_payroll_with_terminal_dues() itself is one atomic
+    // transaction and would reject an unresolved exception (rolling back
+    // ordinary payroll too) regardless of this check. This just avoids a
+    // wasted round trip and gives a clearer message than the server's own
+    // exception text.
     const unresolvedTerminalDuesExceptions = canProcessTerminalDues
       ? (terminalDuesSummary?.exceptions || []).filter(e => !excludedAllocationIds.has(e.allocationId))
       : [];
@@ -1480,16 +1500,47 @@ export function PayrollPage() {
       // which could leave a month's payroll fully deleted with nothing
       // re-inserted if the INSERT failed after the DELETE had already
       // succeeded (Finding A8).
-      const result = await processPayrollBatch(selectedMonth, payrollToSave, {
-        totalGross,
-        totalNet,
-        totalDeductions,
-      });
+      //
+      // ===== TERMINAL DUES PROCESSING (Phase 3B) =====
+      // ONE atomic call, not two -- process_payroll_with_terminal_dues()
+      // (supabase/migrations/20261027000000_terminal_dues_atomic_payroll_integration.sql)
+      // commits ordinary payroll AND (when this caller holds
+      // terminal_dues.approve and there's anything eligible/excluded)
+      // Terminal Dues inside a SINGLE Postgres transaction -- if either
+      // half is invalid, NEITHER commits. This replaces Phase 3A's two
+      // separate, non-atomic RPC calls (process_payroll_batch() then a
+      // second direct process_terminal_due_allocations_batch() call),
+      // which could leave ordinary payroll processed while an included
+      // Terminal Dues obligation silently failed to commit. Both inner
+      // RPCs are no longer directly callable by this app at all (revoked
+      // at the database level) -- this is now the only entry point.
+      if (canProcessTerminalDues) {
+        setProcessingStatus('Processing payroll and Terminal Dues together...');
+      }
+      const result = await processPayrollWithTerminalDues(
+        selectedMonth,
+        payrollToSave,
+        { totalGross, totalNet, totalDeductions },
+        Array.from(excludedAllocationIds),
+        excludedAllocationIds.size > 0 ? exclusionReason.trim() : null
+      );
 
       if (!result.success) {
         console.error('❌ Error processing payroll:', result.error);
-        const message = result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error;
+        const message = result.outcome === 'terminal_dues_validation_failed'
+          ? `${result.error} -- resolve or exclude the allocation above, then process again. Ordinary payroll was NOT processed either -- nothing was committed.`
+          : (result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error);
         showNotification('Failed to save payroll: ' + message, 'error');
+        if (result.outcome === 'network_error') {
+          // The outcome of a network interruption is unknown -- refresh so
+          // the UI reflects reality (this run may have actually committed)
+          // rather than staying stale on an assumed failure. The combined
+          // audit_logs entry (entity_type = 'combined_payroll_run',
+          // keyed by this run's own combined_reference) is the definitive
+          // recovery check if this keeps happening.
+          await fetchData();
+          await fetchProcessedMonths();
+        }
         setProcessing(false);
         setProcessingStatus('');
         return;
@@ -1498,37 +1549,13 @@ export function PayrollPage() {
       await fetchData();
       await fetchProcessedMonths();
 
-      // ===== TERMINAL DUES PROCESSING (Phase 3A) =====
-      // A SEPARATE, independently atomic RPC call, deliberately -- the
-      // existing process_payroll_batch() RPC above is its own single
-      // transaction and cannot safely be extended to cover Terminal Dues
-      // (see 20261026000000_terminal_dues_payroll_processing.sql's header:
-      // payroll.employee_id is NOT NULL, which structurally forbids the
-      // historical-employee rows Terminal Dues must support, and there is
-      // no net-pay coupling to justify entangling the two the way salary
-      // advances were). Ordinary payroll above has already fully committed
-      // by this point regardless of what happens next.
-      let terminalDuesMessage = '';
-      if (canProcessTerminalDues && ((terminalDuesSummary?.eligibleCount || 0) > 0 || excludedAllocationIds.size > 0)) {
-        setProcessingStatus('Processing Terminal Dues payments...');
-        const { data: tdResult, error: tdError } = await supabase.rpc('process_terminal_due_allocations_batch', {
-          p_excluded_ids: Array.from(excludedAllocationIds),
-          p_exclusion_reason: excludedAllocationIds.size > 0 ? exclusionReason.trim() : null,
-        });
-        if (tdError) {
-          console.error('❌ Error processing Terminal Dues payments:', tdError);
-          terminalDuesMessage = ` Terminal Dues processing FAILED: ${getErrorMessage(tdError)} -- ordinary payroll above was still processed successfully; resolve this and process Terminal Dues again.`;
-        } else {
-          const processedCount = tdResult?.processed_count ?? 0;
-          const excludedCount = tdResult?.excluded_count ?? 0;
-          if (processedCount > 0 || excludedCount > 0) {
-            terminalDuesMessage = ` Terminal Dues: ${processedCount} payment(s) totaling ${formatKwacha(tdResult?.total_amount || 0)} processed${excludedCount > 0 ? `, ${excludedCount} excluded` : ''} (ref: ${tdResult?.batch_reference}).`;
-          }
-        }
-        setTerminalDuesSummary(null);
-        setExcludedAllocationIds(new Set());
-        setExclusionReason('');
-      }
+      const terminalDuesMessage = result.terminalDues
+        ? ` Terminal Dues: ${result.terminalDues.processedCount} payment(s) totaling ${formatKwacha(result.terminalDues.totalAmount)} processed${result.terminalDues.excludedCount > 0 ? `, ${result.terminalDues.excludedCount} excluded` : ''} (ref: ${result.terminalDues.batchReference}).`
+        : '';
+
+      setTerminalDuesSummary(null);
+      setExcludedAllocationIds(new Set());
+      setExclusionReason('');
 
       setProcessed(true);
       setShowConfirmModal(false);

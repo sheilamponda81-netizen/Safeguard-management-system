@@ -8,6 +8,18 @@
 // blocks reprocessing an already-approved month, serializes concurrent
 // callers for the same tenant+month, and writes the audit log entry in
 // the same transaction as the payroll write.
+//
+// TERMINAL DUES PHASE 3B: process_payroll_batch() itself is UNCHANGED,
+// but as of 20261027000000_terminal_dues_atomic_payroll_integration.sql
+// it is no longer directly callable by `authenticated` at all -- calling
+// processPayrollBatch() below from any live code path will now fail with
+// a permission-denied error. Payroll.tsx calls
+// processPayrollWithTerminalDues() exclusively (further down this file);
+// processPayrollBatch()/describeProcessPayrollBatchError() are kept here,
+// unmodified, only because process_payroll_with_terminal_dues() calls the
+// underlying RPC internally under its own privileges, and because
+// removing a function with its own existing, passing test suite was not
+// necessary to fix the atomicity gap this phase addresses.
 import { supabase } from '../lib/supabase';
 
 export interface PayrollRecordInput {
@@ -121,6 +133,187 @@ interface ProcessPayrollBatchRpcSuccess {
   deletedCount: number;
   insertedCount: number;
   advanceDeductionsApplied?: number;
+}
+
+// Terminal Dues Phase 3B -- the atomic combined RPC (see
+// supabase/migrations/20261027000000_terminal_dues_atomic_payroll_integration.sql).
+// Replaces the Phase 3A pattern of two separate, non-atomic
+// `supabase.rpc()` calls (processPayrollBatch() then a second direct
+// `process_terminal_due_allocations_batch` call) with ONE call to
+// process_payroll_with_terminal_dues(), which commits ordinary payroll
+// and (when the caller holds terminal_dues.approve) Terminal Dues
+// processing inside a single Postgres transaction -- if either half is
+// invalid, NEITHER commits. process_payroll_batch() and
+// process_terminal_due_allocations_batch() are no longer directly
+// callable by `authenticated` at all (see that migration's PART 2) --
+// this is now the only entry point for both.
+export type ProcessPayrollWithTerminalDuesOutcome =
+  | ProcessPayrollBatchOutcome
+  | 'terminal_dues_validation_failed'; // an included (non-excluded) Terminal Dues allocation failed its own re-validation -- see process_terminal_due_allocations_batch()'s RAISE EXCEPTION list. Ordinary payroll in this SAME call was rolled back too.
+
+export interface TerminalDuesBatchSummary {
+  batchReference: string;
+  processedCount: number;
+  totalAmount: number;
+  excludedCount: number;
+}
+
+export interface ProcessPayrollWithTerminalDuesResult {
+  success: boolean;
+  outcome: ProcessPayrollWithTerminalDuesOutcome;
+  error?: string;
+  month?: string;
+  /** Links this run's own audit_logs entry (entity_type =
+   *  'combined_payroll_run') -- the recovery object to check after a
+   *  network interruption before assuming nothing committed. */
+  combinedReference?: string;
+  deletedCount?: number;
+  insertedCount?: number;
+  advanceDeductionsApplied?: number;
+  /** null when the caller lacked terminal_dues.approve, or there was
+   *  nothing eligible/excluded for this month -- Terminal Dues was never
+   *  attempted at all, not merely a zero-count success. */
+  terminalDues?: TerminalDuesBatchSummary | null;
+  ordinaryPayrollTotal?: number;
+  terminalDuesTotal?: number;
+  combinedTotal?: number;
+}
+
+interface ProcessPayrollWithTerminalDuesRpcSuccess {
+  success: true;
+  month: string;
+  combined_reference: string;
+  payroll: ProcessPayrollBatchRpcSuccess;
+  terminal_dues: {
+    batch_reference: string;
+    processed_count: number;
+    total_amount: number;
+    excluded_count: number;
+  } | null;
+  ordinary_payroll_total: number;
+  terminal_dues_total: number;
+  combined_total: number;
+}
+
+function isProcessPayrollWithTerminalDuesRpcSuccess(data: unknown): data is ProcessPayrollWithTerminalDuesRpcSuccess {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    (data as { success?: unknown }).success === true &&
+    typeof (data as { month?: unknown }).month === 'string' &&
+    typeof (data as { combined_reference?: unknown }).combined_reference === 'string' &&
+    isProcessPayrollBatchRpcSuccess((data as { payroll?: unknown }).payroll)
+  );
+}
+
+// Extends classifyPayrollError() with the two new exception families this
+// RPC can additionally raise -- the authoritative-month mismatch (STEP 2
+// of the migration) and every Terminal Dues re-validation failure (text
+// owned by process_terminal_due_allocations_batch(), unchanged by this
+// RPC, which just lets it propagate).
+function classifyCombinedError(message: string): ProcessPayrollWithTerminalDuesOutcome {
+  if (
+    message.includes('Not authenticated') ||
+    message.includes('No profile found for the current user') ||
+    message.includes('Only Admins or super admins may process payroll')
+  ) {
+    return 'unauthorized';
+  }
+  if (message.includes('already have approved payroll for this month')) {
+    return 'approved_conflict';
+  }
+  if (
+    message.includes('Cannot process: allocation') ||
+    message.includes('pending entitlement revision') ||
+    message.includes('A reason is required to exclude an allocation')
+  ) {
+    return 'terminal_dues_validation_failed';
+  }
+  return 'validation_failed';
+}
+
+/**
+ * Calls process_payroll_with_terminal_dues() -- see that RPC's own
+ * migration header for the full architecture. `terminalDuesExcludedIds`/
+ * `terminalDuesExclusionReason` are forwarded as-is; the RPC itself
+ * decides whether Terminal Dues is even attempted (the caller's own
+ * terminal_dues.approve permission, re-checked server-side every time).
+ *
+ * Never throws, same contract as processPayrollBatch(): every failure
+ * comes back as `{ success: false, outcome, error }`, including the ONE
+ * new failure mode this RPC introduces -- an included Terminal Dues
+ * allocation failing validation, which also means ordinary payroll in
+ * this SAME call did not commit either (never partially).
+ */
+export async function processPayrollWithTerminalDues(
+  month: string,
+  records: PayrollRecordInput[],
+  auditContext: Record<string, unknown> = {},
+  terminalDuesExcludedIds: string[] = [],
+  terminalDuesExclusionReason: string | null = null
+): Promise<ProcessPayrollWithTerminalDuesResult> {
+  if (records.length === 0) {
+    return { success: false, outcome: 'validation_failed', error: 'No payroll records supplied' };
+  }
+
+  try {
+    const { data: { user } } = await supabase.auth.getUser();
+
+    const { data, error } = await supabase.rpc('process_payroll_with_terminal_dues', {
+      p_month: month,
+      p_records: records,
+      p_user_email: user?.email ?? null,
+      p_audit_context: auditContext,
+      p_td_excluded_ids: terminalDuesExcludedIds,
+      p_td_exclusion_reason: terminalDuesExclusionReason,
+    });
+
+    if (error) {
+      if (error.code === RPC_NOT_FOUND_CODE) {
+        return {
+          success: false,
+          outcome: 'missing_rpc',
+          error: 'This feature is not yet available -- the required database function has not been installed. Contact your administrator.',
+        };
+      }
+      return { success: false, outcome: classifyCombinedError(error.message), error: error.message };
+    }
+
+    if (!isProcessPayrollWithTerminalDuesRpcSuccess(data)) {
+      return {
+        success: false,
+        outcome: 'unexpected_response',
+        error: 'process_payroll_with_terminal_dues() returned an unexpected result',
+      };
+    }
+
+    return {
+      success: true,
+      outcome: 'success',
+      month: data.month,
+      combinedReference: data.combined_reference,
+      deletedCount: data.payroll.deletedCount,
+      insertedCount: data.payroll.insertedCount,
+      advanceDeductionsApplied: data.payroll.advanceDeductionsApplied,
+      terminalDues: data.terminal_dues
+        ? {
+            batchReference: data.terminal_dues.batch_reference,
+            processedCount: data.terminal_dues.processed_count,
+            totalAmount: data.terminal_dues.total_amount,
+            excludedCount: data.terminal_dues.excluded_count,
+          }
+        : null,
+      ordinaryPayrollTotal: data.ordinary_payroll_total,
+      terminalDuesTotal: data.terminal_dues_total,
+      combinedTotal: data.combined_total,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      outcome: 'network_error',
+      error: err instanceof Error ? err.message : 'Unknown error calling process_payroll_with_terminal_dues',
+    };
+  }
 }
 
 function isProcessPayrollBatchRpcSuccess(data: unknown): data is ProcessPayrollBatchRpcSuccess {
