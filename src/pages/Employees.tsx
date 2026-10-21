@@ -663,6 +663,15 @@ export function EmployeesPage() {
           if (conflicts.length > 0) {
             message = formatIdentifierConflictMessage(conflicts);
           }
+        } else if (/employee_number/i.test(error.message || '')) {
+          // Every retry above (getNextEmployeeNumberForRegion()) already
+          // re-generates a fresh number from generate_employee_number()'s
+          // own row-locked counter -- reaching here means all attempts
+          // still collided (a genuine, narrow concurrency edge case, or a
+          // counter/data problem an Admin needs to look at), not something
+          // typing the form again will fix on its own. Name the real cause
+          // instead of the fully generic "record already exists".
+          message = 'Employee number is already assigned. Please retry, or contact your Administrator if this keeps happening.';
         }
       }
 
