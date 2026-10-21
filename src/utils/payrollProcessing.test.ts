@@ -273,6 +273,20 @@ describe('processPayrollWithTerminalDues', () => {
     expect(result.outcome).toBe('terminal_dues_validation_failed');
   });
 
+  it('classifies the Admin-class commit gate exception as unauthorized (an Accountant calling this RPC directly)', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Only an Admin or super admin may commit payroll processing directly -- submit a payroll processing request for Admin approval instead' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('unauthorized');
+  });
+
+  it('classifies the exclusion-authority exception as terminal_dues_validation_failed -- a caller without terminal_dues.approve supplied a non-empty exclusion list; nothing committed, including ordinary payroll', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Only an Admin explicitly granted terminal_dues.approve (or a super admin) may select Terminal Dues exclusions' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord], {}, ['alloc-1'], 'out of balance');
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('terminal_dues_validation_failed');
+  });
+
   it('classifies a pending-revision Terminal Dues exception as terminal_dues_validation_failed', async () => {
     rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Cannot process: allocation abc has a pending entitlement revision awaiting Admin review -- decide that revision first, or explicitly exclude this allocation with a reason' } });
     const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);

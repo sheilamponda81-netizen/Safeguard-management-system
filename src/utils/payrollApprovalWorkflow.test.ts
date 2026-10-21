@@ -185,6 +185,12 @@ describe('processApprovedPayrollRequest', () => {
     expect(result.outcome).toBe('terminal_dues_validation_failed');
   });
 
+  it('classifies the exclusion-authority exception distinctly -- a stale snapshot somehow carried a non-empty exclusion list for a reviewer without terminal_dues.approve', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Only an Admin explicitly granted terminal_dues.approve (or a super admin) may select Terminal Dues exclusions' } });
+    const result = await processApprovedPayrollRequest('req-1');
+    expect(result.outcome).toBe('terminal_dues_validation_failed');
+  });
+
   it('classifies a wrong-status (not approved) exception distinctly -- prevents reuse/double-processing', async () => {
     rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'This request is not approved (status: processed) -- it may have already been processed, or was never approved' } });
     const result = await processApprovedPayrollRequest('req-1');

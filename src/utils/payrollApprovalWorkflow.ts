@@ -84,7 +84,12 @@ function classifyOutcome(message: string): PayrollProcessingRequestOutcome {
   if (message.includes('no longer pending') || message.includes('is not approved (status') || message.includes('may have already been')) {
     return 'wrong_status';
   }
-  if (message.includes('Cannot process: allocation') || message.includes('pending entitlement revision') || message.includes('A reason is required to exclude an allocation')) {
+  if (
+    message.includes('Cannot process: allocation') ||
+    message.includes('pending entitlement revision') ||
+    message.includes('A reason is required to exclude an allocation') ||
+    message.includes('may select Terminal Dues exclusions')
+  ) {
     return 'terminal_dues_validation_failed';
   }
   return 'validation_failed';

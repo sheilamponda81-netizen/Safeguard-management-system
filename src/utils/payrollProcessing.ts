@@ -215,7 +215,8 @@ function classifyCombinedError(message: string): ProcessPayrollWithTerminalDuesO
   if (
     message.includes('Not authenticated') ||
     message.includes('No profile found for the current user') ||
-    message.includes('Only Admins or super admins may process payroll')
+    message.includes('Only Admins or super admins may process payroll') ||
+    message.includes('Only an Admin or super admin may commit payroll processing directly')
   ) {
     return 'unauthorized';
   }
@@ -225,7 +226,8 @@ function classifyCombinedError(message: string): ProcessPayrollWithTerminalDuesO
   if (
     message.includes('Cannot process: allocation') ||
     message.includes('pending entitlement revision') ||
-    message.includes('A reason is required to exclude an allocation')
+    message.includes('A reason is required to exclude an allocation') ||
+    message.includes('may select Terminal Dues exclusions')
   ) {
     return 'terminal_dues_validation_failed';
   }
