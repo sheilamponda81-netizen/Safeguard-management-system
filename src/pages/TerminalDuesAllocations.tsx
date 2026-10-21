@@ -11,13 +11,13 @@
 // 20261023000000_terminal_dues_allocation_ledger.sql's header for the
 // full scope boundary).
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, Send, CheckCircle, XCircle, Clock, AlertTriangle, Pencil } from '../utils/icons';
+import { Search, Send, CheckCircle, XCircle, Clock, AlertTriangle, Pencil, ArrowRightCircle } from '../utils/icons';
 import { Card, Button, Badge, EmptyState, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { showNotification } from '../utils/clickHandlers';
 import { getErrorMessage } from '../utils/errorHandler';
-import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
+import { getSystemCurrentMonth, getMonthLabel, getNextMonth } from '../utils/currentMonth';
 
 interface ApprovedEntitlement {
   id: string;
@@ -33,11 +33,14 @@ interface AllocationRow {
   id: string;
   terminal_due_id: string;
   payroll_month: string;
-  status: 'submitted' | 'approved' | 'rejected' | 'held' | 'processed';
+  status: 'submitted' | 'approved' | 'rejected' | 'held' | 'processed' | 'excluded';
   proposed_amount: number;
   last_decided_amount: number | null;
   hold_reason: 'hr_correction' | 'entitlement_revised' | null;
   rejection_reason: string | null;
+  excluded_reason: string | null;
+  processing_reference: string | null;
+  carried_forward_from_id: string | null;
   submitted_at: string;
   decided_at: string | null;
 }
@@ -47,6 +50,7 @@ function statusBadgeColor(status: AllocationRow['status']): 'gray' | 'yellow' | 
   if (status === 'rejected') return 'red';
   if (status === 'held') return 'blue';
   if (status === 'processed') return 'green';
+  if (status === 'excluded') return 'gray';
   return 'yellow';
 }
 
@@ -67,6 +71,8 @@ export function TerminalDuesAllocationsTab({
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rejectTarget, setRejectTarget] = useState<AllocationRow | null>(null);
   const [rejectReason, setRejectReason] = useState('');
+  const [showCarryForwardModal, setShowCarryForwardModal] = useState(false);
+  const [carryForwardBusy, setCarryForwardBusy] = useState(false);
 
   const entitlementIds = useMemo(() => approvedEntitlements.map(e => e.id), [approvedEntitlements]);
 
@@ -123,6 +129,58 @@ export function TerminalDuesAllocationsTab({
 
   const distinctThisMonth = thisMonthByEntitlement.size;
   const remainingCapacity = Math.max(0, 50 - distinctThisMonth);
+
+  // Total actually processed (Process Payroll's Terminal Dues step) per
+  // entitlement, across EVERY month it has ever had a processed
+  // allocation -- this is the real outstanding-balance basis (Section 3:
+  // "the ledger is the source for outstanding balance = approved
+  // entitlement - total processed", never merely-approved amounts).
+  const processedByEntitlement = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const a of allocations) {
+      if (a.status === 'processed') {
+        map.set(a.terminal_due_id, (map.get(a.terminal_due_id) || 0) + Number(a.last_decided_amount ?? a.proposed_amount));
+      }
+    }
+    return map;
+  }, [allocations]);
+
+  // Read-only "Settled" view (Section 7) -- an entitlement is settled only
+  // when total processed equals its full approved entitlement. There is
+  // deliberately no manual HR/Admin toggle to mark something settled; this
+  // is purely derived from the immutable processed-allocation history, and
+  // this phase builds no separate bank-confirmation status (noted as a
+  // future-phase gap, never claimed here).
+  const settledEntitlements = useMemo(
+    () => approvedEntitlements
+      .map(e => ({ entitlement: e, processed: processedByEntitlement.get(e.id) || 0 }))
+      .filter(({ entitlement, processed }) => processed > 0 && processed >= entitlement.total_payable),
+    [approvedEntitlements, processedByEntitlement]
+  );
+
+  const nextMonth = useMemo(() => (currentMonth ? getNextMonth(currentMonth) : ''), [currentMonth]);
+
+  const runCarryForward = async () => {
+    if (!currentMonth || !nextMonth) return;
+    setCarryForwardBusy(true);
+    try {
+      const { data, error } = await supabase.rpc('carry_forward_terminal_due_allocations', {
+        p_from_month: currentMonth,
+        p_to_month: nextMonth,
+      });
+      if (error) throw error;
+      showNotification(
+        `Carried forward ${data?.carried_count ?? 0} allocation(s) to ${getMonthLabel(nextMonth)}${data?.skipped_count ? ` (${data.skipped_count} already there, skipped)` : ''}.`,
+        'success'
+      );
+      setShowCarryForwardModal(false);
+      await fetchAllocations();
+    } catch (err) {
+      showNotification('Error carrying forward allocations: ' + getErrorMessage(err), 'error');
+    } finally {
+      setCarryForwardBusy(false);
+    }
+  };
 
   const filteredEntitlements = useMemo(() => {
     if (!search.trim()) return approvedEntitlements;
@@ -246,8 +304,36 @@ export function TerminalDuesAllocationsTab({
               <Stat label="Rejected this month" value={monthTotals.rejected} />
             </div>
           )}
+          {canApprove && (
+            <Button variant="outline" size="sm" onClick={() => setShowCarryForwardModal(true)} disabled={!currentMonth}>
+              <ArrowRightCircle size={14} className="mr-1" /> Carry Forward to {nextMonth ? getMonthLabel(nextMonth) : 'Next Month'}
+            </Button>
+          )}
         </div>
       </Card>
+
+      {canApprove && settledEntitlements.length > 0 && (
+        <Card className="p-4">
+          <h3 className="text-sm font-semibold text-slate-700 mb-3">Settled -- Fully Processed Entitlements</h3>
+          <div className="space-y-1">
+            {settledEntitlements.map(({ entitlement, processed }) => (
+              <div key={entitlement.id} className="flex items-center justify-between text-sm border-b border-slate-100 last:border-0 py-1.5">
+                <p>
+                  {entitlement.employee_name} <span className="text-slate-400 text-xs">({entitlement.employee_number})</span>
+                  {entitlement.historical_employee_id && <Badge color="gray" className="ml-2">Historical</Badge>}
+                </p>
+                <p className="text-xs text-slate-500">
+                  Entitlement: {formatKwacha(entitlement.total_payable)} &middot; Processed: {formatKwacha(processed)} &middot; Balance: {formatKwacha(entitlement.total_payable - processed)}
+                  {' '}<Badge color="green" className="ml-2">Payroll Processed</Badge>
+                </p>
+              </div>
+            ))}
+          </div>
+          <p className="text-xs text-slate-400 mt-2">
+            "Payroll Processed" reflects that Terminal Dues processing has run for the full entitlement amount -- confirmed bank payment is tracked separately and is not yet shown here.
+          </p>
+        </Card>
+      )}
 
       {canApprove && pendingForAdmin.length > 0 && (
         <Card className="p-4">
@@ -306,6 +392,7 @@ export function TerminalDuesAllocationsTab({
               {filteredEntitlements.map(entitlement => {
                 const existing = thisMonthByEntitlement.get(entitlement.id);
                 const reserved = reservedByEntitlement.get(entitlement.id) || 0;
+                const processedTotal = processedByEntitlement.get(entitlement.id) || 0;
                 const available = entitlement.total_payable - reserved;
                 const isFull = remainingCapacity === 0 && !existing;
                 return (
@@ -317,13 +404,13 @@ export function TerminalDuesAllocationsTab({
                           {entitlement.historical_employee_id && <Badge color="gray" className="ml-2">Historical</Badge>}
                         </p>
                         <p className="text-xs text-slate-500">
-                          Entitlement: {formatKwacha(entitlement.total_payable)} &middot; Processed: {formatKwacha(0)} &middot;
+                          Entitlement: {formatKwacha(entitlement.total_payable)} &middot; Processed: {formatKwacha(processedTotal)} &middot;
                           {' '}Approved reserved: {formatKwacha(reserved)} &middot; Available: {formatKwacha(available)}
                         </p>
                       </div>
                       {existing ? (
                         <Badge color={statusBadgeColor(existing.status)}>
-                          {existing.status === 'held' ? 'Held (correction pending)' : existing.status}
+                          {existing.status === 'held' ? 'Held (correction pending)' : existing.status === 'excluded' ? 'Excluded' : existing.status}
                         </Badge>
                       ) : (
                         <Badge color={isFull ? 'red' : 'gray'}>{isFull ? 'Month full' : 'Not yet allocated'}</Badge>
@@ -339,6 +426,18 @@ export function TerminalDuesAllocationsTab({
                     {existing?.status === 'held' && (
                       <p className="text-xs text-blue-600 mt-2 flex items-center gap-1">
                         <Clock size={12} /> Correction submitted ({formatKwacha(existing.proposed_amount)}) -- awaiting Admin re-approval.
+                      </p>
+                    )}
+
+                    {existing?.status === 'processed' && (
+                      <p className="text-xs text-green-600 mt-2 flex items-center gap-1">
+                        <CheckCircle size={12} /> Processed via Payroll ({formatKwacha(existing.last_decided_amount ?? existing.proposed_amount)}){existing.processing_reference ? ` -- ref: ${existing.processing_reference}` : ''}.
+                      </p>
+                    )}
+
+                    {existing?.status === 'excluded' && (
+                      <p className="text-xs text-slate-500 mt-2 flex items-center gap-1">
+                        <AlertTriangle size={12} /> Excluded from processing{existing.excluded_reason ? `: ${existing.excluded_reason}` : ''}. Requires a fresh Admin decision -- never auto-resumed.
                       </p>
                     )}
 
@@ -388,6 +487,23 @@ export function TerminalDuesAllocationsTab({
           <div className="flex justify-end gap-2 pt-2 border-t">
             <Button variant="outline" onClick={() => setRejectTarget(null)}>Cancel</Button>
             <Button onClick={confirmReject} disabled={busyId === rejectTarget?.id}>Reject</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={showCarryForwardModal} onClose={() => setShowCarryForwardModal(false)} title="Carry Forward to Next Month">
+        <div className="space-y-3">
+          <p className="text-sm text-slate-600">
+            This carries forward submitted, rejected, and excluded allocations from {currentMonth ? getMonthLabel(currentMonth) : 'this month'} into {nextMonth ? getMonthLabel(nextMonth) : 'next month'} as fresh submitted allocations awaiting Admin review -- allocations held pending correction are carried too, but holds from a pending entitlement revision are NOT (they stay in place and are revalidated separately once the revision is decided).
+          </p>
+          <p className="text-xs text-slate-500">
+            Already-processed and already-approved allocations are never touched. Each carried-forward allocation requires a brand new Admin decision -- no approval or rejection history is silently reused. If this would push next month over its own 50-employee cap, nothing is carried and the conflict is reported for you to resolve.
+          </p>
+          <div className="flex justify-end gap-2 pt-2 border-t">
+            <Button variant="outline" onClick={() => setShowCarryForwardModal(false)}>Cancel</Button>
+            <Button onClick={runCarryForward} disabled={carryForwardBusy}>
+              {carryForwardBusy ? 'Carrying forward...' : 'Carry Forward'}
+            </Button>
           </div>
         </div>
       </Modal>

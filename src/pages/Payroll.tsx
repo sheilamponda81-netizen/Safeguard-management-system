@@ -24,12 +24,20 @@ import {
   canApprovePayroll as canApprovePayrollFor,
   isPendingApproval as computeIsPendingApproval,
 } from '../utils/payrollPermissions';
-import { canAccess, PERMISSIONS } from '../utils/permissions';
+import { canAccess, hasExplicitPermission, PERMISSIONS } from '../utils/permissions';
 import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { approvePayrollRun } from '../utils/payrollApproval';
 import { buildPayrollReportCsv } from '../utils/payrollExport';
 import { AttendanceCount, deriveAttendanceCountsState, isPreviewBlocked, hasAnyBlockedPreview } from '../utils/payrollAttendanceCounts';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
+import {
+  summarizeTerminalDuePayrollBatch,
+  computeCombinedPayrollTotals,
+  TerminalDueAllocationForSummary,
+  TerminalDueEntitlementForSummary,
+  TerminalDuePayrollSummary,
+} from '../utils/terminalDuesPayrollIntegration';
+import { buildTerminalDuePaymentsCsv, buildCombinedAccountsSummaryCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
 
 interface Employee {
   id: string;
@@ -174,6 +182,21 @@ export function PayrollPage() {
   const [combinedPlanByEmployee, setCombinedPlanByEmployee] = useState<Map<string, number>>(new Map());
   const [payrollRates, setPayrollRatesState] = useState<PayrollRates>(DEFAULT_RATES);
 
+  // ===== TERMINAL DUES PAYROLL INTEGRATION (Phase 3A) =====
+  // `terminal_dues.approve` is a DELIBERATELY NARROW permission (see
+  // hasExplicitPermission's own doc comment) -- a functional/business Admin
+  // who can process ordinary payroll does NOT automatically gain authority
+  // to process Terminal Dues payments merely by being Admin. This is
+  // checked and gated completely independently of canProcessPayroll.
+  const [canProcessTerminalDues, setCanProcessTerminalDues] = useState(false);
+  const [terminalDuesSummary, setTerminalDuesSummary] = useState<TerminalDuePayrollSummary | null>(null);
+  const [terminalDuesLoading, setTerminalDuesLoading] = useState(false);
+  // Allocation ids the Admin has explicitly chosen to exclude from THIS
+  // processing run (never auto-skipped) -- cleared whenever the modal is
+  // reopened, since an exclusion decision belongs to one processing attempt.
+  const [excludedAllocationIds, setExcludedAllocationIds] = useState<Set<string>>(new Set());
+  const [exclusionReason, setExclusionReason] = useState('');
+
   // ===== PAGINATION STATES =====
   const [payrollPage, setPayrollPage] = useState(1);
   const [payrollItemsPerPage, setPayrollItemsPerPage] = useState(20);
@@ -256,6 +279,11 @@ export function PayrollPage() {
       setCanEditPayroll(await canAccess(canEditPayrollFor(roleContext), PERMISSIONS.PAYROLL_PROCESS));
       setCanViewPayroll(await canAccess(canViewPayrollFor(roleContext), PERMISSIONS.PAYROLL_VIEW));
       setCanApprovePayroll(await canAccess(canApprovePayrollFor(roleContext), PERMISSIONS.PAYROLL_APPROVE));
+
+      // Deliberately hasExplicitPermission(), NOT canAccess() -- an Admin
+      // must not gain Terminal Dues payment authority "for free" the way
+      // canAccess()'s business-admin shortcut would otherwise grant it.
+      setCanProcessTerminalDues(await hasExplicitPermission(PERMISSIONS.TERMINAL_DUES_APPROVE));
     }
   }, []);
 
@@ -1169,6 +1197,188 @@ export function PayrollPage() {
     showNotification('Payroll report exported!', 'success');
   }, [payrollRecords, employeesById, regions, deductionsByEmployee, selectedMonth, userProfile]);
 
+  // ===== TERMINAL DUES SUMMARY (display-only; the RPC re-validates everything) =====
+  // Mirrors, for the confirm modal only, the exact candidate set
+  // process_terminal_due_allocations_batch() itself selects (approved
+  // allocations for the active payroll month) plus already-carried-forward
+  // rows for visibility -- never trusted as authority (see
+  // terminalDuesPayrollIntegration.ts's header comment).
+  const fetchTerminalDuesSummary = useCallback(async () => {
+    if (!canProcessTerminalDues || !isCurrentMonth) {
+      setTerminalDuesSummary(null);
+      return;
+    }
+    setTerminalDuesLoading(true);
+    try {
+      const { data: allocRows, error: allocError } = await supabase
+        .from('terminal_due_allocations')
+        .select('id, terminal_due_id, status, proposed_amount, carried_forward_from_id')
+        .eq('payroll_month', selectedMonth);
+      if (allocError) throw allocError;
+
+      const rows = allocRows || [];
+      const dueIds = Array.from(new Set(rows.map(r => r.terminal_due_id)));
+
+      if (dueIds.length === 0) {
+        setTerminalDuesSummary({ eligibleCount: 0, eligibleTotal: 0, exceptions: [], carriedForwardCount: 0 });
+        return;
+      }
+
+      const [dueRes, processedRes, revisionRes] = await Promise.all([
+        supabase.from('terminal_dues').select('id, status, total_payable, employee_name, employee_number').in('id', dueIds),
+        supabase.from('terminal_due_allocations').select('terminal_due_id, last_decided_amount, proposed_amount').eq('status', 'processed').in('terminal_due_id', dueIds),
+        supabase.from('terminal_due_revisions').select('terminal_due_id').eq('status', 'pending').in('terminal_due_id', dueIds),
+      ]);
+      if (dueRes.error) throw dueRes.error;
+      if (processedRes.error) throw processedRes.error;
+      if (revisionRes.error) throw revisionRes.error;
+
+      const processedByDue = new Map<string, number>();
+      (processedRes.data || []).forEach((r: any) => {
+        const amt = Number(r.last_decided_amount ?? r.proposed_amount);
+        processedByDue.set(r.terminal_due_id, (processedByDue.get(r.terminal_due_id) || 0) + amt);
+      });
+      const pendingRevisionDueIds = new Set((revisionRes.data || []).map((r: any) => r.terminal_due_id));
+      const dueById = new Map((dueRes.data || []).map((d: any) => [d.id, d]));
+
+      const entitlementsById = new Map<string, TerminalDueEntitlementForSummary>();
+      (dueRes.data || []).forEach((d: any) => {
+        entitlementsById.set(d.id, {
+          id: d.id,
+          status: d.status,
+          total_payable: Number(d.total_payable),
+          has_pending_revision: pendingRevisionDueIds.has(d.id),
+          already_processed_total: processedByDue.get(d.id) || 0,
+        });
+      });
+
+      const summaryAllocations: TerminalDueAllocationForSummary[] = rows.map(r => {
+        const due = dueById.get(r.terminal_due_id);
+        return {
+          id: r.id,
+          terminal_due_id: r.terminal_due_id,
+          status: r.status,
+          proposed_amount: Number(r.proposed_amount),
+          carried_forward_from_id: r.carried_forward_from_id,
+          employee_name: due?.employee_name || 'Unknown',
+          employee_number: due?.employee_number || null,
+        };
+      });
+
+      setTerminalDuesSummary(summarizeTerminalDuePayrollBatch(summaryAllocations, entitlementsById));
+    } catch (err) {
+      console.error('Error loading Terminal Dues summary:', err);
+      showNotification('Failed to load Terminal Dues summary: ' + getErrorMessage(err), 'error');
+      setTerminalDuesSummary(null);
+    } finally {
+      setTerminalDuesLoading(false);
+    }
+  }, [canProcessTerminalDues, isCurrentMonth, selectedMonth]);
+
+  // Load/refresh the Terminal Dues summary whenever the confirm modal opens
+  // -- never on every keystroke/render, so this stays a small, bounded set
+  // of queries (at most the 50-cap worth of allocations for one month).
+  useEffect(() => {
+    if (showConfirmModal) {
+      setExcludedAllocationIds(new Set());
+      setExclusionReason('');
+      fetchTerminalDuesSummary();
+    }
+  }, [showConfirmModal, fetchTerminalDuesSummary]);
+
+  const toggleExcludedAllocation = useCallback((allocationId: string) => {
+    setExcludedAllocationIds(prev => {
+      const next = new Set(prev);
+      if (next.has(allocationId)) next.delete(allocationId);
+      else next.add(allocationId);
+      return next;
+    });
+  }, []);
+
+  // ===== EXPORT TERMINAL DUES PAYMENTS (Accounts) =====
+  // Only ever reads already-`processed` allocations for `selectedMonth` --
+  // never calls the processing RPC -- so re-downloading this is always
+  // safe and never reprocesses anything (Section 5/Section 3's immutable-
+  // history requirement).
+  const exportTerminalDuesReport = useCallback(async () => {
+    try {
+      const { data: processedRows, error: procError } = await supabase
+        .from('terminal_due_allocations')
+        .select('id, terminal_due_id, last_decided_amount, proposed_amount, processed_at, processing_reference')
+        .eq('payroll_month', selectedMonth)
+        .eq('status', 'processed');
+      if (procError) throw procError;
+
+      if (!processedRows || processedRows.length === 0) {
+        showNotification('No processed Terminal Dues payments for this month yet.', 'error');
+        return;
+      }
+
+      const dueIds = Array.from(new Set(processedRows.map(r => r.terminal_due_id)));
+      const { data: dueRows, error: dueError } = await supabase
+        .from('terminal_dues')
+        .select('id, employee_id, employee_name, employee_number, historical_employee_id')
+        .in('id', dueIds);
+      if (dueError) throw dueError;
+      const dueById = new Map((dueRows || []).map((d: any) => [d.id, d]));
+
+      const employeeIds = dedupeById((dueRows || []).filter((d: any) => d.employee_id).map((d: any) => ({ id: d.employee_id })));
+      let payDetailsByEmployee = new Map<string, { pay_point: string | null; account_number: string | null }>();
+      if (employeeIds.length > 0) {
+        const { data: empRows, error: empError } = await supabase
+          .from('employees')
+          .select('id, pay_point, account_number')
+          .in('id', employeeIds.map(e => e.id));
+        if (empError) throw empError;
+        payDetailsByEmployee = new Map((empRows || []).map((e: any) => [e.id, e]));
+      }
+
+      const records: TerminalDueExportRecord[] = processedRows.map(r => {
+        const due = dueById.get(r.terminal_due_id);
+        const payDetails = due?.employee_id ? payDetailsByEmployee.get(due.employee_id) : undefined;
+        return {
+          employee_name: due?.employee_name || 'Unknown',
+          employee_number: due?.employee_number || null,
+          pay_point: payDetails?.pay_point || null,
+          account_number: payDetails?.account_number || null,
+          proposed_amount: Number(r.last_decided_amount ?? r.proposed_amount),
+          processed_at: r.processed_at,
+          processing_reference: r.processing_reference,
+          is_historical: !!due?.historical_employee_id,
+        };
+      });
+
+      const csv = buildTerminalDuePaymentsCsv(selectedMonth, records);
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `terminal_dues_payments_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      const combinedCsv = buildCombinedAccountsSummaryCsv(selectedMonth, totals.net, computeTerminalDueExportTotal(records));
+      const combinedBlob = new Blob([combinedCsv], { type: 'text/csv;charset=utf-8;' });
+      const combinedUrl = URL.createObjectURL(combinedBlob);
+      const combinedA = document.createElement('a');
+      combinedA.href = combinedUrl;
+      combinedA.download = `combined_accounts_summary_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
+      combinedA.click();
+      URL.revokeObjectURL(combinedUrl);
+
+      logAudit({
+        action: 'EXPORT',
+        entity_type: 'terminal_due_allocations',
+        new_data: { month: selectedMonth, paymentCount: records.length },
+        region_id: userProfile?.region_id,
+      });
+
+      showNotification('Terminal Dues payments exported!', 'success');
+    } catch (err) {
+      showNotification('Failed to export Terminal Dues payments: ' + getErrorMessage(err), 'error');
+    }
+  }, [selectedMonth, totals.net, userProfile]);
+
   // ===== PROCESS PAYROLL =====
   const processPayroll = useCallback(async () => {
     if (!isCurrentMonth) {
@@ -1192,6 +1402,24 @@ export function PayrollPage() {
     // every employee's attendance as zero absent/late days.
     if (attendanceCountsUnavailable) {
       showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
+      return;
+    }
+
+    // Terminal Dues pre-checks run BEFORE ordinary payroll is touched, so a
+    // blocked Terminal Dues run never leaves ordinary payroll processed
+    // with Terminal Dues silently left half-wired. The RPC itself
+    // re-validates everything server-side regardless (never rely on this
+    // frontend check as authority) -- this only avoids a confusing partial
+    // outcome and gives a clearer message than the server's own exception.
+    const unresolvedTerminalDuesExceptions = canProcessTerminalDues
+      ? (terminalDuesSummary?.exceptions || []).filter(e => !excludedAllocationIds.has(e.allocationId))
+      : [];
+    if (unresolvedTerminalDuesExceptions.length > 0) {
+      showNotification(`${unresolvedTerminalDuesExceptions.length} Terminal Dues allocation(s) need to be resolved or explicitly excluded before processing. See the Terminal Dues summary above.`, 'error');
+      return;
+    }
+    if (canProcessTerminalDues && excludedAllocationIds.size > 0 && !exclusionReason.trim()) {
+      showNotification('A reason is required to exclude Terminal Dues allocations from this processing run.', 'error');
       return;
     }
 
@@ -1270,6 +1498,38 @@ export function PayrollPage() {
       await fetchData();
       await fetchProcessedMonths();
 
+      // ===== TERMINAL DUES PROCESSING (Phase 3A) =====
+      // A SEPARATE, independently atomic RPC call, deliberately -- the
+      // existing process_payroll_batch() RPC above is its own single
+      // transaction and cannot safely be extended to cover Terminal Dues
+      // (see 20261026000000_terminal_dues_payroll_processing.sql's header:
+      // payroll.employee_id is NOT NULL, which structurally forbids the
+      // historical-employee rows Terminal Dues must support, and there is
+      // no net-pay coupling to justify entangling the two the way salary
+      // advances were). Ordinary payroll above has already fully committed
+      // by this point regardless of what happens next.
+      let terminalDuesMessage = '';
+      if (canProcessTerminalDues && ((terminalDuesSummary?.eligibleCount || 0) > 0 || excludedAllocationIds.size > 0)) {
+        setProcessingStatus('Processing Terminal Dues payments...');
+        const { data: tdResult, error: tdError } = await supabase.rpc('process_terminal_due_allocations_batch', {
+          p_excluded_ids: Array.from(excludedAllocationIds),
+          p_exclusion_reason: excludedAllocationIds.size > 0 ? exclusionReason.trim() : null,
+        });
+        if (tdError) {
+          console.error('❌ Error processing Terminal Dues payments:', tdError);
+          terminalDuesMessage = ` Terminal Dues processing FAILED: ${getErrorMessage(tdError)} -- ordinary payroll above was still processed successfully; resolve this and process Terminal Dues again.`;
+        } else {
+          const processedCount = tdResult?.processed_count ?? 0;
+          const excludedCount = tdResult?.excluded_count ?? 0;
+          if (processedCount > 0 || excludedCount > 0) {
+            terminalDuesMessage = ` Terminal Dues: ${processedCount} payment(s) totaling ${formatKwacha(tdResult?.total_amount || 0)} processed${excludedCount > 0 ? `, ${excludedCount} excluded` : ''} (ref: ${tdResult?.batch_reference}).`;
+          }
+        }
+        setTerminalDuesSummary(null);
+        setExcludedAllocationIds(new Set());
+        setExclusionReason('');
+      }
+
       setProcessed(true);
       setShowConfirmModal(false);
       setEditingValues({});
@@ -1277,7 +1537,7 @@ export function PayrollPage() {
 
       setTimeout(() => setProcessed(false), 5000);
 
-      showNotification(`Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${result.insertedCount ?? payrollToSave.length} employees processed. The payroll is now pending approval by a manager or admin.`, 'success');
+      showNotification(`Payroll for ${getMonthLabel(selectedMonth)} processed successfully! ${result.insertedCount ?? payrollToSave.length} employees processed. The payroll is now pending approval by a manager or admin.${terminalDuesMessage}`, 'success');
 
     } catch (err) {
       console.error('❌ Error processing payroll:', err);
@@ -1286,7 +1546,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -1363,6 +1623,15 @@ export function PayrollPage() {
             >
               <FileText size={16} /> Export Report
             </Button>
+
+            {canProcessTerminalDues && (
+              <Button
+                variant="outline"
+                onClick={exportTerminalDuesReport}
+              >
+                <FileText size={16} /> Terminal Dues Payments
+              </Button>
+            )}
 
             {canApprovePayroll && isMonthProcessed && !isApproved && isCurrentMonth && (
               <Button 
@@ -1980,11 +2249,81 @@ export function PayrollPage() {
               <p className="font-bold text-[#081C3A] mt-1">{formatKwacha(totals.net)}</p>
             </div>
           </div>
-          
+
+          {canProcessTerminalDues && (
+            <div className="p-4 rounded-lg border border-slate-200 bg-slate-50 text-sm">
+              <p className="font-semibold text-slate-700 flex items-center gap-2">
+                <Wallet size={16} /> Terminal Dues -- {getMonthLabel(selectedMonth)}
+              </p>
+              {terminalDuesLoading ? (
+                <p className="text-slate-400 mt-2">Loading Terminal Dues summary...</p>
+              ) : !terminalDuesSummary || (terminalDuesSummary.eligibleCount === 0 && terminalDuesSummary.exceptions.length === 0) ? (
+                <p className="text-slate-500 mt-2">No approved Terminal Dues allocations for this month.</p>
+              ) : (
+                <>
+                  <div className="grid grid-cols-3 gap-3 mt-2">
+                    <div>
+                      <p className="text-slate-500 text-xs">Eligible Payments</p>
+                      <p className="font-bold text-slate-800">{terminalDuesSummary.eligibleCount} ({formatKwacha(terminalDuesSummary.eligibleTotal)})</p>
+                    </div>
+                    <div>
+                      <p className="text-slate-500 text-xs">Carried Forward</p>
+                      <p className="font-bold text-slate-800">{terminalDuesSummary.carriedForwardCount}</p>
+                    </div>
+                    <div>
+                      <p className="text-slate-500 text-xs">Combined Total Payable</p>
+                      <p className="font-bold text-[#081C3A]">{formatKwacha(computeCombinedPayrollTotals(totals.net, terminalDuesSummary.eligibleTotal).combinedTotal)}</p>
+                    </div>
+                  </div>
+
+                  {terminalDuesSummary.exceptions.length > 0 && (
+                    <div className="mt-3 p-3 rounded-lg bg-red-50 border border-red-200">
+                      <p className="font-semibold text-red-800 flex items-center gap-2 text-xs">
+                        <AlertCircle size={14} /> {terminalDuesSummary.exceptions.length} allocation(s) need resolution before processing
+                      </p>
+                      <div className="mt-2 space-y-2">
+                        {terminalDuesSummary.exceptions.map(exc => (
+                          <div key={exc.allocationId} className="flex items-start justify-between gap-2 text-xs border-b border-red-100 last:border-0 pb-2 last:pb-0">
+                            <div>
+                              <p className="font-medium text-red-800">{exc.employeeName} {exc.employeeNumber ? `(${exc.employeeNumber})` : ''} -- {formatKwacha(exc.proposedAmount)}</p>
+                              <p className="text-red-600 mt-0.5">{exc.message}</p>
+                            </div>
+                            <label className="flex items-center gap-1 whitespace-nowrap text-red-700">
+                              <input
+                                type="checkbox"
+                                checked={excludedAllocationIds.has(exc.allocationId)}
+                                onChange={() => toggleExcludedAllocation(exc.allocationId)}
+                              />
+                              Exclude
+                            </label>
+                          </div>
+                        ))}
+                      </div>
+                      {excludedAllocationIds.size > 0 && (
+                        <div className="mt-2">
+                          <textarea
+                            value={exclusionReason}
+                            onChange={e => setExclusionReason(e.target.value)}
+                            placeholder="Reason for excluding the selected allocation(s) -- required, recorded in the audit log"
+                            rows={2}
+                            className="w-full px-2 py-1.5 text-xs border border-red-200 rounded"
+                          />
+                        </div>
+                      )}
+                      <p className="text-xs text-red-500 mt-2">
+                        Payroll cannot be processed while unresolved allocations remain -- either correct them in the Terminal Dues Allocations tab, or explicitly exclude them above with a reason. Excluded allocations are never auto-skipped and will need a fresh Admin decision later.
+                      </p>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           <div className="flex items-center justify-end gap-2 pt-4 border-t border-slate-100">
             <Button variant="outline" onClick={() => setShowConfirmModal(false)}>Cancel</Button>
-            <Button variant="secondary" onClick={processPayroll} disabled={processing}>
-              <Save size={14} /> 
+            <Button variant="secondary" onClick={processPayroll} disabled={processing || terminalDuesLoading}>
+              <Save size={14} />
               {processing ? 'Processing...' : isMonthProcessed ? 'Reprocess Payroll' : 'Process & Save Payroll'}
             </Button>
           </div>
