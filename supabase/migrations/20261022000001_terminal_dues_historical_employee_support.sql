@@ -315,6 +315,10 @@ BEGIN
     status = 'approved',
     approved_by = v_caller_id,
     approved_at = NOW(),
+    returned_by = NULL,
+    returned_by_name = NULL,
+    returned_at = NULL,
+    return_reason = NULL,
     updated_at = NOW()
   WHERE id = p_terminal_due_id;
 
