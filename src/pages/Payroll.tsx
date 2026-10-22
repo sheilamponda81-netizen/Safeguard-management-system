@@ -44,7 +44,8 @@ import {
   TerminalDueEntitlementForSummary,
   TerminalDuePayrollSummary,
 } from '../utils/terminalDuesPayrollIntegration';
-import { buildTerminalDuePaymentsCsv, buildCombinedAccountsSummaryCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
+import { buildTerminalDuePaymentsCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
+import { buildOrdinaryPayrollPaymentsCsv, buildAccountsReconciliationSummaryCsv, computeOrdinaryPayrollPaymentTotals, OrdinaryPayrollPaymentRecord } from '../utils/accountsReconciliationExport';
 
 interface Employee {
   id: string;
@@ -96,6 +97,10 @@ interface PayrollRecord {
   salary_advance_deduction: number;
   net_pay: number;
   processed_at: string;
+  // NULL for any row processed before 20261101000000 added this column --
+  // the Accounts export shows an explicit placeholder rather than
+  // fabricating a reference for such a row (see accountsReconciliationExport.ts).
+  processing_reference?: string | null;
   approval_status?: string;
   approved_by?: string | null;
   approved_at?: string | null;
@@ -1481,6 +1486,23 @@ export function PayrollPage() {
   // history requirement).
   const exportTerminalDuesReport = useCallback(async () => {
     try {
+      // SECURITY/CORRECTNESS (Phase 4A Part 2): this export must use only
+      // COMMITTED financial data -- never a pending/live-preview
+      // calculation. `payrollRecords` is only ever populated from rows
+      // that actually exist in the `payroll` table (i.e. a processing RPC
+      // already ran and wrote them), so gating on isMonthProcessed here
+      // (and building every ordinary-payroll figure below from
+      // `payrollRecords` itself, never from `totals`, which falls back to
+      // a live preview for any employee with no committed row yet) closes
+      // a real gap: this export could previously be downloaded for a
+      // month with NO committed payroll at all, silently showing a live,
+      // unapproved, unprocessed preview total as if it were the final
+      // combined amount payable.
+      if (!isMonthProcessed) {
+        showNotification('Ordinary payroll has not been processed for this month yet -- process payroll first, then export.', 'error');
+        return;
+      }
+
       const { data: processedRows, error: procError } = await supabase
         .from('terminal_due_allocations')
         .select('id, terminal_due_id, last_decided_amount, proposed_amount, processed_at, processing_reference')
@@ -1488,31 +1510,33 @@ export function PayrollPage() {
         .eq('status', 'processed');
       if (procError) throw procError;
 
-      if (!processedRows || processedRows.length === 0) {
-        showNotification('No processed Terminal Dues payments for this month yet.', 'error');
-        return;
-      }
-
-      const dueIds = Array.from(new Set(processedRows.map(r => r.terminal_due_id)));
-      const { data: dueRows, error: dueError } = await supabase
-        .from('terminal_dues')
-        .select('id, employee_id, employee_name, employee_number, historical_employee_id')
-        .in('id', dueIds);
+      const dueIds = Array.from(new Set((processedRows || []).map(r => r.terminal_due_id)));
+      const { data: dueRows, error: dueError } = dueIds.length > 0
+        ? await supabase
+            .from('terminal_dues')
+            .select('id, employee_id, employee_name, employee_number, historical_employee_id')
+            .in('id', dueIds)
+        : { data: [], error: null };
       if (dueError) throw dueError;
       const dueById = new Map((dueRows || []).map((d: any) => [d.id, d]));
 
-      const employeeIds = dedupeById((dueRows || []).filter((d: any) => d.employee_id).map((d: any) => ({ id: d.employee_id })));
-      let payDetailsByEmployee = new Map<string, { pay_point: string | null; account_number: string | null }>();
-      if (employeeIds.length > 0) {
+      // Ordinary + Terminal Dues employee pay-detail lookups share one
+      // fetch -- the union of both sides' employee_id sets, never widened
+      // beyond exactly who this export needs.
+      const tdEmployeeIds = dedupeById((dueRows || []).filter((d: any) => d.employee_id).map((d: any) => ({ id: d.employee_id })));
+      const ordinaryEmployeeIds = dedupeById(payrollRecords.map(r => ({ id: r.employee_id })));
+      const allEmployeeIds = dedupeById([...tdEmployeeIds, ...ordinaryEmployeeIds]);
+      let payDetailsByEmployee = new Map<string, { full_name: string | null; employee_number: string | null; pay_point: string | null; account_number: string | null }>();
+      if (allEmployeeIds.length > 0) {
         const { data: empRows, error: empError } = await supabase
           .from('employees')
-          .select('id, pay_point, account_number')
-          .in('id', employeeIds.map(e => e.id));
+          .select('id, full_name, employee_number, pay_point, account_number')
+          .in('id', allEmployeeIds.map(e => e.id));
         if (empError) throw empError;
         payDetailsByEmployee = new Map((empRows || []).map((e: any) => [e.id, e]));
       }
 
-      const records: TerminalDueExportRecord[] = processedRows.map(r => {
+      const records: TerminalDueExportRecord[] = (processedRows || []).map(r => {
         const due = dueById.get(r.terminal_due_id);
         const payDetails = due?.employee_id ? payDetailsByEmployee.get(due.employee_id) : undefined;
         return {
@@ -1527,6 +1551,38 @@ export function PayrollPage() {
         };
       });
 
+      const ordinaryRecords: OrdinaryPayrollPaymentRecord[] = payrollRecords.map(r => {
+        const details = payDetailsByEmployee.get(r.employee_id);
+        return {
+          employee_id: r.employee_id,
+          full_name: details?.full_name || employeesById.get(r.employee_id)?.full_name || '(employee not found)',
+          employee_number: details?.employee_number || employeesById.get(r.employee_id)?.employee_number || null,
+          pay_point: details?.pay_point || null,
+          account_number: details?.account_number || null,
+          gross_pay: r.gross_pay,
+          paye: r.paye,
+          pension: r.pension,
+          uniform_deduction: r.uniform_deduction,
+          salary_advance_deduction: r.salary_advance_deduction || 0,
+          net_pay: r.net_pay,
+          processing_reference: r.processing_reference ?? null,
+        };
+      });
+
+      if (records.length === 0 && ordinaryRecords.length === 0) {
+        showNotification('No committed payments to export for this month.', 'error');
+        return;
+      }
+
+      const ordinaryCsv = buildOrdinaryPayrollPaymentsCsv(selectedMonth, ordinaryRecords);
+      const ordinaryBlob = new Blob([ordinaryCsv], { type: 'text/csv;charset=utf-8;' });
+      const ordinaryUrl = URL.createObjectURL(ordinaryBlob);
+      const ordinaryA = document.createElement('a');
+      ordinaryA.href = ordinaryUrl;
+      ordinaryA.download = `ordinary_payroll_payments_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
+      ordinaryA.click();
+      URL.revokeObjectURL(ordinaryUrl);
+
       const csv = buildTerminalDuePaymentsCsv(selectedMonth, records);
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
@@ -1536,27 +1592,41 @@ export function PayrollPage() {
       a.click();
       URL.revokeObjectURL(url);
 
-      const combinedCsv = buildCombinedAccountsSummaryCsv(selectedMonth, totals.net, computeTerminalDueExportTotal(records));
+      const ordinaryTotals = computeOrdinaryPayrollPaymentTotals(ordinaryRecords);
+      const tdTotal = computeTerminalDueExportTotal(records);
+      const combinedCsv = buildAccountsReconciliationSummaryCsv({
+        month: selectedMonth,
+        ordinaryEmployeeCount: ordinaryRecords.length,
+        ordinaryGross: ordinaryTotals.gross,
+        ordinaryDeductions: ordinaryTotals.paye + ordinaryTotals.pension + ordinaryTotals.uniformDeduction + ordinaryTotals.salaryAdvanceDeduction,
+        ordinaryNet: ordinaryTotals.net,
+        ordinaryProcessingReferences: Array.from(new Set(ordinaryRecords.map(r => r.processing_reference).filter((ref): ref is string => !!ref))),
+        terminalDuesPaymentCount: records.length,
+        terminalDuesCurrentEmployeeCount: records.filter(r => !r.is_historical).length,
+        terminalDuesHistoricalEmployeeCount: records.filter(r => r.is_historical).length,
+        terminalDuesTotal: tdTotal,
+        terminalDuesProcessingReferences: Array.from(new Set(records.map(r => r.processing_reference).filter((ref): ref is string => !!ref))),
+      });
       const combinedBlob = new Blob([combinedCsv], { type: 'text/csv;charset=utf-8;' });
       const combinedUrl = URL.createObjectURL(combinedBlob);
       const combinedA = document.createElement('a');
       combinedA.href = combinedUrl;
-      combinedA.download = `combined_accounts_summary_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
+      combinedA.download = `accounts_reconciliation_summary_${selectedMonth}_${new Date().toISOString().split('T')[0]}.csv`;
       combinedA.click();
       URL.revokeObjectURL(combinedUrl);
 
       logAudit({
         action: 'EXPORT',
         entity_type: 'terminal_due_allocations',
-        new_data: { month: selectedMonth, paymentCount: records.length },
+        new_data: { month: selectedMonth, paymentCount: records.length, ordinaryPaymentCount: ordinaryRecords.length },
         region_id: userProfile?.region_id,
       });
 
-      showNotification('Terminal Dues payments exported!', 'success');
+      showNotification('Accounts export package downloaded (ordinary payroll, Terminal Dues, reconciliation summary)!', 'success');
     } catch (err) {
-      showNotification('Failed to export Terminal Dues payments: ' + getErrorMessage(err), 'error');
+      showNotification('Failed to export Accounts package: ' + getErrorMessage(err), 'error');
     }
-  }, [selectedMonth, totals.net, userProfile]);
+  }, [selectedMonth, isMonthProcessed, payrollRecords, employeesById, userProfile]);
 
   // ===== PROCESS PAYROLL =====
   const processPayroll = useCallback(async () => {
@@ -1848,8 +1918,10 @@ export function PayrollPage() {
               <Button
                 variant="outline"
                 onClick={exportTerminalDuesReport}
+                disabled={!isMonthProcessed}
+                title={!isMonthProcessed ? 'Process payroll for this month first -- this export only ever reads committed payments' : undefined}
               >
-                <FileText size={16} /> Terminal Dues Payments
+                <FileText size={16} /> Accounts Export Package
               </Button>
             )}
 

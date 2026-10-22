@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList, Banknote } from '../utils/icons';
+import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList, Banknote, History } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, EmptyState } from '../components/ui';
 import { TerminalDuesCalculatorTab, TerminalDuesSubmittedTab } from './TerminalDuesCalculator';
 import { TerminalDuesAllocationsTab } from './TerminalDuesAllocations';
+import { TerminalDuesPaymentHistoryTab } from './TerminalDuesPaymentHistory';
 import { EntitlementRevisionPanel } from './TerminalDuesRevision';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -181,7 +182,7 @@ export function TerminalDuesPage() {
   // calculations promoted into the existing approval workflow via their
   // linked terminal_dues row's own live status -- never a self-reported
   // "Settled" state.
-  const [activeTab, setActiveTab] = useState<'records' | 'calculator' | 'submitted' | 'allocations' | 'leave'>('records');
+  const [activeTab, setActiveTab] = useState<'records' | 'calculator' | 'submitted' | 'allocations' | 'history' | 'leave'>('records');
   
   // ===== PAGINATION STATES =====
   const [duesPage, setDuesPage] = useState(1);
@@ -788,6 +789,7 @@ export function TerminalDuesPage() {
           { id: 'calculator', label: 'Calculator', icon: Calculator },
           { id: 'submitted', label: 'Submitted', icon: CheckCircle },
           { id: 'allocations', label: 'Allocations', icon: Banknote },
+          { id: 'history', label: 'Payment History', icon: History },
           { id: 'leave', label: 'Leave', icon: ClipboardList },
         ]}
         active={activeTab}
@@ -828,6 +830,23 @@ export function TerminalDuesPage() {
             }))}
           canPropose={canCreateTerminalDue || canEditTerminalDue}
           canApprove={canApproveTerminalDue}
+        />
+      )}
+
+      {activeTab === 'history' && (
+        <TerminalDuesPaymentHistoryTab
+          approvedEntitlements={calculations
+            .filter(c => c.status === 'approved')
+            .map(c => ({
+              id: c.id,
+              employee_id: c.employee_id,
+              historical_employee_id: c.historical_employee_id,
+              employee_name: c.employee_name,
+              employee_number: c.employee_number,
+              total_payable: c.total_payable,
+              status: c.status,
+            }))}
+          canView={canCreateTerminalDue || canEditTerminalDue || canApproveTerminalDue || canPayTerminalDue}
         />
       )}
 
