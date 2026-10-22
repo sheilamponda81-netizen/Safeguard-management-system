@@ -84,3 +84,26 @@ export function buildItemizedAttendanceBreakdown(record: AttendanceDeductionReco
     lateDeduction: record.late_deduction || 0,
   };
 }
+
+/**
+ * Derives the uniform-only portion of the frozen `payroll.uniform_deduction`
+ * bucket (which bundles uniform + attendance + lecture/appearance into one
+ * committed total) as a REMAINDER against the other frozen, itemized
+ * components -- never from today's employee.uniform_deduction setting or
+ * today's position-eligibility config, both of which can change after the
+ * month was processed and would silently relabel a past month's uniform
+ * charge with a figure that never applied to it. Only meaningful when an
+ * employee_deductions row exists for the month; otherwise 0, so the caller's
+ * "itemized breakdown not available" fallback covers it instead of showing a
+ * fabricated figure.
+ */
+export function deriveUniformOnlyAmount(
+  totalUniformAndAttendance: number,
+  breakdown: ItemizedAttendanceBreakdown,
+  lectureDeduction: number,
+  appearanceDeduction: number
+): number {
+  if (!breakdown.available) return 0;
+  const remainder = totalUniformAndAttendance - breakdown.absentDeduction - breakdown.lateDeduction - lectureDeduction - appearanceDeduction;
+  return Math.max(0, remainder);
+}

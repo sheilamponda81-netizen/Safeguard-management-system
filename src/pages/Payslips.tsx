@@ -9,7 +9,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
-import { buildItemizedAttendanceBreakdown } from '../utils/payslipBreakdown';
+import { buildItemizedAttendanceBreakdown, deriveUniformOnlyAmount } from '../utils/payslipBreakdown';
 import { getCompanySettings } from '../utils/companySettings';
 import {
   getSystemCurrentMonth,
@@ -366,16 +366,6 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
         ? payrollData.filter((r: PayrollRow) => employeesById.get(r.employee_id)?.region_id === userProfile.region_id)
         : payrollData;
 
-      // Positions eligible for a uniform deduction -- same flag Payroll.tsx
-      // gates on, so a senior/office position never shows a fabricated
-      // "Uniform Deduction" line here just because their employee record
-      // still has a leftover uniform_deduction value.
-      const { data: positionsData, error: posError } = await supabase
-        .from('positions')
-        .select('name, requires_uniform');
-      if (posError) throw posError;
-      const positionMap = new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]));
-
       // Fetch employee deductions for the month -- including the FROZEN
       // absent_deduction/late_deduction dollar amounts, not just the day
       // counts, so the breakdown below never has to recompute a historical
@@ -410,8 +400,11 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             const lateDeduction = attendanceBreakdown.lateDeduction;
             const lectureDeduction = deduction?.lecture_deduction || 0;
             const appearanceDeduction = deduction?.appearance_deduction || 0;
-            const positionRequiresUniform = positionMap.get(employee.position) ?? true;
-            const uniformAmount = positionRequiresUniform ? (employee.uniform_deduction ?? payrollRates.uniformDeduction) : 0;
+            // Uniform-only portion of the frozen `payroll.uniform_deduction`
+            // bucket: see deriveUniformOnlyAmount()'s own header -- never
+            // from today's employee.uniform_deduction or position-eligibility
+            // config, both of which can change after the month was processed.
+            const uniformAmount = deriveUniformOnlyAmount(payroll.uniform_deduction || 0, attendanceBreakdown, lectureDeduction, appearanceDeduction);
 
             payslipData.push({
               employee,

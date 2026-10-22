@@ -1003,7 +1003,7 @@ $$;
 -- ============================================================
 -- PART 6: return_terminal_due_for_correction() -- one added guard
 -- -----------------------------------------------------------
--- Everything below is byte-for-byte unchanged from 20261022000000's
+-- Everything below is byte-for-byte unchanged from 20261022000001's
 -- version EXCEPT the single new EXISTS check immediately after the
 -- status='approved' check: Admin's older "flip back to pending" path
 -- must not race against -- or silently discard -- an HR-initiated

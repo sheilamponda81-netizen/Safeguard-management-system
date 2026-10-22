@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { checkPayslipReconciliation, buildItemizedAttendanceBreakdown } from './payslipBreakdown';
+import { checkPayslipReconciliation, buildItemizedAttendanceBreakdown, deriveUniformOnlyAmount } from './payslipBreakdown';
 
 describe('checkPayslipReconciliation', () => {
   const baseInput = {
@@ -61,5 +61,28 @@ describe('buildItemizedAttendanceBreakdown', () => {
     const result = buildItemizedAttendanceBreakdown({ absent_days: 0, absent_deduction: 0, late_days: 0, late_deduction: 0 });
     expect(result.available).toBe(true);
     expect(result.absentDeduction).toBe(0);
+  });
+});
+
+describe('deriveUniformOnlyAmount', () => {
+  it('derives the uniform-only remainder from the frozen total minus the other frozen components', () => {
+    const breakdown = { available: true, absentDays: 2, absentDeduction: 4000, lateDays: 1, lateDeduction: 1000 };
+    // total 10000 = 4000 absent + 1000 late + 500 lecture + 500 appearance + 4000 uniform
+    expect(deriveUniformOnlyAmount(10000, breakdown, 500, 500)).toBe(4000);
+  });
+
+  it('returns 0 (never a negative or a live-rate guess) when no employee_deductions row exists for the month', () => {
+    const breakdown = { available: false, absentDays: 0, absentDeduction: 0, lateDays: 0, lateDeduction: 0 };
+    expect(deriveUniformOnlyAmount(10000, breakdown, 0, 0)).toBe(0);
+  });
+
+  it('floors at 0 rather than going negative if the frozen components exceed the stored total', () => {
+    const breakdown = { available: true, absentDays: 2, absentDeduction: 6000, lateDays: 1, lateDeduction: 6000 };
+    expect(deriveUniformOnlyAmount(10000, breakdown, 0, 0)).toBe(0);
+  });
+
+  it('does not change behavior when an employee has no uniform charge at all (remainder is exactly 0)', () => {
+    const breakdown = { available: true, absentDays: 1, absentDeduction: 4000, lateDays: 0, lateDeduction: 0 };
+    expect(deriveUniformOnlyAmount(4000, breakdown, 0, 0)).toBe(0);
   });
 });
