@@ -843,7 +843,17 @@ export function TerminalDuesPage() {
               historical_employee_id: c.historical_employee_id,
               employee_name: c.employee_name,
               employee_number: c.employee_number,
+              date_joined: c.date_joined,
+              date_left: c.date_left,
+              reason_for_termination: c.reason_for_termination,
+              gratuity: c.gratuity,
+              annual_leave: c.annual_leave,
+              uniform_refund: c.uniform_refund,
+              other_benefits: c.other_benefits,
+              deductions: c.deductions,
+              subtotal: c.subtotal,
               total_payable: c.total_payable,
+              approved_at: c.approved_at,
               status: c.status,
             }))}
           canView={canCreateTerminalDue || canEditTerminalDue || canApproveTerminalDue || canPayTerminalDue}

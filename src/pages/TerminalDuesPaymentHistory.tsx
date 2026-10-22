@@ -17,13 +17,15 @@
 // means "Terminal Dues processing has run for the full entitlement
 // amount," never a claim that a bank transfer has cleared.
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Search, History } from '../utils/icons';
-import { Card, Badge, EmptyState } from '../components/ui';
+import { Search, History, FileText, Printer, Download } from '../utils/icons';
+import { Card, Badge, EmptyState, Modal, Button } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { showNotification } from '../utils/clickHandlers';
 import { getErrorMessage } from '../utils/errorHandler';
-import { getMonthLabel } from '../utils/currentMonth';
+import { getMonthLabel, getSystemCurrentMonth } from '../utils/currentMonth';
+import { summarizeTerminalDuesStatement, StatementAllocation } from '../utils/terminalDuesStatement';
+import { buildTerminalDuesStatementHtml } from '../utils/terminalDuesStatementHtml';
 
 interface Entitlement {
   id: string;
@@ -31,7 +33,17 @@ interface Entitlement {
   historical_employee_id: string | null;
   employee_name: string;
   employee_number: string;
+  date_joined: string;
+  date_left: string;
+  reason_for_termination: string;
+  gratuity: number;
+  annual_leave: number;
+  uniform_refund: number;
+  other_benefits: number;
+  deductions: number;
+  subtotal: number;
   total_payable: number;
+  approved_at: string | null;
   status: string;
 }
 
@@ -61,8 +73,11 @@ export function TerminalDuesPaymentHistoryTab({
   const [allocations, setAllocations] = useState<AllocationHistoryRow[]>([]);
   const [payDetailsByEmployee, setPayDetailsByEmployee] = useState<Map<string, PayDetails>>(new Map());
   const [payDetailsByHistorical, setPayDetailsByHistorical] = useState<Map<string, PayDetails>>(new Map());
+  const [versionByEntitlement, setVersionByEntitlement] = useState<Map<string, number>>(new Map());
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
+  const [statementTarget, setStatementTarget] = useState<Entitlement | null>(null);
+  const [statementMonth, setStatementMonth] = useState('');
 
   const entitlementIds = useMemo(() => approvedEntitlements.map(e => e.id), [approvedEntitlements]);
 
@@ -105,6 +120,23 @@ export function TerminalDuesPaymentHistoryTab({
       } else {
         setPayDetailsByHistorical(new Map());
       }
+
+      // "Version" (Phase 4B Part 3) -- the highest approved revision
+      // version for this entitlement, same field/labeling convention
+      // TerminalDuesRevision.tsx already uses ("v{version}"). An
+      // entitlement never revised has no row here at all -- version 1
+      // (its original, un-revised approval) is the correct default.
+      const { data: revisionRows, error: revisionError } = await supabase
+        .from('terminal_due_revisions')
+        .select('terminal_due_id, version')
+        .in('terminal_due_id', entitlementIds)
+        .eq('status', 'approved');
+      if (revisionError) throw revisionError;
+      const versions = new Map<string, number>();
+      (revisionRows || []).forEach((r: { terminal_due_id: string; version: number }) => {
+        versions.set(r.terminal_due_id, Math.max(versions.get(r.terminal_due_id) || 1, r.version));
+      });
+      setVersionByEntitlement(versions);
     } catch (err) {
       showNotification('Failed to load Terminal Dues payment history: ' + getErrorMessage(err), 'error');
     } finally {
@@ -115,6 +147,10 @@ export function TerminalDuesPaymentHistoryTab({
   useEffect(() => {
     fetchHistory();
   }, [fetchHistory]);
+
+  useEffect(() => {
+    getSystemCurrentMonth().then(setStatementMonth);
+  }, []);
 
   const processedByEntitlement = useMemo(() => {
     const map = new Map<string, AllocationHistoryRow[]>();
@@ -129,6 +165,93 @@ export function TerminalDuesPaymentHistoryTab({
     }
     return map;
   }, [allocations]);
+
+  const buildStatementData = useCallback((entitlement: Entitlement) => {
+    const entitlementAllocations = allocations
+      .filter(a => a.terminal_due_id === entitlement.id && a.status === 'processed')
+      .sort((a, b) => a.payroll_month.localeCompare(b.payroll_month));
+    const processedAllocations: StatementAllocation[] = entitlementAllocations.map(a => ({
+      payrollMonth: a.payroll_month,
+      amount: Number(a.last_decided_amount ?? a.proposed_amount),
+      processingReference: a.processing_reference,
+      processedAt: a.processed_at,
+    }));
+    const currentMonthAllocation = processedAllocations.find(a => a.payrollMonth === statementMonth) || null;
+    const payDetails = entitlement.employee_id
+      ? payDetailsByEmployee.get(entitlement.employee_id)
+      : entitlement.historical_employee_id
+        ? payDetailsByHistorical.get(entitlement.historical_employee_id)
+        : undefined;
+
+    return {
+      subject: {
+        name: entitlement.employee_name,
+        reference: entitlement.employee_number,
+        isHistorical: !!entitlement.historical_employee_id,
+        dateJoined: entitlement.date_joined,
+        dateLeft: entitlement.date_left,
+        reasonForLeaving: entitlement.reason_for_termination,
+        payPoint: payDetails?.pay_point ?? null,
+        accountNumber: payDetails?.account_number ?? null,
+      },
+      entitlement: {
+        version: versionByEntitlement.get(entitlement.id) || 1,
+        pensionArrears: entitlement.gratuity,
+        annualLeaveRefund: entitlement.annual_leave,
+        uniformRefund: entitlement.uniform_refund,
+        outstandingSalary: entitlement.other_benefits,
+        lessNoticeDeduction: entitlement.deductions,
+        totalEntitlements: entitlement.subtotal,
+        finalApprovedEntitlement: entitlement.total_payable,
+        approvedAt: entitlement.approved_at,
+      },
+      processedAllocations,
+      currentMonthAllocation,
+      statementMonth,
+    };
+  }, [allocations, payDetailsByEmployee, payDetailsByHistorical, versionByEntitlement, statementMonth]);
+
+  const printStatement = useCallback((entitlement: Entitlement) => {
+    const input = buildStatementData(entitlement);
+    const summary = summarizeTerminalDuesStatement(input);
+    const printWindow = window.open('', '_blank', 'width=800,height=600');
+    if (!printWindow) {
+      showNotification('Please allow pop-ups to print statements', 'error');
+      return;
+    }
+    printWindow.document.write(buildTerminalDuesStatementHtml(input, summary));
+    printWindow.document.close();
+    printWindow.focus();
+    setTimeout(() => { printWindow.print(); }, 250);
+  }, [buildStatementData]);
+
+  const downloadStatement = useCallback(async (entitlement: Entitlement) => {
+    try {
+      const input = buildStatementData(entitlement);
+      const summary = summarizeTerminalDuesStatement(input);
+      const [html2canvasModule, jsPDFModule] = await Promise.all([import('html2canvas'), import('jspdf')]);
+      const html2canvas = html2canvasModule.default;
+      const jsPDF = jsPDFModule.default;
+
+      const container = document.createElement('div');
+      container.style.position = 'absolute';
+      container.style.left = '-9999px';
+      container.style.width = '800px';
+      container.innerHTML = buildTerminalDuesStatementHtml(input, summary).replace(/<!DOCTYPE[\s\S]*?<body>/, '').replace('</body></html>', '');
+      document.body.appendChild(container);
+
+      const canvas = await html2canvas(container, { scale: 2, useCORS: true, backgroundColor: '#ffffff' });
+      document.body.removeChild(container);
+
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const imgWidth = 210;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, imgWidth, imgHeight);
+      pdf.save(`terminal_dues_statement_${entitlement.employee_number}_${statementMonth}.pdf`);
+    } catch (err) {
+      showNotification('Failed to generate statement PDF: ' + getErrorMessage(err), 'error');
+    }
+  }, [buildStatementData, statementMonth]);
 
   const filteredEntitlements = useMemo(() => {
     if (!search.trim()) return approvedEntitlements;
@@ -196,9 +319,14 @@ export function TerminalDuesPaymentHistoryTab({
                         {payDetails?.account_number ? `Account: ${payDetails.account_number}` : 'Account: (not on file)'}
                       </p>
                     </div>
-                    <Badge color={isFullySettled ? 'green' : totalProcessed > 0 ? 'blue' : 'yellow'}>
-                      {isFullySettled ? 'Fully Settled' : totalProcessed > 0 ? 'Partially Processed' : 'Not Yet Processed'}
-                    </Badge>
+                    <div className="flex items-center gap-2">
+                      <Badge color={isFullySettled ? 'green' : totalProcessed > 0 ? 'blue' : 'yellow'}>
+                        {isFullySettled ? 'Fully Settled' : totalProcessed > 0 ? 'Partially Processed' : 'Not Yet Processed'}
+                      </Badge>
+                      <Button variant="outline" size="sm" onClick={() => setStatementTarget(entitlement)}>
+                        <FileText size={12} className="mr-1" /> Statement
+                      </Button>
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-1 text-xs border-t border-slate-100 pt-2 mb-2">
@@ -250,6 +378,44 @@ export function TerminalDuesPaymentHistoryTab({
       <p className="text-xs text-slate-400">
         "Fully Settled"/"Partially Processed" reflects that Terminal Dues processing has run via Process Payroll -- confirmed bank payment is tracked separately and is not shown here.
       </p>
+
+      <Modal open={!!statementTarget} onClose={() => setStatementTarget(null)} title="Terminal Dues Payment Statement" size="lg">
+        {statementTarget && (() => {
+          const input = buildStatementData(statementTarget);
+          const summary = summarizeTerminalDuesStatement(input);
+          return (
+            <div className="space-y-4">
+              <div className="p-4 border border-slate-200 rounded-lg text-sm space-y-2">
+                <p className="font-semibold">{input.subject.name} <span className="text-slate-400 text-xs">({input.subject.reference})</span> -- v{input.entitlement.version}</p>
+                <p className="text-xs text-slate-500">
+                  {input.subject.dateJoined || 'N/A'} to {input.subject.dateLeft || 'N/A'} &middot; {input.subject.reasonForLeaving || 'Reason not recorded'}
+                </p>
+                <div className="grid grid-cols-2 gap-2 text-xs pt-2 border-t border-slate-100">
+                  <div>Pension Arrears: {formatKwacha(input.entitlement.pensionArrears)}</div>
+                  <div>Annual Leave Refund: {formatKwacha(input.entitlement.annualLeaveRefund)}</div>
+                  <div>Uniform Refund: {formatKwacha(input.entitlement.uniformRefund)}</div>
+                  <div>Verified Outstanding Salary: {formatKwacha(input.entitlement.outstandingSalary)}</div>
+                  <div>Less Notice Deduction: -{formatKwacha(input.entitlement.lessNoticeDeduction)}</div>
+                  <div className="font-semibold">Final Approved Entitlement: {formatKwacha(input.entitlement.finalApprovedEntitlement)}</div>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs pt-2 border-t border-slate-100">
+                  <div>Total Processed To Date: {formatKwacha(summary.totalProcessedToDate)}</div>
+                  <div className="font-semibold">Outstanding Balance: {formatKwacha(summary.outstandingBalance)}</div>
+                </div>
+                <p className="text-xs"><strong>Settlement status:</strong> {summary.settlementBasis}</p>
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <Button variant="outline" onClick={() => printStatement(statementTarget)}>
+                  <Printer size={14} className="mr-1" /> Print
+                </Button>
+                <Button variant="secondary" onClick={() => downloadStatement(statementTarget)}>
+                  <Download size={14} className="mr-1" /> Download PDF
+                </Button>
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
     </div>
   );
 }
