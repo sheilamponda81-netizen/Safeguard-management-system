@@ -415,7 +415,22 @@ GRANT EXECUTE ON FUNCTION process_approved_payroll_request(UUID, TEXT) TO authen
 -- PART 4: process_payroll_with_terminal_dues() -- ONE new line: stamp
 -- processing_reference onto the `payroll` rows this same transaction
 -- just inserted, using the exact employee_id set this run targeted.
--- Every other line byte-for-byte unchanged from 20261027000000.
+-- Every other line byte-for-byte unchanged from the function's CURRENT
+-- live shape as installed by 20261029000000 -- the migration that made
+-- eligible Terminal Dues inclusion UNCONDITIONAL for any Admin-class
+-- caller, removing the old v_has_td_permission gate that previously
+-- caused a legacy Admin's eligible Terminal Dues allocations to be
+-- silently skipped (see 20261029000000's own header for the full
+-- root-cause explanation). An earlier draft of this PART was mistakenly
+-- written against the function's PRE-20261029000000 shape (20261027000000),
+-- which would have reintroduced that exact silent-omission bug on
+-- install -- caught in STAGING preflight before any write, never
+-- installed. This corrected version carries no v_has_td_permission
+-- variable at all: eligible-Terminal-Dues-inclusion remains unconditional
+-- for any Admin-class caller, exactly as 20261029000000 left it. Only the
+-- separate, narrower exclusion-selection check (still requiring
+-- is_super_admin() OR has_explicit_permission('terminal_dues.approve'))
+-- is preserved, unchanged, from that same shape.
 -- ============================================================
 CREATE OR REPLACE FUNCTION process_payroll_with_terminal_dues(
   p_month TEXT,
@@ -434,7 +449,6 @@ DECLARE
   v_caller_id UUID := auth.uid();
   v_tenant_id UUID;
   v_system_month TEXT;
-  v_has_td_permission BOOLEAN;
   v_has_eligible_td BOOLEAN;
   v_payroll_result JSONB;
   v_td_result JSONB := NULL;
@@ -446,13 +460,13 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated';
   END IF;
 
-  IF NOT (is_super_admin() OR is_business_admin()) THEN
-    RAISE EXCEPTION 'Only an Admin or super admin may commit payroll processing directly -- submit a payroll processing request for Admin approval instead';
-  END IF;
-
   v_tenant_id := get_current_tenant_id();
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the current user';
+  END IF;
+
+  IF NOT (is_super_admin() OR is_business_admin()) THEN
+    RAISE EXCEPTION 'Only an Admin or super admin may commit payroll processing directly -- submit a payroll processing request for Admin approval instead';
   END IF;
 
   SELECT value INTO v_system_month FROM system_settings WHERE tenant_id = v_tenant_id AND key = 'current_payroll_month';
@@ -463,9 +477,9 @@ BEGIN
     RAISE EXCEPTION 'Refusing to process: % is not the active payroll month (%) -- it may have changed since this page loaded; refresh and try again', p_month, v_system_month;
   END IF;
 
-  v_has_td_permission := is_super_admin() OR has_explicit_permission('terminal_dues.approve');
-
-  IF p_td_excluded_ids IS NOT NULL AND array_length(p_td_excluded_ids, 1) > 0 AND NOT v_has_td_permission THEN
+  IF p_td_excluded_ids IS NOT NULL AND array_length(p_td_excluded_ids, 1) > 0
+     AND NOT (is_super_admin() OR has_explicit_permission('terminal_dues.approve'))
+  THEN
     RAISE EXCEPTION 'Only an Admin explicitly granted terminal_dues.approve (or a super admin) may select Terminal Dues exclusions';
   END IF;
 
@@ -479,24 +493,22 @@ BEGIN
   WHERE tenant_id = v_tenant_id AND month = p_month
     AND employee_id = ANY(ARRAY(SELECT (r->>'employee_id')::UUID FROM jsonb_array_elements(p_records) AS r));
 
-  IF v_has_td_permission THEN
-    SELECT EXISTS (
-      SELECT 1 FROM terminal_due_allocations
-      WHERE tenant_id = v_tenant_id AND payroll_month = p_month AND status = 'approved'
-    ) INTO v_has_eligible_td;
+  SELECT EXISTS (
+    SELECT 1 FROM terminal_due_allocations
+    WHERE tenant_id = v_tenant_id AND payroll_month = p_month AND status = 'approved'
+  ) INTO v_has_eligible_td;
 
-    IF v_has_eligible_td OR (p_td_excluded_ids IS NOT NULL AND array_length(p_td_excluded_ids, 1) > 0) THEN
-      v_td_result := process_terminal_due_allocations_batch(p_td_excluded_ids, p_td_exclusion_reason);
-      v_td_total := COALESCE((v_td_result->>'total_amount')::NUMERIC, 0);
-    END IF;
+  IF v_has_eligible_td OR (p_td_excluded_ids IS NOT NULL AND array_length(p_td_excluded_ids, 1) > 0) THEN
+    v_td_result := process_terminal_due_allocations_batch(p_td_excluded_ids, p_td_exclusion_reason);
+    v_td_total := COALESCE((v_td_result->>'total_amount')::NUMERIC, 0);
   END IF;
 
   v_combined_reference := 'PWTD-' || p_month || '-' || substr(replace(gen_random_uuid()::text, '-', ''), 1, 8);
 
-  -- NEW: stamp this run's reference onto the exact `payroll` rows
-  -- process_payroll_batch() just (re)wrote for this month -- the ONLY
-  -- place in this function that touches the `payroll` table's own
-  -- columns; everything else about the insert is process_payroll_
+  -- NEW (this migration): stamp this run's reference onto the exact
+  -- `payroll` rows process_payroll_batch() just (re)wrote for this month
+  -- -- the ONLY place in this function that touches the `payroll` table's
+  -- own columns; everything else about the insert is process_payroll_
   -- batch()'s own, untouched, business.
   UPDATE payroll SET processing_reference = v_combined_reference
   WHERE tenant_id = v_tenant_id AND month = p_month
@@ -547,7 +559,10 @@ GRANT EXECUTE ON FUNCTION process_payroll_with_terminal_dues(TEXT, JSONB, TEXT, 
 --
 -- DEPENDENCIES: 20261030000000 (financial_snapshot column + the three
 -- functions this replaces), 20260901000000 (get_payroll_attendance_counts),
--- 20261027000000 (process_payroll_with_terminal_dues' own prior shape).
+-- 20261029000000 (process_payroll_with_terminal_dues' own CURRENT shape --
+-- unconditional Terminal Dues inclusion for any Admin-class caller, no
+-- v_has_td_permission gate -- this migration's PART 4 is a diff against
+-- THAT shape, not against its pre-fix 20261027000000 predecessor).
 --
 -- PREFLIGHT: none needed. No existing column, row, or RLS policy is
 -- modified -- only a new nullable column, a new partial index, and
@@ -574,8 +589,15 @@ GRANT EXECUTE ON FUNCTION process_payroll_with_terminal_dues(TEXT, JSONB, TEXT, 
 --   -- expected: false (internal helper only)
 --
 -- ROLLBACK SQL:
---   -- Functions: re-apply 20261030000000's and 20261027000000's own
---   -- CREATE OR REPLACE bodies for the four functions touched here.
+--   -- Functions: for compute_payroll_request_snapshot/approve_payroll_
+--   -- processing_request/process_approved_payroll_request, re-apply
+--   -- 20261030000000's own CREATE OR REPLACE bodies verbatim. For
+--   -- process_payroll_with_terminal_dues, re-apply 20261029000000's own
+--   -- CREATE OR REPLACE body verbatim -- NOT 20261027000000's: that
+--   -- earlier shape still carries the v_has_td_permission gate
+--   -- 20261029000000 deliberately removed, and reapplying it would
+--   -- reintroduce the silent Terminal-Dues-omission bug for a legacy
+--   -- Admin.
 --   DROP INDEX IF EXISTS idx_payroll_processing_reference;
 --   ALTER TABLE payroll DROP COLUMN IF EXISTS processing_reference;
 -- ============================================================
