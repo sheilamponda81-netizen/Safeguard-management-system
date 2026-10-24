@@ -8,8 +8,8 @@
 -- ROOT CAUSE
 -- -----------------------------------------------------------
 -- propose_terminal_due_allocation(), correct_terminal_due_allocation(),
--- and approve_terminal_due_allocation() (all 20261023000001) each
--- compute the entitlement's outstanding balance as:
+-- and approve_terminal_due_allocation() each compute the entitlement's
+-- outstanding balance as:
 --   v_outstanding := v_due.total_payable;
 -- and sum "other reserved" amounts only over
 --   status IN ('submitted', 'approved', 'held')
@@ -19,11 +19,11 @@
 -- line was updated to account for it, so these three functions compute
 -- the outstanding balance as if nothing had ever been paid.
 --
--- revalidate_terminal_due_allocations_after_revision() (20261024000000)
--- has the same gap: it restores held allocations up to p_effective_total
--- using a running sum that starts at 0 and only tracks OTHER allocations
--- it restores in the same pass -- it never subtracts amounts already
--- committed via 'processed' allocations for the same entitlement either.
+-- revalidate_terminal_due_allocations_after_revision() has the same gap:
+-- it restores held allocations up to p_effective_total using a running
+-- sum that starts at 0 and only tracks OTHER allocations it restores in
+-- the same pass -- it never subtracts amounts already committed via
+-- 'processed' allocations for the same entitlement either.
 --
 -- CONCRETE REPRODUCTION (confirmed live against a disposable Postgres
 -- database running the real, unmodified migration chain): an entitlement
@@ -45,15 +45,46 @@
 -- an allocation that is silently guaranteed to fail later, with no
 -- warning until that final step.
 --
+-- CORRECTION NOTE (2026-11-03, before install): this migration's first
+-- draft was authored against propose_terminal_due_allocation(),
+-- correct_terminal_due_allocation(), approve_terminal_due_allocation()
+-- and revalidate_terminal_due_allocations_after_revision() as they stood
+-- at 20261023000001 / 20261024000000. Several corrective migrations
+-- shipped between then and now and were silently reverted by that draft:
+--   * 20261023095801 / 095821 / 095839 (Phase 2B part 5a/5b/5c) added the
+--     pending-entitlement-revision freeze check
+--     ("...allocation changes are frozen until it is decided") to
+--     propose/correct/approve respectively -- missing from the first draft.
+--   * The advisory-lock-before-row-lock ordering established after Phase
+--     2B's empirically-reproduced deadlock (lock the entitlement via
+--     pg_advisory_xact_lock() BEFORE taking any FOR UPDATE row lock) was
+--     reversed in the first draft for correct/approve (and, in propose,
+--     the entitlement advisory lock ran after the terminal_dues row lock).
+--   * 20261023130357 (Phase 2B fix part 3) changed
+--     revalidate_terminal_due_allocations_after_revision()'s restoration
+--     test from `last_decided_amount IS NOT NULL` to
+--     `pre_hold_status = 'approved'`, and added resetting
+--     `pre_hold_status = NULL` on every branch -- the first draft still
+--     used the old `last_decided_amount IS NOT NULL` test and never
+--     touched pre_hold_status, silently reverting that fix.
+-- The four functions below have been rewritten starting from their
+-- CURRENT LIVE definitions (which already include all of the above) with
+-- ONLY the processed-balance correction grafted on. Every other line is
+-- unchanged from the live definition. See THE FIX below.
+--
 -- THE FIX
 -- -----------------------------------------------------------
--- Every line below is byte-for-byte unchanged from each function's
--- current (20261023000001 / 20261024000000) version EXCEPT: each now
--- also looks up v_already_processed (the SAME query
--- process_terminal_due_allocations_batch() already uses) and subtracts
--- it from the total_payable/effective_total figure used in its own
--- balance check. No schema change, no data change, no change to the
--- already-correct final commit gate.
+-- Each of propose_terminal_due_allocation(), correct_terminal_due_allocation(),
+-- and approve_terminal_due_allocation() now also looks up
+-- v_already_processed (the SAME query process_terminal_due_allocations_batch()
+-- already uses) and subtracts it from the total_payable figure used in its
+-- own balance check. revalidate_terminal_due_allocations_after_revision()
+-- seeds its running sum with the same v_already_processed instead of 0,
+-- so a processed amount is accounted for exactly once -- on top of
+-- whatever that pass itself restores -- rather than being ignored. No
+-- schema change, no data change, no change to the already-correct final
+-- commit gate, and no change to any pre-existing authorization,
+-- concurrency, freeze-check, or restoration-eligibility logic.
 -- ============================================================
 
 CREATE OR REPLACE FUNCTION propose_terminal_due_allocation(
@@ -102,10 +133,19 @@ BEGIN
     RAISE EXCEPTION 'No active payroll month is configured for this tenant -- set one on the Payroll page first';
   END IF;
 
+  -- Serialize ALL allocation activity for this one entitlement BEFORE
+  -- taking any row lock -- the fixed lock-ordering convention established
+  -- after Phase 2B's deadlock fix (advisory lock first, always).
+  PERFORM pg_advisory_xact_lock(hashtextextended(p_terminal_due_id::text, 0));
+
   SELECT * INTO v_due FROM terminal_dues WHERE id = p_terminal_due_id FOR UPDATE;
 
   IF v_due IS NULL OR (v_due.tenant_id <> v_tenant_id AND NOT is_super_admin()) THEN
     RAISE EXCEPTION 'Terminal due record not found';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM terminal_due_revisions WHERE terminal_due_id = p_terminal_due_id AND status = 'pending') THEN
+    RAISE EXCEPTION 'This entitlement has a pending revision awaiting Admin review -- allocation changes are frozen until it is decided';
   END IF;
 
   IF NOT (is_super_admin() OR is_business_admin()) AND v_due.employee_id IS NOT NULL THEN
@@ -123,15 +163,7 @@ BEGIN
     SELECT region_id INTO v_region_id FROM employees WHERE id = v_due.employee_id;
   END IF;
 
-  -- Serialize ALL allocation activity for this one entitlement, across
-  -- every month it might already have a row for.
-  PERFORM pg_advisory_xact_lock(hashtextextended(v_due.id::text, 0));
-
   SELECT * INTO v_existing FROM terminal_due_allocations WHERE terminal_due_id = p_terminal_due_id AND payroll_month = v_month FOR UPDATE;
-  -- Capture FOUND immediately: the next statement is itself a SELECT
-  -- INTO, which would overwrite FOUND before the branch below reads it
-  -- (the same composite-record/FOUND pitfall fixed in Phase 1.5's
-  -- reopen_terminal_due_calculation()).
   v_existing_found := FOUND;
 
   SELECT COALESCE(SUM(proposed_amount), 0) INTO v_other_reserved
@@ -154,8 +186,6 @@ BEGIN
   END IF;
 
   IF v_existing_found THEN
-    -- This entitlement already has a row for this month -- correcting a
-    -- rejected proposal, or adjusting one Admin has not yet decided.
     IF v_existing.status NOT IN ('submitted', 'rejected') THEN
       RAISE EXCEPTION 'Cannot directly re-propose a % allocation -- an approved allocation must go through correct_terminal_due_allocation() instead', v_existing.status;
     END IF;
@@ -181,8 +211,6 @@ BEGIN
 
     v_new_id := v_existing.id;
   ELSE
-    -- Brand-new allocation for this entitlement+month -- enforce the
-    -- 50-distinct-employees-per-month cap, serialized per (tenant, month).
     PERFORM pg_advisory_xact_lock(hashtextextended(v_tenant_id::text || ':' || v_month, 0));
 
     SELECT COUNT(DISTINCT terminal_due_id) INTO v_monthly_count
@@ -233,6 +261,7 @@ DECLARE
   v_already_processed NUMERIC;
   v_outstanding NUMERIC;
   v_previous_version JSONB;
+  v_tdid UUID;
 BEGIN
   IF v_caller_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
@@ -251,9 +280,20 @@ BEGIN
     RAISE EXCEPTION 'Corrected allocation amount must be greater than zero';
   END IF;
 
+  SELECT terminal_due_id INTO v_tdid FROM terminal_due_allocations WHERE id = p_id;
+  IF v_tdid IS NULL THEN
+    RAISE EXCEPTION 'Allocation not found';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtextextended(v_tdid::text, 0));
+
   SELECT * INTO v_alloc FROM terminal_due_allocations WHERE id = p_id FOR UPDATE;
   IF v_alloc IS NULL OR (v_alloc.tenant_id <> v_tenant_id AND NOT is_super_admin()) THEN
     RAISE EXCEPTION 'Allocation not found';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM terminal_due_revisions WHERE terminal_due_id = v_alloc.terminal_due_id AND status = 'pending') THEN
+    RAISE EXCEPTION 'This entitlement has a pending revision awaiting Admin review -- allocation changes are frozen until it is decided';
   END IF;
 
   IF NOT is_super_admin() AND v_alloc.region_id IS NOT NULL AND NOT region_allowed(v_alloc.region_id) THEN
@@ -263,8 +303,6 @@ BEGIN
   IF v_alloc.status <> 'approved' THEN
     RAISE EXCEPTION 'Only an approved allocation can be corrected (this one is %)', v_alloc.status;
   END IF;
-
-  PERFORM pg_advisory_xact_lock(hashtextextended(v_alloc.terminal_due_id::text, 0));
 
   SELECT * INTO v_due FROM terminal_dues WHERE id = v_alloc.terminal_due_id;
 
@@ -332,6 +370,7 @@ DECLARE
   v_already_processed NUMERIC;
   v_outstanding NUMERIC;
   v_previous_version JSONB;
+  v_tdid UUID;
 BEGIN
   IF v_caller_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
@@ -346,9 +385,20 @@ BEGIN
     RAISE EXCEPTION 'Only an Admin explicitly granted terminal_dues.approve (or a super admin) may approve a payment allocation';
   END IF;
 
+  SELECT terminal_due_id INTO v_tdid FROM terminal_due_allocations WHERE id = p_id;
+  IF v_tdid IS NULL THEN
+    RAISE EXCEPTION 'Allocation not found';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtextextended(v_tdid::text, 0));
+
   SELECT * INTO v_alloc FROM terminal_due_allocations WHERE id = p_id FOR UPDATE;
   IF v_alloc IS NULL OR (v_alloc.tenant_id <> v_tenant_id AND NOT is_super_admin()) THEN
     RAISE EXCEPTION 'Allocation not found';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM terminal_due_revisions WHERE terminal_due_id = v_alloc.terminal_due_id AND status = 'pending') THEN
+    RAISE EXCEPTION 'This entitlement has a pending revision awaiting Admin review -- allocation changes are frozen until it is decided';
   END IF;
 
   IF NOT (is_super_admin() OR is_business_admin()) AND v_alloc.region_id IS NOT NULL AND NOT region_allowed(v_alloc.region_id) THEN
@@ -358,11 +408,6 @@ BEGIN
   IF v_alloc.status NOT IN ('submitted', 'held') THEN
     RAISE EXCEPTION 'Only a submitted or held allocation can be approved (this one is %)', v_alloc.status;
   END IF;
-
-  -- Re-validate the balance at approval time too (defense in depth: other
-  -- allocations against the SAME entitlement may have changed between
-  -- this row's submission and now).
-  PERFORM pg_advisory_xact_lock(hashtextextended(v_alloc.terminal_due_id::text, 0));
 
   SELECT * INTO v_due FROM terminal_dues WHERE id = v_alloc.terminal_due_id;
 
@@ -425,7 +470,11 @@ GRANT EXECUTE ON FUNCTION approve_terminal_due_allocation(UUID) TO authenticated
 -- via 'processed' allocations for the same entitlement. Fixed by seeding
 -- the running sum with v_already_processed instead of 0, so a processed
 -- amount is accounted for exactly once, on top of whatever this pass
--- itself restores.
+-- itself restores. The restoration-eligibility test
+-- (pre_hold_status = 'approved') and the pre_hold_status = NULL reset on
+-- every branch -- both from 20261023130357 / canonical
+-- 20261025000000_terminal_dues_revision_restoration_fix.sql -- are
+-- unchanged.
 -- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION revalidate_terminal_due_allocations_after_revision(
   p_terminal_due_id UUID,
@@ -442,6 +491,10 @@ DECLARE
   v_running_sum NUMERIC;
   v_candidate NUMERIC;
 BEGIN
+  -- FIX: seed the running sum with amounts already committed via Process
+  -- Payroll for this entitlement, so a processed amount is accounted for
+  -- exactly once -- on top of whatever this pass itself restores --
+  -- instead of starting from zero as if nothing had ever been paid.
   SELECT COALESCE(SUM(COALESCE(last_decided_amount, proposed_amount)), 0) INTO v_already_processed
   FROM terminal_due_allocations
   WHERE terminal_due_id = p_terminal_due_id AND status = 'processed';
@@ -454,21 +507,21 @@ BEGIN
     ORDER BY submitted_at ASC
     FOR UPDATE
   LOOP
-    IF v_alloc.last_decided_amount IS NOT NULL THEN
+    IF v_alloc.pre_hold_status = 'approved' THEN
       v_candidate := v_alloc.last_decided_amount;
       IF v_running_sum + v_candidate <= p_effective_total THEN
         UPDATE terminal_due_allocations SET
-          status = 'approved', proposed_amount = v_candidate, hold_reason = NULL, updated_at = NOW()
+          status = 'approved', proposed_amount = v_candidate, hold_reason = NULL, pre_hold_status = NULL, updated_at = NOW()
         WHERE id = v_alloc.id;
         v_running_sum := v_running_sum + v_candidate;
       ELSE
         UPDATE terminal_due_allocations SET
-          status = 'submitted', hold_reason = NULL, updated_at = NOW()
+          status = 'submitted', hold_reason = NULL, pre_hold_status = NULL, updated_at = NOW()
         WHERE id = v_alloc.id;
       END IF;
     ELSE
       UPDATE terminal_due_allocations SET
-        status = 'submitted', hold_reason = NULL, updated_at = NOW()
+        status = 'submitted', hold_reason = NULL, pre_hold_status = NULL, updated_at = NOW()
       WHERE id = v_alloc.id;
     END IF;
   END LOOP;
@@ -490,11 +543,20 @@ REVOKE ALL ON FUNCTION revalidate_terminal_due_allocations_after_revision(UUID, 
 -- correctly -- that function is the real money-safety gate and is
 -- untouched here.
 --
--- ROLLBACK: re-apply 20261023000001_terminal_dues_allocation_ledger.sql's
--- own CREATE OR REPLACE FUNCTION blocks for propose_terminal_due_allocation/
--- correct_terminal_due_allocation/approve_terminal_due_allocation, and
--- 20261024000000_terminal_dues_entitlement_revisions.sql's own block for
--- revalidate_terminal_due_allocations_after_revision, verbatim. Safe at any
--- time: this migration changes no stored data, only pre-commit validation
--- logic.
+-- ROLLBACK: this migration changes no stored data, only pre-commit
+-- validation logic, so rollback at any time is safe -- but do NOT roll
+-- back to 20261023000001's / 20261024000000's original blocks verbatim:
+-- that would silently reintroduce the missing pending-revision freeze
+-- checks, the reversed advisory-lock/row-lock ordering, and the stale
+-- `last_decided_amount IS NOT NULL` restoration test this migration's
+-- draft itself had to be corrected away from (see CORRECTION NOTE above).
+-- The correct rollback target is each function's CURRENT definition as it
+-- stood immediately before this migration was installed -- i.e. simply
+-- do not install this migration, or if already installed, re-apply the
+-- CREATE OR REPLACE FUNCTION blocks from
+-- 20261023130344_terminal_dues_phase2b_fix_part2_propose_revision_rpc /
+-- 20261023130357_terminal_dues_phase2b_fix_part3_revalidate_helper_corrected
+-- and 20261023095801/095821/095839 (Phase 2B part 5a/5b/5c) as the last
+-- known-good state, not the ones named in this file's own now-corrected
+-- header.
 -- ============================================================
