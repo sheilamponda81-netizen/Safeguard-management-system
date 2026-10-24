@@ -61,6 +61,19 @@
 -- A failure RAISEs EXCEPTION naming the employee and the mismatch amount,
 -- before process_payroll_batch() is even called -- nothing is written,
 -- full rollback, exactly like every other validation in this function.
+--
+-- CORRECTION NOTE: an earlier draft of this migration's replacement body
+-- was built from an outdated shape of process_payroll_with_terminal_dues()
+-- and reintroduced the v_has_td_permission gate around Terminal Dues
+-- inclusion that 20261029000000 deliberately removed -- the identical
+-- mistake 20261101000000 originally made and was corrected for (see that
+-- migration's own header). Caught in STAGING preflight before any write;
+-- never installed. This corrected version is a diff against the CURRENT
+-- live function (as installed by 20261101000000: no v_has_td_permission,
+-- unconditional Terminal Dues inclusion for any Admin-class caller, the
+-- exclusion-selection check kept separate and narrower) -- the ONLY
+-- addition is the v_bad_record arithmetic-consistency check and its
+-- declaration, described above.
 -- ============================================================
 
 CREATE OR REPLACE FUNCTION process_payroll_with_terminal_dues(
@@ -80,7 +93,6 @@ DECLARE
   v_caller_id UUID := auth.uid();
   v_tenant_id UUID;
   v_system_month TEXT;
-  v_has_td_permission BOOLEAN;
   v_has_eligible_td BOOLEAN;
   v_payroll_result JSONB;
   v_td_result JSONB := NULL;
@@ -93,13 +105,13 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated';
   END IF;
 
-  IF NOT (is_super_admin() OR is_business_admin()) THEN
-    RAISE EXCEPTION 'Only an Admin or super admin may commit payroll processing directly -- submit a payroll processing request for Admin approval instead';
-  END IF;
-
   v_tenant_id := get_current_tenant_id();
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'No profile found for the current user';
+  END IF;
+
+  IF NOT (is_super_admin() OR is_business_admin()) THEN
+    RAISE EXCEPTION 'Only an Admin or super admin may commit payroll processing directly -- submit a payroll processing request for Admin approval instead';
   END IF;
 
   SELECT value INTO v_system_month FROM system_settings WHERE tenant_id = v_tenant_id AND key = 'current_payroll_month';
@@ -110,9 +122,9 @@ BEGIN
     RAISE EXCEPTION 'Refusing to process: % is not the active payroll month (%) -- it may have changed since this page loaded; refresh and try again', p_month, v_system_month;
   END IF;
 
-  v_has_td_permission := is_super_admin() OR has_explicit_permission('terminal_dues.approve');
-
-  IF p_td_excluded_ids IS NOT NULL AND array_length(p_td_excluded_ids, 1) > 0 AND NOT v_has_td_permission THEN
+  IF p_td_excluded_ids IS NOT NULL AND array_length(p_td_excluded_ids, 1) > 0
+     AND NOT (is_super_admin() OR has_explicit_permission('terminal_dues.approve'))
+  THEN
     RAISE EXCEPTION 'Only an Admin explicitly granted terminal_dues.approve (or a super admin) may select Terminal Dues exclusions';
   END IF;
 
@@ -154,16 +166,14 @@ BEGIN
   WHERE tenant_id = v_tenant_id AND month = p_month
     AND employee_id = ANY(ARRAY(SELECT (r->>'employee_id')::UUID FROM jsonb_array_elements(p_records) AS r));
 
-  IF v_has_td_permission THEN
-    SELECT EXISTS (
-      SELECT 1 FROM terminal_due_allocations
-      WHERE tenant_id = v_tenant_id AND payroll_month = p_month AND status = 'approved'
-    ) INTO v_has_eligible_td;
+  SELECT EXISTS (
+    SELECT 1 FROM terminal_due_allocations
+    WHERE tenant_id = v_tenant_id AND payroll_month = p_month AND status = 'approved'
+  ) INTO v_has_eligible_td;
 
-    IF v_has_eligible_td OR (p_td_excluded_ids IS NOT NULL AND array_length(p_td_excluded_ids, 1) > 0) THEN
-      v_td_result := process_terminal_due_allocations_batch(p_td_excluded_ids, p_td_exclusion_reason);
-      v_td_total := COALESCE((v_td_result->>'total_amount')::NUMERIC, 0);
-    END IF;
+  IF v_has_eligible_td OR (p_td_excluded_ids IS NOT NULL AND array_length(p_td_excluded_ids, 1) > 0) THEN
+    v_td_result := process_terminal_due_allocations_batch(p_td_excluded_ids, p_td_exclusion_reason);
+    v_td_total := COALESCE((v_td_result->>'total_amount')::NUMERIC, 0);
   END IF;
 
   v_combined_reference := 'PWTD-' || p_month || '-' || substr(replace(gen_random_uuid()::text, '-', ''), 1, 8);
