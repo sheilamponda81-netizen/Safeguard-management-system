@@ -16,21 +16,67 @@
 --     manipulated RPC call could silently persist a refund computed at
 --     the wrong rate.
 --
+-- A follow-up independent preflight of the first draft of this migration
+-- found two further weaknesses, corrected here before this file was ever
+-- applied anywhere:
+--
+--  3. The "system-calculated months" the pension-override check compared
+--     against was derived from the CALLER-SUPPLIED `p_inputs.dateJoined`,
+--     not from `employees.hire_date` -- for an existing employee, a direct
+--     RPC call could fabricate `dateJoined` to manufacture a match and
+--     bypass the correction-reason requirement entirely. Fixed: for an
+--     existing employee (employee_id IS NOT NULL), `employees.hire_date`
+--     (verified to belong to the caller's own tenant) is now the sole
+--     authoritative source for this computation -- `p_inputs.dateJoined`
+--     is no longer read for this purpose at all, so manipulating it no
+--     longer has any effect on the reason requirement. Historical
+--     subjects (no linked employee record) have no such authoritative
+--     source and continue to derive this from their own submitted inputs,
+--     exactly as before. `dateLeft` has NO authoritative source anywhere
+--     in this schema (no termination-date column exists on `employees`)
+--     and is NOT independently verified for either subject type -- this
+--     migration does not claim otherwise.
+--  4. Neither RPC checked that the supplied `breakdown`/`total_payable`
+--     actually followed from the now-validated inputs -- a caller could
+--     satisfy every reason/rate check above while still supplying an
+--     arbitrary `uniformRefund`, `pensionArrears`, or `total_payable`.
+--     Fixed, within this migration's narrow scope: `pensionArrears` and
+--     `uniformRefund` are now independently recomputed server-side from
+--     the now-authoritative months/rate (mirroring
+--     calculatePensionArrears()/calculateUniformRefund() in
+--     terminalDuesEngine.ts exactly, including its "round up to the whole
+--     Kwacha" rule), and rejected on any mismatch; `total_payable` is
+--     checked for internal consistency against the engine's exact
+--     combination formula applied to the breakdown's own four entitlement
+--     components and its notice deduction. KNOWN LIMITATION, reported
+--     explicitly rather than claimed otherwise: `annualLeaveRefund`,
+--     `outstandingSalaryTotal` and `lessNoticeDeduction` are NOT
+--     independently re-derived from raw inputs here -- doing so safely
+--     would require mirroring the outstanding-salary-entries loop and the
+--     notice-deduction branching logic in SQL too, which is a materially
+--     larger change than this migration's scope. A forger who keeps the
+--     breakdown's own arithmetic internally consistent could still
+--     misstate those three specific fields; this migration does not
+--     claim full server-side financial integrity, only that
+--     `pensionArrears`, `uniformRefund`, and the stated total's
+--     consistency with whatever the other fields claim, are now
+--     authoritative.
+--
 -- This migration re-derives every value these checks compare against
--- directly from server-side data (employment dates already in the
--- submitted inputs, the `payroll` table, and the live `system_settings`
--- row) -- it never trusts a client-supplied "system" value, evidence
--- count, or rate. Per the explicit business policy already implemented in
--- terminalDuesEngine.ts, the uniform refund always uses the CURRENT
--- approved rate for every eligible month, never a historical one -- so a
--- draft's recorded rate must always equal the live setting at the exact
--- moment it is saved or submitted; there is deliberately no notion of an
--- "authorised old rate" to carry forward and no new rate-history table.
--- Once a calculation is submitted, `terminal_due_calculations` is frozen
--- for that row (status moves to 'submitted', and TerminalDuesSubmittedTab
--- never recomputes it), so the rate captured AT SUBMISSION time becomes
--- that calculation's own permanent, authorised historical record on its
--- own, with no extra bookkeeping needed.
+-- directly from server-side data (the employee's own record, the
+-- `payroll` table, and the live `system_settings` row) -- it never trusts
+-- a client-supplied "system" value, evidence count, or rate. Per the
+-- explicit business policy already implemented in terminalDuesEngine.ts,
+-- the uniform refund always uses the CURRENT approved rate for every
+-- eligible month, never a historical one -- so a draft's recorded rate
+-- must always equal the live setting at the exact moment it is saved or
+-- submitted; there is deliberately no notion of an "authorised old rate"
+-- to carry forward and no new rate-history table. Once a calculation is
+-- submitted, `terminal_due_calculations` is frozen for that row (status
+-- moves to 'submitted', and TerminalDuesSubmittedTab never recomputes
+-- it), so the rate captured AT SUBMISSION time becomes that calculation's
+-- own permanent, authorised historical record on its own, with no extra
+-- bookkeeping needed.
 --
 -- Historical employees (no employee_id, no payroll trail) are explicitly
 -- exempted from the uniform-evidence check -- missing evidence is never
@@ -38,24 +84,29 @@
 -- uniformRefundNeedsCorrectionReason()'s existing rule in
 -- terminalDuesEngine.ts.
 --
--- All numeric extraction from the caller-supplied `p_inputs` JSONB is
--- wrapped to fail safely (treated as absent) rather than raising a raw
--- cast error, so a malformed or manipulated payload surfaces as one of
--- the clear validation messages below instead of an opaque database
--- error.
+-- All numeric extraction from caller-supplied JSONB is wrapped to fail
+-- safely (treated as absent) rather than raising a raw cast error;
+-- `uniformDeductionMonths` and `finalSalary` are additionally rejected
+-- outright (a clear RAISE EXCEPTION) if absent, non-numeric or out of
+-- their valid range (negative months; non-positive salary), since there
+-- is no safe default for either once their value directly drives a
+-- recomputed, now-enforced monetary figure.
 --
 -- Signatures, permission checks, tenant/region ownership checks, draft
 -- status checks and audit-log behavior are all preserved unchanged from
 -- the live definitions this migration replaces (confirmed by a fresh
 -- pg_get_functiondef() pull from STAGING immediately before drafting
--- this file). Compatibility: this validation only runs when a row is
--- saved or submitted going forward -- no existing stored row is read or
--- modified by this migration itself. A pre-existing draft that already
--- has an undocumented correction will be blocked at its *next* save or
--- submit attempt until a reason is added; this is the intended effect of
--- closing the gap, not a data loss. Already-submitted/approved/paid
--- `terminal_dues` entitlements are never touched, since both functions
--- only act on rows with status = 'draft'.
+-- this file, and by a second, independent pull mechanically diffed again
+-- before this corrective revision). Compatibility: this validation only
+-- runs when a row is saved or submitted going forward -- no existing
+-- stored row is read or modified by this migration itself. A pre-existing
+-- draft that already has an undocumented correction, a stale/incorrect
+-- rate, or a breakdown that does not match its own now-authoritative
+-- components will be blocked at its *next* save or submit attempt until
+-- it is corrected; this is the intended effect of closing the gap, not
+-- data loss. Already-submitted/approved/paid `terminal_dues` entitlements
+-- are never touched, since both functions only act on rows with
+-- status = 'draft'.
 
 CREATE OR REPLACE FUNCTION update_terminal_due_calculation_draft(
   p_id UUID,
@@ -104,25 +155,61 @@ BEGIN
     RAISE EXCEPTION 'Cannot edit a % calculation -- reopen it first', v_row.status;
   END IF;
 
-  -- Safety enforcement: correction reasons + uniform refund rate (see
+  -- Safety enforcement: correction reasons, authoritative employment
+  -- dates, uniform refund arithmetic and total_payable consistency (see
   -- migration header comment for the full rationale).
   DECLARE
+    v_employee_hire_date DATE;
+    v_employee_tenant_id UUID;
     v_date_joined DATE;
     v_date_left DATE;
     v_system_months INTEGER;
     v_override_months NUMERIC;
     v_override_reason TEXT;
+    v_effective_months NUMERIC;
     v_entered_uniform_months NUMERIC;
     v_entered_uniform_reason TEXT;
     v_evidence_months INTEGER;
     v_current_rate NUMERIC;
     v_claimed_rate NUMERIC;
+    v_final_salary NUMERIC;
+    v_computed_pension_arrears NUMERIC;
+    v_breakdown_pension_arrears NUMERIC;
+    v_computed_uniform_refund NUMERIC;
+    v_breakdown_uniform_refund NUMERIC;
+    v_computed_entitlements NUMERIC;
+    v_computed_total_payable NUMERIC;
+    v_breakdown_total_payable NUMERIC;
   BEGIN
+    -- Authoritative dateJoined: for an existing employee, employees.hire_date
+    -- (verified to belong to this tenant) -- p_inputs.dateJoined is never
+    -- read for this computation, so it can no longer be manipulated to
+    -- bypass the correction-reason check below. Historical subjects have
+    -- no linked employee record, so their dateJoined still comes from the
+    -- submitted inputs, exactly as before. dateLeft has no authoritative
+    -- source anywhere in this schema and is read from the submitted inputs
+    -- for both subject types, same as before -- it is not independently
+    -- verified.
+    IF v_row.employee_id IS NOT NULL THEN
+      SELECT hire_date, tenant_id INTO v_employee_hire_date, v_employee_tenant_id
+      FROM employees WHERE id = v_row.employee_id;
+
+      IF v_employee_hire_date IS NULL OR (v_employee_tenant_id <> v_tenant_id AND NOT is_super_admin()) THEN
+        RAISE EXCEPTION 'The employee for this calculation could not be found';
+      END IF;
+
+      v_date_joined := v_employee_hire_date;
+    ELSE
+      BEGIN
+        v_date_joined := (p_inputs->>'dateJoined')::date;
+      EXCEPTION WHEN OTHERS THEN
+        v_date_joined := NULL;
+      END;
+    END IF;
+
     BEGIN
-      v_date_joined := (p_inputs->>'dateJoined')::date;
       v_date_left := (p_inputs->>'dateLeft')::date;
     EXCEPTION WHEN OTHERS THEN
-      v_date_joined := NULL;
       v_date_left := NULL;
     END;
 
@@ -148,11 +235,19 @@ BEGIN
       RAISE EXCEPTION 'A correction reason is required: the entered completed months (%) differ from the system-calculated months (%)', v_override_months, v_system_months;
     END IF;
 
+    v_effective_months := CASE
+      WHEN v_override_months IS NOT NULL AND v_override_months >= 0 THEN v_override_months
+      ELSE v_system_months
+    END;
+
     BEGIN
       v_entered_uniform_months := (p_inputs->>'uniformDeductionMonths')::numeric;
     EXCEPTION WHEN OTHERS THEN
-      v_entered_uniform_months := 0;
+      v_entered_uniform_months := NULL;
     END;
+    IF v_entered_uniform_months IS NULL OR v_entered_uniform_months < 0 THEN
+      RAISE EXCEPTION 'Uniform deduction months must be a valid, non-negative number';
+    END IF;
     v_entered_uniform_reason := trim(coalesce(p_inputs->>'uniformDeductionCorrectionReason', ''));
 
     IF v_row.employee_id IS NOT NULL THEN
@@ -184,6 +279,69 @@ BEGIN
 
     IF v_claimed_rate IS NULL OR v_claimed_rate <> v_current_rate THEN
       RAISE EXCEPTION 'The uniform refund rate used in this calculation does not match the current approved rate of %. Refresh the Calculator and recalculate before saving.', v_current_rate;
+    END IF;
+
+    BEGIN
+      v_final_salary := (p_inputs->>'finalSalary')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      v_final_salary := NULL;
+    END;
+    IF v_final_salary IS NULL OR v_final_salary <= 0 THEN
+      RAISE EXCEPTION 'Final salary must be greater than zero';
+    END IF;
+
+    -- Recompute the two entitlement components this migration now has an
+    -- authoritative basis for (effective months via employees.hire_date;
+    -- rate via the validated system_settings lookup above), mirroring
+    -- calculatePensionArrears()/calculateUniformRefund() in
+    -- terminalDuesEngine.ts exactly, including its rounding rule -- and
+    -- reject if the supplied breakdown disagrees, rather than silently
+    -- rewriting it.
+    v_computed_pension_arrears := CEIL(ROUND(v_effective_months * v_final_salary * 0.1, 6));
+    BEGIN
+      v_breakdown_pension_arrears := (p_breakdown->>'pensionArrears')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      v_breakdown_pension_arrears := NULL;
+    END;
+    IF v_breakdown_pension_arrears IS NULL OR v_breakdown_pension_arrears <> v_computed_pension_arrears THEN
+      RAISE EXCEPTION 'The pension arrears in this calculation (%) do not match the validated amount of % for % effective months at a final salary of %', v_breakdown_pension_arrears, v_computed_pension_arrears, v_effective_months, v_final_salary;
+    END IF;
+
+    v_computed_uniform_refund := CASE WHEN v_entered_uniform_months > 0 THEN CEIL(ROUND(v_entered_uniform_months * v_current_rate, 6)) ELSE 0 END;
+    BEGIN
+      v_breakdown_uniform_refund := (p_breakdown->>'uniformRefund')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      v_breakdown_uniform_refund := NULL;
+    END;
+    IF v_breakdown_uniform_refund IS NULL OR v_breakdown_uniform_refund <> v_computed_uniform_refund THEN
+      RAISE EXCEPTION 'The uniform refund in this calculation (%) does not match the validated amount of % for % months at the current rate of %', v_breakdown_uniform_refund, v_computed_uniform_refund, v_entered_uniform_months, v_current_rate;
+    END IF;
+
+    -- total_payable consistency: the engine's exact combination formula
+    -- (sum the four entitlement components, round up, subtract the notice
+    -- deduction, floor at zero) applied to the breakdown's OWN stated
+    -- values for the two components not independently re-derived here
+    -- (annualLeaveRefund, outstandingSalaryTotal, lessNoticeDeduction --
+    -- see migration header comment for why). This does not amount to full
+    -- server-side recomputation of those three fields, only to the total
+    -- being internally consistent with whatever they claim, plus the two
+    -- components above being independently correct.
+    v_computed_entitlements := CEIL(ROUND(
+      v_computed_pension_arrears
+      + coalesce((p_breakdown->>'annualLeaveRefund')::numeric, 0)
+      + v_computed_uniform_refund
+      + coalesce((p_breakdown->>'outstandingSalaryTotal')::numeric, 0)
+    , 6));
+    v_computed_total_payable := GREATEST(0, v_computed_entitlements - coalesce((p_breakdown->>'lessNoticeDeduction')::numeric, 0));
+
+    BEGIN
+      v_breakdown_total_payable := (p_breakdown->>'totalPayable')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      v_breakdown_total_payable := NULL;
+    END;
+
+    IF v_breakdown_total_payable IS NULL OR v_breakdown_total_payable <> v_computed_total_payable OR p_total_payable <> v_computed_total_payable THEN
+      RAISE EXCEPTION 'The total payable in this calculation does not match the validated amount of % derived from its own breakdown', v_computed_total_payable;
     END IF;
   END;
 
@@ -268,29 +426,58 @@ BEGIN
     RAISE EXCEPTION 'This calculation has already been submitted (status: %)', v_row.status;
   END IF;
 
-  -- Safety enforcement: correction reasons + uniform refund rate. Runs on
-  -- the stored draft (v_row.inputs), not on client-supplied parameters --
-  -- submit_terminal_due_calculation() takes no inputs of its own, so this
-  -- closes the bypass where a draft saved with a mismatch (however it got
-  -- that way) is promoted into the authoritative terminal_dues workflow
-  -- without ever being blocked. See migration header comment.
+  -- Safety enforcement: correction reasons, authoritative employment
+  -- dates, uniform refund arithmetic and total_payable consistency. Runs
+  -- on the stored draft (v_row.inputs/v_row.breakdown/v_row.total_payable),
+  -- not on client-supplied parameters -- submit_terminal_due_calculation()
+  -- takes no inputs of its own, so this closes the bypass where a draft
+  -- saved with a mismatch (however it got that way, including a raw
+  -- INSERT that never went through update_terminal_due_calculation_draft())
+  -- is promoted into the authoritative terminal_dues workflow without ever
+  -- being blocked. See migration header comment for the full rationale.
   DECLARE
+    v_employee_hire_date DATE;
+    v_employee_tenant_id UUID;
     v_date_joined DATE;
     v_date_left DATE;
     v_system_months INTEGER;
     v_override_months NUMERIC;
     v_override_reason TEXT;
+    v_effective_months NUMERIC;
     v_entered_uniform_months NUMERIC;
     v_entered_uniform_reason TEXT;
     v_evidence_months INTEGER;
     v_current_rate NUMERIC;
     v_claimed_rate NUMERIC;
+    v_final_salary NUMERIC;
+    v_computed_pension_arrears NUMERIC;
+    v_breakdown_pension_arrears NUMERIC;
+    v_computed_uniform_refund NUMERIC;
+    v_breakdown_uniform_refund NUMERIC;
+    v_computed_entitlements NUMERIC;
+    v_computed_total_payable NUMERIC;
+    v_breakdown_total_payable NUMERIC;
   BEGIN
+    IF v_row.employee_id IS NOT NULL THEN
+      SELECT hire_date, tenant_id INTO v_employee_hire_date, v_employee_tenant_id
+      FROM employees WHERE id = v_row.employee_id;
+
+      IF v_employee_hire_date IS NULL OR (v_employee_tenant_id <> v_tenant_id AND NOT is_super_admin()) THEN
+        RAISE EXCEPTION 'The employee for this calculation could not be found';
+      END IF;
+
+      v_date_joined := v_employee_hire_date;
+    ELSE
+      BEGIN
+        v_date_joined := (v_row.inputs->>'dateJoined')::date;
+      EXCEPTION WHEN OTHERS THEN
+        v_date_joined := NULL;
+      END;
+    END IF;
+
     BEGIN
-      v_date_joined := (v_row.inputs->>'dateJoined')::date;
       v_date_left := (v_row.inputs->>'dateLeft')::date;
     EXCEPTION WHEN OTHERS THEN
-      v_date_joined := NULL;
       v_date_left := NULL;
     END;
 
@@ -316,11 +503,19 @@ BEGIN
       RAISE EXCEPTION 'A correction reason is required: the entered completed months (%) differ from the system-calculated months (%)', v_override_months, v_system_months;
     END IF;
 
+    v_effective_months := CASE
+      WHEN v_override_months IS NOT NULL AND v_override_months >= 0 THEN v_override_months
+      ELSE v_system_months
+    END;
+
     BEGIN
       v_entered_uniform_months := (v_row.inputs->>'uniformDeductionMonths')::numeric;
     EXCEPTION WHEN OTHERS THEN
-      v_entered_uniform_months := 0;
+      v_entered_uniform_months := NULL;
     END;
+    IF v_entered_uniform_months IS NULL OR v_entered_uniform_months < 0 THEN
+      RAISE EXCEPTION 'Uniform deduction months must be a valid, non-negative number';
+    END IF;
     v_entered_uniform_reason := trim(coalesce(v_row.inputs->>'uniformDeductionCorrectionReason', ''));
 
     IF v_row.employee_id IS NOT NULL THEN
@@ -352,6 +547,53 @@ BEGIN
 
     IF v_claimed_rate IS NULL OR v_claimed_rate <> v_current_rate THEN
       RAISE EXCEPTION 'The uniform refund rate used in this calculation does not match the current approved rate of %. Reopen the draft, refresh the Calculator and recalculate before submitting.', v_current_rate;
+    END IF;
+
+    BEGIN
+      v_final_salary := (v_row.inputs->>'finalSalary')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      v_final_salary := NULL;
+    END;
+    IF v_final_salary IS NULL OR v_final_salary <= 0 THEN
+      RAISE EXCEPTION 'Final salary must be greater than zero';
+    END IF;
+
+    v_computed_pension_arrears := CEIL(ROUND(v_effective_months * v_final_salary * 0.1, 6));
+    BEGIN
+      v_breakdown_pension_arrears := (v_row.breakdown->>'pensionArrears')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      v_breakdown_pension_arrears := NULL;
+    END;
+    IF v_breakdown_pension_arrears IS NULL OR v_breakdown_pension_arrears <> v_computed_pension_arrears THEN
+      RAISE EXCEPTION 'The pension arrears in this calculation (%) do not match the validated amount of % for % effective months at a final salary of %', v_breakdown_pension_arrears, v_computed_pension_arrears, v_effective_months, v_final_salary;
+    END IF;
+
+    v_computed_uniform_refund := CASE WHEN v_entered_uniform_months > 0 THEN CEIL(ROUND(v_entered_uniform_months * v_current_rate, 6)) ELSE 0 END;
+    BEGIN
+      v_breakdown_uniform_refund := (v_row.breakdown->>'uniformRefund')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      v_breakdown_uniform_refund := NULL;
+    END;
+    IF v_breakdown_uniform_refund IS NULL OR v_breakdown_uniform_refund <> v_computed_uniform_refund THEN
+      RAISE EXCEPTION 'The uniform refund in this calculation (%) does not match the validated amount of % for % months at the current rate of %', v_breakdown_uniform_refund, v_computed_uniform_refund, v_entered_uniform_months, v_current_rate;
+    END IF;
+
+    v_computed_entitlements := CEIL(ROUND(
+      v_computed_pension_arrears
+      + coalesce((v_row.breakdown->>'annualLeaveRefund')::numeric, 0)
+      + v_computed_uniform_refund
+      + coalesce((v_row.breakdown->>'outstandingSalaryTotal')::numeric, 0)
+    , 6));
+    v_computed_total_payable := GREATEST(0, v_computed_entitlements - coalesce((v_row.breakdown->>'lessNoticeDeduction')::numeric, 0));
+
+    BEGIN
+      v_breakdown_total_payable := (v_row.breakdown->>'totalPayable')::numeric;
+    EXCEPTION WHEN OTHERS THEN
+      v_breakdown_total_payable := NULL;
+    END;
+
+    IF v_breakdown_total_payable IS NULL OR v_breakdown_total_payable <> v_computed_total_payable OR v_row.total_payable <> v_computed_total_payable THEN
+      RAISE EXCEPTION 'The total payable in this calculation does not match the validated amount of % derived from its own breakdown', v_computed_total_payable;
     END IF;
   END;
 
