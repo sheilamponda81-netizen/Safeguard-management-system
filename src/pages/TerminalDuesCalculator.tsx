@@ -619,7 +619,7 @@ export function TerminalDuesCalculatorTab({
                     <span className="text-slate-400"> (payroll evidence: {inputs.uniformDeductionPayrollEvidenceMonths})</span>
                   )}
                 </label>
-                <p className="text-xs text-slate-400 mb-1">
+                <p className="text-xs font-medium text-slate-600 mb-1">
                   Current uniform refund rate: {formatKwacha(uniformRefundRate)} / month
                 </p>
                 <input
@@ -650,28 +650,35 @@ export function TerminalDuesCalculatorTab({
                 </Button>
               </div>
               {inputs.outstandingSalaryEntries.map((entry, idx) => (
-                <div key={idx} className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-2 items-center">
-                  <input
-                    type="text"
-                    placeholder="Month (e.g. 2026-03)"
-                    value={entry.month}
-                    onChange={e => updateOutstandingEntry(idx, { month: e.target.value })}
-                    className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
-                  />
-                  <input
-                    type="number"
-                    placeholder="Amount owed"
-                    value={entry.amountOwed}
-                    onChange={e => updateOutstandingEntry(idx, { amountOwed: Number(e.target.value) || 0 })}
-                    className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
-                  />
-                  <input
-                    type="number"
-                    placeholder="Amount already paid"
-                    value={entry.amountPaid}
-                    onChange={e => updateOutstandingEntry(idx, { amountPaid: Number(e.target.value) || 0 })}
-                    className="px-3 py-2 text-sm border border-slate-200 rounded-lg"
-                  />
+                <div key={idx} className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-2 items-end">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-0.5">Month</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. 2026-03"
+                      value={entry.month}
+                      onChange={e => updateOutstandingEntry(idx, { month: e.target.value })}
+                      className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-0.5">Amount Owed</label>
+                    <input
+                      type="number"
+                      value={entry.amountOwed}
+                      onChange={e => updateOutstandingEntry(idx, { amountOwed: Number(e.target.value) || 0 })}
+                      className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-0.5">Amount Already Paid (reduces this month's outstanding amount)</label>
+                    <input
+                      type="number"
+                      value={entry.amountPaid}
+                      onChange={e => updateOutstandingEntry(idx, { amountPaid: Number(e.target.value) || 0 })}
+                      className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+                    />
+                  </div>
                   <Button variant="outline" size="sm" onClick={() => removeOutstandingEntry(idx)}>
                     <Trash2 size={14} />
                   </Button>
