@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList, Banknote, History } from '../utils/icons';
+import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList, Banknote, History, AlertTriangle, TrendingUp } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, EmptyState } from '../components/ui';
 import { TerminalDuesCalculatorTab, TerminalDuesSubmittedTab } from './TerminalDuesCalculator';
 import { TerminalDuesAllocationsTab } from './TerminalDuesAllocations';
@@ -20,6 +20,14 @@ import { formatAuditTimestamp, formatAuditValue } from '../utils/terminalDuesAud
 import { buildOpenDueStatusMap, getOpenDueLabel, isOpenDueUniqueViolation, DUPLICATE_OPEN_DUE_MESSAGE } from '../utils/terminalDuesDuplicates';
 import { getErrorMessage } from '../utils/errorHandler';
 import { UserProfile } from '../utils/currentProfile';
+import {
+  computeEntitlementFinancials,
+  summarizeTerminalDuesOverview,
+  matchesOverviewFilter,
+  OverviewFilter,
+  OverviewAllocation,
+  EntitlementFinancials,
+} from '../utils/terminalDuesOverview';
 
 interface Employee {
   id: string;
@@ -152,7 +160,22 @@ export function TerminalDuesPage() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [editingCalculation, setEditingCalculation] = useState<TerminalDue | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
-  const [filterStatus, setFilterStatus] = useState('all');
+  const [filterStatus, setFilterStatus] = useState<OverviewFilter>('all');
+
+  // ===== MANAGEMENT FINANCIAL OVERVIEW (Records tab) =====
+  // Read-only allocation-ledger rows for every loaded entitlement, used
+  // ONLY to derive display figures (actually paid / reserved / remaining /
+  // available) -- see src/utils/terminalDuesOverview.ts for the exact,
+  // authoritative formulas (same principles as TerminalDuesAllocations.tsx
+  // and TerminalDuesPaymentHistoryTab, and the server-side balance check in
+  // 20261103000000_terminal_dues_allocation_balance_processed_fix.sql).
+  // Fetched for ALL entitlements (not just approved) so a legacy 'paid'
+  // row's ledger-conflict check (see hasLedgerConflict) can see allocation
+  // rows it should never have. A fetch failure is tracked separately so
+  // the summary cards show an explicit error state, never a silent zero.
+  const [overviewAllocations, setOverviewAllocations] = useState<OverviewAllocation[]>([]);
+  const [overviewAllocationsLoading, setOverviewAllocationsLoading] = useState(false);
+  const [overviewAllocationsError, setOverviewAllocationsError] = useState<string | null>(null);
   // Permission-driven action gating. HR Manager: create/edit a Pending
   // calculation, never approve/pay. Functional Admin: approve a Pending
   // calculation (and return an Approved one for correction), never
@@ -221,11 +244,19 @@ export function TerminalDuesPage() {
 
   const displayedCalculations = useMemo(() => {
     let result = calculations;
-    
+
     if (filterStatus !== 'all') {
-      result = result.filter(c => c.status === filterStatus);
+      result = result.filter(c => {
+        const financials = financialsByEntitlement.get(c.id);
+        // While the allocation ledger is still loading/failed, a financial
+        // filter (anything but 'all') has nothing reliable to test against
+        // -- hide the row rather than guess, instead of matching it on an
+        // undefined/zero financial state.
+        if (!financials) return false;
+        return matchesOverviewFilter(filterStatus, { id: c.id, status: c.status, total_payable: c.total_payable }, financials);
+      });
     }
-    
+
     if (search) {
       const searchLower = search.toLowerCase();
       result = result.filter(c => {
@@ -370,6 +401,68 @@ export function TerminalDuesPage() {
       setLoading(false);
     }
   }, [userProfile]);
+
+  const fetchOverviewAllocations = useCallback(async (entitlementIds: string[]) => {
+    if (entitlementIds.length === 0) {
+      setOverviewAllocations([]);
+      setOverviewAllocationsError(null);
+      return;
+    }
+    setOverviewAllocationsLoading(true);
+    setOverviewAllocationsError(null);
+    try {
+      const rows = await fetchInEmployeeIdBatches<OverviewAllocation>(
+        entitlementIds,
+        (batch, from, to, withCount) =>
+          supabase
+            .from('terminal_due_allocations')
+            .select('terminal_due_id, status, proposed_amount, last_decided_amount', withCount ? { count: 'exact' } : undefined)
+            .in('terminal_due_id', batch)
+            .range(from, to)
+      );
+      setOverviewAllocations(rows);
+    } catch (err) {
+      console.error('Error loading Terminal Dues allocation ledger for financial overview:', err);
+      setOverviewAllocationsError(getErrorMessage(err));
+      setOverviewAllocations([]);
+    } finally {
+      setOverviewAllocationsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchOverviewAllocations(calculations.map(c => c.id));
+  }, [calculations, fetchOverviewAllocations]);
+
+  // Per-entitlement financials (actually paid / reserved / remaining /
+  // available), keyed by terminal_dues.id -- undefined only while the
+  // allocation ledger fetch above is still loading or has failed, so
+  // consumers can distinguish "not computed yet" from a genuine zero.
+  const financialsByEntitlement = useMemo(() => {
+    const map = new Map<string, EntitlementFinancials>();
+    if (overviewAllocationsError) return map;
+    const allocationsByEntitlement = new Map<string, OverviewAllocation[]>();
+    for (const a of overviewAllocations) {
+      const list = allocationsByEntitlement.get(a.terminal_due_id) || [];
+      list.push(a);
+      allocationsByEntitlement.set(a.terminal_due_id, list);
+    }
+    for (const c of calculations) {
+      map.set(c.id, computeEntitlementFinancials(
+        { id: c.id, status: c.status, total_payable: c.total_payable },
+        allocationsByEntitlement.get(c.id) || []
+      ));
+    }
+    return map;
+  }, [calculations, overviewAllocations, overviewAllocationsError]);
+
+  const overviewSummary = useMemo(() => {
+    if (overviewAllocationsError) return null;
+    return summarizeTerminalDuesOverview(
+      calculations.map(c => ({ id: c.id, status: c.status, total_payable: c.total_payable })),
+      overviewAllocations
+    );
+  }, [calculations, overviewAllocations, overviewAllocationsError]);
 
   // ===== INITIALIZATION =====
   useEffect(() => {
@@ -751,14 +844,29 @@ export function TerminalDuesPage() {
     }
   }, []);
 
-  const getTypeColor = useCallback((type: string) => {
-    switch (type) {
-      case 'disciplinary': return 'red';
-      case 'redundancy': return 'orange';
-      case 'resignation': return 'blue';
-      case 'retirement': return 'gold';
-      case 'medical': return 'purple';
-      default: return 'gray';
+  // Settlement badge for the financial overview table/detail view --
+  // derived from EntitlementFinancials.settlementStatus (see
+  // src/utils/terminalDuesOverview.ts), never from the raw
+  // terminal_dues.status alone: an 'approved' entitlement can be
+  // not-yet-processed, partially processed, or fully settled via the
+  // ledger while its own status column never changes from 'approved'.
+  const getSettlementBadgeColor = useCallback((financials: EntitlementFinancials | undefined): 'gray' | 'yellow' | 'blue' | 'green' => {
+    if (!financials) return 'gray';
+    switch (financials.settlementStatus) {
+      case 'pending_approval': return 'yellow';
+      case 'not_yet_processed': return 'gray';
+      case 'partially_processed': return 'blue';
+      case 'fully_settled': return 'green';
+    }
+  }, []);
+
+  const getSettlementBadgeLabel = useCallback((financials: EntitlementFinancials | undefined): string => {
+    if (!financials) return 'Loading...';
+    switch (financials.settlementStatus) {
+      case 'pending_approval': return 'Pending Approval';
+      case 'not_yet_processed': return 'Not Yet Processed';
+      case 'partially_processed': return 'Partially Processed';
+      case 'fully_settled': return 'Fully Settled';
     }
   }, []);
 
@@ -878,42 +986,113 @@ export function TerminalDuesPage() {
         </Card>
       )}
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <Card className="p-3 text-center">
-          <p className="text-xs text-slate-500">Total Calculations</p>
-          <p className="text-xl font-bold text-slate-800">{calculations.length}</p>
+      {/* Management Financial Overview -- summary cards A-E. Every figure
+          here is derived from the same authoritative sources the rest of
+          the Terminal Dues UI uses (terminal_dues.total_payable/status and
+          terminal_due_allocations) via src/utils/terminalDuesOverview.ts;
+          nothing here is a new calculation. On an allocation-ledger fetch
+          failure, cards B-E show an explicit error state rather than a
+          silent zero -- see overviewAllocationsError below. */}
+      {overviewAllocationsError ? (
+        <Card className="p-4 bg-red-50 border-red-200">
+          <div className="flex items-start gap-2 text-sm text-red-700">
+            <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
+            <div>
+              <p className="font-medium">Could not load the payment allocation ledger -- financial figures below are incomplete.</p>
+              <p className="text-xs mt-1">{overviewAllocationsError}</p>
+              <Button variant="outline" size="sm" className="mt-2" onClick={() => fetchOverviewAllocations(calculations.map(c => c.id))}>
+                Retry
+              </Button>
+            </div>
+          </div>
         </Card>
-        <Card className="p-3 text-center bg-yellow-50">
-          <p className="text-xs text-yellow-600">Pending</p>
-          <p className="text-xl font-bold text-yellow-700">
-            {calculations.filter(c => c.status === 'pending').length}
-          </p>
-        </Card>
-        <Card className="p-3 text-center bg-emerald-50">
-          <p className="text-xs text-emerald-600">Approved</p>
-          <p className="text-xl font-bold text-emerald-700">
-            {calculations.filter(c => c.status === 'approved').length}
-          </p>
-        </Card>
-        <Card className="p-3 text-center bg-blue-50">
-          <p className="text-xs text-blue-600">Paid</p>
-          <p className="text-xl font-bold text-blue-700">
-            {calculations.filter(c => c.status === 'paid').length}
-          </p>
-        </Card>
-        <Card className="p-3 text-center bg-[#FFF1CC]">
-          <p className="text-xs text-[#D4A017]">Total Payable</p>
-          <p className="text-sm font-bold text-[#D4A017]">
-            {formatKwacha(calculations.reduce((sum, c) => sum + (c.total_payable || 0), 0))}
-          </p>
-        </Card>
-      </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+          <Card className="p-4">
+            <p className="text-xs text-slate-500">Total Confirmed Entitlements</p>
+            <p className="text-lg font-bold text-slate-800 mt-1">
+              {overviewSummary ? formatKwacha(overviewSummary.confirmedEntitlementTotal) : '...'}
+            </p>
+            <p className="text-xs text-slate-400 mt-1">
+              {overviewSummary ? `${overviewSummary.confirmedEntitlementCount} ${overviewSummary.confirmedEntitlementCount === 1 ? 'employee' : 'employees'}` : 'Loading...'}
+              {overviewSummary && overviewSummary.pendingApprovalCount > 0 && (
+                <> &middot; {overviewSummary.pendingApprovalCount} more awaiting approval, not included</>
+              )}
+            </p>
+          </Card>
+          <Card className="p-4 bg-emerald-50 border-emerald-200">
+            <p className="text-xs text-emerald-700">Total Actually Paid</p>
+            <p className="text-lg font-bold text-emerald-800 mt-1">
+              {overviewSummary ? formatKwacha(overviewSummary.actuallyPaidTotal) : '...'}
+            </p>
+            <p className="text-xs text-emerald-600 mt-1">Processed via Payroll or confirmed legacy payment only</p>
+          </Card>
+          <Card className="p-4 bg-red-50 border-red-200">
+            <p className="text-xs text-red-700">Remaining Liability</p>
+            <p className="text-lg font-bold text-red-800 mt-1">
+              {overviewSummary ? formatKwacha(overviewSummary.remainingLiabilityTotal) : '...'}
+            </p>
+            <p className="text-xs text-red-600 mt-1">
+              {overviewSummary && overviewSummary.ledgerConflictCount > 0
+                ? `${overviewSummary.ledgerConflictCount} record(s) need reconciliation -- see warnings below`
+                : 'Confirmed entitlements minus verified payments'}
+            </p>
+          </Card>
+          <Card className="p-4 bg-amber-50 border-amber-200">
+            <p className="text-xs text-amber-700">Approved for Payroll (Reserved -- Not Paid)</p>
+            <p className="text-lg font-bold text-amber-800 mt-1">
+              {overviewSummary ? formatKwacha(overviewSummary.approvedForPayrollTotal) : '...'}
+            </p>
+            <p className="text-xs text-amber-600 mt-1">Approved allocations awaiting Process Payroll</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-xs text-slate-500 flex items-center gap-1"><TrendingUp size={12} /> Settlement Progress</p>
+            <p className="text-lg font-bold text-[#081C3A] mt-1">
+              {overviewSummary ? `${overviewSummary.settlementProgressPct.toFixed(0)}%` : '...'}
+            </p>
+            <div className="w-full h-1.5 bg-slate-100 rounded-full mt-2 overflow-hidden">
+              <div
+                className="h-full bg-[#081C3A] rounded-full"
+                style={{ width: `${overviewSummary ? overviewSummary.settlementProgressPct : 0}%` }}
+              />
+            </div>
+          </Card>
+        </div>
+      )}
 
-      {/* Search and Filter */}
+      {/* Interactive status filters (Step 3) -- real financial state, not
+          passive counters. There is no "Rejected" pill: terminal_dues has
+          no rejected status (the closest real transition, Return for
+          Correction, sends an approved row back to Pending, which the
+          Pending Approval filter + the existing returned-for-correction
+          banner in the detail view already surface). */}
       <Card className="p-4">
+        {overviewAllocationsLoading && (
+          <p className="text-xs text-slate-400 mb-2">Loading payment allocation ledger...</p>
+        )}
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          {([
+            ['all', 'All Records'],
+            ['pending_approval', 'Pending Approval'],
+            ['outstanding', 'Outstanding'],
+            ['fully_settled', 'Fully Settled'],
+          ] as [OverviewFilter, string][]).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => setFilterStatus(value)}
+              className={`px-3 py-1.5 text-sm rounded-full border transition-colors ${
+                filterStatus === value
+                  ? 'bg-[#081C3A] text-white border-[#081C3A]'
+                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <div className="relative">
+          <div className="relative md:col-span-2">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input
               id="searchDues"
@@ -925,18 +1104,6 @@ export function TerminalDuesPage() {
               className="w-full pl-10 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
           </div>
-          <select
-            id="filterStatus"
-            name="filterStatus"
-            value={filterStatus}
-            onChange={e => setFilterStatus(e.target.value)}
-            className="px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
-          >
-            <option value="all">All Status</option>
-            <option value="pending">Pending</option>
-            <option value="approved">Approved</option>
-            <option value="paid">Paid</option>
-          </select>
           <Button variant="outline" onClick={() => {
             setSearch('');
             setFilterStatus('all');
@@ -954,11 +1121,11 @@ export function TerminalDuesPage() {
             <THead>
               <TR hover={false}>
                 <TH>Employee</TH>
-                <TH>Position</TH>
-                <TH>Date Left</TH>
-                <TH className="text-right">Total Payable</TH>
+                <TH className="text-right">Total Entitlement</TH>
+                <TH className="text-right">Actually Paid</TH>
+                <TH className="text-right">Reserved for Payroll</TH>
+                <TH className="text-right">Remaining Balance</TH>
                 <TH>Status</TH>
-                <TH>Type</TH>
                 <TH className="text-right">Actions</TH>
               </TR>
             </THead>
@@ -978,6 +1145,8 @@ export function TerminalDuesPage() {
                     canApprove: canApproveTerminalDue,
                     canPay: canPayTerminalDue,
                   });
+                  const financials = financialsByEntitlement.get(calc.id);
+                  const isPending = calc.status === 'pending';
                   return (
                   <TR key={calc.id} className="hover:bg-slate-50">
                     <TD>
@@ -989,20 +1158,29 @@ export function TerminalDuesPage() {
                         <p className="text-xs text-slate-500">{calc.employee_number}</p>
                       </div>
                     </TD>
-                    <TD>{calc.position}</TD>
-                    <TD>{new Date(calc.date_left).toLocaleDateString()}</TD>
-                    <TD className="text-right font-semibold text-[#D4A017]">
+                    <TD className="text-right font-semibold text-slate-800">
                       {formatKwacha(calc.total_payable)}
                     </TD>
-                    <TD>
-                      <Badge color={getStatusColor(calc.status)}>
-                        {calc.status.toUpperCase()}
-                      </Badge>
+                    <TD className="text-right text-emerald-700">
+                      {isPending || !financials ? '--' : formatKwacha(financials.actuallyPaid)}
+                    </TD>
+                    <TD className="text-right text-amber-700">
+                      {isPending || !financials ? '--' : formatKwacha(financials.approvedUnprocessed)}
+                    </TD>
+                    <TD className="text-right font-semibold text-red-700">
+                      {isPending || !financials ? '--' : formatKwacha(financials.remainingLiability)}
                     </TD>
                     <TD>
-                      <Badge color={getTypeColor(calc.termination_type)}>
-                        {calc.termination_type?.replace('_', ' ') || 'N/A'}
-                      </Badge>
+                      <div className="flex flex-col gap-1">
+                        <Badge color={getSettlementBadgeColor(financials)}>
+                          {getSettlementBadgeLabel(financials)}
+                        </Badge>
+                        {financials?.hasLedgerConflict && (
+                          <span className="text-xs text-red-600 flex items-center gap-1" title="This legacy-paid record also has payment allocation ledger rows -- needs Admin reconciliation.">
+                            <AlertTriangle size={12} /> Needs reconciliation
+                          </span>
+                        )}
+                      </div>
                     </TD>
                     <TD className="text-right">
                       <div className="flex items-center justify-end gap-1">
@@ -1010,6 +1188,7 @@ export function TerminalDuesPage() {
                           type="button"
                           onClick={() => handleViewDetail(calc)}
                           className="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-600"
+                          title="View Details"
                         >
                           <Eye size={14} />
                         </button>
@@ -1390,6 +1569,60 @@ export function TerminalDuesPage() {
                 </div>
               </div>
             </div>
+
+            {/* Financial overview (Step 5) -- processed payments, reserved
+                allocations and the resulting balance, for THIS one
+                entitlement. Same figures/formulas as the Records table and
+                the Allocations/Payment History tabs; nothing here is
+                recomputed differently. */}
+            {showDetailModal.status !== 'pending' && (() => {
+              const financials = financialsByEntitlement.get(showDetailModal.id);
+              return (
+                <div className="border-t pt-4">
+                  <h4 className="font-semibold text-slate-800 mb-3">Financial Overview</h4>
+                  {!financials ? (
+                    <p className="text-xs text-slate-400">
+                      {overviewAllocationsError ? `Could not load payment allocation data: ${overviewAllocationsError}` : 'Loading...'}
+                    </p>
+                  ) : (
+                    <>
+                      <div className="grid grid-cols-2 gap-3 text-sm">
+                        <div>
+                          <p className="text-slate-500 text-xs">Actually Paid</p>
+                          <p className="font-semibold text-emerald-700">{formatKwacha(financials.actuallyPaid)}</p>
+                        </div>
+                        <div>
+                          <p className="text-slate-500 text-xs">Approved, Reserved for Payroll</p>
+                          <p className="font-semibold text-amber-700">{formatKwacha(financials.approvedUnprocessed)}</p>
+                        </div>
+                        <div>
+                          <p className="text-slate-500 text-xs">Remaining Liability</p>
+                          <p className="font-semibold text-red-700">{formatKwacha(financials.remainingLiability)}</p>
+                        </div>
+                        <div>
+                          <p className="text-slate-500 text-xs">Available for Future Allocation</p>
+                          <p className="font-semibold text-slate-800">{formatKwacha(financials.availableForFutureAllocation)}</p>
+                        </div>
+                      </div>
+                      <div className="mt-3">
+                        <Badge color={getSettlementBadgeColor(financials)}>{getSettlementBadgeLabel(financials)}</Badge>
+                      </div>
+                      {financials.isLegacyPaid && (
+                        <p className="text-xs text-slate-400 mt-2">
+                          Recorded as a single legacy payment (see Approval &amp; Payment below) -- this entitlement was never processed through the monthly allocation ledger.
+                        </p>
+                      )}
+                      {financials.hasLedgerConflict && (
+                        <div className="mt-2 rounded-lg border border-red-300 bg-red-50 p-2 text-xs text-red-700 flex items-start gap-1.5">
+                          <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
+                          <span>This record is marked as paid via a legacy direct payment, but it ALSO has payment allocation ledger rows. This should not normally happen -- an Admin should investigate before relying on either figure alone.</span>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              );
+            })()}
 
             <div className="border-t pt-4">
               <p className="text-xs text-slate-500">Reason: {showDetailModal.reason_for_termination}</p>
