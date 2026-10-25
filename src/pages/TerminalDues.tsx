@@ -242,6 +242,40 @@ export function TerminalDuesPage() {
   // Paid-only employee is absent from this map and remains selectable.
   const openDueByEmployeeId = useMemo(() => buildOpenDueStatusMap(calculations), [calculations]);
 
+  // Per-entitlement financials (actually paid / reserved / remaining /
+  // available), keyed by terminal_dues.id -- undefined only while the
+  // allocation ledger fetch below is still loading or has failed, so
+  // consumers can distinguish "not computed yet" from a genuine zero.
+  //
+  // BUG FIX: this MUST be declared before displayedCalculations below,
+  // which reads it inside its own useMemo factory. useMemo's factory runs
+  // synchronously during render, in source order -- declaring this AFTER
+  // displayedCalculations (as a previous version of this file did) meant
+  // every render hit a genuine temporal-dead-zone ReferenceError
+  // ("Cannot access '...' before initialization") the instant
+  // displayedCalculations's factory actually read it. That only happens
+  // on the branch guarded by `filterStatus !== 'all'` (see below), which
+  // is exactly why the page loaded fine (default filter is 'all', so the
+  // read was never reached) but crashed the moment a status filter pill
+  // was clicked.
+  const financialsByEntitlement = useMemo(() => {
+    const map = new Map<string, EntitlementFinancials>();
+    if (overviewAllocationsError) return map;
+    const allocationsByEntitlement = new Map<string, OverviewAllocation[]>();
+    for (const a of overviewAllocations) {
+      const list = allocationsByEntitlement.get(a.terminal_due_id) || [];
+      list.push(a);
+      allocationsByEntitlement.set(a.terminal_due_id, list);
+    }
+    for (const c of calculations) {
+      map.set(c.id, computeEntitlementFinancials(
+        { id: c.id, status: c.status, total_payable: c.total_payable },
+        allocationsByEntitlement.get(c.id) || []
+      ));
+    }
+    return map;
+  }, [calculations, overviewAllocations, overviewAllocationsError]);
+
   const displayedCalculations = useMemo(() => {
     let result = calculations;
 
@@ -433,28 +467,6 @@ export function TerminalDuesPage() {
   useEffect(() => {
     fetchOverviewAllocations(calculations.map(c => c.id));
   }, [calculations, fetchOverviewAllocations]);
-
-  // Per-entitlement financials (actually paid / reserved / remaining /
-  // available), keyed by terminal_dues.id -- undefined only while the
-  // allocation ledger fetch above is still loading or has failed, so
-  // consumers can distinguish "not computed yet" from a genuine zero.
-  const financialsByEntitlement = useMemo(() => {
-    const map = new Map<string, EntitlementFinancials>();
-    if (overviewAllocationsError) return map;
-    const allocationsByEntitlement = new Map<string, OverviewAllocation[]>();
-    for (const a of overviewAllocations) {
-      const list = allocationsByEntitlement.get(a.terminal_due_id) || [];
-      list.push(a);
-      allocationsByEntitlement.set(a.terminal_due_id, list);
-    }
-    for (const c of calculations) {
-      map.set(c.id, computeEntitlementFinancials(
-        { id: c.id, status: c.status, total_payable: c.total_payable },
-        allocationsByEntitlement.get(c.id) || []
-      ));
-    }
-    return map;
-  }, [calculations, overviewAllocations, overviewAllocationsError]);
 
   const overviewSummary = useMemo(() => {
     if (overviewAllocationsError) return null;
@@ -864,8 +876,8 @@ export function TerminalDuesPage() {
     if (!financials) return 'Loading...';
     switch (financials.settlementStatus) {
       case 'pending_approval': return 'Pending Approval';
-      case 'not_yet_processed': return 'Not Yet Processed';
-      case 'partially_processed': return 'Partially Processed';
+      case 'not_yet_processed': return 'Awaiting Payment';
+      case 'partially_processed': return 'Partially Settled';
       case 'fully_settled': return 'Fully Settled';
     }
   }, []);
@@ -879,16 +891,15 @@ export function TerminalDuesPage() {
 
   return (
     <div className="space-y-6 animate-fade-in">
+      {/* BUG 4: the "New Calculation" header shortcut was removed as
+          redundant -- the Calculator tab (and its own calculation
+          actions) is the preferred workflow and remains fully intact and
+          unchanged below. The legacy direct-entry modal this button used
+          to open (showCalculateModal/saveCalculation) is also untouched
+          -- only this one prominent header shortcut into it was removed. */}
       <PageHeader
         title="Terminal Dues Calculator"
         subtitle="Calculate and manage employee termination benefits"
-        actions={
-          canCreateTerminalDue ? (
-            <Button variant="secondary" onClick={() => setShowCalculateModal(true)}>
-              <Calculator size={16} className="mr-1" /> New Calculation
-            </Button>
-          ) : undefined
-        }
       />
 
       <Tabs

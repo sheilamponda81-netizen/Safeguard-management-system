@@ -16,15 +16,36 @@ function allocation(overrides: Partial<OverviewAllocation> = {}): OverviewAlloca
 }
 
 describe('computeEntitlementFinancials', () => {
-  it('matches the Alfred George ground-truth example exactly', () => {
-    // Entitlement 343,000; one approved (unprocessed) allocation of 100,000.
+  it('matches the Alfred George ground-truth example exactly (BUG 2 regression: zero processed must never read as Partially Settled)', () => {
+    // Entitlement 343,000; one approved (unprocessed) allocation of 100,000;
+    // nothing has actually been paid yet.
     const result = computeEntitlementFinancials(entitlement(), [allocation()]);
     expect(result.totalEntitlement).toBe(343000);
     expect(result.actuallyPaid).toBe(0);
     expect(result.approvedUnprocessed).toBe(100000);
     expect(result.remainingLiability).toBe(343000);
     expect(result.availableForFutureAllocation).toBe(243000);
+    // BUG 2: an approved-but-unprocessed allocation must never make this
+    // read as "partially processed" -- nothing has been paid at all.
+    expect(result.settlementStatus).toBe('not_yet_processed');
+  });
+
+  it('BUG 2 regression: after Alfred George\'s MK 100,000 allocation is actually processed, the status becomes Partially Settled -- never before', () => {
+    const result = computeEntitlementFinancials(entitlement(), [
+      allocation({ status: 'processed', proposed_amount: 100000, last_decided_amount: 100000 }),
+    ]);
+    expect(result.actuallyPaid).toBe(100000);
+    expect(result.approvedUnprocessed).toBe(0);
+    expect(result.remainingLiability).toBe(243000);
     expect(result.settlementStatus).toBe('partially_processed');
+  });
+
+  it('BUG 2 regression: approvedSum alone, at any size, never changes settlementStatus away from not_yet_processed', () => {
+    const result = computeEntitlementFinancials(entitlement({ total_payable: 100000 }), [
+      allocation({ status: 'approved', proposed_amount: 100000, last_decided_amount: 100000 }), // fully reserved, nothing processed
+    ]);
+    expect(result.actuallyPaid).toBe(0);
+    expect(result.settlementStatus).toBe('not_yet_processed');
   });
 
   it('never counts an approved-but-unprocessed allocation as paid', () => {

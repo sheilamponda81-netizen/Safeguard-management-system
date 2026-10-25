@@ -46,6 +46,41 @@ async function fetchUniformRefundRate(): Promise<number> {
   }
 }
 
+// BUG 3 fix: submit_terminal_due_calculation() and
+// update_terminal_due_calculation_draft() report every validation failure
+// via a plain `RAISE EXCEPTION` with no explicit SQLSTATE, which Postgres/
+// PostgREST always surfaces as code 'P0001'. The shared getErrorMessage()
+// deliberately discards any coded Postgrest-like error whose code isn't in
+// its small allowlist (since in general a raw driver message can leak
+// table/column/constraint names), and P0001 isn't in that allowlist -- so a
+// legitimate, already-safe validation message like "The uniform refund rate
+// used in this calculation does not match the current approved rate of
+// 10000. Reopen the draft, refresh the Calculator and recalculate before
+// submitting." was being discarded in favour of a generic
+// "Something went wrong" string, leaving HR with no way to tell a stale
+// draft from an actual outage.
+//
+// Both RPCs' full bodies were read directly from the live database and
+// confirmed to raise only plain, author-written, HR-readable text on every
+// exception path -- never a raw table/column name. That guarantee holds for
+// this specific pair of RPCs only, so it is deliberately not promoted into
+// the shared, app-wide getErrorMessage() (which must stay safe by default
+// for every other caller); it is scoped to this file's two call sites.
+export function getCalculationRpcErrorMessage(error: unknown): string {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code: unknown }).code === 'P0001' &&
+    'message' in error &&
+    typeof (error as { message: unknown }).message === 'string' &&
+    (error as { message: string }).message.trim().length > 0
+  ) {
+    return (error as { message: string }).message;
+  }
+  return getErrorMessage(error);
+}
+
 // ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
@@ -444,7 +479,7 @@ export function TerminalDuesCalculatorTab({
       resetForm();
       await fetchDrafts();
     } catch (err) {
-      showNotification('Error saving draft: ' + getErrorMessage(err), 'error');
+      showNotification('Error saving draft: ' + getCalculationRpcErrorMessage(err), 'error');
     } finally {
       setSaving(false);
     }
@@ -458,7 +493,7 @@ export function TerminalDuesCalculatorTab({
   const submitDraft = async (id: string) => {
     const { error } = await supabase.rpc('submit_terminal_due_calculation', { p_id: id });
     if (error) {
-      showNotification('Error submitting calculation: ' + getErrorMessage(error), 'error');
+      showNotification('Error submitting calculation: ' + getCalculationRpcErrorMessage(error), 'error');
       return;
     }
     showNotification('Calculation submitted for Admin approval', 'success');

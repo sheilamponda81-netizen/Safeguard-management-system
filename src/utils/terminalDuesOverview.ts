@@ -120,12 +120,19 @@ export function computeEntitlementFinancials(
 
   const remainingLiability = Math.max(0, totalEntitlement - processedSum);
   const availableForFutureAllocation = Math.max(0, totalEntitlement - processedSum - approvedSum);
+  // BUG FIX: an approved-but-unprocessed allocation (approvedSum > 0) must
+  // NEVER make an entitlement look "partially processed" -- it is a
+  // reservation, not a payment. Settlement status depends ONLY on
+  // processedSum (what Process Payroll has actually committed):
+  //   processedSum === 0            -> 'not_yet_processed' ("Awaiting Payment")
+  //   0 < processedSum < total      -> 'partially_processed' ("Partially Settled")
+  //   processedSum >= total         -> 'fully_settled'
   const settlementStatus: SettlementStatus =
-    processedSum > 0 && processedSum >= totalEntitlement
-      ? 'fully_settled'
-      : processedSum > 0 || approvedSum > 0
-        ? 'partially_processed'
-        : 'not_yet_processed';
+    processedSum <= 0
+      ? 'not_yet_processed'
+      : processedSum >= totalEntitlement
+        ? 'fully_settled'
+        : 'partially_processed';
 
   return {
     totalEntitlement,
