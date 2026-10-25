@@ -110,6 +110,14 @@ export interface CalculationInputsSnapshot {
   uniformDeductionMonths: number;
   uniformDeductionPayrollEvidenceMonths: number | null;
   uniformDeductionCorrectionReason?: string | null;
+  /** The CURRENT approved uniform refund rate actually used to compute this
+   * snapshot's saved breakdown (see Row label=Uniform Refund). Populated at
+   * save time from the live `terminal_dues_uniform_refund_rate` system
+   * setting -- never a stale or client-chosen value; the backend re-checks
+   * it against that same setting on every save/submit (see
+   * 20261105000000_terminal_dues_calculator_safety_enforcement.sql). This is
+   * what makes the applied rate auditable from the saved record alone. */
+  uniformRefundRatePerMonth?: number;
   outstandingSalaryEntries: OutstandingSalaryEntryInput[];
   noticeStatus: NoticeStatus;
   requiredNoticeDays: number;
@@ -382,11 +390,27 @@ export function TerminalDuesCalculatorTab({
       return;
     }
 
+    // Save-time consistency check: re-fetch the live rate right before
+    // saving so a change made by an Admin while this form was open (a
+    // stale tab) is never silently baked into a saved calculation. The
+    // backend enforces this same check independently, but failing here
+    // gives HR a clear, immediate message instead of an RPC error.
+    const latestRate = await fetchUniformRefundRate();
+    if (latestRate !== uniformRefundRate) {
+      setUniformRefundRate(latestRate);
+      showNotification('The uniform refund rate has changed since this form was opened. Review the updated calculation, then save again.', 'error');
+      return;
+    }
+
     setSaving(true);
     try {
       const subjectName = subjectMode === 'existing' ? selectedEmployee!.fullName : selectedHistorical!.full_name;
       const subjectNumber = subjectMode === 'existing' ? selectedEmployee!.employeeNumber : selectedHistorical!.historical_reference;
       const position = subjectMode === 'existing' ? selectedEmployee!.position : null;
+      // The rate actually used to compute breakdownResult (see the
+      // breakdownResult useMemo above) is recorded alongside the inputs it
+      // was applied to, so the saved record is self-auditing.
+      const inputsToSave: CalculationInputsSnapshot = { ...inputs, uniformRefundRatePerMonth: uniformRefundRate };
 
       if (editingId) {
         const { error } = await supabase.rpc('update_terminal_due_calculation_draft', {
@@ -394,7 +418,7 @@ export function TerminalDuesCalculatorTab({
           p_subject_name: subjectName,
           p_subject_number: subjectNumber,
           p_position: position,
-          p_inputs: inputs,
+          p_inputs: inputsToSave,
           p_breakdown: breakdownResult,
           p_total_payable: breakdownResult.totalPayable,
         });
@@ -409,7 +433,7 @@ export function TerminalDuesCalculatorTab({
             subject_name: subjectName,
             subject_number: subjectNumber,
             position,
-            inputs,
+            inputs: inputsToSave,
             breakdown: breakdownResult,
             total_payable: breakdownResult.totalPayable,
           },
@@ -595,6 +619,9 @@ export function TerminalDuesCalculatorTab({
                     <span className="text-slate-400"> (payroll evidence: {inputs.uniformDeductionPayrollEvidenceMonths})</span>
                   )}
                 </label>
+                <p className="text-xs text-slate-400 mb-1">
+                  Current uniform refund rate: {formatKwacha(uniformRefundRate)} / month
+                </p>
                 <input
                   type="number"
                   value={inputs.uniformDeductionMonths}
