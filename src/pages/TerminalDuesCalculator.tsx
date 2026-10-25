@@ -17,11 +17,34 @@ import {
   calculateTerminalDuesBreakdown,
   isTerminalDuesValidationError,
   uniformRefundNeedsCorrectionReason,
+  pensionMonthsOverrideNeedsCorrectionReason,
   findOutstandingSalaryDoubleCountWarnings,
+  DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH,
   TerminalDuesBreakdown,
   OutstandingSalaryEntryInput,
   NoticeStatus,
 } from '../utils/terminalDuesEngine';
+
+// `terminal_dues_uniform_refund_rate` is an Admin-only system setting (same
+// RLS as `current_payroll_month`/`uniform_deduction_default` -- INSERT/
+// UPDATE restricted to Admins, SELECT open to the tenant). Read-only here;
+// this page never writes it. Falls back to the current flat rate when no
+// Admin has set it yet, so behaviour is unchanged until that setting exists.
+async function fetchUniformRefundRate(): Promise<number> {
+  try {
+    const { data, error } = await supabase
+      .from('system_settings')
+      .select('value')
+      .eq('key', 'terminal_dues_uniform_refund_rate')
+      .maybeSingle();
+    if (error || !data) return DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH;
+    const parsed = Number(data.value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH;
+  } catch {
+    // Read-only, best-effort -- never block the Calculator on this lookup.
+    return DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -150,6 +173,15 @@ export function TerminalDuesCalculatorTab({
   const [terminationType, setTerminationType] = useState('resignation');
   const [saving, setSaving] = useState(false);
 
+  // The CURRENT approved uniform refund rate -- fetched once per visit to
+  // this tab, never refetched mid-edit, so a rate change made by an Admin
+  // while this page is open never silently alters the live preview under
+  // HR's hands. Only ever read here; see fetchUniformRefundRate() above.
+  const [uniformRefundRate, setUniformRefundRate] = useState(DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH);
+  useEffect(() => {
+    fetchUniformRefundRate().then(setUniformRefundRate);
+  }, []);
+
   const canUse = canCreate || canEdit;
 
   const fetchHistoricalEmployees = useCallback(async () => {
@@ -255,18 +287,22 @@ export function TerminalDuesCalculatorTab({
         pensionMonthsOverride: inputs.pensionMonthsOverride,
         unusedLeaveDays: inputs.unusedLeaveDays,
         uniformDeductionMonths: inputs.uniformDeductionMonths,
+        uniformRefundRatePerMonth: uniformRefundRate,
         outstandingSalaryEntries: inputs.outstandingSalaryEntries,
         noticeStatus: inputs.noticeStatus,
         requiredNoticeDays: inputs.requiredNoticeDays,
         lateNoticeDays: inputs.lateNoticeDays,
       }),
-    [inputs]
+    [inputs, uniformRefundRate]
   );
 
   const uniformNeedsReason = uniformRefundNeedsCorrectionReason(
     inputs.uniformDeductionPayrollEvidenceMonths,
     inputs.uniformDeductionMonths
   );
+  const pensionNeedsReason =
+    !isTerminalDuesValidationError(breakdownResult) &&
+    pensionMonthsOverrideNeedsCorrectionReason(breakdownResult.completedMonths, inputs.pensionMonthsOverride);
 
   const [doubleCountWarnings, setDoubleCountWarnings] = useState<string[]>([]);
   useEffect(() => {
@@ -339,6 +375,10 @@ export function TerminalDuesCalculatorTab({
     }
     if (uniformNeedsReason && !inputs.uniformDeductionCorrectionReason?.trim()) {
       showNotification('A correction reason is required: the entered uniform-deduction months differ from payroll evidence', 'error');
+      return;
+    }
+    if (pensionNeedsReason && !inputs.pensionMonthsOverrideReason?.trim()) {
+      showNotification('A correction reason is required: the entered completed months differ from the system calculation', 'error');
       return;
     }
 
@@ -525,9 +565,9 @@ export function TerminalDuesCalculatorTab({
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>
-              {inputs.pensionMonthsOverride != null && (
+              {pensionNeedsReason && (
                 <div>
-                  <label className="block text-xs font-medium text-slate-500 mb-1">Reason for correction *</label>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">Reason for correction (required -- disagrees with system-calculated months) *</label>
                   <input
                     type="text"
                     value={inputs.pensionMonthsOverrideReason || ''}

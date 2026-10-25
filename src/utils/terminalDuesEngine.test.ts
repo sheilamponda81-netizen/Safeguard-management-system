@@ -5,6 +5,8 @@ import {
   calculateAnnualLeaveRefund,
   calculateUniformRefund,
   uniformRefundNeedsCorrectionReason,
+  pensionMonthsOverrideNeedsCorrectionReason,
+  DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH,
   calculateOutstandingSalaryEntries,
   findOutstandingSalaryDoubleCountWarnings,
   calculateLessNoticeDeduction,
@@ -97,13 +99,28 @@ describe('calculateAnnualLeaveRefund', () => {
 });
 
 describe('calculateUniformRefund', () => {
-  it('pays MWK 10,000 per month actually deducted', () => {
+  it('pays MWK 10,000 per month actually deducted when no rate is supplied (back-compat default)', () => {
     expect(calculateUniformRefund(6)).toBe(60000);
   });
 
   it('returns 0 for zero or negative months', () => {
     expect(calculateUniformRefund(0)).toBe(0);
     expect(calculateUniformRefund(-1)).toBe(0);
+  });
+
+  it('uses the CURRENT approved rate for every eligible month, never a historical rate', () => {
+    // Confirmed business policy example: historical rate was MK 5,000,
+    // current approved rate is MK 10,000, 7 eligible months -> MK 70,000
+    // (months x CURRENT rate, not a sum of historical amounts).
+    expect(calculateUniformRefund(7, 10000)).toBe(70000);
+  });
+
+  it('applies a different current rate when one is supplied', () => {
+    expect(calculateUniformRefund(6, 5000)).toBe(30000);
+  });
+
+  it('defaults to DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH when no rate argument is given', () => {
+    expect(calculateUniformRefund(4)).toBe(4 * DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH);
   });
 });
 
@@ -115,6 +132,25 @@ describe('uniformRefundNeedsCorrectionReason', () => {
   it('requires a reason only when the entered count disagrees with reliable evidence', () => {
     expect(uniformRefundNeedsCorrectionReason(6, 6)).toBe(false);
     expect(uniformRefundNeedsCorrectionReason(6, 4)).toBe(true);
+  });
+});
+
+describe('pensionMonthsOverrideNeedsCorrectionReason', () => {
+  it('never requires a reason when no override was supplied', () => {
+    expect(pensionMonthsOverrideNeedsCorrectionReason(72, null)).toBe(false);
+    expect(pensionMonthsOverrideNeedsCorrectionReason(72, undefined)).toBe(false);
+  });
+
+  it('never requires a reason when the override matches the system calculation', () => {
+    expect(pensionMonthsOverrideNeedsCorrectionReason(72, 72)).toBe(false);
+  });
+
+  it('requires a reason only when the override disagrees with the system calculation', () => {
+    expect(pensionMonthsOverrideNeedsCorrectionReason(72, 70)).toBe(true);
+  });
+
+  it('ignores a non-finite override', () => {
+    expect(pensionMonthsOverrideNeedsCorrectionReason(72, NaN)).toBe(false);
   });
 });
 
@@ -265,5 +301,24 @@ describe('calculateTerminalDuesBreakdown', () => {
     expect(result.rawPayable).toBe(-150000);
     expect(result.totalPayable).toBe(0);
     expect(result.excessDeduction).toBe(150000);
+  });
+
+  it('defaults the uniform refund to the current flat rate when no rate is supplied', () => {
+    const result = calculateTerminalDuesBreakdown(validInputs);
+    if (isTerminalDuesValidationError(result)) throw new Error('expected a successful breakdown');
+    expect(result.uniformRefund).toBe(60000); // 6 months x DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH
+  });
+
+  it('uses the supplied CURRENT approved rate for the whole uniform refund, regardless of any historical rate', () => {
+    const result = calculateTerminalDuesBreakdown({
+      ...validInputs,
+      uniformDeductionMonths: 7,
+      uniformRefundRatePerMonth: 10000, // the current approved rate
+    });
+    if (isTerminalDuesValidationError(result)) throw new Error('expected a successful breakdown');
+    // Confirmed business policy example: 7 months x current rate (10,000) =
+    // 70,000, even though the historical rate for some of those months was
+    // MK 5,000 -- this breakdown never sees or sums a historical amount.
+    expect(result.uniformRefund).toBe(70000);
   });
 });

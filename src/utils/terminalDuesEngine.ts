@@ -117,12 +117,25 @@ export function calculateAnnualLeaveRefund(unusedLeaveDays: number, finalSalary:
 // Uniform refund
 // ---------------------------------------------------------------------------
 
-const UNIFORM_REFUND_PER_MONTH = 10000;
+/** Fallback rate used only when no approved `terminal_dues_uniform_refund_rate`
+ * system setting exists yet (see TerminalDuesCalculator.tsx) -- keeps every
+ * existing caller/test that omits `ratePerMonth` behaving exactly as before. */
+export const DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH = 10000;
 
-/** Uniform refund = MWK 10,000 per month actually deducted. */
-export function calculateUniformRefund(deductionMonths: number): number {
+/**
+ * Uniform refund = eligible deduction months x the CURRENT approved monthly
+ * rate -- confirmed business policy: the current rate applies to every
+ * eligible month, including months whose historical deduction rate was
+ * different. Historical payroll amounts are evidence of HOW MANY months a
+ * deduction occurred, never of what rate to refund at; this function
+ * deliberately has no parameter for a historical rate.
+ */
+export function calculateUniformRefund(
+  deductionMonths: number,
+  ratePerMonth: number = DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH
+): number {
   if (!(deductionMonths > 0)) return 0;
-  return roundUpToWholeKwacha(deductionMonths * UNIFORM_REFUND_PER_MONTH);
+  return roundUpToWholeKwacha(deductionMonths * ratePerMonth);
 }
 
 /**
@@ -138,6 +151,21 @@ export function uniformRefundNeedsCorrectionReason(
 ): boolean {
   if (payrollEvidenceMonths == null) return false;
   return enteredMonths !== payrollEvidenceMonths;
+}
+
+/**
+ * Whether an HR-entered pension-months override needs a documented
+ * correction reason: true only when an override was actually supplied AND
+ * it disagrees with the system-calculated completed-months count. Mirrors
+ * uniformRefundNeedsCorrectionReason()'s shape -- no override, or an
+ * override that happens to match the system count, never needs one.
+ */
+export function pensionMonthsOverrideNeedsCorrectionReason(
+  systemCalculatedMonths: number,
+  overrideMonths: number | null | undefined
+): boolean {
+  if (overrideMonths == null || !Number.isFinite(overrideMonths)) return false;
+  return overrideMonths !== systemCalculatedMonths;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +274,10 @@ export interface TerminalDuesCalculationInputs {
   pensionMonthsOverride?: number | null;
   unusedLeaveDays?: number;
   uniformDeductionMonths?: number;
+  /** The CURRENT approved monthly uniform refund rate, sourced from the
+   * `terminal_dues_uniform_refund_rate` system setting by the caller.
+   * Defaults to DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH when omitted. */
+  uniformRefundRatePerMonth?: number;
   outstandingSalaryEntries?: OutstandingSalaryEntryInput[];
   noticeStatus: NoticeStatus;
   requiredNoticeDays?: number;
@@ -308,7 +340,10 @@ export function calculateTerminalDuesBreakdown(
     inputs.pensionMonthsOverride
   );
   const annualLeaveRefund = calculateAnnualLeaveRefund(inputs.unusedLeaveDays ?? 0, inputs.finalSalary);
-  const uniformRefund = calculateUniformRefund(inputs.uniformDeductionMonths ?? 0);
+  const uniformRefund = calculateUniformRefund(
+    inputs.uniformDeductionMonths ?? 0,
+    inputs.uniformRefundRatePerMonth ?? DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH
+  );
   const { entries: outstandingSalaryEntries, total: outstandingSalaryTotal } = calculateOutstandingSalaryEntries(
     inputs.outstandingSalaryEntries ?? []
   );
