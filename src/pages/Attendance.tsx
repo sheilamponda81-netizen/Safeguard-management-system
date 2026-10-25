@@ -4,7 +4,7 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs 
 import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import { supabase } from '../lib/supabase';
 import { getCurrentProfile } from '../utils/currentProfile';
-import { getAvailableMonthsFromSystem, getActualCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
+import { getAvailableMonthsFromSystem, getActualCurrentMonth, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
 import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
 import { sanitizeInput } from '../utils/securityHeaders';
@@ -664,20 +664,67 @@ function MonthlyRegisterTab() {
   }, [selectedMonth, userProfile, getDatesForMonth]);
 
   // ===== INITIALIZATION =====
+  // Two DELIBERATELY SEPARATE month concepts, never collapsed into one
+  // variable again (that collapse is exactly what caused two opposite
+  // bugs on two separate occasions -- see both comments below):
+  //
+  // 1. `systemMonth` -- the ACTUAL current calendar month (Africa/
+  //    Blantyre), resolved synchronously, with zero async delay. This is
+  //    the sole anchor for: the edit-permission gate (`isCurrentMonth`,
+  //    `updateAttendance`'s "can only edit the current month" check),
+  //    the "Jump to Current"/"Switch to <month>" buttons, and the
+  //    historical+forward range passed to getAvailableMonthsFromSystem.
+  //    It must NEVER be swapped for the admin-advanced payroll-processing
+  //    cursor (getSystemCurrentMonth()): that cursor can legitimately lag
+  //    behind the calendar (e.g. still finalizing a prior pay period), and
+  //    doing so once already caused a real bug -- with the cursor left at
+  //    its default (2026-07) well into October, Monthly Register treated
+  //    July as "current," so a manual attendance edit on 12 Oct 2026
+  //    silently saved against 1 July 2026 instead. See
+  //    getActualCurrentMonth's own comment in currentMonth.ts.
+  //
+  // 2. `selectedMonth`'s INITIAL value only -- which month this page's
+  //    grid first displays, before any explicit navigation. Settings ->
+  //    Month Settings (current_payroll_month, via getSystemCurrentMonth())
+  //    is the authoritative source for this: Payroll, Terminal Dues
+  //    Allocations, Salary Advances, Payments, Payslips, Reports and
+  //    Dashboard all already default to it, and Attendance defaulting
+  //    instead to today's real calendar month was the one outlier --
+  //    confusing HR when Attendance opened to a different month than
+  //    every other operational screen, and obscuring why a month's
+  //    payroll showed no attendance deductions (the two screens were
+  //    silently looking at different months the whole time).
+  //
+  // Setting `selectedMonth` only once this async fetch resolves (rather
+  // than synchronously to `systemMonth` first and then overwriting it)
+  // avoids ever briefly rendering -- or allowing an edit against -- the
+  // wrong month while the setting loads: `selectedMonth` stays '' (its
+  // initial state) until this completes, `getDatesForMonth('')` returns
+  // no dates, the data-fetch effect below is gated on `selectedMonth`
+  // being truthy, and `updateAttendance`'s edit gate already requires
+  // `selectedMonth === systemMonth` -- '' can never equal a real month,
+  // so no write is possible during this gap either. The user simply sees
+  // the existing loading state slightly longer, exactly as Payroll.tsx
+  // already does while awaiting the same setting.
+  //
+  // Changing `selectedMonth` afterwards -- via Previous/Next, the month
+  // dropdown, or "Jump to Current" -- is pure client-side navigation and
+  // never writes back to current_payroll_month; only Settings -> Month
+  // Settings (setSystemCurrentMonth) does that. And since this effect re-
+  // fetches getSystemCurrentMonth() fresh on every mount (no module-level
+  // caching anywhere in currentMonth.ts), a change made in Settings is
+  // picked up the next time this page is opened/refreshed, with no stale
+  // cached default.
   useEffect(() => {
     const init = async () => {
-      // The ACTUAL current calendar month (Africa/Blantyre) -- NOT the
-      // admin-advanced payroll-processing cursor getSystemCurrentMonth
-      // returns, which can legitimately lag behind the calendar and
-      // previously left this page treating July 2026 as "current" well
-      // into October. See getActualCurrentMonth's own comment in
-      // currentMonth.ts.
       const month = getActualCurrentMonth();
       setSystemMonth(month);
-      setSelectedMonth(month);
 
       const months = getAvailableMonthsFromSystem(month);
       setAvailableMonths(months);
+
+      const payrollMonth = await getSystemCurrentMonth();
+      setSelectedMonth(payrollMonth);
 
       await fetchUserProfile();
     };

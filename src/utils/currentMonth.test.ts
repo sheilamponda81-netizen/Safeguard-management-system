@@ -1,4 +1,31 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+
+// Minimal chainable mock covering only the two call shapes
+// getSystemCurrentMonth() actually uses against `system_settings`:
+// .select('value').eq('key', ...).maybeSingle(), and a terminal
+// .insert([...]) when no row exists yet. Reset and reconfigured per test
+// via mockSelectResult/mockInsertResult below, following the same
+// mocked-Supabase-client convention as payrollApproval.test.ts (there
+// mocking just `.rpc`; here just `.from`, since that is the only entry
+// point this function touches).
+const { mockFrom, mockMaybeSingle, mockInsert } = vi.hoisted(() => {
+  const mockMaybeSingle = vi.fn();
+  const mockInsert = vi.fn();
+  const mockFrom = vi.fn(() => ({
+    select: vi.fn(() => ({
+      eq: vi.fn(() => ({
+        maybeSingle: mockMaybeSingle,
+      })),
+    })),
+    insert: mockInsert,
+  }));
+  return { mockFrom, mockMaybeSingle, mockInsert };
+});
+
+vi.mock('../lib/supabase', () => ({
+  supabase: { from: mockFrom },
+}));
+
 import {
   getPreviousMonth,
   getNextMonth,
@@ -6,6 +33,7 @@ import {
   getSystemStartDate,
   getChartMonths,
   getActualCurrentMonth,
+  getSystemCurrentMonth,
 } from './currentMonth';
 
 // Local helper mirroring the file's own "YYYY-MM" key format, driven off
@@ -209,5 +237,82 @@ describe('getActualCurrentMonth: real Africa/Blantyre calendar month, independen
     vi.setSystemTime(new Date('2026-12-25T10:00:00.000Z'));
     expect(getActualCurrentMonth()).not.toBe('2026-07');
     expect(getActualCurrentMonth()).toBe('2026-12');
+  });
+});
+
+// Month Consistency fix: Attendance (and every other month-dependent
+// screen) now defaults its initial displayed month to whatever this
+// function returns -- Task 3's "missing/invalid settings and error
+// handling" requirement, exercised directly against the real function
+// rather than re-derived in each page's own test file.
+describe('getSystemCurrentMonth: the authoritative current_payroll_month, with safe fallbacks', () => {
+  // Derived from getSystemStartDate() rather than hardcoded, like this
+  // file's other describe blocks -- the fallback currentMonth.ts itself
+  // uses whenever nothing valid is stored is always exactly the system
+  // start month, whatever that is configured to be.
+  const startKey = monthKey(getSystemStartDate());
+
+  beforeEach(() => {
+    mockMaybeSingle.mockReset();
+    mockInsert.mockReset();
+    mockFrom.mockClear();
+  });
+
+  it('returns the stored value when a valid current_payroll_month row exists', async () => {
+    mockMaybeSingle.mockResolvedValue({ data: { value: '2026-07' }, error: null });
+    await expect(getSystemCurrentMonth()).resolves.toBe('2026-07');
+  });
+
+  it('returns a later stored month just as faithfully (not hardcoded to the system start month)', async () => {
+    mockMaybeSingle.mockResolvedValue({ data: { value: '2026-09' }, error: null });
+    await expect(getSystemCurrentMonth()).resolves.toBe('2026-09');
+  });
+
+  it('missing setting (no row yet, maybeSingle returns null data/no error): falls back to the system start month AND creates the default row', async () => {
+    mockMaybeSingle.mockResolvedValue({ data: null, error: null });
+    mockInsert.mockResolvedValue({ error: null });
+
+    await expect(getSystemCurrentMonth()).resolves.toBe(startKey);
+    expect(mockInsert).toHaveBeenCalledTimes(1);
+    expect(mockInsert).toHaveBeenCalledWith([
+      expect.objectContaining({ key: 'current_payroll_month', value: startKey }),
+    ]);
+  });
+
+  it('missing setting, but the auto-create insert itself fails: still returns the system-start-month fallback rather than throwing', async () => {
+    mockMaybeSingle.mockResolvedValue({ data: null, error: null });
+    mockInsert.mockResolvedValue({ error: { message: 'insert failed' } });
+    await expect(getSystemCurrentMonth()).resolves.toBe(startKey);
+  });
+
+  it('invalid stored value (before the system start date): discards it and falls back to the system start month, without touching the stored row', async () => {
+    const beforeStart = monthKey(addMonths(getSystemStartDate(), -1));
+    mockMaybeSingle.mockResolvedValue({ data: { value: beforeStart }, error: null });
+    await expect(getSystemCurrentMonth()).resolves.toBe(startKey);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('a genuine fetch error (e.g. network/RLS failure): falls back to the system start month rather than surfacing the error to the caller', async () => {
+    mockMaybeSingle.mockResolvedValue({ data: null, error: { message: 'network error' } });
+    await expect(getSystemCurrentMonth()).resolves.toBe(startKey);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('an unexpected thrown exception (not a returned error) is also caught and still resolves to the system-start-month fallback', async () => {
+    mockMaybeSingle.mockRejectedValue(new Error('unexpected'));
+    await expect(getSystemCurrentMonth()).resolves.toBe(startKey);
+  });
+
+  it('is called fresh on every invocation -- no module-level caching of a previously resolved month', async () => {
+    mockMaybeSingle.mockResolvedValueOnce({ data: { value: '2026-07' }, error: null });
+    await expect(getSystemCurrentMonth()).resolves.toBe('2026-07');
+
+    // Settings -> Month Settings is updated to a different month between
+    // these two calls (simulated by changing what the next DB read
+    // returns) -- the second call must reflect it immediately, with no
+    // stale cached default carried over from the first call.
+    mockMaybeSingle.mockResolvedValueOnce({ data: { value: '2026-10' }, error: null });
+    await expect(getSystemCurrentMonth()).resolves.toBe('2026-10');
+    expect(mockFrom).toHaveBeenCalledTimes(2);
   });
 });
