@@ -839,17 +839,31 @@ export function TerminalDuesSubmittedTab({ canEdit }: { canEdit: boolean }) {
 
   if (loading) return <p className="text-sm text-slate-400">Loading...</p>;
 
+  const explanation = (
+    <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+      <p className="text-sm text-blue-800">
+        This tab lists calculations submitted through the Calculator tab above, and shows their real status in the
+        existing Terminal Dues approval workflow. <strong>Admin entitlement approvals happen in the Records tab</strong>,
+        not here -- this tab is for tracking a Calculator submission only, never for approving it.
+      </p>
+    </div>
+  );
+
   if (submitted.length === 0) {
     return (
-      <EmptyState
-        title="No submitted calculations yet"
-        description="A draft calculation submitted for Admin approval from the Calculator tab appears here, showing its real status in the existing Terminal Dues approval workflow -- this is never a payment record itself."
-      />
+      <div className="space-y-3">
+        {explanation}
+        <EmptyState
+          title="No submitted calculations yet"
+          description="A draft calculation submitted for Admin approval from the Calculator tab appears here, showing its real status in the existing Terminal Dues approval workflow -- this is never a payment record itself."
+        />
+      </div>
     );
   }
 
   return (
     <div className="space-y-2">
+      {explanation}
       {submitted.map(row => (
         <Card key={row.id} className="p-0">
           <div className="flex items-center justify-between p-3">

@@ -40,9 +40,11 @@ import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
 import {
   summarizeTerminalDuePayrollBatch,
   computeCombinedPayrollTotals,
+  buildTerminalDuePayrollPreview,
   TerminalDueAllocationForSummary,
   TerminalDueEntitlementForSummary,
   TerminalDuePayrollSummary,
+  TerminalDuePayrollPreview,
 } from '../utils/terminalDuesPayrollIntegration';
 import { buildTerminalDuePaymentsCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
 import { buildOrdinaryPayrollPaymentsCsv, buildAccountsReconciliationSummaryCsv, computeOrdinaryPayrollPaymentTotals, OrdinaryPayrollPaymentRecord } from '../utils/accountsReconciliationExport';
@@ -203,6 +205,19 @@ export function PayrollPage() {
   const [canProcessTerminalDues, setCanProcessTerminalDues] = useState(false);
   const [terminalDuesSummary, setTerminalDuesSummary] = useState<TerminalDuePayrollSummary | null>(null);
   const [terminalDuesLoading, setTerminalDuesLoading] = useState(false);
+  // Pre-submission preview (main page, before any processing request
+  // exists or the confirm modal is opened) -- a separate, narrower
+  // concern from terminalDuesSummary above, which only ever loads inside
+  // the confirm modal. This one is visible to anyone who can view this
+  // page (Accountant included), not gated by terminal_dues.approve,
+  // since its whole purpose is to give an Accountant the same heads-up an
+  // Admin already gets once a request exists. Never set to a zero/empty
+  // result on a fetch failure -- terminalDuesPreviewError is tracked
+  // separately so the UI can show a clear error instead of a misleading
+  // "no allocations" state.
+  const [terminalDuesPreview, setTerminalDuesPreview] = useState<TerminalDuePayrollPreview | null>(null);
+  const [terminalDuesPreviewLoading, setTerminalDuesPreviewLoading] = useState(false);
+  const [terminalDuesPreviewError, setTerminalDuesPreviewError] = useState<string | null>(null);
   // Allocation ids the Admin has explicitly chosen to exclude from THIS
   // processing run (never auto-skipped) -- cleared whenever the modal is
   // reopened, since an exclusion decision belongs to one processing attempt.
@@ -778,6 +793,65 @@ export function PayrollPage() {
     }
   }, [selectedMonth, systemMonth, userProfile]);
 
+  // ===== TERMINAL DUES PRE-SUBMISSION PREVIEW (main page, always visible) =====
+  // Unlike fetchTerminalDuesSummary() below (confirm-modal-only, gated by
+  // canProcessTerminalDues), this is visible to anyone who can view this
+  // page -- it exists specifically so an Accountant preparing a payroll
+  // submission (who typically does NOT hold terminal_dues.approve) is not
+  // left with zero visibility into already-approved Terminal Dues
+  // allocations before they submit. Scoped to the selected month and to
+  // 'approved'/'processed' allocations only -- rejected, submitted, held,
+  // and excluded rows, and rows for any other month, are never included.
+  // Tenant isolation is enforced by the existing, unchanged RLS on both
+  // tables queried below; no new RPC or permission is introduced. On a
+  // fetch failure, the error is tracked separately and the UI never
+  // renders a bare zero in its place. Declared here (before the handlers
+  // below that reference it in their own dependency arrays) to avoid a
+  // block-scope "used before declaration" error.
+  const fetchTerminalDuesPreview = useCallback(async () => {
+    setTerminalDuesPreviewLoading(true);
+    setTerminalDuesPreviewError(null);
+    try {
+      const { data: allocRows, error: allocError } = await supabase
+        .from('terminal_due_allocations')
+        .select('id, terminal_due_id, status, proposed_amount, last_decided_amount')
+        .eq('payroll_month', selectedMonth)
+        .in('status', ['approved', 'processed']);
+      if (allocError) throw allocError;
+
+      const rows = allocRows || [];
+      const dueIds = Array.from(new Set(rows.map(r => r.terminal_due_id)));
+
+      if (dueIds.length === 0) {
+        setTerminalDuesPreview({ approvedUnprocessedCount: 0, approvedUnprocessedTotal: 0, recipients: [] });
+        return;
+      }
+
+      const { data: dueRows, error: dueError } = await supabase
+        .from('terminal_dues')
+        .select('id, employee_name, employee_number, historical_employee_id')
+        .in('id', dueIds);
+      if (dueError) throw dueError;
+
+      const dueById = new Map((dueRows || []).map((d: any) => [d.id, d]));
+      setTerminalDuesPreview(buildTerminalDuePayrollPreview(rows as any, dueById));
+    } catch (err) {
+      console.error('Error loading Terminal Dues preview:', err);
+      setTerminalDuesPreviewError(getErrorMessage(err));
+      setTerminalDuesPreview(null);
+    } finally {
+      setTerminalDuesPreviewLoading(false);
+    }
+  }, [selectedMonth]);
+
+  // Load on mount and whenever the selected month changes; also refreshed
+  // alongside fetchPayrollRequests() after any processing/submission
+  // action below, since those are exactly the moments allocation statuses
+  // for the active month can change.
+  useEffect(() => {
+    fetchTerminalDuesPreview();
+  }, [fetchTerminalDuesPreview]);
+
   const approveAndProcessRequest = useCallback(async (requestId: string, alreadyApproved: boolean = false) => {
     setRequestActionBusy(true);
     try {
@@ -786,6 +860,7 @@ export function PayrollPage() {
         if (!approveResult.success) {
           showNotification('Failed to approve payroll request: ' + approveResult.error, 'error');
           await fetchPayrollRequests();
+          await fetchTerminalDuesPreview();
           return;
         }
       }
@@ -796,11 +871,13 @@ export function PayrollPage() {
           'error'
         );
         await fetchPayrollRequests();
+        await fetchTerminalDuesPreview();
         return;
       }
       await fetchData();
       await fetchProcessedMonths();
       await fetchPayrollRequests();
+      await fetchTerminalDuesPreview();
       const tdMessage = processResult.terminalDues
         ? ` Terminal Dues: ${processResult.terminalDues.processedCount} payment(s) totaling ${formatKwacha(processResult.terminalDues.totalAmount)} processed${processResult.terminalDues.excludedCount > 0 ? `, ${processResult.terminalDues.excludedCount} excluded` : ''}.`
         : '';
@@ -810,7 +887,7 @@ export function PayrollPage() {
     } finally {
       setRequestActionBusy(false);
     }
-  }, [fetchData, fetchProcessedMonths, fetchPayrollRequests]);
+  }, [fetchData, fetchProcessedMonths, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   const confirmRejectRequest = useCallback(async () => {
     if (!rejectRequestTarget) return;
@@ -829,12 +906,13 @@ export function PayrollPage() {
       setRejectRequestTarget(null);
       setRejectRequestReason('');
       await fetchPayrollRequests();
+      await fetchTerminalDuesPreview();
     } catch (err) {
       showNotification('Error rejecting payroll request: ' + getErrorMessage(err), 'error');
     } finally {
       setRequestActionBusy(false);
     }
-  }, [rejectRequestTarget, rejectRequestReason, fetchPayrollRequests]);
+  }, [rejectRequestTarget, rejectRequestReason, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   // ===== Shared payroll rates (PAYE rate/threshold, pension rate) from Settings =====
   useEffect(() => {
@@ -1216,6 +1294,7 @@ export function PayrollPage() {
         }
         setShowCopyModal(false);
         await fetchPayrollRequests();
+        await fetchTerminalDuesPreview();
         showNotification(`Payroll copied from ${getMonthLabel(sourceMonth)} submitted for Admin approval. ${newRecords.length} records included. Nothing will be processed until an Admin approves it.`, 'success');
         return;
       }
@@ -1243,6 +1322,7 @@ export function PayrollPage() {
 
       await fetchData();
       await fetchProcessedMonths();
+      await fetchTerminalDuesPreview();
       setHasData(true);
       setIsApproved(false);
       setShowCopyModal(false);
@@ -1253,7 +1333,7 @@ export function PayrollPage() {
     } finally {
       setProcessingStatus('');
     }
-  }, [canProcessPayroll, attendanceCountsUnavailable, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths, isAdminClass, fetchPayrollRequests]);
+  }, [canProcessPayroll, attendanceCountsUnavailable, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths, isAdminClass, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
@@ -1771,6 +1851,7 @@ export function PayrollPage() {
         setExclusionReason('');
         setShowConfirmModal(false);
         await fetchPayrollRequests();
+        await fetchTerminalDuesPreview();
         showNotification(`Payroll for ${getMonthLabel(selectedMonth)} submitted for Admin approval. ${payrollToSave.length} employees included. Nothing will be processed until an Admin approves it.`, 'success');
         setProcessing(false);
         setProcessingStatus('');
@@ -1811,6 +1892,7 @@ export function PayrollPage() {
 
       await fetchData();
       await fetchProcessedMonths();
+      await fetchTerminalDuesPreview();
 
       const terminalDuesMessage = result.terminalDues
         ? ` Terminal Dues: ${result.terminalDues.processedCount} payment(s) totaling ${formatKwacha(result.terminalDues.totalAmount)} processed${result.terminalDues.excludedCount > 0 ? `, ${result.terminalDues.excludedCount} excluded` : ''} (ref: ${result.terminalDues.batchReference}).`
@@ -1836,7 +1918,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason, isAdminClass, fetchPayrollRequests]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason, isAdminClass, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -2338,6 +2420,87 @@ export function PayrollPage() {
           </div>
         </Card>
       </div>
+
+      {/* Pre-submission Terminal Dues preview -- informational only, built
+          client-side from the current `terminal_due_allocations` rows for
+          the selected month. It is NOT the authoritative financial record:
+          that remains compute_payroll_request_snapshot() (captured at
+          submission into payroll_processing_requests.financial_snapshot)
+          and process_payroll_with_terminal_dues() (at actual processing).
+          This card exists so approved, unprocessed Terminal Dues are
+          visible before either of those run. */}
+      <Card className="p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+            <FileText size={16} className="text-[#D4A017]" /> Terminal Dues -- {getMonthLabel(selectedMonth)}
+          </h3>
+          <span className="text-xs text-slate-400">Pre-submission estimate, not the official financial snapshot</span>
+        </div>
+        {terminalDuesPreviewLoading ? (
+          <p className="text-sm text-slate-500">Loading Terminal Dues...</p>
+        ) : terminalDuesPreviewError ? (
+          <div className="flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
+            <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
+            <span>Could not load Terminal Dues data: {terminalDuesPreviewError}. Figures below do not include Terminal Dues until this is resolved -- they are not necessarily zero.</span>
+          </div>
+        ) : terminalDuesPreview ? (
+          <>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+              <div>
+                <p className="text-xs text-slate-500">Ordinary Net Payroll</p>
+                <p className="text-lg font-bold text-slate-800 mt-1">{hasBlockedPreview ? '—' : formatKwacha(totals.net)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Approved, Unprocessed Terminal Dues</p>
+                <p className="text-lg font-bold text-[#081C3A] mt-1">{formatKwacha(terminalDuesPreview.approvedUnprocessedTotal)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Combined Expected Disbursement</p>
+                <p className="text-lg font-bold text-[#D4A017] mt-1">
+                  {hasBlockedPreview ? '—' : formatKwacha(computeCombinedPayrollTotals(totals.net, terminalDuesPreview.approvedUnprocessedTotal).combinedTotal)}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Terminal Dues Recipients</p>
+                <p className="text-lg font-bold text-slate-800 mt-1">{terminalDuesPreview.approvedUnprocessedCount}</p>
+              </div>
+            </div>
+            {terminalDuesPreview.recipients.length > 0 ? (
+              <div className="border border-slate-200 rounded-lg overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-50">
+                    <tr>
+                      <th className="text-left px-3 py-2 text-xs font-medium text-slate-500">Name</th>
+                      <th className="text-left px-3 py-2 text-xs font-medium text-slate-500">Employee/Reference No.</th>
+                      <th className="text-right px-3 py-2 text-xs font-medium text-slate-500">Amount</th>
+                      <th className="text-left px-3 py-2 text-xs font-medium text-slate-500">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {terminalDuesPreview.recipients.map((r) => (
+                      <tr key={r.terminalDueId} className="border-t border-slate-100">
+                        <td className="px-3 py-2 text-slate-800">
+                          {r.employeeName}
+                          {r.isHistorical && <span className="ml-1 text-xs text-slate-400">(Historical)</span>}
+                        </td>
+                        <td className="px-3 py-2 text-slate-600">{r.employeeNumber || '—'}</td>
+                        <td className="px-3 py-2 text-right text-slate-800">{formatKwacha(r.amount)}</td>
+                        <td className="px-3 py-2">
+                          <span className={`text-xs px-2 py-0.5 rounded-full ${r.status === 'processed' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
+                            {r.status === 'processed' ? 'Processed' : 'Approved'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No approved or processed Terminal Dues allocations for {getMonthLabel(selectedMonth)}.</p>
+            )}
+          </>
+        ) : null}
+      </Card>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <Card className="p-5">
