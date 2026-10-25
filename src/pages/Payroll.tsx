@@ -4,7 +4,6 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
-import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
@@ -40,6 +39,9 @@ import {
   summarizeTerminalDuePayrollBatch,
   computeCombinedPayrollTotals,
   buildTerminalDuePayrollPreview,
+  paginateTerminalDueRecipients,
+  lastTerminalDueRecipientsPage,
+  clampTerminalDueRecipientsPage,
   TerminalDueAllocationForSummary,
   TerminalDueEntitlementForSummary,
   TerminalDuePayrollSummary,
@@ -47,7 +49,7 @@ import {
 } from '../utils/terminalDuesPayrollIntegration';
 import { buildTerminalDuePaymentsCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
 import { buildOrdinaryPayrollPaymentsCsv, buildAccountsReconciliationSummaryCsv, computeOrdinaryPayrollPaymentTotals, OrdinaryPayrollPaymentRecord } from '../utils/accountsReconciliationExport';
-import { buildPayrollDeductionBreakdown, PayrollDeductionBreakdownEmployeeInput } from '../utils/payrollDeductionBreakdown';
+import { buildPayrollDeductionBreakdown, deriveItemizedAttendanceDeduction, PayrollDeductionBreakdownEmployeeInput } from '../utils/payrollDeductionBreakdown';
 
 interface Employee {
   id: string;
@@ -145,10 +147,8 @@ export function PayrollPage() {
   const [processing, setProcessing] = useState(false);
   const [processed, setProcessed] = useState(false);
   const [editingValues, setEditingValues] = useState<Record<string, Partial<PayrollRecord>>>({});
-  const [showCopyModal, setShowCopyModal] = useState(false);
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
-  const [copySourceMonths, setCopySourceMonths] = useState<string[]>([]);
   // Region id -> name, for the Export Report's "Region" column and for
   // scoping a historical (already-processed) month's payroll rows to a
   // regular Admin's own region -- fetched once, same pattern as
@@ -171,7 +171,7 @@ export function PayrollPage() {
   // (get_payroll_attendance_counts) fails for any reason -- fail-closed
   // guard: attendanceCounts is never trusted as "zero deductions" while
   // this is true. See the blocking banner in the render below and the
-  // guard clauses in processPayroll()/copyFromPreviousMonth(). Always
+  // guard clauses in processPayroll(). Always
   // false for a historical month, which never calls this RPC (its counts
   // come from the stored employee_deductions rows instead).
   const [attendanceCountsUnavailable, setAttendanceCountsUnavailable] = useState(false);
@@ -250,6 +250,14 @@ export function PayrollPage() {
   const [payrollItemsPerPage, setPayrollItemsPerPage] = useState(20);
   useEffect(() => { getDefaultPageSize().then(setPayrollItemsPerPage); }, []);
 
+  // Independent pagination for the Terminal Dues Recipients subsection
+  // (UAT fix -- it previously rendered every matching recipient with no
+  // pagination at all). Deliberately its own state, never shared with
+  // payrollPage/payrollItemsPerPage above -- paginating one list must
+  // never affect the other.
+  const [terminalDuesRecipientsPage, setTerminalDuesRecipientsPage] = useState(1);
+  const [terminalDuesRecipientsItemsPerPage, setTerminalDuesRecipientsItemsPerPage] = useState(20);
+
   // ===== MEMOIZED VALUES =====
   const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
   const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
@@ -283,6 +291,42 @@ export function PayrollPage() {
   useEffect(() => {
     setPayrollPage(1);
   }, [search]);
+
+  // UAT fix: changing the page size while on a later page left
+  // paginatedEmployees computing a startIndex past the end of
+  // filteredEmployees (e.g. page 10 of 20-per-page, then switching to
+  // 100-per-page -- totalPages drops below the current page), silently
+  // rendering an empty table with Previous/Next left in a stale,
+  // inconsistent state. Reset to page 1 on every page-size change, the
+  // same convention already used for a search change above.
+  useEffect(() => {
+    setPayrollPage(1);
+  }, [payrollItemsPerPage]);
+
+  // Terminal Dues Recipients pagination (independent of the ordinary
+  // payroll table's own payrollPage/payrollItemsPerPage above) --
+  // paginated recipients, never the summary totals, which always read
+  // the full, unpaginated terminalDuesPreview.
+  const paginatedTerminalDuesRecipients = useMemo(
+    () => paginateTerminalDueRecipients(terminalDuesPreview?.recipients || [], terminalDuesRecipientsPage, terminalDuesRecipientsItemsPerPage),
+    [terminalDuesPreview, terminalDuesRecipientsPage, terminalDuesRecipientsItemsPerPage]
+  );
+
+  // Reset/clamp on month change, data reload, or page-size change -- a
+  // stale page number from a previous month (or a larger recipient list)
+  // must never leave this table showing zero rows while Previous/Next
+  // sit in an inconsistent state.
+  useEffect(() => {
+    setTerminalDuesRecipientsPage(1);
+  }, [selectedMonth, terminalDuesRecipientsItemsPerPage]);
+
+  useEffect(() => {
+    const recipientCount = terminalDuesPreview?.recipients.length || 0;
+    const clamped = clampTerminalDueRecipientsPage(terminalDuesRecipientsPage, recipientCount, terminalDuesRecipientsItemsPerPage);
+    if (clamped !== terminalDuesRecipientsPage) {
+      setTerminalDuesRecipientsPage(clamped);
+    }
+  }, [terminalDuesPreview, terminalDuesRecipientsItemsPerPage, terminalDuesRecipientsPage]);
 
   // ===== FETCH APPROVER NAME =====
   useEffect(() => {
@@ -596,11 +640,10 @@ export function PayrollPage() {
       // attendance-derived deductions with nothing in the UI indicating
       // anything was wrong. The RPC leg below fails LOUD instead: any
       // error is captured (not swallowed) and surfaces as
-      // `attendanceCountsUnavailable`, which blocks Process Payroll /
-      // Copy From Previous Month and shows a blocking banner -- see the
-      // guard clauses in processPayroll()/copyFromPreviousMonth() and the
-      // render section below. A historical month never calls this RPC at
-      // all (employeeIds there come from what's already stored).
+      // `attendanceCountsUnavailable`, which blocks Process Payroll and
+      // shows a blocking banner -- see the guard clause in processPayroll()
+      // and the render section below. A historical month never calls this
+      // RPC at all (employeeIds there come from what's already stored).
       const [payrollDataRaw, deductionsDataRaw, attendanceRpcResult, positionsRequiringUniformMap] = await Promise.all([
         historicalPayrollPromise ?? fetchInEmployeeIdBatches<PayrollRecord>(
           employeeIds,
@@ -1056,21 +1099,27 @@ export function PayrollPage() {
   // appearance/uniform-only/salary-advance), aggregated the same way
   // `totals` above is -- over every employee for the selected month, via
   // the SAME getDisplayPayroll()/getEmployeeDeduction() figures the
-  // existing stats cards and table already use. See
-  // payrollDeductionBreakdown.ts: this never invents a split for an
-  // employee with no employee_deductions row, and its own grandTotal
-  // formula is identical to totals' own Total Deductions calculation, so
-  // the two are guaranteed to reconcile.
+  // existing stats cards and table already use.
+  //
+  // UAT fix: for a NOT-YET-PROCESSED employee, calculatePayroll() never
+  // reads the frozen employee_deductions row for absence/late at all --
+  // it derives them from the LIVE attendanceCounts map times the live
+  // payrollRates (see calculateLivePayroll() in payrollCalculations.ts).
+  // Reading only employeeDeductions here (as the first version of this
+  // card did) meant every not-yet-processed employee had NO itemization
+  // source at all, so the entire bundled uniform/attendance total landed
+  // in "Not itemized" even though real per-category figures exist --
+  // deriveItemizedAttendanceDeduction() picks the correct one of the two
+  // sources per employee (see payrollDeductionBreakdown.ts's header).
   const deductionBreakdown = useMemo(() => {
     const inputs: PayrollDeductionBreakdownEmployeeInput[] = employees.map(emp => {
       const p = getDisplayPayroll(emp);
       const deduction = getEmployeeDeduction(emp.id);
-      return {
-        paye: p.paye,
-        pension: p.pension,
-        uniformAndAttendanceTotal: p.uniform_deduction || 0,
-        salaryAdvanceDeduction: p.salary_advance_deduction || 0,
-        attendanceRecord: deduction
+      const isProcessed = payrollByEmployee.has(emp.id);
+      const itemized = deriveItemizedAttendanceDeduction({
+        isProcessed,
+        liveAttendance: attendanceCounts.get(emp.id) || null,
+        frozenRecord: deduction
           ? {
               absent_days: deduction.absent_days,
               late_days: deduction.late_days,
@@ -1080,10 +1129,19 @@ export function PayrollPage() {
           : null,
         lectureDeduction: deduction?.lecture_deduction || 0,
         appearanceDeduction: deduction?.appearance_deduction || 0,
+        liveAbsentRate: payrollRates.absentDeduction,
+        liveLateRate: payrollRates.lateDeduction,
+      });
+      return {
+        paye: p.paye,
+        pension: p.pension,
+        uniformAndAttendanceTotal: p.uniform_deduction || 0,
+        salaryAdvanceDeduction: p.salary_advance_deduction || 0,
+        itemized,
       };
     });
     return buildPayrollDeductionBreakdown(inputs);
-  }, [employees, getDisplayPayroll, getEmployeeDeduction]);
+  }, [employees, getDisplayPayroll, getEmployeeDeduction, payrollByEmployee, attendanceCounts, payrollRates]);
 
   // True only when at least one CURRENTLY DISPLAYED figure is actually a
   // live calculation built on a failed/unavailable attendance-count fetch
@@ -1142,9 +1200,6 @@ export function PayrollPage() {
       const months = getAvailableMonthsFromSystem(month);
       setAvailableMonths(months);
 
-      const pastMonths = months.filter(m => m < month);
-      setCopySourceMonths(pastMonths);
-
       const { data: regionsData } = await supabase.from('regions').select('id, name');
       setRegions(regionsData || []);
 
@@ -1190,183 +1245,6 @@ export function PayrollPage() {
       setPayrollPage(1);
     }
   }, [selectedMonth]);
-
-  // ===== COPY FROM PREVIOUS MONTH =====
-  const copyFromPreviousMonth = useCallback(async (sourceMonth: string) => {
-    if (!canProcessPayroll) {
-      showNotification('You do not have permission to copy payroll data.', 'error');
-      return;
-    }
-
-    // Same fail-closed guard as processPayroll() -- calculatePayroll()
-    // below is called per employee to compute the target month's uniform/
-    // attendance deductions, which must never proceed on a known-missing
-    // attendance-count fetch.
-    if (attendanceCountsUnavailable) {
-      showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
-      return;
-    }
-
-    setProcessingStatus('Copying data from ' + getMonthLabel(sourceMonth) + '...');
-
-    try {
-      const employeeIds = employees.map(e => e.id);
-      if (employeeIds.length === 0) {
-        showNotification('No employees found to copy payroll for.', 'error');
-        return;
-      }
-
-      // The target month's existing rows are no longer deleted here up
-      // front -- process_payroll_batch() (called below, once newRecords is
-      // built) does the delete and insert atomically in one transaction,
-      // scoped to exactly `employeeIds` as before. (A separate manual
-      // pre-delete would race with that atomic RPC step and isn't needed.)
-      //
-      // Same oversized-IN-list risk/fix as the main fetchData payroll query
-      // -- batched via employeeBatchFetch instead of one request built from
-      // the entire employee population.
-      let sourceData: PayrollRecord[];
-      try {
-        const sourceDataRaw = await fetchInEmployeeIdBatches<PayrollRecord>(
-          employeeIds,
-          (batch, from, to, withCount) =>
-            supabase
-              .from('payroll')
-              .select('*', withCount ? { count: 'exact' } : undefined)
-              .eq('month', sourceMonth)
-              .in('employee_id', batch)
-              .range(from, to)
-        );
-        sourceData = dedupeById(sourceDataRaw);
-      } catch (sourceError: any) {
-        console.error('Error fetching source data:', sourceError);
-        showNotification('Failed to fetch source data: ' + sourceError.message, 'error');
-        return;
-      }
-
-      if (!sourceData || sourceData.length === 0) {
-        showNotification('No data found in the selected source month.', 'error');
-        return;
-      }
-
-      // Carry forward only the manually-entered pay components (basic
-      // salary override, allowances, overtime, bonus) -- everything else
-      // (PAYE, pension, uniform/attendance deductions) is recalculated fresh
-      // for the target month via calculatePayroll using the currently
-      // configured rates and the target month's own attendance. Blindly
-      // copying last month's gross/paye/pension/uniform_deduction would
-      // silently carry forward a stale PAYE rate if it changed since, and
-      // attendance-based deductions in particular are inherently specific
-      // to the month they happened in -- an employee absent 3 days last
-      // month didn't necessarily miss any days this month.
-      const employeesByIdForCopy = new Map(employees.map(e => [e.id, e]));
-      const newRecords = sourceData
-        .map(record => {
-          const employee = employeesByIdForCopy.get(record.employee_id);
-          if (!employee) return null;
-          const payroll = calculatePayroll(employee, {
-            basic_salary: record.basic_salary,
-            allowances: record.allowances || 0,
-            overtime: record.overtime || 0,
-            bonus: record.bonus || 0,
-          });
-          return {
-            employee_id: employee.id,
-            month: selectedMonth,
-            basic_salary: payroll.basic_salary,
-            allowances: payroll.allowances,
-            overtime: payroll.overtime,
-            bonus: payroll.bonus,
-            gross_pay: payroll.gross_pay,
-            paye: payroll.paye,
-            pension: payroll.pension,
-            uniform_deduction: payroll.uniform_deduction,
-            // payroll.net_pay is the FINAL (post-advance) figure used for
-            // display/totals throughout this page -- process_payroll_batch()
-            // subtracts its OWN server-computed salary advance deduction
-            // from whatever net_pay it receives, so the value sent here
-            // must be added back to the PRE-advance figure or the RPC
-            // would subtract the same deduction a second time.
-            net_pay: payroll.net_pay + payroll.salary_advance_deduction,
-            processed_at: new Date().toISOString(),
-            approval_status: 'pending',
-            approved_by: null,
-            approved_at: null,
-            approval_notes: null
-          };
-        })
-        .filter((r): r is NonNullable<typeof r> => r !== null);
-
-      if (newRecords.length === 0) {
-        showNotification('None of the source month\'s employees are still active.', 'error');
-        return;
-      }
-
-      // Terminal Dues Phase 3B: this one atomic call now covers BOTH
-      // ordinary payroll AND (if this caller holds terminal_dues.approve
-      // and there's anything eligible) Terminal Dues in a single Postgres
-      // transaction -- see process_payroll_with_terminal_dues()'s own
-      // migration header. This modal has no exception-resolution UI of
-      // its own, so it never excludes anything (empty list below); if a
-      // Terminal Dues allocation needs resolving, this call fails loudly
-      // (outcome 'terminal_dues_validation_failed') rather than silently
-      // skipping it -- the Admin is directed to the Process Payroll
-      // modal's own Terminal Dues summary instead.
-      //
-      // Phase 3D: same Admin-class gate as processPayroll() -- an
-      // Accountant copying forward cannot commit directly either; this
-      // submits a request for Admin approval instead.
-      if (!isAdminClass) {
-        const submitResult = await submitPayrollProcessingRequest(selectedMonth, newRecords, {
-          sourceMonth,
-          targetMonth: selectedMonth,
-        }, [], null);
-        if (!submitResult.success) {
-          showNotification('Failed to submit copied payroll for approval: ' + submitResult.error, 'error');
-          return;
-        }
-        setShowCopyModal(false);
-        await fetchPayrollRequests();
-        await fetchTerminalDuesPreview();
-        showNotification(`Payroll copied from ${getMonthLabel(sourceMonth)} submitted for Admin approval. ${newRecords.length} records included. Nothing will be processed until an Admin approves it.`, 'success');
-        return;
-      }
-
-      const result = await processPayrollWithTerminalDues(selectedMonth, newRecords, {
-        sourceMonth,
-        targetMonth: selectedMonth,
-      }, [], null);
-
-      if (!result.success) {
-        console.error('Error copying data:', result.error);
-        const message = result.outcome === 'terminal_dues_validation_failed'
-          ? `${result.error} -- resolve or exclude this in the Terminal Dues summary on the Process Payroll screen, then copy again.`
-          : (result.error ? describeProcessPayrollBatchError(result.error, id => employeesById.get(id)?.full_name) : result.error);
-        showNotification('Failed to copy data: ' + message, 'error');
-        if (result.outcome === 'network_error') {
-          // A network interruption's outcome is unknown -- refresh so the
-          // UI reflects reality (possibly already committed) rather than
-          // staying stale on an assumed failure.
-          await fetchData();
-          await fetchProcessedMonths();
-        }
-        return;
-      }
-
-      await fetchData();
-      await fetchProcessedMonths();
-      await fetchTerminalDuesPreview();
-      setHasData(true);
-      setIsApproved(false);
-      setShowCopyModal(false);
-      showNotification(`Payroll data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}. ${result.insertedCount ?? newRecords.length} records copied.${result.terminalDues ? ` Terminal Dues: ${result.terminalDues.processedCount} payment(s) totaling ${formatKwacha(result.terminalDues.totalAmount)}.` : ''}`, 'success');
-    } catch (err) {
-      console.error('Error copying data:', err);
-      showNotification('Failed to copy data: ' + getErrorMessage(err), 'error');
-    } finally {
-      setProcessingStatus('');
-    }
-  }, [canProcessPayroll, attendanceCountsUnavailable, selectedMonth, employees, employeesById, calculatePayroll, fetchData, fetchProcessedMonths, isAdminClass, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   // ===== APPROVE PAYROLL =====
   const approvePayroll = useCallback(async (status: 'approved' | 'rejected') => {
@@ -1821,7 +1699,6 @@ export function PayrollPage() {
           paye: payroll.paye,
           pension: payroll.pension,
           uniform_deduction: payroll.uniform_deduction,
-          // See the identical comment in copyFromPreviousMonth() above --
           // payroll.net_pay here is already post-advance; add the
           // deduction back so process_payroll_batch() (which subtracts
           // its own server-computed copy) doesn't subtract it twice.
@@ -2577,27 +2454,15 @@ export function PayrollPage() {
             rows yet -- replaces the old full-width "No Payroll Records"
             empty-state panel. The employee preview/search table below
             renders unconditionally either way (it always has; this badge
-            and the optional Copy action are the only things that used to
-            live inside that panel), so removing the panel changes nothing
-            about data loading, validation, or processing -- only how the
-            "nothing committed yet" state is communicated. */}
+            is the only thing that used to live inside that panel), so
+            removing the panel changes nothing about data loading,
+            validation, or processing -- only how the "nothing committed
+            yet" state is communicated. The "Copy from Previous Month"
+            action that used to sit here was removed per explicit request
+            -- confirmed to have no other caller/entry point anywhere in
+            this file before removal. */}
         {!hasData && (
           <Badge color="yellow" className="text-xs">Unprocessed -- preview only</Badge>
-        )}
-        {!hasData && copySourceMonths.length > 0 && (
-          <Button
-            variant="outline"
-            className="text-xs py-1 px-2"
-            onClick={() => {
-              if (attendanceCountsUnavailable) {
-                showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
-                return;
-              }
-              setShowCopyModal(true);
-            }}
-          >
-            Copy from Previous Month
-          </Button>
         )}
       </Card>
 
@@ -2792,7 +2657,7 @@ export function PayrollPage() {
                 </TR>
               </THead>
               <TBody>
-                {terminalDuesPreview.recipients.map(r => (
+                {paginatedTerminalDuesRecipients.map(r => (
                   <TR key={r.terminalDueId}>
                     <TD>
                       <div className="flex items-center gap-1.5">
@@ -2816,6 +2681,18 @@ export function PayrollPage() {
               </TBody>
             </table>
           </div>
+          {/* Lightweight, independent pagination -- never paginates the
+              summary totals above (approvedUnprocessedTotal/Count), which
+              always read the full terminalDuesPreview.recipients list. */}
+          <Pagination
+            currentPage={terminalDuesRecipientsPage}
+            totalPages={lastTerminalDueRecipientsPage(terminalDuesPreview.recipients.length, terminalDuesRecipientsItemsPerPage)}
+            totalItems={terminalDuesPreview.recipients.length}
+            itemsPerPage={terminalDuesRecipientsItemsPerPage}
+            onPageChange={setTerminalDuesRecipientsPage}
+            onItemsPerPageChange={setTerminalDuesRecipientsItemsPerPage}
+            itemsPerPageOptions={[20, 50, 100]}
+          />
         </div>
       )}
 
@@ -3123,13 +3000,6 @@ export function PayrollPage() {
         </div>
       )}
 
-      <CopyFromPreviousModal 
-        open={showCopyModal} 
-        onClose={() => setShowCopyModal(false)} 
-        onConfirm={copyFromPreviousMonth} 
-        currentMonth={selectedMonth} 
-        availableMonths={copySourceMonths}
-      />
     </div>
   );
 }

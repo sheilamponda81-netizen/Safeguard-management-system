@@ -3,6 +3,9 @@ import {
   summarizeTerminalDuePayrollBatch,
   computeCombinedPayrollTotals,
   buildTerminalDuePayrollPreview,
+  paginateTerminalDueRecipients,
+  lastTerminalDueRecipientsPage,
+  clampTerminalDueRecipientsPage,
   TerminalDueAllocationForSummary,
   TerminalDueEntitlementForSummary,
   TerminalDuePreviewAllocation,
@@ -219,5 +222,72 @@ describe('buildTerminalDuePayrollPreview', () => {
     expect(combined.ordinaryPayrollTotal).toBe(2000000);
     expect(combined.terminalDuesTotal).toBe(100000);
     expect(combined.combinedTotal).toBe(2100000);
+  });
+});
+
+describe('Terminal Dues Recipients pagination', () => {
+  const items = Array.from({ length: 45 }, (_, i) => i + 1); // [1..45]
+
+  describe('paginateTerminalDueRecipients', () => {
+    it('defaults to a page of 20', () => {
+      expect(paginateTerminalDueRecipients(items, 1, 20)).toEqual(items.slice(0, 20));
+    });
+
+    it('returns the correct slice for a later page', () => {
+      expect(paginateTerminalDueRecipients(items, 2, 20)).toEqual(items.slice(20, 40));
+    });
+
+    it('returns a partial final page rather than padding or erroring', () => {
+      expect(paginateTerminalDueRecipients(items, 3, 20)).toEqual(items.slice(40, 45));
+    });
+
+    it('supports the 50 and 100 page-size options', () => {
+      expect(paginateTerminalDueRecipients(items, 1, 50)).toEqual(items);
+      expect(paginateTerminalDueRecipients(items, 1, 100)).toEqual(items);
+    });
+
+    it('never fabricates rows for a page past the end -- returns empty, not padded or wrapped', () => {
+      expect(paginateTerminalDueRecipients(items, 10, 20)).toEqual([]);
+    });
+
+    it('preserves each item exactly as given, including historical-recipient markers', () => {
+      const recipients = [
+        { terminalDueId: 'a', isHistorical: true },
+        { terminalDueId: 'b', isHistorical: false },
+      ];
+      expect(paginateTerminalDueRecipients(recipients, 1, 20)).toEqual(recipients);
+    });
+  });
+
+  describe('lastTerminalDueRecipientsPage', () => {
+    it('computes the correct last page for a given item count and page size', () => {
+      expect(lastTerminalDueRecipientsPage(45, 20)).toBe(3);
+      expect(lastTerminalDueRecipientsPage(40, 20)).toBe(2);
+      expect(lastTerminalDueRecipientsPage(45, 50)).toBe(1);
+    });
+
+    it('is never less than 1, even for zero items', () => {
+      expect(lastTerminalDueRecipientsPage(0, 20)).toBe(1);
+    });
+  });
+
+  describe('clampTerminalDueRecipientsPage', () => {
+    it('leaves a valid page number unchanged', () => {
+      expect(clampTerminalDueRecipientsPage(2, 45, 20)).toBe(2);
+    });
+
+    it('clamps down to the last valid page when the recipient count shrinks (e.g. a month change)', () => {
+      // Was on page 3 of a 45-item month; the newly selected month has only 5.
+      expect(clampTerminalDueRecipientsPage(3, 5, 20)).toBe(1);
+    });
+
+    it('clamps down when increasing the page size drops the total page count below the current page', () => {
+      // Page 3 at 20/page (45 items -> 3 pages), switched to 50/page (-> 1 page).
+      expect(clampTerminalDueRecipientsPage(3, 45, 50)).toBe(1);
+    });
+
+    it('never clamps an empty list below page 1', () => {
+      expect(clampTerminalDueRecipientsPage(5, 0, 20)).toBe(1);
+    });
   });
 });

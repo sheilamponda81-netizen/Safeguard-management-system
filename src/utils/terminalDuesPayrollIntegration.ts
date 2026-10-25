@@ -227,3 +227,39 @@ export function buildTerminalDuePayrollPreview(
 
   return { approvedUnprocessedCount, approvedUnprocessedTotal, recipients };
 }
+
+// ---------------------------------------------------------------------------
+// Terminal Dues Recipients pagination (Payroll.tsx) -- lightweight,
+// independent of the ordinary payroll table's own pagination state. Pure
+// display slicing only: it never touches approvedUnprocessedTotal/
+// approvedUnprocessedCount, which the caller always computes from the
+// FULL, unpaginated recipients list -- paginating the list a Terminal
+// Due's row happens to render on never changes what it is owed.
+// ---------------------------------------------------------------------------
+
+export function paginateTerminalDueRecipients<T>(recipients: T[], page: number, itemsPerPage: number): T[] {
+  const startIndex = (page - 1) * itemsPerPage;
+  const endIndex = Math.min(startIndex + itemsPerPage, recipients.length);
+  return recipients.slice(startIndex, endIndex);
+}
+
+/**
+ * The last valid page number for a given item count/page size, never less
+ * than 1 (an empty list is still "page 1 of 1", not "page 1 of 0").
+ */
+export function lastTerminalDueRecipientsPage(totalItems: number, itemsPerPage: number): number {
+  return Math.max(1, Math.ceil(totalItems / itemsPerPage));
+}
+
+/**
+ * Clamps a current page number down to the last valid page whenever the
+ * recipient count or page size shrinks out from under it (e.g. switching
+ * to a smaller month's data, or increasing the page size) -- never lets
+ * the caller render a page past the end with Previous/Next left in an
+ * inconsistent state. Returns the SAME number unchanged when it's already
+ * valid, so a caller can use this to decide whether a state update is
+ * even needed.
+ */
+export function clampTerminalDueRecipientsPage(currentPage: number, totalItems: number, itemsPerPage: number): number {
+  return Math.min(currentPage, lastTerminalDueRecipientsPage(totalItems, itemsPerPage));
+}

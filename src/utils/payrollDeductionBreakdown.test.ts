@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { buildPayrollDeductionBreakdown, PayrollDeductionBreakdownEmployeeInput } from './payrollDeductionBreakdown';
+import {
+  buildPayrollDeductionBreakdown,
+  deriveItemizedAttendanceDeduction,
+  PayrollDeductionBreakdownEmployeeInput,
+  ItemizedAttendanceDeductionAmounts,
+} from './payrollDeductionBreakdown';
 
 function employee(overrides: Partial<PayrollDeductionBreakdownEmployeeInput> = {}): PayrollDeductionBreakdownEmployeeInput {
   return {
@@ -7,12 +12,81 @@ function employee(overrides: Partial<PayrollDeductionBreakdownEmployeeInput> = {
     pension: 0,
     uniformAndAttendanceTotal: 0,
     salaryAdvanceDeduction: 0,
-    attendanceRecord: null,
-    lectureDeduction: 0,
-    appearanceDeduction: 0,
+    itemized: null,
     ...overrides,
   };
 }
+
+function itemized(overrides: Partial<ItemizedAttendanceDeductionAmounts> = {}): ItemizedAttendanceDeductionAmounts {
+  return { absenceDeduction: 0, lateDeduction: 0, lectureDeduction: 0, appearanceDeduction: 0, ...overrides };
+}
+
+describe('deriveItemizedAttendanceDeduction', () => {
+  it('a NOT-YET-PROCESSED employee is itemized from the LIVE attendanceCounts + live rates, never the frozen employee_deductions row -- this is the exact UAT defect: calculatePayroll() never reads employee_deductions for absence/late on a live preview, so this must match', () => {
+    const result = deriveItemizedAttendanceDeduction({
+      isProcessed: false,
+      liveAttendance: { absentDays: 2, lateDays: 3 },
+      frozenRecord: null, // no employee_deductions row exists yet for this unprocessed month
+      lectureDeduction: 0,
+      appearanceDeduction: 0,
+      liveAbsentRate: 10000,
+      liveLateRate: 4200,
+    });
+    expect(result).toEqual({ absenceDeduction: 20000, lateDeduction: 12600, lectureDeduction: 0, appearanceDeduction: 0 });
+  });
+
+  it('a not-yet-processed employee with zero live attendance days is itemized as a confirmed zero, never "not itemized"', () => {
+    const result = deriveItemizedAttendanceDeduction({
+      isProcessed: false,
+      liveAttendance: null, // no map entry -- a succeeded fetch simply omitted this employee (0 days)
+      frozenRecord: null,
+      lectureDeduction: 0,
+      appearanceDeduction: 0,
+      liveAbsentRate: 10000,
+      liveLateRate: 4200,
+    });
+    expect(result).toEqual({ absenceDeduction: 0, lateDeduction: 0, lectureDeduction: 0, appearanceDeduction: 0 });
+  });
+
+  it('a not-yet-processed employee still reads lecture/appearance from the employee_deductions row when one exists (these are entered independently of processing status)', () => {
+    const result = deriveItemizedAttendanceDeduction({
+      isProcessed: false,
+      liveAttendance: { absentDays: 0, lateDays: 0 },
+      frozenRecord: null,
+      lectureDeduction: 3000,
+      appearanceDeduction: 2000,
+      liveAbsentRate: 10000,
+      liveLateRate: 4200,
+    });
+    expect(result).toEqual({ absenceDeduction: 0, lateDeduction: 0, lectureDeduction: 3000, appearanceDeduction: 2000 });
+  });
+
+  it('an ALREADY-PROCESSED employee is itemized from the frozen employee_deductions row, ignoring the live rate/attendance entirely', () => {
+    const result = deriveItemizedAttendanceDeduction({
+      isProcessed: true,
+      liveAttendance: { absentDays: 99, lateDays: 99 }, // must be ignored -- processed uses the frozen record only
+      frozenRecord: { absent_days: 1, late_days: 2, absent_deduction: 8000, late_deduction: 8400 },
+      lectureDeduction: 0,
+      appearanceDeduction: 0,
+      liveAbsentRate: 999999,
+      liveLateRate: 999999,
+    });
+    expect(result).toEqual({ absenceDeduction: 8000, lateDeduction: 8400, lectureDeduction: 0, appearanceDeduction: 0 });
+  });
+
+  it('an already-processed employee with no frozen employee_deductions row has no reliable source -- returns null, never a guess', () => {
+    const result = deriveItemizedAttendanceDeduction({
+      isProcessed: true,
+      liveAttendance: { absentDays: 5, lateDays: 5 },
+      frozenRecord: null,
+      lectureDeduction: 0,
+      appearanceDeduction: 0,
+      liveAbsentRate: 10000,
+      liveLateRate: 4200,
+    });
+    expect(result).toBeNull();
+  });
+});
 
 describe('buildPayrollDeductionBreakdown', () => {
   it('splits a fully itemized employee into exact categories that reconcile', () => {
@@ -22,9 +96,7 @@ describe('buildPayrollDeductionBreakdown', () => {
         pension: 20000,
         uniformAndAttendanceTotal: 10000 + 4200 * 2 + 3000 + 2000, // absent(1 day)=10000 + late(2 days) + lecture + appearance
         salaryAdvanceDeduction: 15000,
-        attendanceRecord: { absent_days: 1, late_days: 2, absent_deduction: 10000, late_deduction: 8400 },
-        lectureDeduction: 3000,
-        appearanceDeduction: 2000,
+        itemized: itemized({ absenceDeduction: 10000, lateDeduction: 8400, lectureDeduction: 3000, appearanceDeduction: 2000 }),
       }),
     ]);
 
@@ -44,12 +116,8 @@ describe('buildPayrollDeductionBreakdown', () => {
   it('derives a non-zero uniform-only remainder when the bundle exceeds the itemized parts', () => {
     const result = buildPayrollDeductionBreakdown([
       employee({
-        paye: 0,
-        pension: 0,
         uniformAndAttendanceTotal: 10000 + 8400 + 15000, // absent + late + uniform itself
-        attendanceRecord: { absent_days: 1, late_days: 2, absent_deduction: 10000, late_deduction: 8400 },
-        lectureDeduction: 0,
-        appearanceDeduction: 0,
+        itemized: itemized({ absenceDeduction: 10000, lateDeduction: 8400 }),
       }),
     ]);
     expect(result.absenceTotal).toBe(10000);
@@ -58,10 +126,33 @@ describe('buildPayrollDeductionBreakdown', () => {
     expect(result.reconciles).toBe(true);
   });
 
-  it('never invents a split for an employee with no employee_deductions row -- shows an explicit unitemized bucket instead', () => {
+  it('reconciles the exact UAT-reported scenario: a not-yet-processed employee whose bundled total is entirely live-attendance-driven', () => {
+    // Mirrors calculateLivePayroll(): uniformDeductionValue (10000, position
+    // requires uniform, employee override none) + absentDeduction (1 day x
+    // 10000) + lateDeduction (2 days x 4200), no lecture/appearance.
+    const liveItemized = deriveItemizedAttendanceDeduction({
+      isProcessed: false,
+      liveAttendance: { absentDays: 1, lateDays: 2 },
+      frozenRecord: null,
+      lectureDeduction: 0,
+      appearanceDeduction: 0,
+      liveAbsentRate: 10000,
+      liveLateRate: 4200,
+    })!;
+    const bundledTotal = 10000 + 1 * 10000 + 2 * 4200;
     const result = buildPayrollDeductionBreakdown([
-      employee({ uniformAndAttendanceTotal: 42000, attendanceRecord: null }),
+      employee({ uniformAndAttendanceTotal: bundledTotal, itemized: liveItemized }),
     ]);
+    expect(result.absenceTotal).toBe(10000);
+    expect(result.lateTotal).toBe(8400);
+    expect(result.uniformOnlyTotal).toBe(10000);
+    expect(result.unitemizedUniformAndAttendanceTotal).toBe(0);
+    expect(result.employeesWithoutItemizedBreakdown).toBe(0);
+    expect(result.reconciles).toBe(true);
+  });
+
+  it('never invents a split for an already-processed employee with no employee_deductions row -- shows an explicit unitemized bucket instead', () => {
+    const result = buildPayrollDeductionBreakdown([employee({ uniformAndAttendanceTotal: 42000, itemized: null })]);
     expect(result.absenceTotal).toBe(0);
     expect(result.lateTotal).toBe(0);
     expect(result.lectureTotal).toBe(0);
@@ -72,8 +163,8 @@ describe('buildPayrollDeductionBreakdown', () => {
     expect(result.reconciles).toBe(true);
   });
 
-  it('does not count an employee with zero bundled deductions and no record as "missing a breakdown"', () => {
-    const result = buildPayrollDeductionBreakdown([employee({ uniformAndAttendanceTotal: 0, attendanceRecord: null })]);
+  it('does not count an employee with zero bundled deductions and no itemization as "missing a breakdown"', () => {
+    const result = buildPayrollDeductionBreakdown([employee({ uniformAndAttendanceTotal: 0, itemized: null })]);
     expect(result.employeesWithoutItemizedBreakdown).toBe(0);
     expect(result.unitemizedUniformAndAttendanceTotal).toBe(0);
   });
@@ -84,13 +175,13 @@ describe('buildPayrollDeductionBreakdown', () => {
         paye: 30000,
         pension: 10000,
         uniformAndAttendanceTotal: 10000,
-        attendanceRecord: { absent_days: 1, late_days: 0, absent_deduction: 10000, late_deduction: 0 },
+        itemized: itemized({ absenceDeduction: 10000 }),
       }),
       employee({
         paye: 20000,
         pension: 5000,
         uniformAndAttendanceTotal: 10000,
-        attendanceRecord: null,
+        itemized: null,
       }),
     ]);
     expect(result.payeTotal).toBe(50000);
