@@ -199,4 +199,25 @@ describe('buildTerminalDuePayrollPreview', () => {
     );
     expect(computeCombinedPayrollTotals(5000000, preview.approvedUnprocessedTotal).combinedTotal).toBe(5100000);
   });
+
+  it('does not double-count an active employee who has both an ordinary salary and a Terminal Dues allocation', () => {
+    // The ordinary payroll total below is computed entirely independently
+    // (same as Payroll.tsx's own `totals.net`, summed over `employees`)
+    // and never reads from or writes into the Terminal Dues preview --
+    // this test asserts that combining the two is purely additive, with
+    // Alfred George's ordinary net pay counted exactly once and his
+    // Terminal Dues allocation counted exactly once, never merged into a
+    // single row or subtracted from either figure.
+    const ordinaryNetPayrollForAllEmployees = 2000000; // includes Alfred George's own ordinary net pay
+    const preview = buildTerminalDuePayrollPreview(
+      [previewAllocation({ terminal_due_id: 'due-alfred', proposed_amount: 100000 })],
+      new Map([['due-alfred', previewDue({ employee_name: 'Alfred George', employee_number: 'SFG-S-413' })]])
+    );
+    expect(preview.recipients).toHaveLength(1);
+    expect(preview.approvedUnprocessedTotal).toBe(100000);
+    const combined = computeCombinedPayrollTotals(ordinaryNetPayrollForAllEmployees, preview.approvedUnprocessedTotal);
+    expect(combined.ordinaryPayrollTotal).toBe(2000000);
+    expect(combined.terminalDuesTotal).toBe(100000);
+    expect(combined.combinedTotal).toBe(2100000);
+  });
 });

@@ -4,7 +4,6 @@ import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
 import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
-import { EmptyState } from '../components/EmptyState';
 import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
@@ -48,6 +47,7 @@ import {
 } from '../utils/terminalDuesPayrollIntegration';
 import { buildTerminalDuePaymentsCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
 import { buildOrdinaryPayrollPaymentsCsv, buildAccountsReconciliationSummaryCsv, computeOrdinaryPayrollPaymentTotals, OrdinaryPayrollPaymentRecord } from '../utils/accountsReconciliationExport';
+import { buildPayrollDeductionBreakdown, PayrollDeductionBreakdownEmployeeInput } from '../utils/payrollDeductionBreakdown';
 
 interface Employee {
   id: string;
@@ -1051,6 +1051,39 @@ export function PayrollPage() {
     // re-deriving it separately here and risking the two disagreeing.
     return employees.filter(emp => getDisplayPayroll(emp).uniform_deduction > 0);
   }, [employees, getDisplayPayroll]);
+
+  // Itemized deductions breakdown (PAYE/pension/absence/late/lecture/
+  // appearance/uniform-only/salary-advance), aggregated the same way
+  // `totals` above is -- over every employee for the selected month, via
+  // the SAME getDisplayPayroll()/getEmployeeDeduction() figures the
+  // existing stats cards and table already use. See
+  // payrollDeductionBreakdown.ts: this never invents a split for an
+  // employee with no employee_deductions row, and its own grandTotal
+  // formula is identical to totals' own Total Deductions calculation, so
+  // the two are guaranteed to reconcile.
+  const deductionBreakdown = useMemo(() => {
+    const inputs: PayrollDeductionBreakdownEmployeeInput[] = employees.map(emp => {
+      const p = getDisplayPayroll(emp);
+      const deduction = getEmployeeDeduction(emp.id);
+      return {
+        paye: p.paye,
+        pension: p.pension,
+        uniformAndAttendanceTotal: p.uniform_deduction || 0,
+        salaryAdvanceDeduction: p.salary_advance_deduction || 0,
+        attendanceRecord: deduction
+          ? {
+              absent_days: deduction.absent_days,
+              late_days: deduction.late_days,
+              absent_deduction: deduction.absent_deduction,
+              late_deduction: deduction.late_deduction,
+            }
+          : null,
+        lectureDeduction: deduction?.lecture_deduction || 0,
+        appearanceDeduction: deduction?.appearance_deduction || 0,
+      };
+    });
+    return buildPayrollDeductionBreakdown(inputs);
+  }, [employees, getDisplayPayroll, getEmployeeDeduction]);
 
   // True only when at least one CURRENTLY DISPLAYED figure is actually a
   // live calculation built on a failed/unavailable attendance-count fetch
@@ -2421,105 +2454,94 @@ export function PayrollPage() {
         </Card>
       </div>
 
-      {/* Pre-submission Terminal Dues preview -- informational only, built
-          client-side from the current `terminal_due_allocations` rows for
-          the selected month. It is NOT the authoritative financial record:
-          that remains compute_payroll_request_snapshot() (captured at
-          submission into payroll_processing_requests.financial_snapshot)
-          and process_payroll_with_terminal_dues() (at actual processing).
-          This card exists so approved, unprocessed Terminal Dues are
-          visible before either of those run. */}
-      <Card className="p-5">
-        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-          <h3 className="font-semibold text-slate-800 flex items-center gap-2">
-            <FileText size={16} className="text-[#D4A017]" /> Terminal Dues -- {getMonthLabel(selectedMonth)}
+      {/* Deductions Breakdown + Terminal Dues summary -- replaces the old
+          Gross/Net Pay Formula cards (same calculation functions,
+          untouched; this space now shows information the Accountant can
+          act on). The Terminal Dues card here is a pre-submission
+          estimate only, built client-side from the current
+          `terminal_due_allocations` rows for the selected month -- it is
+          NOT the authoritative financial record (that remains
+          compute_payroll_request_snapshot()/process_payroll_with_terminal_dues()).
+          The full Terminal Dues RECIPIENT LIST lives below the ordinary
+          employee table (see "Terminal Dues Recipients" further down),
+          as its own clearly labeled subsection of the payroll recipients
+          area. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <Card className="p-5">
+          <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
+            <Calculator size={16} className="text-[#D4A017]" /> Deductions Breakdown -- {getMonthLabel(selectedMonth)}
           </h3>
-          <span className="text-xs text-slate-400">Pre-submission estimate, not the official financial snapshot</span>
-        </div>
-        {terminalDuesPreviewLoading ? (
-          <p className="text-sm text-slate-500">Loading Terminal Dues...</p>
-        ) : terminalDuesPreviewError ? (
-          <div className="flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
-            <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
-            <span>Could not load Terminal Dues data: {terminalDuesPreviewError}. Figures below do not include Terminal Dues until this is resolved -- they are not necessarily zero.</span>
-          </div>
-        ) : terminalDuesPreview ? (
-          <>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-              <div>
-                <p className="text-xs text-slate-500">Ordinary Net Payroll</p>
-                <p className="text-lg font-bold text-slate-800 mt-1">{hasBlockedPreview ? '—' : formatKwacha(totals.net)}</p>
+          {hasBlockedPreview ? (
+            <p className="text-sm text-red-600">Attendance totals unavailable -- deduction categories cannot be shown reliably.</p>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+                <div className="flex justify-between"><span className="text-slate-500">PAYE</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.payeTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">Pension</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.pensionTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">Absence</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.absenceTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">Late Arrival</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.lateTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">Lecture</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.lectureTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">Appearance</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.appearanceTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">Uniform</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.uniformOnlyTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">Salary Advances</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.salaryAdvanceTotal)}</span></div>
               </div>
+              {/* Hygiene deductions do not exist anywhere in this schema (no
+                  column, rate, or UI) -- no such category is invented here.
+                  An employee whose bundled uniform/attendance total can't be
+                  split (no employee_deductions row for the month) has that
+                  amount shown here explicitly instead of being folded into
+                  one of the named categories as a guess. */}
+              {deductionBreakdown.unitemizedUniformAndAttendanceTotal > 0 && (
+                <div className="flex justify-between text-sm mt-2 pt-2 border-t border-slate-100">
+                  <span className="text-amber-600">Not itemized ({deductionBreakdown.employeesWithoutItemizedBreakdown} employee{deductionBreakdown.employeesWithoutItemizedBreakdown === 1 ? '' : 's'})</span>
+                  <span className="font-medium text-amber-700">{formatKwacha(deductionBreakdown.unitemizedUniformAndAttendanceTotal)}</span>
+                </div>
+              )}
+              <div className="flex justify-between text-sm mt-2 pt-2 border-t border-slate-200 font-semibold">
+                <span className="text-slate-700">Total Deductions</span>
+                <span className="text-slate-900">{formatKwacha(deductionBreakdown.grandTotal)}</span>
+              </div>
+              {!deductionBreakdown.reconciles && (
+                <p className="text-xs text-red-600 mt-2">These categories do not fully reconcile with Total Deductions -- please check the underlying records.</p>
+              )}
+            </>
+          )}
+        </Card>
+
+        <Card className="p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+              <FileText size={16} className="text-[#D4A017]" /> Terminal Dues -- {getMonthLabel(selectedMonth)}
+            </h3>
+            <span className="text-xs text-slate-400">Estimate, not the official snapshot</span>
+          </div>
+          {terminalDuesPreviewLoading ? (
+            <p className="text-sm text-slate-500">Loading Terminal Dues...</p>
+          ) : terminalDuesPreviewError ? (
+            <div className="flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
+              <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
+              <span>Could not load Terminal Dues data: {terminalDuesPreviewError}. Figures do not include Terminal Dues until this is resolved -- they are not necessarily zero.</span>
+            </div>
+          ) : terminalDuesPreview ? (
+            <div className="grid grid-cols-2 gap-4">
               <div>
-                <p className="text-xs text-slate-500">Approved, Unprocessed Terminal Dues</p>
+                <p className="text-xs text-slate-500">Approved, Unprocessed</p>
                 <p className="text-lg font-bold text-[#081C3A] mt-1">{formatKwacha(terminalDuesPreview.approvedUnprocessedTotal)}</p>
+                <p className="text-xs text-slate-400 mt-0.5">Reserved, not yet paid</p>
               </div>
               <div>
                 <p className="text-xs text-slate-500">Combined Expected Disbursement</p>
                 <p className="text-lg font-bold text-[#D4A017] mt-1">
                   {hasBlockedPreview ? '—' : formatKwacha(computeCombinedPayrollTotals(totals.net, terminalDuesPreview.approvedUnprocessedTotal).combinedTotal)}
                 </p>
+                <p className="text-xs text-slate-400 mt-0.5">Ordinary net + approved Terminal Dues</p>
               </div>
-              <div>
-                <p className="text-xs text-slate-500">Terminal Dues Recipients</p>
-                <p className="text-lg font-bold text-slate-800 mt-1">{terminalDuesPreview.approvedUnprocessedCount}</p>
+              <div className="col-span-2">
+                <p className="text-xs text-slate-500">Recipients</p>
+                <p className="text-sm font-semibold text-slate-800 mt-0.5">{terminalDuesPreview.approvedUnprocessedCount} awaiting payment -- see Terminal Dues Recipients below the employee list</p>
               </div>
             </div>
-            {terminalDuesPreview.recipients.length > 0 ? (
-              <div className="border border-slate-200 rounded-lg overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead className="bg-slate-50">
-                    <tr>
-                      <th className="text-left px-3 py-2 text-xs font-medium text-slate-500">Name</th>
-                      <th className="text-left px-3 py-2 text-xs font-medium text-slate-500">Employee/Reference No.</th>
-                      <th className="text-right px-3 py-2 text-xs font-medium text-slate-500">Amount</th>
-                      <th className="text-left px-3 py-2 text-xs font-medium text-slate-500">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {terminalDuesPreview.recipients.map((r) => (
-                      <tr key={r.terminalDueId} className="border-t border-slate-100">
-                        <td className="px-3 py-2 text-slate-800">
-                          {r.employeeName}
-                          {r.isHistorical && <span className="ml-1 text-xs text-slate-400">(Historical)</span>}
-                        </td>
-                        <td className="px-3 py-2 text-slate-600">{r.employeeNumber || '—'}</td>
-                        <td className="px-3 py-2 text-right text-slate-800">{formatKwacha(r.amount)}</td>
-                        <td className="px-3 py-2">
-                          <span className={`text-xs px-2 py-0.5 rounded-full ${r.status === 'processed' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
-                            {r.status === 'processed' ? 'Processed' : 'Approved'}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <p className="text-sm text-slate-500">No approved or processed Terminal Dues allocations for {getMonthLabel(selectedMonth)}.</p>
-            )}
-          </>
-        ) : null}
-      </Card>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Card className="p-5">
-          <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
-            <Calculator size={16} className="text-[#D4A017]" /> Gross Pay Formula
-          </h3>
-          <p className="text-sm text-slate-600">= Basic Salary + Allowances + Overtime + Bonus</p>
-        </Card>
-        <Card className="p-5">
-          <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
-            <Calculator size={16} className="text-[#D4A017]" /> Net Pay Formula
-          </h3>
-          {/* Rates come from live payrollRates (Settings), not hardcoded --
-              a stale "PAYE (30%)" label here would contradict whatever an
-              admin has actually configured. */}
-          <p className="text-sm text-slate-600">
-            = Gross Pay - PAYE ({(payrollRates.payeRate * 100).toFixed(0)}% above {formatKwacha(payrollRates.payeThreshold)}) - Pension ({(payrollRates.pensionEmployeeRate * 100).toFixed(0)}%) - Uniform Deduction - Attendance Deductions - Salary Advance Deduction (if any)
-          </p>
-          <p className="text-xs text-slate-500 mt-2">Attendance Deductions: Absent ({formatKwacha(payrollRates.absentDeduction)}/day) + Late (MK4,200/day) + Lecture + Appearance</p>
+          ) : null}
         </Card>
       </div>
 
@@ -2551,26 +2573,33 @@ export function PayrollPage() {
         {isApproved && (
           <Badge color="green" className="text-xs">✅ Approved</Badge>
         )}
+        {/* Compact status indicator for a month with no committed payroll
+            rows yet -- replaces the old full-width "No Payroll Records"
+            empty-state panel. The employee preview/search table below
+            renders unconditionally either way (it always has; this badge
+            and the optional Copy action are the only things that used to
+            live inside that panel), so removing the panel changes nothing
+            about data loading, validation, or processing -- only how the
+            "nothing committed yet" state is communicated. */}
+        {!hasData && (
+          <Badge color="yellow" className="text-xs">Unprocessed -- preview only</Badge>
+        )}
+        {!hasData && copySourceMonths.length > 0 && (
+          <Button
+            variant="outline"
+            className="text-xs py-1 px-2"
+            onClick={() => {
+              if (attendanceCountsUnavailable) {
+                showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
+                return;
+              }
+              setShowCopyModal(true);
+            }}
+          >
+            Copy from Previous Month
+          </Button>
+        )}
       </Card>
-
-      {!hasData && (
-        <EmptyState
-          title="No Payroll Records"
-          message={`No payroll data found for ${getMonthLabel(selectedMonth)}.`}
-          actionLabel={copySourceMonths.length > 0 ? "Copy from Previous Month" : ""}
-          onAction={() => {
-            if (copySourceMonths.length === 0) {
-              showNotification('No previous months available to copy from.', 'error');
-              return;
-            }
-            if (attendanceCountsUnavailable) {
-              showNotification('Unable to load attendance totals required for payroll. Please refresh and try again.', 'error');
-              return;
-            }
-            setShowCopyModal(true);
-          }}
-        />
-      )}
 
       <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
         <div className="overflow-x-auto">
@@ -2728,6 +2757,67 @@ export function PayrollPage() {
         onPageChange={setPayrollPage}
         onItemsPerPageChange={setPayrollItemsPerPage}
       />
+
+      {/* Terminal Dues Recipients -- a clearly labeled subsection BELOW the
+          ordinary employee list, not merged into it. A unified list was
+          considered and rejected: a historical/terminated Terminal Dues
+          recipient has no `employees` row at all, so folding them into the
+          table above would mean fabricating a fake ordinary-payroll row for
+          them (explicitly disallowed) or leaving several of that table's
+          columns (Basic/Allowances/Overtime/Bonus/editable inputs) blank
+          and confusing for a real employee row. This subsection reuses the
+          exact same `terminalDuesPreview` data the summary card above
+          already computed -- nothing here is fetched or calculated twice,
+          and an active employee's ordinary salary row above is completely
+          unaffected: this list only ever adds Terminal Dues amounts to the
+          "Combined Expected Disbursement" figure, never to that employee's
+          own net_pay. */}
+      {!terminalDuesPreviewLoading && !terminalDuesPreviewError && terminalDuesPreview && terminalDuesPreview.recipients.length > 0 && (
+        <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+          <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between flex-wrap gap-2">
+            <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+              <FileText size={16} className="text-[#D4A017]" /> Terminal Dues Recipients -- {getMonthLabel(selectedMonth)}
+            </h3>
+            <span className="text-xs text-slate-400">Separate from ordinary payroll -- never subtracted from salaries above</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <THead>
+                <TR hover={false}>
+                  <TH>Name</TH>
+                  <TH>Employee/Reference No.</TH>
+                  <TH className="text-right">Approved Allocation</TH>
+                  <TH className="text-right">Processed</TH>
+                  <TH>Status</TH>
+                </TR>
+              </THead>
+              <TBody>
+                {terminalDuesPreview.recipients.map(r => (
+                  <TR key={r.terminalDueId}>
+                    <TD>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-medium text-slate-800">{r.employeeName}</span>
+                        <Badge color="gray" className="text-[10px]">Terminal Dues</Badge>
+                        {r.isHistorical && <Badge color="gray" className="text-[10px]">Historical</Badge>}
+                      </div>
+                    </TD>
+                    <TD className="text-slate-600">{r.employeeNumber || '—'}</TD>
+                    <TD className="text-right text-slate-800">{formatKwacha(r.amount)}</TD>
+                    <TD className="text-right text-slate-800">
+                      {r.status === 'processed' ? formatKwacha(r.amount) : formatKwacha(0)}
+                    </TD>
+                    <TD>
+                      <Badge color={r.status === 'processed' ? 'green' : 'yellow'}>
+                        {r.status === 'processed' ? 'Processed' : 'Approved -- Not Yet Paid'}
+                      </Badge>
+                    </TD>
+                  </TR>
+                ))}
+              </TBody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Process Payroll Modal - Positioned at top */}
       <Modal 
