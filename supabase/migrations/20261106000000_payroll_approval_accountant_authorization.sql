@@ -1,7 +1,11 @@
 -- ============================================================
 -- MIGRATION: Allow an authorized Accountant to approve/reject payroll,
 -- alongside Admin/super-admin, via the existing payroll.approve
--- permission. Add an audit log entry to the decision.
+-- permission. Add an audit log entry to the decision. Add a fail-closed
+-- state-transition guard so a repeated/duplicate call against an
+-- already-decided row can no longer silently overwrite the original
+-- decision (found during this hotfix's own final safety review --
+-- see the guard's own comment above the UPDATE statement below).
 -- Date: 2026-11-06
 -- ============================================================
 --
@@ -249,6 +253,58 @@ BEGIN
   INTO v_requested_count
   FROM unnest(p_payroll_ids) AS t(id);
 
+  -- FAIL-CLOSED STATE-TRANSITION GUARD (2026-11-06, this migration --
+  -- added after the hotfix's own rehearsal showed a duplicate/repeated
+  -- call to this RPC against an already-decided row silently SUCCEEDED,
+  -- overwriting approved_by/approved_at/approval_notes with the new
+  -- caller's values and inserting a second audit_logs row, with no record
+  -- in `payroll` itself of the original decision having been overwritten).
+  -- This function's pre-existing WHERE clause never checked the row's
+  -- CURRENT approval_status at all -- every call was an unconditional
+  -- overwrite, not a guarded transition.
+  --
+  -- Permits exactly the transitions the rest of this schema actually
+  -- relies on, and nothing else:
+  --   pending  -> approved   (the normal, first decision)
+  --   pending  -> rejected   (the normal, first decision)
+  --   approved -> rejected   (the DOCUMENTED "un-approve" escape hatch --
+  --                           see process_payroll_batch()'s own comment,
+  --                           20260803000002: "Reprocessing must never
+  --                           silently revert an approval to pending --
+  --                           that has to go through an explicit
+  --                           reject/un-approve step first (the existing
+  --                           approvePayroll flow)". That function
+  --                           independently REFUSES to reprocess any
+  --                           month with an existing 'approved' row,
+  --                           specifically because it expects THIS
+  --                           function's reject path to be how an
+  --                           approval gets undone first. Blocking this
+  --                           transition here would break that already-
+  --                           shipped, relied-upon escape hatch.)
+  -- Blocks:
+  --   approved -> approved  (re-approving an unchanged decision -- a
+  --                          no-op that should not stamp a new approver/
+  --                          timestamp over the original one)
+  --   rejected -> rejected  (same, for rejection)
+  --   rejected -> approved  (directly "approving" a rejected, stale row
+  --                          with no intervening reprocess -- the row's
+  --                          own figures were never recalculated after
+  --                          whatever caused the rejection; the correct
+  --                          path is reprocess first via
+  --                          process_payroll_batch(), which resets
+  --                          approval_status to 'pending' and makes the
+  --                          FRESH row eligible for a normal pending ->
+  --                          approved decision)
+  -- A row this guard excludes simply fails to match the WHERE clause
+  -- below, exactly like a wrong-tenant or wrong-region row already did --
+  -- the existing all-or-nothing COUNT(DISTINCT...) vs ROW_COUNT check a
+  -- few lines down therefore already aborts the ENTIRE call (not just the
+  -- excluded row) and raises the existing 'Payroll approval scope
+  -- changed; refresh and retry' exception, with NOTHING written -- the
+  -- original decision's approved_by/approved_at/approval_notes and its
+  -- own audit_logs entry are left completely untouched, and no new
+  -- audit_logs row is inserted for a call that changes nothing.
+
   -- One atomic UPDATE. p_month is an additional guard on top of the
   -- supplied ids (belt-and-braces: every id already implies its own
   -- month via the row itself, but this also protects against a stale id
@@ -268,6 +324,10 @@ BEGIN
       updated_at = NOW()
   WHERE p.id = ANY(p_payroll_ids)
     AND p.month = p_month
+    AND (
+      p.approval_status = 'pending'
+      OR (p.approval_status = 'approved' AND p_status = 'rejected')
+    )
     AND (
       v_is_super
       OR (
@@ -357,8 +417,28 @@ GRANT EXECUTE ON FUNCTION public.approve_payroll_run(TEXT, TEXT, TEXT, UUID[]) T
 -- Accountant still cannot approve their own initiated processing request
 -- through that workflow; this migration does not touch it.
 --
+-- BEHAVIOR CHANGE (state-transition guard): previously, calling this RPC
+-- twice against the same row (by anyone, any status) silently succeeded
+-- both times, overwriting approved_by/approved_at/approval_notes and
+-- inserting a second audit_logs row -- no error, no indication the
+-- original decision had been overwritten. Now: pending->approved,
+-- pending->rejected, and approved->rejected (the documented un-approve
+-- escape hatch process_payroll_batch() relies on) still succeed exactly
+-- as before; approved->approved, rejected->rejected, and rejected->
+-- approved now fail the SAME WAY an already-wrong-tenant row always did
+-- (excluded from the WHERE clause, caught by the existing all-or-nothing
+-- count check, 'Payroll approval scope changed; refresh and retry',
+-- nothing written). Any caller who legitimately needs to approve a
+-- rejected month's payroll must reprocess it first (process_payroll_
+-- batch(), which resets approval_status to 'pending') -- this migration
+-- does not change that requirement, only makes it impossible to bypass
+-- via a direct, stale rejected->approved call.
+--
 -- VERIFICATION SQL (run immediately after applying):
 --   SELECT prosrc LIKE '%public.has_permission(''payroll.approve'')%' AS has_new_branch
+--   FROM pg_proc WHERE proname = 'approve_payroll_run';
+--   -- expected: true
+--   SELECT prosrc LIKE '%p.approval_status = ''pending''%' AS has_transition_guard
 --   FROM pg_proc WHERE proname = 'approve_payroll_run';
 --   -- expected: true
 --   SELECT has_function_privilege('authenticated', 'approve_payroll_run(text, text, text, uuid[])', 'EXECUTE');
@@ -367,7 +447,7 @@ GRANT EXECUTE ON FUNCTION public.approve_payroll_run(TEXT, TEXT, TEXT, UUID[]) T
 -- ROLLBACK SQL (run this to fully revert this migration -- restores the
 -- EXACT prior body from 20260831010000_payroll_approval_rpc_search_path_
 -- fix.sql verbatim, including dropping the new has_permission(...)
--- branch and the new audit_logs insert):
+-- branch, the new audit_logs insert, and the new state-transition guard):
 --   DROP FUNCTION IF EXISTS public.approve_payroll_run(TEXT, TEXT, TEXT, UUID[]);
 --   -- Then re-apply 20260831010000_payroll_approval_rpc_search_path_fix.sql's
 --   -- own CREATE OR REPLACE FUNCTION approve_payroll_run block verbatim.
