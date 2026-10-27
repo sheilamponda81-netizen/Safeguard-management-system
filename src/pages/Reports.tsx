@@ -13,6 +13,7 @@ import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSe
 import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
 import { toCsvRow } from '../utils/csvExport';
 import { canAccess, PERMISSIONS } from '../utils/permissions';
+import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
 
@@ -141,9 +142,18 @@ export function ReportsPage() {
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
   const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
 
-  // Filter out deleted employees for all calculations
+  // Filter out deleted AND non-payable employees for all calculations.
+  // Every consumer of this list below (department/company/workstation
+  // breakdowns, payrollSummary) sums getEmployeeFigures(emp).net_pay, the
+  // same payroll-dollar figure Payroll.tsx computes -- so this must use
+  // the SAME payable-employee whitelist Payroll.tsx's own roster query
+  // does (Active + On Leave only), not merely "not soft-deleted". Without
+  // this, a non-deleted-but-non-payable employee (e.g. 'Terminated'/
+  // 'Suspended' via Security.tsx's status dropdown, which never touches
+  // is_deleted) would be counted here and silently excluded there,
+  // producing a population mismatch against Payroll.tsx's own total.
   const activeEmployees = useMemo(() => {
-    return employees.filter(emp => !emp.is_deleted);
+    return employees.filter(emp => !emp.is_deleted && PAYABLE_EMPLOYEE_STATUSES.includes(emp.status as typeof PAYABLE_EMPLOYEE_STATUSES[number]));
   }, [employees]);
 
   // O(1) lookup instead of a repeated linear .find() over payrollRecords in
@@ -352,7 +362,6 @@ export function ReportsPage() {
 
   const totalCompanies = useMemo(() => companyData.length, [companyData]);
   const totalWorkstations = useMemo(() => workstationData.length, [workstationData]);
-  const totalCompanyPayroll = useMemo(() => companyData.reduce((sum, c) => sum + c.totalPayroll, 0), [companyData]);
 
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
@@ -928,8 +937,15 @@ export function ReportsPage() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-xs text-slate-500">Total Payroll</p>
-                <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(totalCompanyPayroll)}</p>
-                <p className="text-xs text-slate-500 mt-1">Monthly expenditure</p>
+                {/* payrollSummary.totalNet (summed over the SAME
+                    activeEmployees population as the "Total Employees"
+                    card above and every CSV export's own "Total Payroll"
+                    line below) -- not totalCompanyPayroll, which silently
+                    skips any employee with no company/resident assignment
+                    and previously made this card disagree with its own
+                    neighbor and with every export of the same screen. */}
+                <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(payrollSummary.totalNet)}</p>
+                <p className="text-xs text-slate-500 mt-1">Monthly expenditure, net pay excl. salary advances</p>
               </div>
               <div className="w-10 h-10 rounded-lg bg-[#FFF1CC] text-[#D4A017] flex items-center justify-center">
                 <DollarSign size={18} />

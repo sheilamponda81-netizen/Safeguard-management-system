@@ -23,6 +23,7 @@ import { resolveDashboardPermissions, buildPendingTasks, PendingTask } from '../
 import { countRegisteredAsOf, countPendingPayrollMonths, estimateMonthlyPayrollTotal } from '../utils/dashboardMetrics';
 import { getPayrollRates } from '../utils/payrollSettings';
 import { AttendanceCount } from '../utils/payrollCalculations';
+import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
@@ -763,7 +764,15 @@ export function Dashboard() {
             const attendanceByEmployeeId = new Map<string, AttendanceCount>(
               attendanceRpcRows.map(r => [r.employee_id, { absentDays: r.absent_days, lateDays: r.late_days }])
             );
-            const estimate = estimateMonthlyPayrollTotal(employeesData, attendanceByEmployeeId, positionsRequiringUniformMap, payrollRates);
+            // Same payable-employee whitelist Payroll.tsx's own roster query
+            // uses (Active + On Leave only) -- `employeesData` here is only
+            // filtered by is_deleted=false, which would otherwise also sum
+            // in a non-deleted-but-non-payable employee (e.g. 'Terminated'/
+            // 'Suspended' via Security.tsx's status dropdown, which never
+            // touches is_deleted) that Payroll.tsx's own preview correctly
+            // excludes -- see PAYABLE_EMPLOYEE_STATUSES's own doc comment.
+            const payableEmployeesData = employeesData.filter((e: any) => PAYABLE_EMPLOYEE_STATUSES.includes(e.status));
+            const estimate = estimateMonthlyPayrollTotal(payableEmployeesData, attendanceByEmployeeId, positionsRequiringUniformMap, payrollRates);
             setStats(prev => ({ ...prev, totalPayroll: estimate }));
           } catch (estimateErr) {
             console.error('Error computing projected payroll estimate:', estimateErr);
@@ -1133,7 +1142,7 @@ export function Dashboard() {
             value={formatKwacha(stats.totalPayroll)}
             icon={Wallet}
             accent="gold"
-            sub={monthlyPayrollIsEstimate ? `Estimated • ${monthLabel} • Not processed yet` : `Period: ${monthLabel}`}
+            sub={monthlyPayrollIsEstimate ? `Estimated net pay, excl. salary advances • ${monthLabel} • Not processed yet` : `Period: ${monthLabel}`}
           />
         )}
         <StatCard title="On Leave" value={String(stats.onLeave)} icon={UserMinus} accent="red" sub="Currently on leave" />
