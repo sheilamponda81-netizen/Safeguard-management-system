@@ -9,6 +9,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
+import { buildItemizedAttendanceBreakdown, deriveUniformOnlyAmount } from '../utils/payslipBreakdown';
 import { getCompanySettings } from '../utils/companySettings';
 import {
   getSystemCurrentMonth,
@@ -61,6 +62,7 @@ interface PayrollRecord {
   paye: number;
   pension: number;
   uniform_deduction: number;
+  salary_advance_deduction: number;
   net_pay: number;
   processed_at: string;
   approval_status?: string;
@@ -83,6 +85,12 @@ interface ExtendedPayrollRecord extends PayrollRecord {
   lecture_deduction?: number;
   appearance_deduction?: number;
   uniform_amount?: number;
+  // False when no employee_deductions row exists for this employee/month --
+  // the Uniform & Attendance total shown is still the real, committed
+  // amount (payroll.uniform_deduction), but its attendance-day itemization
+  // could not be reliably reconstructed, so the UI says so rather than
+  // showing a silent zero that looks like "no absences."
+  attendance_breakdown_available?: boolean;
 }
 
 // Raw Supabase row shapes -- match the exact columns each query below
@@ -114,6 +122,7 @@ interface PayrollRow {
   paye: number | null;
   pension: number | null;
   uniform_deduction: number | null;
+  salary_advance_deduction: number | null;
   net_pay: number;
   processed_at: string;
   approval_status: string | null;
@@ -123,6 +132,12 @@ interface DeductionRow {
   employee_id: string;
   absent_days: number | null;
   late_days: number | null;
+  // The FROZEN dollar amounts actually charged for this employee/month --
+  // see buildItemizedAttendanceBreakdown()'s own header for why these must
+  // be read directly rather than recomputed from absent_days/late_days x
+  // today's configured rate.
+  absent_deduction: number | null;
+  late_deduction: number | null;
   lecture_deduction: number | null;
   appearance_deduction: number | null;
 }
@@ -282,7 +297,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
       // RLS already scopes this read to the caller's own tenant.
       const { data: rawPayrollData, error: payError } = await supabase
         .from('payroll')
-        .select('*')
+        .select('id, employee_id, month, basic_salary, allowances, overtime, bonus, gross_pay, paye, pension, uniform_deduction, salary_advance_deduction, net_pay, processed_at, approval_status')
         .eq('month', monthYear);
       if (payError) throw payError;
 
@@ -351,20 +366,13 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
         ? payrollData.filter((r: PayrollRow) => employeesById.get(r.employee_id)?.region_id === userProfile.region_id)
         : payrollData;
 
-      // Positions eligible for a uniform deduction -- same flag Payroll.tsx
-      // gates on, so a senior/office position never shows a fabricated
-      // "Uniform Deduction" line here just because their employee record
-      // still has a leftover uniform_deduction value.
-      const { data: positionsData, error: posError } = await supabase
-        .from('positions')
-        .select('name, requires_uniform');
-      if (posError) throw posError;
-      const positionMap = new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]));
-
-      // Fetch employee deductions for the month
+      // Fetch employee deductions for the month -- including the FROZEN
+      // absent_deduction/late_deduction dollar amounts, not just the day
+      // counts, so the breakdown below never has to recompute a historical
+      // amount from today's configured rate (see buildItemizedAttendanceBreakdown()).
       const { data: deductionsData, error: dedError } = await supabase
         .from('employee_deductions')
-        .select('*')
+        .select('employee_id, absent_days, late_days, absent_deduction, late_deduction, lecture_deduction, appearance_deduction')
         .eq('month', monthYear);
 
       if (dedError) throw dedError;
@@ -377,15 +385,26 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
           const deduction = deductionsData?.find((d: DeductionRow) => d.employee_id === payroll.employee_id);
 
           if (employee) {
-            // Calculate deduction breakdown
-            const absentDays = deduction?.absent_days || 0;
-            const lateDays = deduction?.late_days || 0;
-            const absentDeduction = absentDays * payrollRates.absentDeduction;
-            const lateDeduction = lateDays * payrollRates.lateDeduction;
+            // Calculate deduction breakdown -- absent_deduction/late_deduction
+            // come straight from the FROZEN employee_deductions row (what was
+            // actually charged that month), never from days x today's
+            // configured rate: payrollRates reflects system_settings AS OF
+            // NOW, which may have changed since this payroll was processed.
+            // Recomputing from it would silently relabel a past month's
+            // deduction with a rate that never applied to it. See
+            // buildItemizedAttendanceBreakdown()'s own header.
+            const attendanceBreakdown = buildItemizedAttendanceBreakdown(deduction);
+            const absentDays = attendanceBreakdown.absentDays;
+            const lateDays = attendanceBreakdown.lateDays;
+            const absentDeduction = attendanceBreakdown.absentDeduction;
+            const lateDeduction = attendanceBreakdown.lateDeduction;
             const lectureDeduction = deduction?.lecture_deduction || 0;
             const appearanceDeduction = deduction?.appearance_deduction || 0;
-            const positionRequiresUniform = positionMap.get(employee.position) ?? true;
-            const uniformAmount = positionRequiresUniform ? (employee.uniform_deduction ?? payrollRates.uniformDeduction) : 0;
+            // Uniform-only portion of the frozen `payroll.uniform_deduction`
+            // bucket: see deriveUniformOnlyAmount()'s own header -- never
+            // from today's employee.uniform_deduction or position-eligibility
+            // config, both of which can change after the month was processed.
+            const uniformAmount = deriveUniformOnlyAmount(payroll.uniform_deduction || 0, attendanceBreakdown, lectureDeduction, appearanceDeduction);
 
             payslipData.push({
               employee,
@@ -401,6 +420,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
                 paye: payroll.paye || 0,
                 pension: payroll.pension || 0,
                 uniform_deduction: payroll.uniform_deduction || 0,
+                salary_advance_deduction: payroll.salary_advance_deduction || 0,
                 net_pay: payroll.net_pay,
                 processed_at: payroll.processed_at,
                 approval_status: payroll.approval_status || 'pending',
@@ -410,7 +430,8 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
                 late_deduction: lateDeduction,
                 lecture_deduction: lectureDeduction,
                 appearance_deduction: appearanceDeduction,
-                uniform_amount: uniformAmount
+                uniform_amount: uniformAmount,
+                attendance_breakdown_available: attendanceBreakdown.available
               } as ExtendedPayrollRecord,
               month: selectedMonth,
               year: selectedYear
@@ -515,6 +536,8 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
     const absentDays = p.absent_days || 0;
     const lateDays = p.late_days || 0;
     const totalUniformAtt = p.uniform_deduction || 0;
+    const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
+    const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
     const payePct = Math.round(payrollRates.payeRate * 100);
     const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
 
@@ -592,13 +615,16 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             <div class="row deduction-item"><span class="label">Pension (${pensionPct}%)</span><span class="amount">-${formatKwacha(p.pension)}</span></div>
             <div class="row deduction-item" style="border-bottom: none;"><span class="label">Uniform & Attendance</span><span class="amount">-${formatKwacha(totalUniformAtt)}</span></div>
             <div class="deduction-breakdown">
+              ${attendanceBreakdownAvailable ? `
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
               ${absentDays > 0 ? `<div>Absent (${absentDays} × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}): -${formatKwacha(absentDeduction)}</div>` : ''}
               ${lateDays > 0 ? `<div>Late (${lateDays} × MK4,200): -${formatKwacha(lateDeduction)}</div>` : ''}
               ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
               ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
+              ` : (totalUniformAtt > 0 ? `<div>Itemized breakdown not available for this period -- total shown as processed.</div>` : '')}
             </div>
-            <div class="total-row" style="border-top-color: #dc2626; margin-top: 4px;"><span>Total Deductions</span><span class="amount" style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + totalUniformAtt)}</span></div>
+            ${salaryAdvanceDeduction > 0 ? `<div class="row deduction-item"><span class="label">Salary Advance</span><span class="amount">-${formatKwacha(salaryAdvanceDeduction)}</span></div>` : ''}
+            <div class="total-row" style="border-top-color: #dc2626; margin-top: 4px;"><span>Total Deductions</span><span class="amount" style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + totalUniformAtt + salaryAdvanceDeduction)}</span></div>
           </div>
         </div>
         <div class="net-pay-section">
@@ -637,6 +663,8 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
       const absentDays = p.absent_days || 0;
       const lateDays = p.late_days || 0;
       const totalUniformAtt = p.uniform_deduction || 0;
+      const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
+      const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
       const payePct = Math.round(payrollRates.payeRate * 100);
       const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
 
@@ -688,13 +716,16 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Pension (${pensionPct}%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.pension)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5; border-bottom: none;"><span style="color: #555;">Uniform & Attendance</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(totalUniformAtt)}</span></div>
             <div style="font-size: 11px; color: #dc2626; padding-left: 20px; padding-bottom: 6px;">
+              ${attendanceBreakdownAvailable ? `
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
               ${absentDays > 0 ? `<div>Absent (${absentDays} × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}): -${formatKwacha(absentDeduction)}</div>` : ''}
               ${lateDays > 0 ? `<div>Late (${lateDays} × MK4,200): -${formatKwacha(lateDeduction)}</div>` : ''}
               ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
               ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
+              ` : (totalUniformAtt > 0 ? `<div>Itemized breakdown not available for this period -- total shown as processed.</div>` : '')}
             </div>
-            <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 4px; border-top-color: #dc2626;"><span>Total Deductions</span><span style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + totalUniformAtt)}</span></div>
+            ${salaryAdvanceDeduction > 0 ? `<div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Salary Advance</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(salaryAdvanceDeduction)}</span></div>` : ''}
+            <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 4px; border-top-color: #dc2626;"><span>Total Deductions</span><span style="color: #dc2626;">-${formatKwacha(p.paye + p.pension + totalUniformAtt + salaryAdvanceDeduction)}</span></div>
           </div>
         </div>
         <div style="background: linear-gradient(135deg, ${t.primaryColor} 0%, ${t.primaryColor}cc 100%); color: white; padding: 20px 25px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-top: 20px;">
@@ -1251,6 +1282,16 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
   const n = p.net_pay;
   const payePct = Math.round(payrollRates.payeRate * 100);
   const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
+  const uniformAmount = p.uniform_amount ?? 0;
+  const absentDeduction = p.absent_deduction || 0;
+  const lateDeduction = p.late_deduction || 0;
+  const lectureDeduction = p.lecture_deduction || 0;
+  const appearanceDeduction = p.appearance_deduction || 0;
+  const absentDays = p.absent_days || 0;
+  const lateDays = p.late_days || 0;
+  const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
+  const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
+  const totalDeductions = p.paye + p.pension + p.uniform_deduction + salaryAdvanceDeduction;
 
   return (
     <div className="space-y-5">
@@ -1326,9 +1367,31 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
                   <span className="font-mono text-red-600">-{formatKwacha(v as number)}</span>
                 </div>
               ))}
+              {attendanceBreakdownAvailable ? (
+                <div className="pl-3 space-y-1 text-[11px] text-red-500">
+                  {uniformAmount > 0 && <div className="flex justify-between"><span>Uniform Deduction</span><span className="font-mono">-{formatKwacha(uniformAmount)}</span></div>}
+                  {absentDays > 0 && (
+                    <div className="flex justify-between">
+                      <span>Absent ({absentDays} × {formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))})</span>
+                      <span className="font-mono">-{formatKwacha(absentDeduction)}</span>
+                    </div>
+                  )}
+                  {lateDays > 0 && <div className="flex justify-between"><span>Late ({lateDays} × MK4,200)</span><span className="font-mono">-{formatKwacha(lateDeduction)}</span></div>}
+                  {lectureDeduction > 0 && <div className="flex justify-between"><span>Lecture Deduction</span><span className="font-mono">-{formatKwacha(lectureDeduction)}</span></div>}
+                  {appearanceDeduction > 0 && <div className="flex justify-between"><span>Appearance Deduction</span><span className="font-mono">-{formatKwacha(appearanceDeduction)}</span></div>}
+                </div>
+              ) : p.uniform_deduction > 0 ? (
+                <p className="pl-3 text-[11px] text-slate-400">Itemized breakdown not available for this period -- total shown as processed.</p>
+              ) : null}
+              {salaryAdvanceDeduction > 0 && (
+                <div className="flex justify-between">
+                  <span className="text-slate-600">Salary Advance</span>
+                  <span className="font-mono text-red-600">-{formatKwacha(salaryAdvanceDeduction)}</span>
+                </div>
+              )}
               <div className="flex justify-between pt-2 mt-2 border-t border-slate-200 font-bold">
                 <span>Total Deductions</span>
-                <span className="font-mono text-red-600">-{formatKwacha(p.paye + p.pension + p.uniform_deduction)}</span>
+                <span className="font-mono text-red-600">-{formatKwacha(totalDeductions)}</span>
               </div>
             </div>
           </div>
@@ -1341,7 +1404,6 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
           </div>
           {template.showAuthorizedBy && (
             <div className="text-right text-xs">
-              <p className="opacity-80">Payment Method: Bank Transfer</p>
               <p className="opacity-80">Authorized: {template.authorizedName} ({template.authorizedTitle})</p>
             </div>
           )}

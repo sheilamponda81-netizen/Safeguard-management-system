@@ -7,7 +7,12 @@
 // see that migration's header for why).
 
 export interface OpenDueLookupRow {
-  employee_id: string;
+  // Nullable since Phase 1.6: a historical-employee-linked row has no
+  // employee_id at all. This map only ever drives the EXISTING-employee
+  // selector (the legacy "New Calculation" flow never creates a
+  // historical-subject row), so such a row is simply skipped below --
+  // there is no employee_id to key it by.
+  employee_id: string | null;
   status: string;
 }
 
@@ -18,7 +23,7 @@ export interface OpenDueLookupRow {
 export function buildOpenDueStatusMap(rows: OpenDueLookupRow[]): Map<string, 'pending' | 'approved'> {
   const map = new Map<string, 'pending' | 'approved'>();
   for (const row of rows) {
-    if (row.status === 'pending' || row.status === 'approved') {
+    if (row.employee_id && (row.status === 'pending' || row.status === 'approved')) {
       map.set(row.employee_id, row.status);
     }
   }

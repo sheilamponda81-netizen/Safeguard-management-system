@@ -12,15 +12,89 @@ import path from 'node:path';
 // at the source level instead of rendering the component.
 const attendanceSource = fs.readFileSync(path.resolve(__dirname, './Attendance.tsx'), 'utf-8');
 
-describe('Monthly Register: the current month comes from the real calendar date, not the payroll-processing cursor', () => {
-  it('initializes systemMonth/selectedMonth from getActualCurrentMonth(), not getSystemCurrentMonth()', () => {
-    expect(attendanceSource).toMatch(/const month = getActualCurrentMonth\(\);/);
-    expect(attendanceSource).not.toMatch(/getSystemCurrentMonth\(/);
-    expect(attendanceSource).not.toMatch(/import \{[^}]*getSystemCurrentMonth/);
+describe('Monthly Register: the edit-permission gate comes from the real calendar date, never the payroll-processing cursor', () => {
+  // Month Consistency fix: Attendance's INITIAL displayed month now
+  // defaults to Settings -> Month Settings (current_payroll_month, via
+  // getSystemCurrentMonth()), matching every other month-dependent screen
+  // (Payroll, Terminal Dues Allocations, Salary Advances, Payments,
+  // Payslips, Reports, Dashboard). But `systemMonth` -- the one thing that
+  // gates whether an edit is even allowed, and the "Jump to Current"/
+  // "Switch to <month>" targets -- must stay anchored to the real
+  // calendar date (getActualCurrentMonth()) and must NEVER be reassigned
+  // from the payroll cursor. Collapsing these two into one variable is
+  // exactly what caused a real bug once already (see getActualCurrentMonth's
+  // own comment in currentMonth.ts): a manual edit on 12 Oct 2026 silently
+  // saved against 1 July 2026 because the page treated the stale cursor as
+  // "current." These assertions pin that `systemMonth` specifically still
+  // comes from getActualCurrentMonth() only.
+  it('still assigns systemMonth from getActualCurrentMonth(), never from getSystemCurrentMonth()', () => {
+    expect(attendanceSource).toMatch(/const month = getActualCurrentMonth\(\);\s*\n\s*setSystemMonth\(month\);/);
   });
 
-  it('imports getActualCurrentMonth from currentMonth.ts', () => {
+  it('imports both getActualCurrentMonth and getSystemCurrentMonth from currentMonth.ts', () => {
     expect(attendanceSource).toMatch(/import \{[^}]*getActualCurrentMonth[^}]*\} from '\.\.\/utils\/currentMonth'/);
+    expect(attendanceSource).toMatch(/import \{[^}]*getSystemCurrentMonth[^}]*\} from '\.\.\/utils\/currentMonth'/);
+  });
+
+  it('availableMonths (and therefore historical-month navigation range) is still derived from the real calendar month, not the payroll cursor', () => {
+    expect(attendanceSource).toMatch(/const months = getAvailableMonthsFromSystem\(month\);/);
+  });
+});
+
+describe('Monthly Register: the INITIAL selected month defaults to current_payroll_month (Settings -> Month Settings)', () => {
+  it('fetches the payroll-cursor month via getSystemCurrentMonth() and sets selectedMonth from it, only after that await resolves', () => {
+    const initBody = attendanceSource.slice(
+      attendanceSource.indexOf('const init = async () => {'),
+      attendanceSource.indexOf('init();')
+    );
+    // Order matters: systemMonth/availableMonths must already be set
+    // (synchronously, from the real calendar month) BEFORE this await, so
+    // the edit gate is correct from the first render -- and selectedMonth
+    // must be set only AFTER the await, never before it and then
+    // overwritten, so there is no intermediate render where selectedMonth
+    // briefly equals the real calendar month instead of the payroll
+    // cursor (which would risk a flash of the wrong default, or -- worse
+    // -- a write race, before settling).
+    const setSystemMonthIdx = initBody.indexOf('setSystemMonth(month)');
+    const awaitIdx = initBody.indexOf('await getSystemCurrentMonth()');
+    const setSelectedMonthIdx = initBody.indexOf('setSelectedMonth(payrollMonth)');
+    expect(setSystemMonthIdx).toBeGreaterThan(-1);
+    expect(awaitIdx).toBeGreaterThan(-1);
+    expect(setSelectedMonthIdx).toBeGreaterThan(-1);
+    expect(setSystemMonthIdx).toBeLessThan(awaitIdx);
+    expect(awaitIdx).toBeLessThan(setSelectedMonthIdx);
+  });
+
+  it('never synchronously initializes selectedMonth to the real calendar month before the payroll-cursor fetch resolves', () => {
+    const initBody = attendanceSource.slice(
+      attendanceSource.indexOf('const init = async () => {'),
+      attendanceSource.indexOf('init();')
+    );
+    expect(initBody).not.toMatch(/setSelectedMonth\(month\)/);
+  });
+
+  it('selectedMonth starts empty (not pre-seeded to any month), so no data fetch or edit can race ahead of the resolved payroll-cursor default', () => {
+    expect(attendanceSource).toMatch(/const \[selectedMonth, setSelectedMonth\] = useState\(''\);/);
+  });
+
+  it('navigating within Attendance (Previous/Next/dropdown/Jump to Current) only ever calls setSelectedMonth -- never invokes setSystemCurrentMonth() -- so browsing never silently rewrites the Admin global month setting', () => {
+    // Matches an actual call (open paren immediately after the name), not
+    // this file's own explanatory comment mentioning the function by name.
+    expect(attendanceSource).not.toMatch(/setSystemCurrentMonth\(/);
+    expect(attendanceSource).not.toMatch(/import \{[^}]*setSystemCurrentMonth/);
+  });
+
+  it('REGRESSION: the per-cell attendance write still targets the real calendar date of that cell, never selectedMonth/systemMonth -- confirms this fix changed only which month initially DISPLAYS, not what a write is keyed to, so no October record can be rewritten into July', () => {
+    expect(attendanceSource).toMatch(
+      /supabase\.rpc\('attendance_correct', \{\s*p_employee_id: employeeId,\s*p_date: date,\s*p_status: nextStatus,\s*\}\)/
+    );
+    expect(attendanceSource).not.toMatch(/p_date:\s*selectedMonth/);
+    expect(attendanceSource).not.toMatch(/p_date:\s*systemMonth/);
+    // getDatesForMonth (the only thing standing between "which month is
+    // selected" and "which dates get rendered/written") is untouched by
+    // this fix -- it still derives every date in a month purely from the
+    // month string itself, with no dependency on current_payroll_month.
+    expect(attendanceSource).toMatch(/const getDatesForMonth = useCallback\(\(monthYear: string\) => \{/);
   });
 });
 

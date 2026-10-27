@@ -9,7 +9,7 @@ vi.mock('../lib/supabase', () => ({
   },
 }));
 
-const { processPayrollBatch, describeProcessPayrollBatchError } = await import('./payrollProcessing');
+const { processPayrollBatch, describeProcessPayrollBatchError, processPayrollWithTerminalDues } = await import('./payrollProcessing');
 
 const sampleRecord = {
   employee_id: 'emp-1',
@@ -168,5 +168,167 @@ describe('describeProcessPayrollBatchError', () => {
   it('leaves an unrelated error (e.g. duplicate employee_id) completely untouched', () => {
     const message = 'Refusing to process: the same employee_id appears more than once in this batch';
     expect(describeProcessPayrollBatchError(message, () => 'Jane Banda')).toBe(message);
+  });
+});
+
+// Terminal Dues Phase 3B -- process_payroll_with_terminal_dues(), the
+// atomic combined RPC that replaces two separate, non-atomic calls.
+describe('processPayrollWithTerminalDues', () => {
+  beforeEach(() => {
+    rpcMock.mockReset();
+    getUserMock.mockReset();
+    getUserMock.mockResolvedValue({ data: { user: { email: 'admin@example.com' } } });
+  });
+
+  const rpcSuccess = (overrides: Record<string, unknown> = {}) => ({
+    data: {
+      success: true,
+      month: '2026-11',
+      combined_reference: 'PWTD-2026-11-abcd1234',
+      payroll: { success: true, month: '2026-11', deletedCount: 0, insertedCount: 1, advanceDeductionsApplied: 0 },
+      terminal_dues: null,
+      ordinary_payroll_total: 90000,
+      terminal_dues_total: 0,
+      combined_total: 90000,
+      ...overrides,
+    },
+    error: null,
+  });
+
+  it('rejects an empty record list without calling the RPC at all', async () => {
+    const result = await processPayrollWithTerminalDues('2026-11', []);
+    expect(result).toEqual({ success: false, outcome: 'validation_failed', error: 'No payroll records supplied' });
+    expect(rpcMock).not.toHaveBeenCalled();
+  });
+
+  it('calls process_payroll_with_terminal_dues with month, records, audit context, and the Terminal Dues exclusion list/reason', async () => {
+    rpcMock.mockResolvedValueOnce(rpcSuccess());
+    await processPayrollWithTerminalDues('2026-11', [sampleRecord], { employeeCount: 1 }, ['alloc-1', 'alloc-2'], 'Needs HR correction');
+    expect(rpcMock).toHaveBeenCalledWith('process_payroll_with_terminal_dues', {
+      p_month: '2026-11',
+      p_records: [sampleRecord],
+      p_user_email: 'admin@example.com',
+      p_audit_context: { employeeCount: 1 },
+      p_td_excluded_ids: ['alloc-1', 'alloc-2'],
+      p_td_exclusion_reason: 'Needs HR correction',
+    });
+  });
+
+  it('defaults to no exclusions when none are passed', async () => {
+    rpcMock.mockResolvedValueOnce(rpcSuccess());
+    await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(rpcMock).toHaveBeenCalledWith('process_payroll_with_terminal_dues', expect.objectContaining({
+      p_td_excluded_ids: [],
+      p_td_exclusion_reason: null,
+    }));
+  });
+
+  it('returns a structured success result with payroll + null Terminal Dues when none was included', async () => {
+    rpcMock.mockResolvedValueOnce(rpcSuccess());
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result).toEqual({
+      success: true,
+      outcome: 'success',
+      month: '2026-11',
+      combinedReference: 'PWTD-2026-11-abcd1234',
+      deletedCount: 0,
+      insertedCount: 1,
+      advanceDeductionsApplied: 0,
+      terminalDues: null,
+      ordinaryPayrollTotal: 90000,
+      terminalDuesTotal: 0,
+      combinedTotal: 90000,
+    });
+  });
+
+  it('returns a structured success result with a populated Terminal Dues summary when it was included', async () => {
+    rpcMock.mockResolvedValueOnce(rpcSuccess({
+      terminal_dues: { batch_reference: 'TDPB-2026-11-xyz', processed_count: 2, total_amount: 50000, excluded_count: 1 },
+      terminal_dues_total: 50000,
+      combined_total: 140000,
+    }));
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord], {}, ['alloc-3'], 'out of balance');
+    expect(result.success).toBe(true);
+    expect(result.terminalDues).toEqual({ batchReference: 'TDPB-2026-11-xyz', processedCount: 2, totalAmount: 50000, excludedCount: 1 });
+    expect(result.combinedTotal).toBe(140000);
+  });
+
+  it('classifies an authorization exception the same way as the plain payroll RPC', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Only Admins or super admins may process payroll' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('unauthorized');
+  });
+
+  it('classifies an approved-month conflict the same way as the plain payroll RPC', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Cannot reprocess 2026-11: 1 of the targeted employees already have approved payroll for this month. Reject the existing approval first.' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.outcome).toBe('approved_conflict');
+  });
+
+  it('classifies a Terminal Dues re-validation exception (balance/approval/revision) as terminal_dues_validation_failed -- and NOT as a generic validation failure, since ordinary payroll in the SAME call also rolled back', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: "Cannot process: allocation abc of 999999 would bring this entitlement's total processed to 999999 against an approved entitlement of only 100000 -- resolve this before retrying, or explicitly exclude this allocation with a reason" } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('terminal_dues_validation_failed');
+  });
+
+  it('classifies the Admin-class commit gate exception as unauthorized (an Accountant calling this RPC directly)', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Only an Admin or super admin may commit payroll processing directly -- submit a payroll processing request for Admin approval instead' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('unauthorized');
+  });
+
+  it('classifies the exclusion-authority exception as terminal_dues_validation_failed -- a caller without terminal_dues.approve supplied a non-empty exclusion list; nothing committed, including ordinary payroll', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Only an Admin explicitly granted terminal_dues.approve (or a super admin) may select Terminal Dues exclusions' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord], {}, ['alloc-1'], 'out of balance');
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('terminal_dues_validation_failed');
+  });
+
+  it('classifies a pending-revision Terminal Dues exception as terminal_dues_validation_failed', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Cannot process: allocation abc has a pending entitlement revision awaiting Admin review -- decide that revision first, or explicitly exclude this allocation with a reason' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.outcome).toBe('terminal_dues_validation_failed');
+  });
+
+  it('classifies a missing-exclusion-reason Terminal Dues exception as terminal_dues_validation_failed', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'A reason is required to exclude an allocation from processing' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord], {}, ['alloc-1']);
+    expect(result.outcome).toBe('terminal_dues_validation_failed');
+  });
+
+  it('classifies an authoritative-month mismatch as a generic validation_failed', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { message: 'Refusing to process: 2026-12 is not the active payroll month (2026-11) -- it may have changed since this page loaded; refresh and try again' } });
+    const result = await processPayrollWithTerminalDues('2026-12', [sampleRecord]);
+    expect(result.outcome).toBe('validation_failed');
+  });
+
+  it('classifies a PGRST202 (function not found) error as missing_rpc', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: { code: 'PGRST202', message: 'Could not find the function public.process_payroll_with_terminal_dues in the schema cache' } });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.outcome).toBe('missing_rpc');
+    expect(result.error).not.toMatch(/schema cache/);
+  });
+
+  it('surfaces a network-level throw as a structured failure', async () => {
+    rpcMock.mockRejectedValueOnce(new Error('network error'));
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result).toEqual({ success: false, outcome: 'network_error', error: 'network error' });
+  });
+
+  it('treats a missing/malformed RPC response as a failure rather than assuming success', async () => {
+    rpcMock.mockResolvedValueOnce({ data: null, error: null });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('unexpected_response');
+  });
+
+  it('treats a response missing the nested payroll result as unexpected, not success', async () => {
+    rpcMock.mockResolvedValueOnce({ data: { success: true, month: '2026-11', combined_reference: 'PWTD-x' }, error: null });
+    const result = await processPayrollWithTerminalDues('2026-11', [sampleRecord]);
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('unexpected_response');
   });
 });

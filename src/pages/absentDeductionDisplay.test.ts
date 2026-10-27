@@ -19,12 +19,16 @@ import path from 'node:path';
 // payrollRates.absentDeduction directly, which reflects only TODAY's
 // system_settings and would relabel a past month's deduction with a rate
 // that didn't apply when it was processed. A page-level/generic explainer
-// that isn't tied to one employee's stored record (e.g. Payroll.tsx's "Net
-// Pay Formula" reference card, or its "Process Payroll" confirmation modal,
+// that isn't tied to one employee's stored record (e.g. Payroll.tsx's
+// deduction-summary banner, or its "Process Payroll" confirmation modal,
 // which only ever describes the CURRENT month about to be processed) is
-// exempt -- it may legitimately keep using the live rate directly. See
-// getHistoricalSafeAbsentRate's own tests in payrollCalculations.test.ts for
-// the historical-vs-live derivation itself.
+// exempt -- it may legitimately keep using the live rate directly. (The
+// old "Net Pay Formula"/"Gross Pay Formula" reference cards, which used to
+// carry one such occurrence, were removed in the Payroll Management page
+// redesign -- the calculation functions they described are untouched,
+// only that explanatory card is gone.) See getHistoricalSafeAbsentRate's
+// own tests in payrollCalculations.test.ts for the historical-vs-live
+// derivation itself.
 const payrollSource = fs.readFileSync(
   path.resolve(__dirname, './Payroll.tsx'),
   'utf-8'
@@ -51,9 +55,9 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(payrollSource).not.toMatch(/Absent:\s*\{attendance!\.absentDays\}\s*×\s*MK4,?200/);
   });
 
-  it('Payroll.tsx: the generic (non-employee-specific) absenteeism labels use formatKwacha(payrollRates.absentDeduction) -- the Net Pay Formula card, the deduction-summary banner\'s live-month branch, and the Process/Reprocess Payroll modal (which only ever describes the current month)', () => {
+  it('Payroll.tsx: the generic (non-employee-specific) absenteeism labels use formatKwacha(payrollRates.absentDeduction) -- the deduction-summary banner\'s live-month branch and the Process/Reprocess Payroll modal (which only ever describes the current month)', () => {
     const matches = payrollSource.match(/formatKwacha\(payrollRates\.absentDeduction\)/g) || [];
-    expect(matches.length).toBeGreaterThanOrEqual(3);
+    expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
   it('Payroll.tsx: the per-employee row breakdown derives its absent-day rate via getHistoricalSafeAbsentRate, not the live rate directly, since this row can be an already-processed historical month', () => {
@@ -72,7 +76,6 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
 
   it('Payroll.tsx: the late-arrival rate is left untouched (still MK 4,200)', () => {
     expect(payrollSource).toMatch(/Late Arrival:\s*MK\s*4,200 per late day/);
-    expect(payrollSource).toMatch(/Late \(MK4,200\/day\)/);
     expect(payrollSource).toMatch(/Late:\s*\{attendance!\.lateDays\}\s*×\s*MK4,200/);
   });
 
