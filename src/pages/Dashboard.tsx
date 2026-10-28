@@ -21,7 +21,7 @@ import { showNotification } from '../utils/clickHandlers';
 import { getErrorMessage } from '../utils/errorHandler';
 import { resolveDashboardPermissions, buildPendingTasks, PendingTask } from '../utils/dashboardPermissions';
 import { countRegisteredAsOf, countPendingPayrollMonths } from '../utils/dashboardMetrics';
-import { getPayrollRates } from '../utils/payrollSettings';
+import { getPayrollRatesStrict } from '../utils/payrollSettings';
 import { AttendanceCount } from '../utils/payrollCalculations';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
 import { fetchSalaryAdvanceDeductionByEmployee } from '../utils/livePayrollEstimate';
@@ -805,7 +805,16 @@ export function Dashboard() {
             // prevent. See payrollReconciliation.ts's own header for the
             // full contract.
             const [payrollRates, positionsRequiringUniformMap, attendanceRpcRows, salaryAdvanceByEmployeeId] = await Promise.all([
-              getPayrollRates(),
+              // Fail-closed (payroll-settings patch): getPayrollRatesStrict()
+              // never silently substitutes DEFAULT_RATES on a fetch error or
+              // a corrupted configured value -- unwrapped to throw here so a
+              // failure aborts this WHOLE Promise.all exactly like the other
+              // three required inputs, instead of presenting an unconfigured
+              // PAYE/pension rate as the real one.
+              getPayrollRatesStrict().then(result => {
+                if (result.status === 'unavailable') throw new Error(result.reason);
+                return result.rates;
+              }),
               (async () => {
                 const { data, error } = await supabase.from('positions').select('name, requires_uniform');
                 if (error) throw error;
@@ -960,7 +969,7 @@ export function Dashboard() {
         setPayrollCardLoading(false);
       }
     }
-  }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity, canApproveTerminalDues, canPayTerminalDues]);
+  }, [selectedMonth, systemMonth, userProfile, canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity, canApproveTerminalDues, canPayTerminalDues]);
 
   useEffect(() => {
     // permissionsResolved is required here, not just userProfile/selectedMonth

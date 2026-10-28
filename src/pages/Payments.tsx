@@ -18,7 +18,7 @@ import {
 } from '../utils/currentMonth';
 import { Pagination } from '../components/Pagination';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
-import { getPayrollRates } from '../utils/payrollSettings';
+import { getPayrollRatesStrict } from '../utils/payrollSettings';
 import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
 import { resolvePaymentNetPay } from '../utils/paymentNetPay';
 import { getDefaultPageSize } from '../utils/uiSettings';
@@ -65,6 +65,14 @@ export function PaymentsPage() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [selectedEmployees, setSelectedEmployees] = useState<string[]>([]);
   const [processingBulk, setProcessingBulk] = useState(false);
+  // Fail-closed payroll-settings patch: true when PAYE/pension/deduction
+  // rates could not be loaded -- any employee WITHOUT an approved payroll
+  // row this month shows an estimated net_pay computed from these rates
+  // (see resolvePaymentNetPay below), so an unavailable fetch must block
+  // both viewing a trustworthy figure and editing/marking-paid, not
+  // silently fall back to a default/guessed rate.
+  const [financialDataUnavailable, setFinancialDataUnavailable] = useState(false);
+  const [financialDataUnavailableReason, setFinancialDataUnavailableReason] = useState('');
 
   // Debounced so typing in these fields doesn't refetch the whole employees
   // table on every keystroke -- only once input settles for 300ms.
@@ -83,7 +91,12 @@ export function PaymentsPage() {
   // ===== MEMOIZED VALUES =====
   const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
   const isFutureMonthSelected = useMemo(() => selectedMonth > systemMonth, [selectedMonth, systemMonth]);
-  const canEdit = useMemo(() => isCurrentMonth, [isCurrentMonth]);
+  // Fail-closed (payroll-settings patch): blocks every edit/mark-as-paid
+  // path (updatePaymentStatus, bulkUpdateStatus) through this one flag,
+  // rather than adding the same check separately to each handler --
+  // required because an unestimated employee's displayed net_pay could
+  // otherwise be persisted into payment_status via a stale/defaulted rate.
+  const canEdit = useMemo(() => isCurrentMonth && !financialDataUnavailable, [isCurrentMonth, financialDataUnavailable]);
   const isSuperAdmin = useMemo(() => userProfile?.is_super_admin, [userProfile]);
   const userRegion = useMemo(() => userProfile?.regions, [userProfile]);
 
@@ -134,6 +147,7 @@ export function PaymentsPage() {
   // ===== FETCH PAYMENT DATA =====
   const fetchPaymentData = useCallback(async () => {
     setLoading(true);
+    setFinancialDataUnavailable(false);
     try {
       // employees_general: non-sensitive employee read surface (Design B2) --
       // Payments never needs guard/security-only fields, and this keeps
@@ -187,7 +201,20 @@ export function PaymentsPage() {
       // The estimate (when no approved payroll exists yet) uses the exact same
       // calculateLivePayroll formula Payroll.tsx uses, so this page never shows
       // a different number for the same unprocessed month.
-      const payrollRates = await getPayrollRates();
+      //
+      // Fail-closed (payroll-settings patch): getPayrollRatesStrict() never
+      // silently substitutes DEFAULT_RATES on a fetch error or a corrupted
+      // configured value. A failure here aborts this whole fetch (via the
+      // throw below, caught by this function's own try/catch further down)
+      // rather than computing an estimated net_pay -- which an Admin could
+      // then mark "Paid" against, persisting a wrong figure -- from an
+      // unconfigured or stale rate.
+      const payrollRatesResult = await getPayrollRatesStrict();
+      if (payrollRatesResult.status === 'unavailable') {
+        setFinancialDataUnavailableReason(payrollRatesResult.reason);
+        throw new Error(payrollRatesResult.reason);
+      }
+      const payrollRates = payrollRatesResult.rates;
 
       const { data: positionsData } = await supabase
         .from('positions')
@@ -312,6 +339,13 @@ export function PaymentsPage() {
       setPayments(filtered);
     } catch (err) {
       console.error('Error:', err);
+      // Fail-closed (payroll-settings patch): previously silent -- the
+      // page would keep showing whatever was already on screen with no
+      // indication a required fetch (notably payroll rates) had failed.
+      // `payments` is deliberately left UNCHANGED (not cleared/replaced)
+      // -- the banner below is what tells the viewer not to trust it,
+      // and editing/marking-paid is blocked while this is true.
+      setFinancialDataUnavailable(true);
     } finally {
       setLoading(false);
     }
@@ -374,7 +408,12 @@ export function PaymentsPage() {
   // ===== UPDATE PAYMENT STATUS =====
   const updatePaymentStatus = useCallback(async (employeeId: string, newStatus: string) => {
     if (!canEdit) {
-      showNotification('Payments can only be edited for the current month.', 'error');
+      showNotification(
+        financialDataUnavailable
+          ? 'Payroll rate settings are unavailable. Retry loading the page before editing payments.'
+          : 'Payments can only be edited for the current month.',
+        'error'
+      );
       return;
     }
 
@@ -453,12 +492,17 @@ export function PaymentsPage() {
       console.error('Error updating status:', err);
       showNotification('Failed to update status', 'error');
     }
-  }, [canEdit, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, financialDataUnavailable, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== UPDATE PAYMENT DETAILS =====
   const updatePaymentDetails = useCallback(async (payment: PaymentRecord) => {
     if (!canEdit) {
-      showNotification('Payments can only be edited for the current month.', 'error');
+      showNotification(
+        financialDataUnavailable
+          ? 'Payroll rate settings are unavailable. Retry loading the page before editing payments.'
+          : 'Payments can only be edited for the current month.',
+        'error'
+      );
       return;
     }
 
@@ -522,12 +566,17 @@ export function PaymentsPage() {
       console.error('Error updating:', err);
       showNotification('Failed to update payment details', 'error');
     }
-  }, [canEdit, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, financialDataUnavailable, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== BULK UPDATE STATUS =====
   const bulkUpdateStatus = useCallback(async (newStatus: string) => {
     if (!canEdit) {
-      showNotification('Payments can only be edited for the current month.', 'error');
+      showNotification(
+        financialDataUnavailable
+          ? 'Payroll rate settings are unavailable. Retry loading the page before editing payments.'
+          : 'Payments can only be edited for the current month.',
+        'error'
+      );
       return;
     }
 
@@ -600,7 +649,7 @@ export function PaymentsPage() {
     setSelectedEmployees([]);
     fetchPaymentData();
     setProcessingBulk(false);
-  }, [canEdit, selectedEmployees, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
+  }, [canEdit, financialDataUnavailable, selectedEmployees, paymentsByEmployee, selectedMonth, userProfile, fetchPaymentData]);
 
   // ===== EXPORT PAYMENTS =====
   const exportPayments = useCallback(() => {
@@ -918,8 +967,30 @@ export function PaymentsPage() {
         </div>
       </Card>
 
+      {/* Fail-closed (payroll-settings patch): required financial settings
+          could not be loaded -- any displayed net_pay for an employee
+          without an approved payroll row this month may be unreliable;
+          editing/marking-paid is blocked (see canEdit above) until a retry
+          succeeds. */}
+      {financialDataUnavailable && (
+        <Card className="p-4 bg-red-50 border-red-300 border">
+          <div className="flex items-start gap-3">
+            <Lock size={20} className="text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-semibold text-red-800">Unable to load payroll rate settings.</p>
+              <p className="text-sm text-red-700 mt-1">
+                {financialDataUnavailableReason || 'Any estimated net pay shown below may be unreliable. Editing and marking payments as paid are disabled until this loads successfully.'}
+              </p>
+              <button onClick={() => fetchPaymentData()} className="mt-2 text-sm font-medium text-red-800 hover:underline">
+                Retry
+              </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {/* Edit Mode Indicator */}
-      {!canEdit && payments.length > 0 && (
+      {!canEdit && !financialDataUnavailable && payments.length > 0 && (
         <Card className="p-3 bg-amber-50 border-amber-200 border">
           <div className="flex items-center gap-2">
             <Lock size={16} className="text-amber-600" />

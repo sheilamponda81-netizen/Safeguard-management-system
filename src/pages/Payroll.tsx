@@ -8,7 +8,7 @@ import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
-import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
+import { getPayrollRatesStrict, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll, getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
 import { calculatePooledAllocation } from '../utils/salaryAdvanceCalculations';
 import { processPayrollWithTerminalDues, describeProcessPayrollBatchError } from '../utils/payrollProcessing';
@@ -195,6 +195,14 @@ export function PayrollPage() {
   // design. Absent (0) for an employee with no current plan.
   const [combinedPlanByEmployee, setCombinedPlanByEmployee] = useState<Map<string, number>>(new Map());
   const [payrollRates, setPayrollRatesState] = useState<PayrollRates>(DEFAULT_RATES);
+  // Fail-closed payroll-settings patch: true when the PAYE/pension/
+  // deduction rates could not be loaded from Settings this session --
+  // `payrollRates` above is then left at its last-known value (the
+  // DEFAULT_RATES initial value on first load) and MUST NOT be trusted
+  // for a live calculation or for Process Payroll -- mirrors
+  // attendanceCountsUnavailable's own existing fail-closed pattern below.
+  const [payrollRatesUnavailable, setPayrollRatesUnavailable] = useState(false);
+  const [payrollRatesUnavailableReason, setPayrollRatesUnavailableReason] = useState('');
 
   // ===== TERMINAL DUES PAYROLL INTEGRATION (Phase 3A) =====
   // `terminal_dues.approve` is a DELIBERATELY NARROW permission (see
@@ -958,9 +966,26 @@ export function PayrollPage() {
   }, [rejectRequestTarget, rejectRequestReason, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   // ===== Shared payroll rates (PAYE rate/threshold, pension rate) from Settings =====
-  useEffect(() => {
-    getPayrollRates().then(setPayrollRatesState);
+  // Fail-closed (payroll-settings patch): getPayrollRatesStrict() never
+  // silently substitutes DEFAULT_RATES on a fetch error or a corrupted
+  // configured value -- only a genuinely never-configured field falls
+  // back to its documented historical default. A failure here sets
+  // payrollRatesUnavailable, which blocks Process Payroll exactly like
+  // attendanceCountsUnavailable already does.
+  const fetchPayrollRates = useCallback(async () => {
+    const result = await getPayrollRatesStrict();
+    if (result.status === 'ok') {
+      setPayrollRatesState(result.rates);
+      setPayrollRatesUnavailable(false);
+      setPayrollRatesUnavailableReason('');
+    } else {
+      setPayrollRatesUnavailable(true);
+      setPayrollRatesUnavailableReason(result.reason);
+    }
   }, []);
+  useEffect(() => {
+    fetchPayrollRates();
+  }, [fetchPayrollRates]);
 
   // ===== LOOKUP INDEXES =====
   // With ~2000 employees, a linear .find() over payrollRecords/
@@ -1645,6 +1670,16 @@ export function PayrollPage() {
       return;
     }
 
+    // Fail-closed, defense in depth (payroll-settings patch): same
+    // reasoning as attendanceCountsUnavailable above -- without this,
+    // calculatePayroll() below would silently use whatever `payrollRates`
+    // happened to already be in state (DEFAULT_RATES on first load),
+    // presenting an unconfigured/stale PAYE/pension rate as authoritative.
+    if (payrollRatesUnavailable) {
+      showNotification('Unable to load payroll rate settings. Please refresh and try again.', 'error');
+      return;
+    }
+
     // Terminal Dues pre-checks, run BEFORE even calling the RPC. As of
     // Phase 3B these are advisory/UX-only, not the actual safety boundary
     // -- process_payroll_with_terminal_dues() itself is one atomic
@@ -1828,7 +1863,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason, isAdminClass, fetchPayrollRequests, fetchTerminalDuesPreview]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, payrollRatesUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason, isAdminClass, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -1947,7 +1982,7 @@ export function PayrollPage() {
               <Button
                 variant={isMonthProcessed ? "outline" : "secondary"}
                 onClick={() => setShowConfirmModal(true)}
-                disabled={processing || isApproved || attendanceCountsUnavailable}
+                disabled={processing || isApproved || attendanceCountsUnavailable || payrollRatesUnavailable}
               >
                 {processing ? (
                   <span className="flex items-center gap-2">
@@ -2178,6 +2213,28 @@ export function PayrollPage() {
               </p>
               <button
                 onClick={() => fetchData()}
+                className="mt-2 text-sm font-medium text-red-800 hover:underline"
+              >
+                Retry
+              </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {payrollRatesUnavailable && (
+        <Card className="p-4 bg-red-50 border-red-300 border">
+          <div className="flex items-start gap-3">
+            <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-semibold text-red-800">
+                Unable to load payroll rate settings (PAYE, pension, deductions).
+              </p>
+              <p className="text-sm text-red-700 mt-1">
+                {payrollRatesUnavailableReason || 'Processing is disabled until this loads successfully, so payroll is never calculated with a default or guessed rate in place of what was actually configured.'}
+              </p>
+              <button
+                onClick={() => fetchPayrollRates()}
                 className="mt-2 text-sm font-medium text-red-800 hover:underline"
               >
                 Retry

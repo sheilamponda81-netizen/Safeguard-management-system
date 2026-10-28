@@ -9,7 +9,7 @@ import { EmptyState } from '../components/EmptyState';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
-import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
+import { getPayrollRatesStrict, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { AttendanceCount } from '../utils/payrollCalculations';
 import { toCsvRow } from '../utils/csvExport';
 import { canAccess, PERMISSIONS } from '../utils/permissions';
@@ -489,8 +489,16 @@ export function ReportsPage() {
       // figure (same formula as Payroll.tsx/Payments.tsx), not a naive
       // "basic salary as net pay" guess, and attendance rates are real
       // instead of random. =====
+      // Fail-closed (payroll-settings patch): getPayrollRatesStrict() never
+      // silently substitutes DEFAULT_RATES on a fetch error or a corrupted
+      // configured value -- unwrapped to throw here so a failure propagates
+      // to this function's own outer catch (financialDataUnavailable),
+      // exactly like the attendance/positions/salary-advance fetches.
       const [rates, { data: positionsData }] = await Promise.all([
-        getPayrollRates(),
+        getPayrollRatesStrict().then(result => {
+          if (result.status === 'unavailable') throw new Error(result.reason);
+          return result.rates;
+        }),
         supabase.from('positions').select('name, requires_uniform'),
       ]);
       setPayrollRates(rates);
