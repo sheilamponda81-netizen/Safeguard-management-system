@@ -9,8 +9,21 @@ import path from 'node:path';
 // infrastructure (no @testing-library/react dependency), so these tests pin
 // the fix at the source level: the literal hardcoded absence string must not
 // reappear, and each display must derive its value from the configured rate.
-// The late-arrival rate is intentionally NOT touched here -- it is a
-// separate configured setting that may legitimately still read "MK 4,200".
+// SAFEGUARD -- October attendance/payroll investigation (Harold Kanada,
+// SFG-S-790): the late-arrival rate's hardcoded "MK 4,200" text, previously
+// left untouched here as a deliberate scope decision, is now confirmed to be
+// simply wrong for a real tenant (its actual configured late_day_deduction is
+// MK 0, an explicit, valid configured rate -- see the October payroll
+// hotfix's own "explicit 0 is valid" principle), so the three late-arrival
+// labels below are now fixed the same way the absence ones already were.
+// Unlike the absence fix, this round does NOT add a getHistoricalSafeLateRate
+// equivalent -- the per-employee row breakdown's late rate now reads the LIVE
+// payrollRates.lateDeduction directly, which (like the absence rate before
+// this investigation) can mislabel an already-processed historical month if
+// the rate has since changed. This is a known, narrower residual gap,
+// documented rather than fixed in this round to keep the change narrowly
+// scoped; closing it fully would mean adding a late-day counterpart to
+// getHistoricalSafeAbsentRate.
 //
 // A second regression is pinned here too: a per-employee/per-payslip absence
 // display (which can render an already-processed HISTORICAL month) must use
@@ -74,9 +87,21 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(payrollSource).toMatch(/rate in effect when each employee.{0,2}s payroll was processed/);
   });
 
-  it('Payroll.tsx: the late-arrival rate is left untouched (still MK 4,200)', () => {
-    expect(payrollSource).toMatch(/Late Arrival:\s*MK\s*4,200 per late day/);
-    expect(payrollSource).toMatch(/Late:\s*\{attendance!\.lateDays\}\s*×\s*MK4,200/);
+  it('Payroll.tsx: no remaining "Late Arrival: MK 4,200 per late day" hardcoded label', () => {
+    expect(payrollSource).not.toMatch(/Late Arrival:\s*MK\s*4,200 per late day/);
+  });
+
+  it('Payroll.tsx: no remaining "Late: {days} × MK4,200" hardcoded label', () => {
+    expect(payrollSource).not.toMatch(/Late:\s*\{attendance!\.lateDays\}\s*×\s*MK4,?200/);
+  });
+
+  it('Payroll.tsx: the late-arrival labels now derive from the configured payrollRates.lateDeduction rate (live, not a historical-safe wrapper -- see this file\'s header)', () => {
+    const matches = payrollSource.match(/formatKwacha\(payrollRates\.lateDeduction\)/g) || [];
+    expect(matches.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('Payroll.tsx: the deduction-summary banner falls back to non-numeric wording for Late Arrival too on a historical/past month', () => {
+    expect(payrollSource).toMatch(/Late Arrival:\s*\{\(isCurrentMonth \|\| isFutureMonthSelected\)\s*\?\s*`\$\{formatKwacha\(payrollRates\.lateDeduction\)\} per late day`/);
   });
 
   it('Payslips.tsx: no remaining "Absent (... × MK4,200)" hardcoded label', () => {
