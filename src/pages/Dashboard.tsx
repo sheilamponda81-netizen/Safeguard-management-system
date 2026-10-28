@@ -24,6 +24,7 @@ import { countRegisteredAsOf, countPendingPayrollMonths, estimateMonthlyPayrollT
 import { getPayrollRates } from '../utils/payrollSettings';
 import { AttendanceCount } from '../utils/payrollCalculations';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
+import { fetchSalaryAdvanceDeductionByEmployee } from '../utils/livePayrollEstimate';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
@@ -733,7 +734,7 @@ export function Dashboard() {
         if (selectedMonthPayrollRecords.length === 0) {
           setMonthlyPayrollIsEstimate(true);
           try {
-            const [payrollRates, positionsRequiringUniformMap, attendanceRpcRows] = await Promise.all([
+            const [payrollRates, positionsRequiringUniformMap, attendanceRpcRows, salaryAdvanceByEmployeeId] = await Promise.all([
               getPayrollRates(),
               (async () => {
                 try {
@@ -760,6 +761,18 @@ export function Dashboard() {
                       return [] as { employee_id: string; absent_days: number; late_days: number }[];
                     }
                   })(),
+              // Same pooled-allocation formula Payroll.tsx's own preview
+              // uses (fetchSalaryAdvanceDeductionByEmployee mirrors its
+              // fetch and calls the same calculatePooledAllocation()) --
+              // see livePayrollEstimate.ts's own header. A fetch failure
+              // here must not block the rest of the estimate; it degrades
+              // to "no known advances" (under-estimate, never a crash),
+              // consistent with how the attendance/positions fetches above
+              // each fail independently.
+              fetchSalaryAdvanceDeductionByEmployee(employeeIds, selectedMonth).catch(advanceErr => {
+                console.error('Error fetching salary advances for payroll estimate:', advanceErr);
+                return new Map<string, number>();
+              }),
             ]);
             const attendanceByEmployeeId = new Map<string, AttendanceCount>(
               attendanceRpcRows.map(r => [r.employee_id, { absentDays: r.absent_days, lateDays: r.late_days }])
@@ -772,7 +785,7 @@ export function Dashboard() {
             // touches is_deleted) that Payroll.tsx's own preview correctly
             // excludes -- see PAYABLE_EMPLOYEE_STATUSES's own doc comment.
             const payableEmployeesData = employeesData.filter((e: any) => PAYABLE_EMPLOYEE_STATUSES.includes(e.status));
-            const estimate = estimateMonthlyPayrollTotal(payableEmployeesData, attendanceByEmployeeId, positionsRequiringUniformMap, payrollRates);
+            const estimate = estimateMonthlyPayrollTotal(payableEmployeesData, attendanceByEmployeeId, positionsRequiringUniformMap, payrollRates, salaryAdvanceByEmployeeId);
             setStats(prev => ({ ...prev, totalPayroll: estimate }));
           } catch (estimateErr) {
             console.error('Error computing projected payroll estimate:', estimateErr);
@@ -1142,7 +1155,7 @@ export function Dashboard() {
             value={formatKwacha(stats.totalPayroll)}
             icon={Wallet}
             accent="gold"
-            sub={monthlyPayrollIsEstimate ? `Estimated net pay, excl. salary advances • ${monthLabel} • Not processed yet` : `Period: ${monthLabel}`}
+            sub={monthlyPayrollIsEstimate ? `Estimated net pay • ${monthLabel} • Not processed yet` : `Period: ${monthLabel}`}
           />
         )}
         <StatCard title="On Leave" value={String(stats.onLeave)} icon={UserMinus} accent="red" sub="Currently on leave" />

@@ -10,10 +10,11 @@ import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
-import { calculateLivePayroll, AttendanceCount } from '../utils/payrollCalculations';
+import { AttendanceCount } from '../utils/payrollCalculations';
 import { toCsvRow } from '../utils/csvExport';
 import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
+import { computeEstimatedNetPay, fetchSalaryAdvanceDeductionByEmployee } from '../utils/livePayrollEstimate';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
 
@@ -136,6 +137,11 @@ export function ReportsPage() {
   // never a fabricated random percentage.
   const [attendanceRateByEmployee, setAttendanceRateByEmployee] = useState<Map<string, { present: number; total: number }>>(new Map());
   const [deductionsByEmployee, setDeductionsByEmployee] = useState<Map<string, { lecture_deduction?: number; appearance_deduction?: number }>>(new Map());
+  // THIS month's pooled salary-advance deduction per employee (missing
+  // entry = no active advance) -- see livePayrollEstimate.ts's own header.
+  // Only applied to getEmployeeFigures' live-calculation fallback below,
+  // never to an already-processed payroll row's own stored net_pay.
+  const [salaryAdvanceByEmployee, setSalaryAdvanceByEmployee] = useState<Map<string, number>>(new Map());
 
   // ===== MEMOIZED VALUES =====
   const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
@@ -171,10 +177,19 @@ export function ReportsPage() {
   const getEmployeeFigures = useCallback((emp: Employee) => {
     const payroll = payrollByEmployee.get(emp.id);
     if (payroll) {
+      // Already-processed row: payroll.net_pay was computed server-side by
+      // process_payroll_batch(), which already subtracted that run's own
+      // salary-advance deduction once -- do NOT subtract
+      // salaryAdvanceByEmployee here too, or it would be double-counted.
       return { gross_pay: payroll.gross_pay, paye: payroll.paye, pension: payroll.pension, net_pay: payroll.net_pay };
     }
     const deduction = deductionsByEmployee.get(emp.id);
-    const live = calculateLivePayroll({
+    // Unprocessed month: the same "Estimated Net Payroll" contract
+    // Dashboard.tsx's estimateMonthlyPayrollTotal() calls -- one formula,
+    // not an independently recreated one -- so this matches Payroll.tsx's
+    // own preview net-pay figure for the same employee/month, salary
+    // advance included exactly once.
+    return computeEstimatedNetPay({
       basicSalary: emp.basic_salary || 0,
       position: emp.position,
       employeeUniformDeduction: emp.uniform_deduction,
@@ -183,9 +198,9 @@ export function ReportsPage() {
       attendance: attendanceCountsByEmployee.get(emp.id),
       lectureDeduction: deduction?.lecture_deduction,
       appearanceDeduction: deduction?.appearance_deduction,
+      salaryAdvanceDeduction: salaryAdvanceByEmployee.get(emp.id),
     });
-    return { gross_pay: live.grossPay, paye: live.paye, pension: live.pension, net_pay: live.netPay };
-  }, [payrollByEmployee, deductionsByEmployee, positionsRequiringUniform, payrollRates, attendanceCountsByEmployee]);
+  }, [payrollByEmployee, deductionsByEmployee, positionsRequiringUniform, payrollRates, attendanceCountsByEmployee, salaryAdvanceByEmployee]);
 
   // Real attendance rate for an employee this month -- 0% (not a random
   // percentage) when no attendance has been recorded yet.
@@ -461,6 +476,23 @@ export function ReportsPage() {
         .select('employee_id, lecture_deduction, appearance_deduction')
         .eq('month', selectedMonth);
       setDeductionsByEmployee(new Map((deductionsData || []).map(d => [d.employee_id, d])));
+
+      // Same pooled-allocation formula Payroll.tsx's own preview uses
+      // (fetchSalaryAdvanceDeductionByEmployee mirrors its fetch and calls
+      // the same calculatePooledAllocation()) -- so an unprocessed month's
+      // net-pay figure here matches Payroll.tsx's own preview exactly, not
+      // merely approximately. Only matters for getEmployeeFigures' live-
+      // calculation fallback below; an employee with an already-processed
+      // payroll row this month is unaffected (that row's own net_pay is
+      // already salary-advance-inclusive, computed server-side). A fetch
+      // failure degrades to "no known advances" rather than blocking the
+      // rest of the report.
+      try {
+        setSalaryAdvanceByEmployee(await fetchSalaryAdvanceDeductionByEmployee(employeeIds, selectedMonth));
+      } catch (advanceErr) {
+        console.error('Error fetching salary advances for payroll report:', advanceErr);
+        setSalaryAdvanceByEmployee(new Map());
+      }
 
       // Report-scoped RPC (see 20260817000006) -- gated by
       // reports.recruitment.view, NOT recruitment.view, so this cannot be
@@ -945,7 +977,7 @@ export function ReportsPage() {
                     and previously made this card disagree with its own
                     neighbor and with every export of the same screen. */}
                 <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(payrollSummary.totalNet)}</p>
-                <p className="text-xs text-slate-500 mt-1">Monthly expenditure, net pay excl. salary advances</p>
+                <p className="text-xs text-slate-500 mt-1">Monthly expenditure, net pay</p>
               </div>
               <div className="w-10 h-10 rounded-lg bg-[#FFF1CC] text-[#D4A017] flex items-center justify-center">
                 <DollarSign size={18} />
