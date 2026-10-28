@@ -1,5 +1,5 @@
-﻿import { useState, useEffect, useCallback, useMemo } from 'react';
-import { FileDown, FileSpreadsheet, Users, DollarSign, Calendar, UserCheck, Building2, MapPin, PieChart, ChevronLeft, ChevronRight, Home } from '../utils/icons';
+﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { FileDown, FileSpreadsheet, Users, DollarSign, Calendar, UserCheck, Building2, MapPin, PieChart, ChevronLeft, ChevronRight, Home, RefreshCw } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -15,6 +15,7 @@ import { toCsvRow } from '../utils/csvExport';
 import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
 import { computeEstimatedNetPay, fetchSalaryAdvanceDeductionByEmployee } from '../utils/livePayrollEstimate';
+import { reconcileMonthlyPayroll, ReconciliationEmployee, StoredPayrollRow, LiveEstimateInputs } from '../utils/payrollReconciliation';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
 
@@ -55,6 +56,7 @@ interface PayrollRecord {
   paye: number;
   pension: number;
   net_pay: number;
+  approval_status: string;
 }
 
 interface Applicant {
@@ -142,6 +144,18 @@ export function ReportsPage() {
   // Only applied to getEmployeeFigures' live-calculation fallback below,
   // never to an already-processed payroll row's own stored net_pay.
   const [salaryAdvanceByEmployee, setSalaryAdvanceByEmployee] = useState<Map<string, number>>(new Map());
+  // Financial-reliability patch: true when the most recent fetch failed
+  // partway through (attendance/rates/positions/salary-advances) -- the
+  // "Total Payroll" card must show an explicit Unavailable/Retry state
+  // instead of silently continuing to display a PREVIOUS, now-stale
+  // total with no indication anything went wrong.
+  const [financialDataUnavailable, setFinancialDataUnavailable] = useState(false);
+  const [financialDataLoading, setFinancialDataLoading] = useState(false);
+  // Monotonically increasing per-fetch token -- a slower, in-flight
+  // request for an earlier selectedMonth must never overwrite the report
+  // with its now-stale result after the user has already moved on to a
+  // different month.
+  const fetchRequestTokenRef = useRef(0);
 
   // ===== MEMOIZED VALUES =====
   const isCurrentMonth = useMemo(() => selectedMonth === systemMonth, [selectedMonth, systemMonth]);
@@ -360,20 +374,59 @@ export function ReportsPage() {
     })).sort((a, b) => b.totalEmployees - a.totalEmployees);
   }, [activeEmployees, getEmployeeFigures]);
 
-  const payrollSummary = useMemo(() => {
-    let totalGross = 0, totalNet = 0, totalPAYE = 0, totalPension = 0;
-    // Sums getEmployeeFigures per employee (real processed record if one
-    // exists, otherwise the live calculation) so a partially-processed month
-    // -- some employees processed, some not -- is never silently undercounted.
-    activeEmployees.forEach(emp => {
-      const figures = getEmployeeFigures(emp);
-      totalGross += figures.gross_pay;
-      totalNet += figures.net_pay;
-      totalPAYE += figures.paye;
-      totalPension += figures.pension;
-    });
-    return { totalGross, totalNet, totalPAYE, totalPension };
-  }, [activeEmployees, getEmployeeFigures]);
+  // THE "Total Payroll" card's figure -- via reconcileMonthlyPayroll()
+  // (payrollReconciliation.ts), the SAME shared reconciliation
+  // Dashboard.tsx's "Monthly Payroll" card uses, rather than this
+  // screen's own independently-filtered reduction. Fixes two real
+  // defects the previous activeEmployees.reduce(getEmployeeFigures)
+  // version had: (1) for a HISTORICAL month, it filtered stored payroll
+  // rows by each employee's CURRENT status/is_deleted, retroactively
+  // dropping a legitimate stored row for anyone since terminated/
+  // deleted; (2) it never distinguished "every employee could be
+  // estimated" from "some required financial input failed to load",
+  // which this function's `unavailable` flag now makes explicit.
+  const payrollReconciliation = useMemo(() => {
+    const isHistoricalMonth = selectedMonth < systemMonth;
+    const storedPayrollRows: StoredPayrollRow[] = payrollRecords.map(r => ({
+      employee_id: r.employee_id,
+      gross_pay: r.gross_pay,
+      paye: r.paye,
+      pension: r.pension,
+      net_pay: r.net_pay,
+      approval_status: r.approval_status,
+    }));
+    const currentPayableEmployees: ReconciliationEmployee[] = activeEmployees.map(e => ({
+      id: e.id,
+      basic_salary: e.basic_salary,
+      position: e.position,
+      uniform_deduction: e.uniform_deduction,
+    }));
+    // Unlike Dashboard.tsx, Reports.tsx's fetchData() always fetches
+    // attendance/rates/positions/salary-advances unconditionally (no
+    // skip-when-fully-processed optimization) -- so `liveEstimateInputs`
+    // is always passed here; whether the MOST RECENT fetch actually
+    // succeeded is tracked separately by `financialDataUnavailable`
+    // (set in fetchData()'s own catch block), which the "Total Payroll"
+    // card checks FIRST, before ever reading this reconciliation's own
+    // totals/state -- a failed fetchData() call never updates these
+    // source state values at all, so they would otherwise look like
+    // stale-but-structurally-present data rather than "unavailable".
+    const liveEstimateInputs: LiveEstimateInputs = {
+      attendanceByEmployeeId: attendanceCountsByEmployee,
+      positionsRequiringUniform,
+      payrollRates,
+      salaryAdvanceByEmployeeId: salaryAdvanceByEmployee,
+      deductionsByEmployeeId: deductionsByEmployee,
+    };
+    return reconcileMonthlyPayroll(isHistoricalMonth, currentPayableEmployees, storedPayrollRows, liveEstimateInputs);
+  }, [selectedMonth, systemMonth, payrollRecords, activeEmployees, attendanceCountsByEmployee, positionsRequiringUniform, payrollRates, salaryAdvanceByEmployee, deductionsByEmployee]);
+
+  const payrollSummary = useMemo(() => ({
+    totalGross: payrollReconciliation.totals.gross_pay,
+    totalNet: payrollReconciliation.totals.net_pay,
+    totalPAYE: payrollReconciliation.totals.paye,
+    totalPension: payrollReconciliation.totals.pension,
+  }), [payrollReconciliation]);
 
   const totalCompanies = useMemo(() => companyData.length, [companyData]);
   const totalWorkstations = useMemo(() => workstationData.length, [workstationData]);
@@ -394,6 +447,13 @@ export function ReportsPage() {
 
   const fetchData = useCallback(async () => {
     setLoading(true);
+    // Never leave a PREVIOUS month's (or a failed fetch's) total visible
+    // under a newly selected month/request -- the Total Payroll card
+    // renders its own loading state until this fetch's own result passes
+    // the race-guard token check below.
+    setFinancialDataLoading(true);
+    setFinancialDataUnavailable(false);
+    const fetchRequestToken = ++fetchRequestTokenRef.current;
     try {
       // CRITICAL: Exclude deleted employees
       // employees_general: non-sensitive employee read surface (Design B2) --
@@ -484,15 +544,17 @@ export function ReportsPage() {
       // merely approximately. Only matters for getEmployeeFigures' live-
       // calculation fallback below; an employee with an already-processed
       // payroll row this month is unaffected (that row's own net_pay is
-      // already salary-advance-inclusive, computed server-side). A fetch
-      // failure degrades to "no known advances" rather than blocking the
-      // rest of the report.
-      try {
-        setSalaryAdvanceByEmployee(await fetchSalaryAdvanceDeductionByEmployee(employeeIds, selectedMonth));
-      } catch (advanceErr) {
-        console.error('Error fetching salary advances for payroll report:', advanceErr);
-        setSalaryAdvanceByEmployee(new Map());
-      }
+      // already salary-advance-inclusive, computed server-side).
+      //
+      // FAIL-CLOSED (financial-reliability patch): deliberately NO
+      // try/catch here -- a failure now propagates to this function's
+      // outer catch, exactly like the attendance/positions/rates fetches
+      // above already do, instead of silently substituting an empty map.
+      // Omitting a real salary-advance deduction does not UNDERSTATE net
+      // pay -- it OVERSTATES it, which is exactly the "plausible but
+      // incorrect total" this patch exists to prevent. See
+      // payrollReconciliation.ts's own header for the shared contract.
+      setSalaryAdvanceByEmployee(await fetchSalaryAdvanceDeductionByEmployee(employeeIds, selectedMonth));
 
       // Report-scoped RPC (see 20260817000006) -- gated by
       // reports.recruitment.view, NOT recruitment.view, so this cannot be
@@ -513,8 +575,22 @@ export function ReportsPage() {
       } else {
         setHasData(true);
       }
+
+      if (fetchRequestToken === fetchRequestTokenRef.current) {
+        setFinancialDataLoading(false);
+        setFinancialDataUnavailable(false);
+      }
     } catch (err: any) {
       console.error('Error fetching data:', err);
+      // Financial-reliability patch: previously silent -- any failure in
+      // this function (attendance/positions/rates/salary-advances/payroll
+      // rows) now surfaces as an explicit Unavailable state on the Total
+      // Payroll card instead of leaving a stale, previously-fetched total
+      // on screen with no indication anything went wrong.
+      if (fetchRequestToken === fetchRequestTokenRef.current) {
+        setFinancialDataUnavailable(true);
+        setFinancialDataLoading(false);
+      }
     } finally {
       setLoading(false);
     }
@@ -746,10 +822,20 @@ export function ReportsPage() {
 
   // ===== EXPORT REPORT =====
   const exportReport = useCallback(async () => {
+    // Financial-reliability patch: never embed a withheld/unavailable
+    // payroll total into a downloaded file -- a CSV, unlike the on-screen
+    // card, has no "Retry" button and could be shared/archived as if it
+    // were a real figure.
+    const reportUsesFinancialSummary = activeReport === 'payroll' || activeReport === 'department' || activeReport === 'company' || activeReport === 'workstation';
+    if (reportUsesFinancialSummary && financialDataUnavailable) {
+      showNotification('Cannot export: required financial data is currently unavailable. Retry the report first.', 'error');
+      return;
+    }
+
     const reportData = currentData;
     const reportType = activeReport;
     const recordCount = reportData.rows.length;
-    
+
     let csvContent = `${reportData.title}\nGenerated: ${new Date().toLocaleString()}\n\n${reportData.headers.join(',')}\n`;
     reportData.rows.forEach(row => {
       csvContent += toCsvRow(row) + '\n';
@@ -797,7 +883,7 @@ export function ReportsPage() {
     });
     
     showNotification(`${activeReport.toUpperCase()} Report exported!`, 'success');
-  }, [currentData, activeReport, selectedMonth, userProfile, payrollSummary, departmentData, activeEmployees, companyData, workstationData]);
+  }, [currentData, activeReport, selectedMonth, userProfile, payrollSummary, departmentData, activeEmployees, companyData, workstationData, canViewFinancial, financialDataUnavailable]);
 
   // ===== REPORT TABS =====
   const reportTabs = useMemo(() => [
@@ -965,19 +1051,39 @@ export function ReportsPage() {
               </div>
             </div>
           </Card>
-          <Card className="p-4">
+          <Card className={`p-4 ${financialDataUnavailable ? 'border border-amber-200 bg-amber-50' : ''}`}>
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-xs text-slate-500">Total Payroll</p>
-                {/* payrollSummary.totalNet (summed over the SAME
-                    activeEmployees population as the "Total Employees"
-                    card above and every CSV export's own "Total Payroll"
-                    line below) -- not totalCompanyPayroll, which silently
-                    skips any employee with no company/resident assignment
-                    and previously made this card disagree with its own
-                    neighbor and with every export of the same screen. */}
-                <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(payrollSummary.totalNet)}</p>
-                <p className="text-xs text-slate-500 mt-1">Monthly expenditure, net pay</p>
+                {/* payrollSummary.totalNet now comes from
+                    reconcileMonthlyPayroll() (the SAME shared
+                    reconciliation Dashboard.tsx's "Monthly Payroll" card
+                    uses) over the same activeEmployees population as the
+                    "Total Employees" card above and every CSV export
+                    below -- not an independent reduction that merely
+                    happens to agree. financialDataLoading/Unavailable
+                    (financial-reliability patch) take priority over the
+                    number itself: never show a stale or incomplete total
+                    with no indication anything went wrong. */}
+                {financialDataLoading ? (
+                  <p className="text-xl font-bold text-slate-400 mt-1">Loading…</p>
+                ) : financialDataUnavailable ? (
+                  <>
+                    <p className="text-xl font-bold text-amber-700 mt-1">Unavailable</p>
+                    <Button size="sm" variant="outline" className="mt-1" onClick={fetchData}>
+                      <RefreshCw size={14} className="mr-1" /> Retry
+                    </Button>
+                  </>
+                ) : (
+                  <p className="text-xl font-bold text-slate-800 mt-1">{formatKwacha(payrollSummary.totalNet)}</p>
+                )}
+                <p className="text-xs text-slate-500 mt-1">
+                  {financialDataUnavailable
+                    ? 'Could not load required financial data -- figure withheld rather than shown incomplete.'
+                    : payrollReconciliation.state === 'partial'
+                      ? 'Provisional -- partially processed, not final'
+                      : 'Monthly expenditure, net pay'}
+                </p>
               </div>
               <div className="w-10 h-10 rounded-lg bg-[#FFF1CC] text-[#D4A017] flex items-center justify-center">
                 <DollarSign size={18} />

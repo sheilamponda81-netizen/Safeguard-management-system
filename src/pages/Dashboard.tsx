@@ -20,11 +20,12 @@ import {
 import { showNotification } from '../utils/clickHandlers';
 import { getErrorMessage } from '../utils/errorHandler';
 import { resolveDashboardPermissions, buildPendingTasks, PendingTask } from '../utils/dashboardPermissions';
-import { countRegisteredAsOf, countPendingPayrollMonths, estimateMonthlyPayrollTotal } from '../utils/dashboardMetrics';
+import { countRegisteredAsOf, countPendingPayrollMonths } from '../utils/dashboardMetrics';
 import { getPayrollRates } from '../utils/payrollSettings';
 import { AttendanceCount } from '../utils/payrollCalculations';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
 import { fetchSalaryAdvanceDeductionByEmployee } from '../utils/livePayrollEstimate';
+import { reconcileMonthlyPayroll, MonthProcessingState, ReconciliationEmployee, StoredPayrollRow } from '../utils/payrollReconciliation';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
@@ -134,11 +135,32 @@ export function Dashboard() {
   const [recent, setRecent] = useState<any[]>([]);
   const [growthData, setGrowthData] = useState<any[]>([]);
   const [payrollStatusLabel, setPayrollStatusLabel] = useState('Not Processed');
-  // True when `stats.totalPayroll` is a projected estimate (the selected
-  // month has no processed `payroll` rows yet), false when it's the real
-  // stored net-pay total -- the "Monthly Payroll" card's title/sub-text
-  // read this so an estimate is never presented as the final figure.
-  const [monthlyPayrollIsEstimate, setMonthlyPayrollIsEstimate] = useState(false);
+  // Financial-reliability patch (Defect 1/2): the per-employee
+  // reconciliation state (see reconcileMonthlyPayroll()) for the
+  // selected month -- 'unprocessed' | 'partial' | 'fully_processed'.
+  // 'partial' means some payable employees are stored, some are still
+  // estimated -- the card must label this "Provisional", never present
+  // it as final approved payroll expenditure.
+  const [monthlyPayrollState, setMonthlyPayrollState] = useState<MonthProcessingState>('unprocessed');
+  // true when at least one employee needed a live estimate (attendance/
+  // payroll-rates/positions/salary-advance data) and that data could not
+  // be fetched -- the card MUST render an explicit "Unavailable" state
+  // instead of any dollar figure when this is true (see
+  // payrollReconciliation.ts's own header: a total that silently omits
+  // whichever employees could not be estimated is exactly the
+  // "plausible but incorrect" figure this exists to prevent).
+  const [payrollEstimateUnavailable, setPayrollEstimateUnavailable] = useState(false);
+  // true while the payroll card's own data is being (re)fetched for the
+  // currently selected month -- used to blank/dim the card instead of
+  // leaving a PREVIOUS month's total visible under a newly selected month
+  // while the new month's figure is still in flight.
+  const [payrollCardLoading, setPayrollCardLoading] = useState(false);
+  // Monotonically increasing per-fetch token: a slow, in-flight request
+  // for an earlier `selectedMonth` must never overwrite the card with its
+  // (now stale) result after the user has already moved on to a
+  // different month -- see the guard at the top/bottom of the payroll
+  // reconciliation block below.
+  const payrollRequestTokenRef = useRef(0);
   // Real count of the selected month's processed-but-not-yet-approved
   // payroll rows, in the caller's own authorized scope -- feeds the
   // "Approve Payroll" pending task's visibility/count. 0 by default (fail-
@@ -348,7 +370,16 @@ export function Dashboard() {
     setLoading(true);
     setInitialLoad(true);
     setDashboardFetchError(false);
-    
+    // Financial-reliability patch: a new fetch (including one triggered by
+    // changing `selectedMonth`) must immediately stop presenting whatever
+    // payroll figure was on screen for the PREVIOUS month/request -- the
+    // card renders its own loading state (never a stale total) until this
+    // fetch's own payroll block (further below) resolves and passes its
+    // own race-guard token check.
+    setPayrollCardLoading(true);
+    setPayrollEstimateUnavailable(false);
+    const payrollRequestToken = ++payrollRequestTokenRef.current;
+
     try {
       // ===== CRITICAL: Exclude deleted employees =====
       // Reads from `employees_general` (20260817000008), not `employees`
@@ -681,6 +712,9 @@ export function Dashboard() {
         const allPayrollRecords = await fetchInEmployeeIdBatches<{
           month: string;
           net_pay: number;
+          gross_pay: number;
+          paye: number;
+          pension: number;
           employee_id: string;
           approval_status: string;
         }>(
@@ -688,7 +722,7 @@ export function Dashboard() {
           (batch, from, to, withCount) =>
             supabase
               .from('payroll')
-              .select('month, net_pay, employee_id, approval_status', withCount ? { count: 'exact' } : undefined)
+              .select('month, net_pay, gross_pay, paye, pension, employee_id, approval_status', withCount ? { count: 'exact' } : undefined)
               .in('employee_id', batch)
               .range(from, to)
         );
@@ -713,87 +747,110 @@ export function Dashboard() {
               : 'Pending Approval'
         );
 
-        // "Monthly Payroll" stat card. When the selected month HAS
-        // processed rows, this is the real net-pay total -- matching
-        // exactly what the Monthly Payroll Trend chart below calls the
-        // same figure (both read from `payrollTotalsByMonthKey`, built
-        // from the same fetch).
-        //
-        // When it does NOT, management still wants a large, useful figure
-        // rather than a bare "Not Processed" -- so this computes a
-        // PROJECTED total instead, using estimateMonthlyPayrollTotal()
-        // (dashboardMetrics.ts), which sums calculateLivePayroll() per
-        // employee -- the exact same formula Payroll.tsx/Payments.tsx
-        // already use for an unprocessed month's own live preview, not an
-        // invented figure. `monthlyPayrollIsEstimate` tracks which case
-        // this is so the card can label it honestly instead of presenting
-        // it as the final processed amount. This extra fetch (attendance
-        // RPC + payroll rates + position uniform flags) only runs for a
-        // month with zero processed rows -- an already-processed month
-        // never pays this cost.
-        if (selectedMonthPayrollRecords.length === 0) {
-          setMonthlyPayrollIsEstimate(true);
+        // "Monthly Payroll" stat card -- per-employee reconciliation via
+        // reconcileMonthlyPayroll() (payrollReconciliation.ts), mirroring
+        // Payroll.tsx's own fetchData() exactly: isHistoricalMonth =
+        // selectedMonth < systemMonth decides whether population comes
+        // from stored `payroll` rows alone (any employee's CURRENT status
+        // never retroactively excludes a historical row) or from today's
+        // payable roster UNION anyone already stored this month, with
+        // each employee using their stored row if one exists, otherwise a
+        // live estimate. Replaces the previous all-or-nothing "zero stored
+        // rows -> estimate everyone, one-or-more -> sum stored rows only"
+        // split, which silently OMITTED every payable employee without a
+        // row during a partially-processed month (Defect 2).
+        const isHistoricalMonth = selectedMonth < systemMonth;
+        const storedPayrollRowsForMonth: StoredPayrollRow[] = selectedMonthPayrollRecords.map((r: any) => ({
+          employee_id: r.employee_id,
+          gross_pay: r.gross_pay || 0,
+          paye: r.paye || 0,
+          pension: r.pension || 0,
+          net_pay: r.net_pay || 0,
+          approval_status: r.approval_status,
+        }));
+        // Same payable-employee whitelist Payroll.tsx's own branch-B roster
+        // query uses (Active + On Leave only) -- `employeesData` here is
+        // only filtered by is_deleted=false at the SQL level, which would
+        // otherwise also feed in a non-deleted-but-non-payable employee
+        // (e.g. 'Terminated'/'Suspended') for a forward-looking estimate.
+        // This population is used ONLY as the live-estimate candidate set
+        // (and, for a current/future month, unioned with anyone already
+        // stored) -- never to filter a historical month's stored rows,
+        // which is exactly the retroactive-exclusion bug this patch fixes.
+        const currentPayableEmployees: ReconciliationEmployee[] = employeesData
+          .filter((e: any) => PAYABLE_EMPLOYEE_STATUSES.includes(e.status))
+          .map((e: any) => ({ id: e.id, basic_salary: e.basic_salary, position: e.position, uniform_deduction: e.uniform_deduction }));
+
+        const storedIds = new Set(storedPayrollRowsForMonth.map(r => r.employee_id));
+        const needsLiveEstimate = !isHistoricalMonth && currentPayableEmployees.some(e => !storedIds.has(e.id));
+
+        let liveEstimateInputs: Parameters<typeof reconcileMonthlyPayroll>[3];
+        if (!needsLiveEstimate) {
+          // Either a historical month (never estimated) or every payable
+          // employee already has a stored row -- no estimate needed at
+          // all, so this fetch is skipped entirely, exactly preserving the
+          // "an already-processed month never pays this cost" property.
+          liveEstimateInputs = undefined;
+        } else {
           try {
+            // FAIL-CLOSED (Defect 1): a SINGLE Promise.all with NO
+            // per-input catch -- unlike the previous version, a failure in
+            // ANY of these four required inputs must abort the WHOLE
+            // estimate rather than silently substituting an empty/default
+            // map for just that one input. Silently treating a failed
+            // salary-advance (or attendance, or rates, or uniform-
+            // eligibility) fetch as "zero" does not UNDERESTIMATE net pay
+            // -- omitting a real deduction OVERSTATES it, which is exactly
+            // the "plausible but incorrect total" this patch exists to
+            // prevent. See payrollReconciliation.ts's own header for the
+            // full contract.
             const [payrollRates, positionsRequiringUniformMap, attendanceRpcRows, salaryAdvanceByEmployeeId] = await Promise.all([
               getPayrollRates(),
               (async () => {
-                try {
-                  const { data, error } = await supabase.from('positions').select('name, requires_uniform');
-                  if (error) throw error;
-                  return new Map((data || []).map((p: any) => [p.name, p.requires_uniform !== false]));
-                } catch (positionsErr) {
-                  console.error('Error fetching position uniform flags for payroll estimate:', positionsErr);
-                  return new Map<string, boolean>();
-                }
+                const { data, error } = await supabase.from('positions').select('name, requires_uniform');
+                if (error) throw error;
+                return new Map((data || []).map((p: any) => [p.name, p.requires_uniform !== false]));
               })(),
               employeeIds.length === 0
                 ? Promise.resolve([] as { employee_id: string; absent_days: number; late_days: number }[])
                 : (async () => {
-                    try {
-                      const { data, error } = await supabase.rpc('get_payroll_attendance_counts', {
-                        p_employee_ids: employeeIds,
-                        p_month: selectedMonth,
-                      });
-                      if (error) throw error;
-                      return (data || []) as { employee_id: string; absent_days: number; late_days: number }[];
-                    } catch (attendanceErr) {
-                      console.error('Error fetching attendance for payroll estimate:', attendanceErr);
-                      return [] as { employee_id: string; absent_days: number; late_days: number }[];
-                    }
+                    const { data, error } = await supabase.rpc('get_payroll_attendance_counts', {
+                      p_employee_ids: employeeIds,
+                      p_month: selectedMonth,
+                    });
+                    if (error) throw error;
+                    return (data || []) as { employee_id: string; absent_days: number; late_days: number }[];
                   })(),
               // Same pooled-allocation formula Payroll.tsx's own preview
               // uses (fetchSalaryAdvanceDeductionByEmployee mirrors its
               // fetch and calls the same calculatePooledAllocation()) --
-              // see livePayrollEstimate.ts's own header. A fetch failure
-              // here must not block the rest of the estimate; it degrades
-              // to "no known advances" (under-estimate, never a crash),
-              // consistent with how the attendance/positions fetches above
-              // each fail independently.
-              fetchSalaryAdvanceDeductionByEmployee(employeeIds, selectedMonth).catch(advanceErr => {
-                console.error('Error fetching salary advances for payroll estimate:', advanceErr);
-                return new Map<string, number>();
-              }),
+              // see livePayrollEstimate.ts's own header. A failure here
+              // now propagates (no .catch()) so it aborts this ENTIRE
+              // Promise.all, exactly like the other three required inputs.
+              fetchSalaryAdvanceDeductionByEmployee(employeeIds, selectedMonth),
             ]);
             const attendanceByEmployeeId = new Map<string, AttendanceCount>(
               attendanceRpcRows.map(r => [r.employee_id, { absentDays: r.absent_days, lateDays: r.late_days }])
             );
-            // Same payable-employee whitelist Payroll.tsx's own roster query
-            // uses (Active + On Leave only) -- `employeesData` here is only
-            // filtered by is_deleted=false, which would otherwise also sum
-            // in a non-deleted-but-non-payable employee (e.g. 'Terminated'/
-            // 'Suspended' via Security.tsx's status dropdown, which never
-            // touches is_deleted) that Payroll.tsx's own preview correctly
-            // excludes -- see PAYABLE_EMPLOYEE_STATUSES's own doc comment.
-            const payableEmployeesData = employeesData.filter((e: any) => PAYABLE_EMPLOYEE_STATUSES.includes(e.status));
-            const estimate = estimateMonthlyPayrollTotal(payableEmployeesData, attendanceByEmployeeId, positionsRequiringUniformMap, payrollRates, salaryAdvanceByEmployeeId);
-            setStats(prev => ({ ...prev, totalPayroll: estimate }));
+            liveEstimateInputs = { attendanceByEmployeeId, positionsRequiringUniform: positionsRequiringUniformMap, payrollRates, salaryAdvanceByEmployeeId };
           } catch (estimateErr) {
-            console.error('Error computing projected payroll estimate:', estimateErr);
-            setStats(prev => ({ ...prev, totalPayroll: 0 }));
+            console.error('Error fetching required inputs for the payroll estimate -- reconciliation will report unavailable:', estimateErr);
+            liveEstimateInputs = undefined; // reconcileMonthlyPayroll() below sets unavailable:true for the affected employees
           }
-        } else {
-          setMonthlyPayrollIsEstimate(false);
-          setStats(prev => ({ ...prev, totalPayroll: payrollTotalsByMonthKey.get(selectedMonthKey || '') || 0 }));
+        }
+
+        const reconciliation = reconcileMonthlyPayroll(isHistoricalMonth, currentPayableEmployees, storedPayrollRowsForMonth, liveEstimateInputs);
+
+        // RACE GUARD: a slower request for an EARLIER selectedMonth must
+        // never overwrite the card with its now-stale result after the
+        // user has already moved on to viewing a different month -- the
+        // newer request's own (already-applied, or still in-flight) state
+        // wins instead. Silently discard, nothing else to do.
+        if (payrollRequestToken === payrollRequestTokenRef.current) {
+          setMonthlyPayrollState(reconciliation.state);
+          setPayrollEstimateUnavailable(reconciliation.unavailable);
+          setPayrollCardLoading(false);
+          setStats(prev => ({ ...prev, totalPayroll: reconciliation.unavailable ? 0 : reconciliation.totals.net_pay }));
         }
 
         // Real count of DISTINCT payroll MONTHS/RUNS awaiting approval, in
@@ -825,7 +882,9 @@ export function Dashboard() {
         // mid-session role change) must never keep showing a stale
         // "Approve Payroll" count from a previous fetch that had access.
         setPendingPayrollApprovalCount(0);
-        setMonthlyPayrollIsEstimate(false);
+        setMonthlyPayrollState('unprocessed');
+        setPayrollEstimateUnavailable(false);
+        setPayrollCardLoading(false);
       }
 
       // ===== TERMINAL DUES — real counts feeding the "Terminal Dues
@@ -891,6 +950,15 @@ export function Dashboard() {
       showNotification('Failed to load dashboard data: ' + getErrorMessage(err), 'error');
     } finally {
       setLoading(false);
+      // Guards against the payroll card getting stuck on "Loading…"
+      // forever if something EARLIER in this function throws before the
+      // payroll reconciliation block above ever runs/clears it itself --
+      // but still respects the race-guard token, so THIS (possibly stale)
+      // invocation's cleanup can never clear the loading flag out from
+      // under a NEWER, still-in-flight request for a different month.
+      if (payrollRequestToken === payrollRequestTokenRef.current) {
+        setPayrollCardLoading(false);
+      }
     }
   }, [selectedMonth, userProfile, canViewPayroll, canViewAttendance, canViewRecruitment, canViewSecurity, canApproveTerminalDues, canPayTerminalDues]);
 
@@ -1143,20 +1211,51 @@ export function Dashboard() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard title="Total Employees" value={String(stats.total)} icon={Users} accent="navy" sub={`${stats.activeGuards} Active Guards`} />
         {canViewPayroll && (
-          // Still agrees with the "Payroll Status" card below rather than
-          // contradicting it: `monthlyPayrollIsEstimate` is set from the
-          // exact same "does the selected month have processed payroll
-          // rows" check that drives `payrollStatusLabel`, so the two can
-          // never disagree about whether this month has been processed --
-          // this card just also shows a truthfully-labeled projected
-          // figure instead of only bare status text when it hasn't.
-          <StatCard
-            title={monthlyPayrollIsEstimate ? 'Projected Payroll' : 'Monthly Payroll'}
-            value={formatKwacha(stats.totalPayroll)}
-            icon={Wallet}
-            accent="gold"
-            sub={monthlyPayrollIsEstimate ? `Estimated net pay • ${monthLabel} • Not processed yet` : `Period: ${monthLabel}`}
-          />
+          payrollCardLoading ? (
+            // A new fetch (e.g. the user just changed months) is in
+            // flight -- never show the PREVIOUS month's total while this
+            // one is still loading (Defect 1, requirement 9).
+            <StatCard title="Monthly Payroll" value="Loading…" icon={Wallet} accent="gold" sub={`${monthLabel}`} />
+          ) : payrollEstimateUnavailable ? (
+            // Required financial inputs (attendance/payroll rates/uniform
+            // eligibility/salary advances) could not be fetched -- never
+            // display a total computed from incomplete data (Defect 1).
+            // Not a StatCard: needs a Retry action, which StatCard's props
+            // don't support and this patch does not extend that shared
+            // component for.
+            <Card className="p-5 border border-amber-200 bg-amber-50">
+              <div className="flex items-start justify-between">
+                <div>
+                  <p className="text-sm text-slate-500 font-medium">Monthly Payroll</p>
+                  <p className="text-2xl md:text-3xl font-bold text-amber-700 mt-2 tracking-tight">Unavailable</p>
+                  <p className="text-xs text-slate-600 mt-1">Could not load required financial data for {monthLabel} -- figure withheld rather than shown incomplete.</p>
+                  <Button size="sm" variant="outline" className="mt-3" onClick={refreshData} disabled={refreshing}>
+                    <RefreshCw size={14} className={`mr-1 ${refreshing ? 'animate-spin' : ''}`} /> Retry
+                  </Button>
+                </div>
+                <div className="w-11 h-11 rounded-lg flex items-center justify-center bg-amber-100 text-amber-600"><Wallet size={22} /></div>
+              </div>
+            </Card>
+          ) : (
+            // `monthlyPayrollState` agrees with the "Payroll Status" card
+            // below (both ultimately derive from the same stored-rows
+            // fetch) without conflating "processed" with "approved" --
+            // 'partial' is explicitly labeled Provisional, never presented
+            // as final approved payroll expenditure (Defect 2).
+            <StatCard
+              title={monthlyPayrollState === 'unprocessed' ? 'Projected Payroll' : monthlyPayrollState === 'partial' ? 'Provisional Payroll' : 'Monthly Payroll'}
+              value={formatKwacha(stats.totalPayroll)}
+              icon={Wallet}
+              accent="gold"
+              sub={
+                monthlyPayrollState === 'unprocessed'
+                  ? `Estimated net pay • ${monthLabel} • Not processed yet`
+                  : monthlyPayrollState === 'partial'
+                    ? `Provisional • ${monthLabel} • partially processed, not final`
+                    : `Period: ${monthLabel}`
+              }
+            />
+          )
         )}
         <StatCard title="On Leave" value={String(stats.onLeave)} icon={UserMinus} accent="red" sub="Currently on leave" />
         {canViewRecruitment && (

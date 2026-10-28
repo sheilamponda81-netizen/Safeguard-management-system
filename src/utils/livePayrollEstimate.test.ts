@@ -34,6 +34,7 @@ function chain(result: { data: unknown[] | null; error: unknown; count?: number 
   return builder;
 }
 
+
 describe('fetchSalaryAdvanceDeductionByEmployee', () => {
   beforeEach(() => {
     fromMock.mockReset();
@@ -113,6 +114,27 @@ describe('fetchSalaryAdvanceDeductionByEmployee', () => {
       throw new Error(`unexpected table: ${table}`);
     });
     await expect(fetchSalaryAdvanceDeductionByEmployee(['e1'], '2026-10')).rejects.toThrow('network error');
+  });
+
+  it('a SECOND page failing after the first page already succeeded (partial pagination failure) propagates -- never silently returns only the first page\'s partial result', async () => {
+    // Page 1: 1 row, but count=2 tells fetchOneBatch a second page is
+    // expected. Page 2: fails outright. The call counter is declared
+    // OUTSIDE chain()/chainSequence() and shared across every `.from()`
+    // invocation for this table -- the real buildQuery callback also
+    // calls `.from(...)` fresh per page, so the mock must track state
+    // across those calls the same way successive real HTTP requests would.
+    let salaryAdvancesCall = 0;
+    fromMock.mockImplementation((table: string) => {
+      if (table === 'salary_advances') {
+        const results = [
+          { data: [{ id: 'adv-1', employee_id: 'e1', advance_amount: 50000, application_date: '2026-09-01', created_at: '2026-09-01T00:00:00Z' }], error: null, count: 2 },
+          { data: null, error: new Error('page 2 failed') },
+        ];
+        return chain(results[Math.min(salaryAdvancesCall++, results.length - 1)]);
+      }
+      throw new Error(`unexpected table: ${table}`);
+    });
+    await expect(fetchSalaryAdvanceDeductionByEmployee(['e1', 'e2'], '2026-10')).rejects.toThrow('page 2 failed');
   });
 
   it('a fully-repaid advance (remaining balance 0) contributes nothing, even if a combined plan still exists', async () => {
