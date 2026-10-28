@@ -3,8 +3,9 @@
 // a component-test harness (this repo has none) -- Dashboard.tsx itself
 // just calls these against its own fetched data.
 
-import { calculateLivePayroll, AttendanceCount } from './payrollCalculations';
+import { AttendanceCount } from './payrollCalculations';
 import { PayrollRates } from './payrollSettings';
+import { computeEstimatedNetPay } from './livePayrollEstimate';
 
 export interface EmployeeRegistrationRecord {
   hire_date: string | null;
@@ -58,38 +59,44 @@ export interface PayrollEstimateEmployee {
   uniform_deduction: number | null;
 }
 
-// Projected payroll total for a month with no processed `payroll` rows yet
-// -- summed via calculateLivePayroll(), the SAME "single source of truth"
-// formula Payroll.tsx and Payments.tsx already use for an unprocessed
-// month's own live preview (see payrollCalculations.ts's header), reused
-// here rather than inventing a second, possibly-diverging formula.
-// Deliberately narrower than Payroll.tsx's own per-employee preview: it
-// omits salary-advance deductions (calculatePooledAllocation's oldest-
-// advance-first logic across each employee's up-to-2 open advances) and
-// the employee_deductions lecture/appearance line items -- both real, but
-// each requiring their own additional fetch across the whole roster for a
-// dashboard-level aggregate that is explicitly labeled "Estimated", not a
+// Projected NET payroll total for a month with no processed `payroll` rows
+// yet -- summed via calculateLivePayroll(), the SAME "single source of
+// truth" formula Payroll.tsx and Payments.tsx already use for an
+// unprocessed month's own live preview (see payrollCalculations.ts's
+// header), reused here rather than inventing a second, possibly-diverging
+// formula. `salaryAdvanceByEmployeeId` (2026-11, financial-consistency
+// correction) subtracts THIS month's pooled salary-advance deduction per
+// employee -- computed by fetchSalaryAdvanceDeductionByEmployee()
+// (livePayrollEstimate.ts), which mirrors Payroll.tsx's own fetch and
+// calls the SAME calculatePooledAllocation() Payroll.tsx uses -- so this
+// total now matches Payroll.tsx's own preview net-pay figure for the same
+// population/month, not merely close to it. A missing map entry means "no
+// active advance", not "fetch failed" -- see that function's own header.
+// Still deliberately narrower than Payroll.tsx's own per-employee preview
+// in exactly one remaining way: the employee_deductions lecture/appearance
+// line items, which would require their own additional roster-wide fetch
+// for a dashboard-level aggregate explicitly labeled "Estimated", not a
 // replacement for Payroll.tsx's own authoritative pre-processing preview.
-// This means the estimate can run slightly HIGH for employees with active
-// salary advances or lecture/appearance deductions -- an accepted,
-// disclosed simplification, not a fabricated figure: every input it does
-// use (basic salary, position, uniform deduction, attendance-derived
-// deductions, configured payroll rates) is real.
+// Every input this function uses (basic salary, position, uniform
+// deduction, attendance-derived deductions, configured payroll rates, and
+// now salary advances) is real, not invented.
 export function estimateMonthlyPayrollTotal(
   employees: PayrollEstimateEmployee[],
   attendanceByEmployeeId: Map<string, AttendanceCount>,
   positionsRequiringUniform: Map<string, boolean>,
-  payrollRates: PayrollRates
+  payrollRates: PayrollRates,
+  salaryAdvanceByEmployeeId: Map<string, number> = new Map()
 ): number {
   return employees.reduce((total, e) => {
-    const live = calculateLivePayroll({
+    const figures = computeEstimatedNetPay({
       basicSalary: e.basic_salary,
       position: e.position,
       employeeUniformDeduction: e.uniform_deduction,
       positionsRequiringUniform,
       payrollRates,
       attendance: attendanceByEmployeeId.get(e.id),
+      salaryAdvanceDeduction: salaryAdvanceByEmployeeId.get(e.id),
     });
-    return total + live.netPay;
+    return total + figures.net_pay;
   }, 0);
 }

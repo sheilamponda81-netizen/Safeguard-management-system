@@ -481,8 +481,8 @@ function EmployeeModal({
           <div className="mt-4 p-3 bg-amber-50 rounded-lg border border-amber-200">
             <p className="text-xs text-amber-700 flex items-center gap-2">
               <Scissors size={14} />
-              <strong>Note:</strong> Appearance deduction (MK 2,000) is applied monthly for uniform cleaning, shaving, and keeping hair short and smart.
-              Lecture deductions (MK 3,000 each) apply for missed Wednesday/Thursday lectures. Full month absence from lectures incurs MK 15,000 deduction.
+              <strong>Note:</strong> Appearance deduction (MK {deductionRates.appearanceDeduction.toLocaleString()}) is applied monthly for uniform cleaning, shaving, and keeping hair short and smart.
+              Lecture deductions (MK {deductionRates.lectureDeduction.toLocaleString()} each) apply for missed Wednesday/Thursday lectures. Full month absence from lectures incurs MK {deductionRates.lectureFullMonthDeduction.toLocaleString()} deduction.
             </p>
           </div>
         </div>

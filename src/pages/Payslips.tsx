@@ -58,6 +58,11 @@ interface PayrollRecord {
   allowances: number;
   overtime: number;
   bonus: number;
+  // Refund-persistence hotfix -- see
+  // supabase/migrations/20261108000000_payroll_refund_adjustments.sql.
+  // Never part of gross_pay/paye/pension; added at the net-pay level
+  // only, same as salary_advance_deduction's own placement.
+  refund: number;
   gross_pay: number;
   paye: number;
   pension: number;
@@ -118,6 +123,7 @@ interface PayrollRow {
   allowances: number | null;
   overtime: number | null;
   bonus: number | null;
+  refund: number | null;
   gross_pay: number;
   paye: number | null;
   pension: number | null;
@@ -297,7 +303,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
       // RLS already scopes this read to the caller's own tenant.
       const { data: rawPayrollData, error: payError } = await supabase
         .from('payroll')
-        .select('id, employee_id, month, basic_salary, allowances, overtime, bonus, gross_pay, paye, pension, uniform_deduction, salary_advance_deduction, net_pay, processed_at, approval_status')
+        .select('id, employee_id, month, basic_salary, allowances, overtime, bonus, refund, gross_pay, paye, pension, uniform_deduction, salary_advance_deduction, net_pay, processed_at, approval_status')
         .eq('month', monthYear);
       if (payError) throw payError;
 
@@ -416,6 +422,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
                 allowances: payroll.allowances || 0,
                 overtime: payroll.overtime || 0,
                 bonus: payroll.bonus || 0,
+                refund: payroll.refund || 0,
                 gross_pay: payroll.gross_pay,
                 paye: payroll.paye || 0,
                 pension: payroll.pension || 0,
@@ -608,6 +615,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             <div class="row"><span class="label">Overtime</span><span class="amount">${formatKwacha(p.overtime)}</span></div>
             <div class="row"><span class="label">Bonus</span><span class="amount">${formatKwacha(p.bonus)}</span></div>
             <div class="total-row"><span>Gross Pay</span><span class="amount">${formatKwacha(p.gross_pay)}</span></div>
+            ${p.refund > 0 ? `<div class="row"><span class="label">Refund</span><span class="amount">${formatKwacha(p.refund)}</span></div>` : ''}
           </div>
           <div>
             <div class="section-title">Deductions</div>
@@ -709,6 +717,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Overtime</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.overtime)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Bonus</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.bonus)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 10px 0; font-size: 15px; font-weight: bold; border-top: 2px solid #ddd; margin-top: 8px;"><span>Gross Pay</span><span style="color: ${t.primaryColor};">${formatKwacha(p.gross_pay)}</span></div>
+            ${p.refund > 0 ? `<div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Refund</span><span style="font-weight: 500; font-family: monospace;">${formatKwacha(p.refund)}</span></div>` : ''}
           </div>
           <div>
             <div style="font-size: 13px; font-weight: bold; color: ${t.primaryColor}; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #ddd; padding-bottom: 8px; margin-bottom: 12px;">Deductions</div>
@@ -1352,6 +1361,12 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
                 <span>Gross Pay</span>
                 <span className="font-mono text-[#081C3A]">{formatKwacha(p.gross_pay)}</span>
               </div>
+              {p.refund > 0 && (
+                <div className="flex justify-between">
+                  <span className="text-slate-600">Refund</span>
+                  <span className="font-mono text-slate-800">{formatKwacha(p.refund)}</span>
+                </div>
+              )}
             </div>
           </div>
           <div>

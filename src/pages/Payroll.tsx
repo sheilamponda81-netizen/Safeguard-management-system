@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Search, Wallet, Calculator, Check, CheckCircle2, ChevronRight, Save, AlertCircle, Shield, Lock, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon, UserCheck, Clock, XCircle, FileText } from 'lucide-react';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
@@ -8,7 +8,7 @@ import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
-import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
+import { getPayrollRatesStrict, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { calculateLivePayroll, getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
 import { calculatePooledAllocation } from '../utils/salaryAdvanceCalculations';
 import { processPayrollWithTerminalDues, describeProcessPayrollBatchError } from '../utils/payrollProcessing';
@@ -35,6 +35,16 @@ import { approvePayrollRun } from '../utils/payrollApproval';
 import { buildPayrollReportCsv } from '../utils/payrollExport';
 import { AttendanceCount, deriveAttendanceCountsState, isPreviewBlocked, hasAnyBlockedPreview } from '../utils/payrollAttendanceCounts';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
+import { debounce } from '../utils/debounce';
+import {
+  RefundDraft,
+  emptyRefundDraft,
+  mapRowToRefundDraft,
+  validateRefundDraftInput,
+  shouldApplyRefundSaveResponse,
+  REFUND_REASON_CODES,
+  REFUND_REFERENCE_CATEGORIES,
+} from '../utils/payrollRefundDrafts';
 import {
   summarizeTerminalDuePayrollBatch,
   computeCombinedPayrollTotals,
@@ -78,6 +88,18 @@ interface PayrollRegion {
 // src/utils/payrollAttendanceCounts.ts -- extracted so they're
 // independently unit-testable; see that file's own header for details.
 
+interface RefundSaveArgs {
+  employeeId: string;
+  month: string;
+  amount: number;
+  reasonCode: string | null;
+  reasonNotes: string | null;
+  referenceMonth: string | null;
+  referenceCategory: string | null;
+  expectedUpdatedAt: string | null;
+  confirmDuplicate: boolean;
+}
+
 interface PayrollRecord {
   id: string;
   employee_id: string;
@@ -86,6 +108,13 @@ interface PayrollRecord {
   allowances: number;
   overtime: number;
   bonus: number;
+  // Added by the refund-persistence hotfix -- never part of gross_pay/
+  // paye/pension (see 20261108000000_payroll_refund_adjustments.sql's own
+  // header for why a refund of a wrongly-withheld deduction is not
+  // taxable new income the way bonus is). Applied after salary_advance_
+  // deduction, directly into net_pay. 0 for every row processed before
+  // this column existed.
+  refund: number;
   gross_pay: number;
   paye: number;
   pension: number;
@@ -147,6 +176,26 @@ export function PayrollPage() {
   const [processing, setProcessing] = useState(false);
   const [processed, setProcessed] = useState(false);
   const [editingValues, setEditingValues] = useState<Record<string, Partial<PayrollRecord>>>({});
+  // ===== REFUND DRAFTS (urgent refund-persistence hotfix) =====
+  // Durable, database-backed per (employee, month) drafts -- see
+  // supabase/migrations/20261108000000_payroll_refund_adjustments.sql.
+  // Deliberately NOT part of editingValues: that state is unsaved-until-
+  // processed React state (the exact thing that "disappears" today);
+  // refundDrafts always reflects what is actually persisted, re-fetched
+  // fresh on every month change so a draft can never leak across months.
+  const [refundDrafts, setRefundDrafts] = useState<Record<string, RefundDraft>>({});
+  const [refundSaveStatus, setRefundSaveStatus] = useState<Record<string, { state: 'idle' | 'saving' | 'saved' | 'error'; message?: string }>>({});
+  const [refundDuplicateWarning, setRefundDuplicateWarning] = useState<Record<string, { month: string; amount: number } | null>>({});
+  // Pure UI state (never persisted) -- whether the reason/notes/reference
+  // panel is expanded for a given employee's Refund cell.
+  const [refundEditorExpanded, setRefundEditorExpanded] = useState<Record<string, boolean>>({});
+  // Per-employee monotonic sequence number -- the race guard that stops an
+  // older, slower in-flight save response from overwriting a newer one.
+  const refundSaveSeqRef = useRef<Record<string, number>>({});
+  // Per-employee debounced save function, created once per employee id so
+  // concurrent edits to different employees' refund fields never share or
+  // reset each other's timer.
+  const refundDebouncedSaveRef = useRef<Record<string, (args: RefundSaveArgs) => void>>({});
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   // Region id -> name, for the Export Report's "Region" column and for
@@ -195,6 +244,14 @@ export function PayrollPage() {
   // design. Absent (0) for an employee with no current plan.
   const [combinedPlanByEmployee, setCombinedPlanByEmployee] = useState<Map<string, number>>(new Map());
   const [payrollRates, setPayrollRatesState] = useState<PayrollRates>(DEFAULT_RATES);
+  // Fail-closed payroll-settings patch: true when the PAYE/pension/
+  // deduction rates could not be loaded from Settings this session --
+  // `payrollRates` above is then left at its last-known value (the
+  // DEFAULT_RATES initial value on first load) and MUST NOT be trusted
+  // for a live calculation or for Process Payroll -- mirrors
+  // attendanceCountsUnavailable's own existing fail-closed pattern below.
+  const [payrollRatesUnavailable, setPayrollRatesUnavailable] = useState(false);
+  const [payrollRatesUnavailableReason, setPayrollRatesUnavailableReason] = useState('');
 
   // ===== TERMINAL DUES PAYROLL INTEGRATION (Phase 3A) =====
   // `terminal_dues.approve` is a DELIBERATELY NARROW permission (see
@@ -735,6 +792,43 @@ export function PayrollPage() {
 
       setPositionsRequiringUniform(positionsRequiringUniformMap);
 
+      // ===== Refund drafts (urgent refund-persistence hotfix) =====
+      // Reset FIRST, unconditionally, before the fetch even starts --
+      // this is what guarantees a draft can never visually leak from one
+      // month into another while the new month's own fetch is still in
+      // flight. Only relevant for the current/future (preparing a run)
+      // branch -- a historical month's refund is the stored, frozen
+      // `payroll.refund` column on each row already fetched above, never
+      // this draft table.
+      setRefundDrafts({});
+      setRefundSaveStatus({});
+      setRefundDuplicateWarning({});
+      if (!isHistoricalMonth && employeeIds.length > 0) {
+        try {
+          const refundDraftRows = await fetchInEmployeeIdBatches<{
+            employee_id: string; amount: number; reason_code: string | null; reason_notes: string | null;
+            reference_month: string | null; reference_category: string | null; status: string; updated_at: string;
+          }>(
+            employeeIds,
+            (batch, from, to, withCount) =>
+              supabase
+                .from('payroll_refund_drafts')
+                .select('employee_id, amount, reason_code, reason_notes, reference_month, reference_category, status, updated_at', withCount ? { count: 'exact' } : undefined)
+                .eq('month', selectedMonth)
+                .in('employee_id', batch)
+                .range(from, to)
+          );
+          const draftMap: Record<string, RefundDraft> = {};
+          refundDraftRows.forEach(row => {
+            draftMap[row.employee_id] = mapRowToRefundDraft(row);
+          });
+          setRefundDrafts(draftMap);
+        } catch (refundErr) {
+          console.error('Error fetching refund drafts:', refundErr);
+          showNotification('Could not load saved refund adjustments: ' + getErrorMessage(refundErr), 'error');
+        }
+      }
+
       // ===== Active salary advances + each employee's ONE combined
       // repayment plan (for the payroll preview only -- the actual
       // deduction is always computed/applied server-side by
@@ -958,9 +1052,26 @@ export function PayrollPage() {
   }, [rejectRequestTarget, rejectRequestReason, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   // ===== Shared payroll rates (PAYE rate/threshold, pension rate) from Settings =====
-  useEffect(() => {
-    getPayrollRates().then(setPayrollRatesState);
+  // Fail-closed (payroll-settings patch): getPayrollRatesStrict() never
+  // silently substitutes DEFAULT_RATES on a fetch error or a corrupted
+  // configured value -- only a genuinely never-configured field falls
+  // back to its documented historical default. A failure here sets
+  // payrollRatesUnavailable, which blocks Process Payroll exactly like
+  // attendanceCountsUnavailable already does.
+  const fetchPayrollRates = useCallback(async () => {
+    const result = await getPayrollRatesStrict();
+    if (result.status === 'ok') {
+      setPayrollRatesState(result.rates);
+      setPayrollRatesUnavailable(false);
+      setPayrollRatesUnavailableReason('');
+    } else {
+      setPayrollRatesUnavailable(true);
+      setPayrollRatesUnavailableReason(result.reason);
+    }
   }, []);
+  useEffect(() => {
+    fetchPayrollRates();
+  }, [fetchPayrollRates]);
 
   // ===== LOOKUP INDEXES =====
   // With ~2000 employees, a linear .find() over payrollRecords/
@@ -1042,7 +1153,16 @@ export function PayrollPage() {
         createdAt: a.createdAt,
       }))
     ).total;
-    const netPay = netPayBeforeAdvance - salaryAdvanceDeduction;
+    // Refund (urgent refund-persistence hotfix): added AFTER the salary-
+    // advance deduction, outside grossPay/paye/pension entirely -- see
+    // 20261108000000_payroll_refund_adjustments.sql's header for why this
+    // is not taxable the way bonus is. Read from customValues so callers
+    // (getDisplayPayroll, below) can pass in the live, persisted draft
+    // amount for an unprocessed month's preview; an already-processed
+    // record's own stored `refund` column is used instead once one
+    // exists (see getDisplayPayroll/getPayrollForEmployee).
+    const refund = customValues?.refund ?? 0;
+    const netPay = netPayBeforeAdvance - salaryAdvanceDeduction + refund;
 
     return {
       id: '',
@@ -1052,6 +1172,7 @@ export function PayrollPage() {
       allowances,
       overtime,
       bonus,
+      refund,
       gross_pay: live.grossPay,
       paye,
       pension,
@@ -1070,12 +1191,19 @@ export function PayrollPage() {
     const existing = getPayrollForEmployee(employee.id);
     if (existing) return existing;
     const edited = editingValues[employee.id];
-    return calculatePayroll(employee, edited);
-  }, [getPayrollForEmployee, editingValues, calculatePayroll]);
+    // Live preview only -- an already-processed record (the `existing`
+    // branch above) carries its own frozen `refund` column instead, and
+    // is returned before this line is ever reached. A 'cancelled' draft
+    // contributes 0, matching upsert_payroll_refund_draft()'s own
+    // "a deliberate zero cancels" rule.
+    const draftRefund = refundDrafts[employee.id];
+    const liveRefund = draftRefund && draftRefund.status !== 'cancelled' ? draftRefund.amount : 0;
+    return calculatePayroll(employee, { ...edited, refund: liveRefund });
+  }, [getPayrollForEmployee, editingValues, calculatePayroll, refundDrafts]);
 
   // ===== GET TOTALS =====
   const totals = useMemo(() => {
-    let gross = 0, net = 0, paye = 0, pension = 0, uniformDeductions = 0, salaryAdvanceDeductions = 0;
+    let gross = 0, net = 0, paye = 0, pension = 0, uniformDeductions = 0, salaryAdvanceDeductions = 0, refunds = 0;
     employees.forEach(emp => {
       const p = getDisplayPayroll(emp);
       gross += p.gross_pay;
@@ -1084,8 +1212,9 @@ export function PayrollPage() {
       pension += p.pension;
       uniformDeductions += p.uniform_deduction || 0;
       salaryAdvanceDeductions += p.salary_advance_deduction || 0;
+      refunds += p.refund || 0;
     });
-    return { gross, net, paye, pension, uniformDeductions, salaryAdvanceDeductions };
+    return { gross, net, paye, pension, uniformDeductions, salaryAdvanceDeductions, refunds };
   }, [employees, getDisplayPayroll]);
 
   const employeesWithDeductions = useMemo(() => {
@@ -1179,6 +1308,119 @@ export function PayrollPage() {
       [employeeId]: { ...prev[employeeId], [field]: safeValue }
     }));
   }, [canEditPayroll, isApproved]);
+
+  // ===== REFUND DRAFT AUTO-SAVE (urgent refund-persistence hotfix) =====
+  // Persists on every change (debounced), independently of Process
+  // Payroll -- saving a draft NEVER processes/approves/pays/posts
+  // anything; it only calls upsert_payroll_refund_draft(), which never
+  // touches the `payroll` table. See
+  // supabase/migrations/20261108000000_payroll_refund_adjustments.sql.
+  const performRefundSave = useCallback(async (args: RefundSaveArgs) => {
+    const mySeq = (refundSaveSeqRef.current[args.employeeId] || 0) + 1;
+    refundSaveSeqRef.current[args.employeeId] = mySeq;
+    setRefundSaveStatus(prev => ({ ...prev, [args.employeeId]: { state: 'saving' } }));
+
+    try {
+      const { data, error } = await supabase.rpc('upsert_payroll_refund_draft', {
+        p_employee_id: args.employeeId,
+        p_month: args.month,
+        p_amount: args.amount,
+        p_reason_code: args.reasonCode,
+        p_reason_notes: args.reasonNotes,
+        p_reference_month: args.referenceMonth,
+        p_reference_category: args.referenceCategory,
+        p_expected_updated_at: args.expectedUpdatedAt,
+        p_confirm_duplicate: args.confirmDuplicate,
+      });
+      if (error) throw error;
+
+      // Race guard: a slower, older save for this SAME employee must
+      // never overwrite what a newer save (issued after it) already
+      // applied -- discard this response entirely if a newer one has
+      // since been issued.
+      if (!shouldApplyRefundSaveResponse(refundSaveSeqRef.current[args.employeeId], mySeq)) return;
+
+      if (data?.duplicate_warning) {
+        setRefundDuplicateWarning(prev => ({ ...prev, [args.employeeId]: data.conflicting_draft }));
+        setRefundSaveStatus(prev => ({ ...prev, [args.employeeId]: { state: 'idle' } }));
+        return;
+      }
+
+      setRefundDuplicateWarning(prev => ({ ...prev, [args.employeeId]: null }));
+      setRefundDrafts(prev => ({ ...prev, [args.employeeId]: mapRowToRefundDraft(data.draft) }));
+      setRefundSaveStatus(prev => ({ ...prev, [args.employeeId]: { state: 'saved' } }));
+    } catch (err) {
+      if (!shouldApplyRefundSaveResponse(refundSaveSeqRef.current[args.employeeId], mySeq)) return;
+      setRefundSaveStatus(prev => ({ ...prev, [args.employeeId]: { state: 'error', message: getErrorMessage(err) } }));
+    }
+  }, []);
+
+  const getDebouncedRefundSave = useCallback((employeeId: string) => {
+    if (!refundDebouncedSaveRef.current[employeeId]) {
+      refundDebouncedSaveRef.current[employeeId] = debounce((args: RefundSaveArgs) => {
+        performRefundSave(args);
+      }, 600);
+    }
+    return refundDebouncedSaveRef.current[employeeId];
+  }, [performRefundSave]);
+
+  // Called on every keystroke in the Refund amount/reason/notes/reference
+  // inputs. Updates the optimistic local draft immediately (so typing
+  // feels responsive) and schedules the actual debounced save -- nothing
+  // here ever writes to `payroll` or triggers processing/approval.
+  const updateRefundDraft = useCallback((employeeId: string, patch: Partial<RefundDraft>) => {
+    if (!canEditPayroll) {
+      showNotification('You do not have permission to edit payroll refund adjustments', 'error');
+      return;
+    }
+    if (isApproved) {
+      showNotification('Cannot edit approved payroll. Please unapprove first.', 'error');
+      return;
+    }
+
+    const current = refundDrafts[employeeId] || emptyRefundDraft();
+    const next: RefundDraft = { ...current, ...patch };
+    if (next.amount < 0 || !Number.isFinite(next.amount)) next.amount = 0;
+
+    setRefundDrafts(prev => ({ ...prev, [employeeId]: next }));
+    setRefundDuplicateWarning(prev => ({ ...prev, [employeeId]: null }));
+
+    const validationError = validateRefundDraftInput(next.amount, next.reasonCode, next.reasonNotes);
+    if (validationError) {
+      setRefundSaveStatus(prev => ({ ...prev, [employeeId]: { state: 'error', message: validationError } }));
+      return;
+    }
+
+    getDebouncedRefundSave(employeeId)({
+      employeeId,
+      month: selectedMonth,
+      amount: next.amount,
+      reasonCode: next.reasonCode,
+      reasonNotes: next.reasonNotes,
+      referenceMonth: next.referenceMonth,
+      referenceCategory: next.referenceCategory,
+      expectedUpdatedAt: current.updatedAt,
+      confirmDuplicate: false,
+    });
+  }, [canEditPayroll, isApproved, refundDrafts, selectedMonth, getDebouncedRefundSave]);
+
+  // Explicit "save anyway" after a duplicate-refund warning -- an
+  // authorized human confirming, never an automatic override.
+  const confirmDuplicateRefund = useCallback((employeeId: string) => {
+    const current = refundDrafts[employeeId];
+    if (!current) return;
+    performRefundSave({
+      employeeId,
+      month: selectedMonth,
+      amount: current.amount,
+      reasonCode: current.reasonCode,
+      reasonNotes: current.reasonNotes,
+      referenceMonth: current.referenceMonth,
+      referenceCategory: current.referenceCategory,
+      expectedUpdatedAt: current.updatedAt,
+      confirmDuplicate: true,
+    });
+  }, [refundDrafts, selectedMonth, performRefundSave]);
 
   // ===== INITIALIZATION =====
   // Runs once on mount only -- fetchProcessedMonths depends on userProfile
@@ -1645,6 +1887,16 @@ export function PayrollPage() {
       return;
     }
 
+    // Fail-closed, defense in depth (payroll-settings patch): same
+    // reasoning as attendanceCountsUnavailable above -- without this,
+    // calculatePayroll() below would silently use whatever `payrollRates`
+    // happened to already be in state (DEFAULT_RATES on first load),
+    // presenting an unconfigured/stale PAYE/pension rate as authoritative.
+    if (payrollRatesUnavailable) {
+      showNotification('Unable to load payroll rate settings. Please refresh and try again.', 'error');
+      return;
+    }
+
     // Terminal Dues pre-checks, run BEFORE even calling the RPC. As of
     // Phase 3B these are advisory/UX-only, not the actual safety boundary
     // -- process_payroll_with_terminal_dues() itself is one atomic
@@ -1677,12 +1929,20 @@ export function PayrollPage() {
       
       for (const employee of employees) {
         const edited = editingValues[employee.id];
+        // Same merge getDisplayPayroll() already does for the live table
+        // preview -- without it, this submission loop would silently
+        // compute refund = 0 for everyone (editingValues never carries a
+        // refund field at all; it only comes from refundDrafts), even
+        // though the table the admin is looking at right now shows the
+        // real saved amount.
+        const draftRefund = refundDrafts[employee.id];
+        const liveRefund = draftRefund && draftRefund.status !== 'cancelled' ? draftRefund.amount : 0;
 
         // calculatePayroll computes uniform/attendance deductions itself (rates,
         // per-position uniform eligibility, and live attendance counts) -- it
         // never reads a uniform_deduction override from customValues, so there's
         // no need to (and no correct way to) pre-compute it here.
-        const payroll = calculatePayroll(employee, edited);
+        const payroll = calculatePayroll(employee, { ...edited, refund: liveRefund });
 
         totalGross += payroll.gross_pay;
         totalNet += payroll.net_pay;
@@ -1699,10 +1959,20 @@ export function PayrollPage() {
           paye: payroll.paye,
           pension: payroll.pension,
           uniform_deduction: payroll.uniform_deduction,
-          // payroll.net_pay here is already post-advance; add the
-          // deduction back so process_payroll_batch() (which subtracts
-          // its own server-computed copy) doesn't subtract it twice.
-          net_pay: payroll.net_pay + payroll.salary_advance_deduction,
+          // payroll.net_pay here is already post-advance and post-refund;
+          // add the advance deduction back and subtract the refund back
+          // out so process_payroll_batch() (which independently
+          // recomputes BOTH the advance deduction and the refund amount
+          // server-side, from salary_advance_repayment_plans and
+          // payroll_refund_drafts respectively -- see
+          // 20261108000000_payroll_refund_adjustments.sql -- and applies
+          // each exactly once itself) never double-subtracts the advance
+          // or double-adds the refund. This submitted net_pay is NOT
+          // itself trusted for the refund figure either way -- the RPC
+          // never reads a refund field from this payload at all -- but it
+          // must still be mathematically clean of refund before the RPC's
+          // own "- advance + refund" arithmetic runs against it.
+          net_pay: payroll.net_pay + payroll.salary_advance_deduction - payroll.refund,
           processed_at: new Date().toISOString(),
           approval_status: 'pending',
           approved_by: null,
@@ -1828,7 +2098,7 @@ export function PayrollPage() {
       setProcessing(false);
       setProcessingStatus('');
     }
-  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, employees, employeesById, editingValues, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason, isAdminClass, fetchPayrollRequests, fetchTerminalDuesPreview]);
+  }, [isCurrentMonth, isFutureMonthSelected, canProcessPayroll, attendanceCountsUnavailable, payrollRatesUnavailable, employees, employeesById, editingValues, refundDrafts, calculatePayroll, selectedMonth, fetchData, fetchProcessedMonths, canProcessTerminalDues, terminalDuesSummary, excludedAllocationIds, exclusionReason, isAdminClass, fetchPayrollRequests, fetchTerminalDuesPreview]);
 
   // ===== RENDER =====
   if (!canViewPayroll && !loading) {
@@ -1947,7 +2217,7 @@ export function PayrollPage() {
               <Button
                 variant={isMonthProcessed ? "outline" : "secondary"}
                 onClick={() => setShowConfirmModal(true)}
-                disabled={processing || isApproved || attendanceCountsUnavailable}
+                disabled={processing || isApproved || attendanceCountsUnavailable || payrollRatesUnavailable}
               >
                 {processing ? (
                   <span className="flex items-center gap-2">
@@ -2187,6 +2457,28 @@ export function PayrollPage() {
         </Card>
       )}
 
+      {payrollRatesUnavailable && (
+        <Card className="p-4 bg-red-50 border-red-300 border">
+          <div className="flex items-start gap-3">
+            <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-semibold text-red-800">
+                Unable to load payroll rate settings (PAYE, pension, deductions).
+              </p>
+              <p className="text-sm text-red-700 mt-1">
+                {payrollRatesUnavailableReason || 'Processing is disabled until this loads successfully, so payroll is never calculated with a default or guessed rate in place of what was actually configured.'}
+              </p>
+              <button
+                onClick={() => fetchPayrollRates()}
+                className="mt-2 text-sm font-medium text-red-800 hover:underline"
+              >
+                Retry
+              </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {processedMonths.length > 0 && (
         <Card className="p-3 bg-emerald-50 border-emerald-200 border">
           <div className="flex items-center gap-4 flex-wrap">
@@ -2237,7 +2529,7 @@ export function PayrollPage() {
               <div className="mt-2 text-xs text-red-600 space-y-1">
                 <p>• Uniform Deduction: Default MK 10,000 per employee (adjustable in employee profile)</p>
                 <p>• Absenteeism: {(isCurrentMonth || isFutureMonthSelected) ? `${formatKwacha(payrollRates.absentDeduction)} per absent day` : 'rate in effect when each employee\'s payroll was processed (see breakdown below)'}</p>
-                <p>• Late Arrival: MK 4,200 per late day</p>
+                <p>• Late Arrival: {(isCurrentMonth || isFutureMonthSelected) ? `${formatKwacha(payrollRates.lateDeduction)} per late day` : 'rate in effect when each employee\'s payroll was processed (see breakdown below)'}</p>
               </div>
             </div>
           </div>
@@ -2477,6 +2769,7 @@ export function PayrollPage() {
                 <TH className="text-right">Allowances</TH>
                 <TH className="text-right">Overtime</TH>
                 <TH className="text-right">Bonus</TH>
+                <TH className="text-right">Refund</TH>
                 <TH className="text-right bg-emerald-50/50">Gross</TH>
                 <TH className="text-right bg-red-50/50">Uniform/Att</TH>
                 <TH className="text-right bg-slate-100">Net Pay</TH>
@@ -2580,6 +2873,101 @@ export function PayrollPage() {
                         <span className="font-mono">{formatKwacha(p.bonus)}</span>
                       )}
                     </TD>
+                    <TD className="text-right">
+                      {isEditable ? (() => {
+                        const draft = refundDrafts[emp.id] || emptyRefundDraft();
+                        const saveState = refundSaveStatus[emp.id]?.state || 'idle';
+                        const saveMessage = refundSaveStatus[emp.id]?.message;
+                        const duplicate = refundDuplicateWarning[emp.id];
+                        const expanded = !!refundEditorExpanded[emp.id] || draft.amount > 0;
+                        return (
+                          <div className="flex flex-col items-end gap-1 w-36">
+                            <input
+                              id={`refund-${emp.id}`}
+                              name={`refund-${emp.id}`}
+                              type="number"
+                              min="0"
+                              value={draft.amount}
+                              onChange={e => {
+                                const amount = Math.max(0, Number(e.target.value) || 0);
+                                updateRefundDraft(emp.id, { amount });
+                                if (amount > 0) setRefundEditorExpanded(prev => ({ ...prev, [emp.id]: true }));
+                              }}
+                              className="w-full text-right text-xs border border-slate-200 rounded px-1 py-0.5 focus:ring-1 focus:ring-[#081C3A]"
+                            />
+                            {expanded && (
+                              <>
+                                <select
+                                  id={`refund-reason-${emp.id}`}
+                                  name={`refund-reason-${emp.id}`}
+                                  value={draft.reasonCode || ''}
+                                  onChange={e => updateRefundDraft(emp.id, { reasonCode: e.target.value || null })}
+                                  className="w-full text-[10px] border border-slate-200 rounded px-1 py-0.5"
+                                >
+                                  <option value="">Select reason...</option>
+                                  {REFUND_REASON_CODES.map(r => (
+                                    <option key={r.value} value={r.value}>{r.label}</option>
+                                  ))}
+                                </select>
+                                {draft.reasonCode === 'other' && (
+                                  <input
+                                    id={`refund-notes-${emp.id}`}
+                                    name={`refund-notes-${emp.id}`}
+                                    type="text"
+                                    placeholder="Describe the reason..."
+                                    value={draft.reasonNotes || ''}
+                                    onChange={e => updateRefundDraft(emp.id, { reasonNotes: e.target.value })}
+                                    className="w-full text-[10px] border border-slate-200 rounded px-1 py-0.5"
+                                  />
+                                )}
+                                <div className="flex gap-1 w-full">
+                                  <input
+                                    id={`refund-ref-month-${emp.id}`}
+                                    name={`refund-ref-month-${emp.id}`}
+                                    type="text"
+                                    placeholder="From month (YYYY-MM)"
+                                    value={draft.referenceMonth || ''}
+                                    onChange={e => updateRefundDraft(emp.id, { referenceMonth: e.target.value || null })}
+                                    className="w-1/2 text-[10px] border border-slate-200 rounded px-1 py-0.5"
+                                  />
+                                  <select
+                                    id={`refund-ref-category-${emp.id}`}
+                                    name={`refund-ref-category-${emp.id}`}
+                                    value={draft.referenceCategory || ''}
+                                    onChange={e => updateRefundDraft(emp.id, { referenceCategory: e.target.value || null })}
+                                    className="w-1/2 text-[10px] border border-slate-200 rounded px-1 py-0.5"
+                                  >
+                                    <option value="">Which deduction?</option>
+                                    {REFUND_REFERENCE_CATEGORIES.map(c => (
+                                      <option key={c.value} value={c.value}>{c.label}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                              </>
+                            )}
+                            {duplicate && (
+                              <div className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 py-0.5 w-full">
+                                Possible duplicate: {formatKwacha(duplicate.amount)} already refunded for {duplicate.month} against the same deduction.
+                                <button
+                                  type="button"
+                                  onClick={() => confirmDuplicateRefund(emp.id)}
+                                  className="block mt-0.5 underline text-amber-800"
+                                >
+                                  Save anyway
+                                </button>
+                              </div>
+                            )}
+                            {saveState === 'saving' && <span className="text-[10px] text-slate-400">Saving...</span>}
+                            {saveState === 'saved' && <span className="text-[10px] text-emerald-600">Saved ✓</span>}
+                            {saveState === 'error' && (
+                              <span className="text-[10px] text-red-600" role="alert">Error: {saveMessage}</span>
+                            )}
+                          </div>
+                        );
+                      })() : (
+                        <span className="font-mono">{formatKwacha(p.refund)}</span>
+                      )}
+                    </TD>
                     <TD className="text-right font-mono font-semibold text-emerald-700 bg-emerald-50/50">
                       {formatKwacha(p.gross_pay)}
                     </TD>
@@ -2593,7 +2981,7 @@ export function PayrollPage() {
                             <div className="text-[10px] text-red-400 space-y-0.5">
                               {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
                               {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × {formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}</div>}
-                              {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × MK4,200</div>}
+                              {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × {formatKwacha(payrollRates.lateDeduction)}</div>}
                               {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
                               {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
                             </div>
@@ -2754,7 +3142,7 @@ export function PayrollPage() {
               <div className="mt-2 text-xs text-red-600 border-t border-red-200 pt-2">
                 <p>• Uniform Deduction: MK 10,000 per employee (default, adjustable)</p>
                 <p>• Absenteeism: {formatKwacha(payrollRates.absentDeduction)} per absent day</p>
-                <p>• Late Arrival: MK 4,200 per late day</p>
+                <p>• Late Arrival: {formatKwacha(payrollRates.lateDeduction)} per late day</p>
               </div>
             </div>
           )}

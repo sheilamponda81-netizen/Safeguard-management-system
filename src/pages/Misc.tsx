@@ -9,7 +9,7 @@ import { logAudit } from '../utils/auditLogger';
 // ===== IMPORT MonthSettings =====
 import { MonthSettings } from '../components/MonthSettings';
 import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
-import { getPayrollRates, setPayrollRates } from '../utils/payrollSettings';
+import { getPayrollRatesStrict, setPayrollRates } from '../utils/payrollSettings';
 import { getCompanySettings, setCompanySettings, uploadCompanyLogo, DEFAULT_COMPANY_INFO } from '../utils/companySettings';
 import { getDefaultPageSize, setDefaultPageSize } from '../utils/uiSettings';
 import { normalizeForDedup } from '../utils/textNormalize';
@@ -106,6 +106,13 @@ export function SettingsPage() {
   const [tab, setTab] = useState('company');
   const [saving, setSaving] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
+  // Fail-closed payroll-settings patch: true when the Tax/Pension/Payroll
+  // tabs' current rates could not be loaded on initial page load --
+  // blocks all three Save buttons (in addition to each handler's own
+  // independent re-check) so a viewer can't save a form pre-filled with
+  // nothing better than its own stale default state.
+  const [payrollSettingsUnavailable, setPayrollSettingsUnavailable] = useState(false);
+  const [payrollSettingsUnavailableReason, setPayrollSettingsUnavailableReason] = useState('');
   const [roles, setRoles] = useState<any[]>([]);
   const [loadingRoles, setLoadingRoles] = useState(true);
   const [showRoleModal, setShowRoleModal] = useState(false);
@@ -705,10 +712,19 @@ const handleDeletePosition = async (position: Position) => {
       // was previously the only place this was saved -- Payroll never read it).
       const { data: { user } } = await supabase.auth.getUser();
       if (user) {
-        const currentRates = await getPayrollRates();
+        // Fail-closed (payroll-settings patch): this spreads currentRates
+        // and overwrites ONLY the PAYE fields below -- a silently-
+        // defaulted fetch here would write DEFAULT_RATES's pension/
+        // deduction values back over whatever was actually configured
+        // for those UNRELATED fields, even though this save never
+        // touched them. Abort the whole save instead.
+        const currentRatesResult = await getPayrollRatesStrict();
+        if (currentRatesResult.status === 'unavailable') {
+          throw new Error(`Could not load current payroll settings before saving: ${currentRatesResult.reason}`);
+        }
         await setPayrollRates(
           {
-            ...currentRates,
+            ...currentRatesResult.rates,
             payeRate: (parseFloat(taxForm.taxRate) || 0) / 100,
             payeThreshold: parseFloat(taxForm.taxFreeThreshold) || 0,
           },
@@ -732,6 +748,7 @@ const handleDeletePosition = async (position: Position) => {
     } catch (error) {
       console.error('Error saving tax settings:', error);
       setSaving(false);
+      showNotification(error instanceof Error ? error.message : 'Failed to save tax settings', 'error');
     }
   };
 
@@ -747,10 +764,17 @@ const handleDeletePosition = async (position: Position) => {
       // bookkeeping figure and isn't subtracted from anyone's net pay.
       const { data: { user } } = await supabase.auth.getUser();
       if (user) {
-        const currentRates = await getPayrollRates();
+        // Fail-closed (payroll-settings patch): same reasoning as
+        // handleSaveTax -- a silently-defaulted fetch here would write
+        // DEFAULT_RATES's PAYE/deduction values back over whatever was
+        // actually configured for those UNRELATED fields.
+        const currentRatesResult = await getPayrollRatesStrict();
+        if (currentRatesResult.status === 'unavailable') {
+          throw new Error(`Could not load current payroll settings before saving: ${currentRatesResult.reason}`);
+        }
         await setPayrollRates(
           {
-            ...currentRates,
+            ...currentRatesResult.rates,
             pensionEmployeeRate: (parseFloat(pensionForm.employeeContribution) || 0) / 100,
           },
           user.id
@@ -764,7 +788,7 @@ const handleDeletePosition = async (position: Position) => {
         old_data: Object.keys(oldData).length > 0 ? oldData : null,
         new_data: pensionForm
       });
-      
+
       setTimeout(() => {
         setSaving(false);
         setShowSuccess(true);
@@ -773,6 +797,7 @@ const handleDeletePosition = async (position: Position) => {
     } catch (error) {
       console.error('Error saving pension settings:', error);
       setSaving(false);
+      showNotification(error instanceof Error ? error.message : 'Failed to save pension settings', 'error');
     }
   };
 
@@ -792,7 +817,15 @@ const handleDeletePosition = async (position: Position) => {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error('Not signed in');
 
-      const currentRates = await getPayrollRates();
+      // Fail-closed (payroll-settings patch): same reasoning as
+      // handleSaveTax/handleSavePension -- a silently-defaulted fetch
+      // here would write DEFAULT_RATES's PAYE/pension values back over
+      // whatever was actually configured for those UNRELATED fields.
+      const currentRatesResult = await getPayrollRatesStrict();
+      if (currentRatesResult.status === 'unavailable') {
+        throw new Error(`Could not load current payroll settings before saving: ${currentRatesResult.reason}`);
+      }
+      const currentRates = currentRatesResult.rates;
       const oldRates = {
         uniformDeduction: currentRates.uniformDeduction,
         absentDeduction: currentRates.absentDeduction,
@@ -825,7 +858,7 @@ const handleDeletePosition = async (position: Position) => {
     } catch (error) {
       console.error('Error saving payroll settings:', error);
       setSaving(false);
-      showNotification('Failed to save payroll settings', 'error');
+      showNotification(error instanceof Error ? error.message : 'Failed to save payroll settings', 'error');
     }
   };
 
@@ -837,22 +870,41 @@ const handleDeletePosition = async (position: Position) => {
     getCompanySettings().then(setCompanyForm);
   };
 
+  // Fail-closed (payroll-settings patch): on an unavailable fetch, the
+  // form is left at whatever it currently shows (never silently
+  // repopulated with DEFAULT_RATES) and an error is shown -- repopulating
+  // with 30%/5% here is exactly as dangerous as the save handlers above,
+  // since the next thing a viewer does after Cancel is often re-examine
+  // and then Save again.
   const handleCancelTax = () => {
-    getPayrollRates().then(rates => {
-      setTaxForm(prev => ({ ...prev, taxRate: String(rates.payeRate * 100), taxFreeThreshold: String(rates.payeThreshold) }));
+    getPayrollRatesStrict().then(result => {
+      if (result.status === 'unavailable') {
+        showNotification(`Could not reload current tax settings: ${result.reason}`, 'error');
+        return;
+      }
+      setTaxForm(prev => ({ ...prev, taxRate: String(result.rates.payeRate * 100), taxFreeThreshold: String(result.rates.payeThreshold) }));
     });
   };
 
   const handleCancelPension = () => {
-    getPayrollRates().then(rates => {
-      setPensionForm(prev => ({ ...prev, employeeContribution: String(rates.pensionEmployeeRate * 100) }));
+    getPayrollRatesStrict().then(result => {
+      if (result.status === 'unavailable') {
+        showNotification(`Could not reload current pension settings: ${result.reason}`, 'error');
+        return;
+      }
+      setPensionForm(prev => ({ ...prev, employeeContribution: String(result.rates.pensionEmployeeRate * 100) }));
     });
   };
 
   const handleCancelPayroll = () => {
     const savedPayroll = localStorage.getItem('payrollSettings');
     setPayrollForm(prev => savedPayroll ? { ...prev, ...JSON.parse(savedPayroll) } : prev);
-    getPayrollRates().then(rates => {
+    getPayrollRatesStrict().then(result => {
+      if (result.status === 'unavailable') {
+        showNotification(`Could not reload current deduction settings: ${result.reason}`, 'error');
+        return;
+      }
+      const rates = result.rates;
       setDeductionRatesForm({
         uniformDeduction: String(rates.uniformDeduction),
         absentDeduction: String(rates.absentDeduction),
@@ -861,6 +913,33 @@ const handleDeletePosition = async (position: Position) => {
         lectureFullMonthDeduction: String(rates.lectureFullMonthDeduction),
         appearanceDeduction: String(rates.appearanceDeduction),
       });
+    });
+  };
+
+  // Shared by the initial page load and the banner's own Retry button
+  // (payroll-settings patch) -- fail-closed: on an unavailable fetch, the
+  // three forms are left exactly as they already were (localStorage/
+  // default values, never silently replaced by DEFAULT_RATES), and
+  // payrollSettingsUnavailable blocks all three Save buttons until this
+  // succeeds.
+  const loadPayrollSettingsIntoForms = async () => {
+    const result = await getPayrollRatesStrict();
+    if (result.status === 'unavailable') {
+      setPayrollSettingsUnavailable(true);
+      setPayrollSettingsUnavailableReason(result.reason);
+      return;
+    }
+    setPayrollSettingsUnavailable(false);
+    const rates = result.rates;
+    setTaxForm(prev => ({ ...prev, taxRate: String(rates.payeRate * 100), taxFreeThreshold: String(rates.payeThreshold) }));
+    setPensionForm(prev => ({ ...prev, employeeContribution: String(rates.pensionEmployeeRate * 100) }));
+    setDeductionRatesForm({
+      uniformDeduction: String(rates.uniformDeduction),
+      absentDeduction: String(rates.absentDeduction),
+      lateDeduction: String(rates.lateDeduction),
+      lectureDeduction: String(rates.lectureDeduction),
+      lectureFullMonthDeduction: String(rates.lectureFullMonthDeduction),
+      appearanceDeduction: String(rates.appearanceDeduction),
     });
   };
 
@@ -1011,18 +1090,13 @@ const handleDeletePosition = async (position: Position) => {
     // system_settings is the shared source of truth Payroll.tsx (and now
     // Attendance.tsx/Payslips.tsx) actually read -- load it last so it wins
     // over any stale/different localStorage value cached in this browser.
-    getPayrollRates().then(rates => {
-      setTaxForm(prev => ({ ...prev, taxRate: String(rates.payeRate * 100), taxFreeThreshold: String(rates.payeThreshold) }));
-      setPensionForm(prev => ({ ...prev, employeeContribution: String(rates.pensionEmployeeRate * 100) }));
-      setDeductionRatesForm({
-        uniformDeduction: String(rates.uniformDeduction),
-        absentDeduction: String(rates.absentDeduction),
-        lateDeduction: String(rates.lateDeduction),
-        lectureDeduction: String(rates.lectureDeduction),
-        lectureFullMonthDeduction: String(rates.lectureFullMonthDeduction),
-        appearanceDeduction: String(rates.appearanceDeduction),
-      });
-    });
+    //
+    // Fail-closed (payroll-settings patch): on an unavailable fetch, the
+    // three forms are left showing only their localStorage/default values
+    // -- never silently replaced by DEFAULT_RATES -- and
+    // payrollSettingsUnavailable blocks all three Save buttons until a
+    // retry succeeds.
+    loadPayrollSettingsIntoForms();
 
     // Company info is shared (system_settings) too -- see companySettings.ts.
     getCompanySettings().then(setCompanyForm);
@@ -1282,6 +1356,23 @@ const handleDeletePosition = async (position: Position) => {
         </Card>
       )}
       
+      {payrollSettingsUnavailable && (tab === 'tax' || tab === 'pension' || tab === 'payroll') && (
+        <Card className="p-4 bg-red-50 border-red-300 border mb-4">
+          <div className="flex items-start gap-3">
+            <AlertTriangle size={20} className="text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-semibold text-red-800">Unable to load current payroll rate settings.</p>
+              <p className="text-sm text-red-700 mt-1">
+                {payrollSettingsUnavailableReason || 'The values shown below may not reflect what is actually configured. Saving is disabled until this loads successfully, so a defaulted value can never silently overwrite a real configured rate (including an explicit 0%).'}
+              </p>
+              <button onClick={() => loadPayrollSettingsIntoForms()} className="mt-2 text-sm font-medium text-red-800 hover:underline">
+                Retry
+              </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {tab === 'tax' && (
         <Card className="p-6">
           <h3 className="font-semibold text-slate-800 mb-4">Tax Settings (PAYE)</h3>
@@ -1297,7 +1388,7 @@ const handleDeletePosition = async (position: Position) => {
           </div>
           <div className="flex items-center justify-end gap-2 mt-6">
             <Button variant="outline" onClick={handleCancelTax}>Cancel</Button>
-            <Button variant="secondary" onClick={handleSaveTax} disabled={saving}>
+            <Button variant="secondary" onClick={handleSaveTax} disabled={saving || payrollSettingsUnavailable}>
               {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
             </Button>
           </div>
@@ -1315,7 +1406,7 @@ const handleDeletePosition = async (position: Position) => {
           </div>
           <div className="flex items-center justify-end gap-2 mt-6">
             <Button variant="outline" onClick={handleCancelPension}>Cancel</Button>
-            <Button variant="secondary" onClick={handleSavePension} disabled={saving}>
+            <Button variant="secondary" onClick={handleSavePension} disabled={saving || payrollSettingsUnavailable}>
               {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
             </Button>
           </div>
@@ -1377,7 +1468,7 @@ const handleDeletePosition = async (position: Position) => {
 
           <div className="flex items-center justify-end gap-2 mt-6">
             <Button variant="outline" onClick={handleCancelPayroll}>Cancel</Button>
-            <Button variant="secondary" onClick={handleSavePayroll} disabled={saving}>
+            <Button variant="secondary" onClick={handleSavePayroll} disabled={saving || payrollSettingsUnavailable}>
               {saving ? 'Saving...' : <><CheckCircle size={14} className="mr-1" /> Save Changes</>}
             </Button>
           </div>

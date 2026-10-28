@@ -40,6 +40,22 @@ describe('checkPayslipReconciliation', () => {
     const result = checkPayslipReconciliation({ ...baseInput, netPay: 200000.6 });
     expect(result.reconciles).toBe(true);
   });
+
+  it('refund defaults to 0 -- every existing caller/test above is unaffected by the refund-persistence hotfix', () => {
+    expect(checkPayslipReconciliation(baseInput)).toEqual({ grossReconciles: true, netReconciles: true, reconciles: true });
+  });
+
+  it('a refund is added at the NET level only, never into the gross reconciliation (not taxable new income the way bonus is)', () => {
+    const result = checkPayslipReconciliation({ ...baseInput, refund: 20000, netPay: 220000 });
+    expect(result.grossReconciles).toBe(true);
+    expect(result.netReconciles).toBe(true);
+    expect(result.reconciles).toBe(true);
+  });
+
+  it('flags a net_pay that omits a refund the record claims to have (refund present but net_pay not adjusted for it)', () => {
+    const result = checkPayslipReconciliation({ ...baseInput, refund: 20000, netPay: 200000 });
+    expect(result.netReconciles).toBe(false);
+  });
 });
 
 describe('buildItemizedAttendanceBreakdown', () => {
