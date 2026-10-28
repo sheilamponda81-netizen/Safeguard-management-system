@@ -205,3 +205,55 @@ describe('reconcileMonthlyPayroll -- Dashboard/Reports/Payroll reconciliation pa
     expect(result.totals.net_pay).toBe(payrollTsxStyleTotal);
   });
 });
+
+// Refund-persistence hotfix (2026-11): Dashboard.tsx and Reports.tsx must
+// include a saved, active payroll_refund_drafts amount in an UNPROCESSED
+// month's estimate, exactly like Payroll.tsx's own preview -- see
+// livePayrollEstimate.ts's fetchRefundByEmployee() header.
+describe('reconcileMonthlyPayroll -- refund-persistence hotfix (2026-11)', () => {
+  it('a saved refund draft is added exactly once for an estimated employee, alongside an unrelated salary advance', () => {
+    const result = reconcileMonthlyPayroll(
+      false, [E1, E2], [],
+      inputs({
+        salaryAdvanceByEmployeeId: new Map([['e2', 50000]]),
+        refundByEmployeeId: new Map([['e2', 15000]]),
+      })
+    );
+    const e1 = result.employees.find(e => e.employeeId === 'e1')!;
+    const e2 = result.employees.find(e => e.employeeId === 'e2')!;
+    expect(e1.figures.net_pay).toBe(300000); // untouched -- no refund entry for e1
+    expect(e2.figures.net_pay).toBe(250000 - 50000 + 15000); // advance subtracted, refund added, once each
+    expect(result.totals.net_pay).toBe(300000 + (250000 - 50000 + 15000));
+  });
+
+  it('a stored employee\'s figure is never touched by the live refund map, even if one exists for them', () => {
+    const stored: StoredPayrollRow[] = [
+      { employee_id: 'e1', gross_pay: 300000, paye: 0, pension: 0, net_pay: 310000, approval_status: 'approved' }, // already refund-inclusive from processing
+    ];
+    const result = reconcileMonthlyPayroll(
+      false, [E1, E2], stored,
+      inputs({ refundByEmployeeId: new Map([['e1', 999999], ['e2', 15000]]) }) // e1's map entry must be IGNORED (stored)
+    );
+    const e1 = result.employees.find(e => e.employeeId === 'e1')!;
+    const e2 = result.employees.find(e => e.employeeId === 'e2')!;
+    expect(e1.figures.net_pay).toBe(310000); // untouched by the (irrelevant) 999999 entry
+    expect(e2.figures.net_pay).toBe(250000 + 15000); // estimated, refund added exactly once
+  });
+
+  it('omitting refundByEmployeeId entirely (caller never fetched it) behaves exactly as if no employee has a refund -- no crash, no unavailable', () => {
+    const result = reconcileMonthlyPayroll(false, [E1], [], inputs()); // inputs() has no refundByEmployeeId key at all
+    expect(result.unavailable).toBe(false);
+    expect(result.employees[0].figures.net_pay).toBe(300000);
+  });
+
+  it('for the SAME synthetic population/month including a refund, reproduces exactly what Payroll.tsx\'s own preview (live estimate + refund - advance) would produce', () => {
+    const liveInputs = inputs({
+      salaryAdvanceByEmployeeId: new Map([['e2', 50000]]),
+      refundByEmployeeId: new Map([['e2', 15000]]),
+    });
+    const result = reconcileMonthlyPayroll(false, [E1, E2], [], liveInputs);
+
+    const payrollTsxStyleTotal = 300000 /* e1 live, no refund/advance */ + (250000 - 50000 + 15000) /* e2 live - advance + refund */;
+    expect(result.totals.net_pay).toBe(payrollTsxStyleTotal);
+  });
+});

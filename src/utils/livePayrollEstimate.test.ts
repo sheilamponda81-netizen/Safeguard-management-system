@@ -17,7 +17,8 @@ vi.mock('../lib/supabase', () => ({
   },
 }));
 
-import { fetchSalaryAdvanceDeductionByEmployee } from './livePayrollEstimate';
+import { fetchSalaryAdvanceDeductionByEmployee, fetchRefundByEmployee, computeEstimatedNetPay } from './livePayrollEstimate';
+import { PayrollRates } from './payrollSettings';
 
 // A minimal chainable query-builder stand-in: every intermediate method
 // returns the same object, and the TERMINAL call in each real query chain
@@ -157,5 +158,134 @@ describe('fetchSalaryAdvanceDeductionByEmployee', () => {
 
     const result = await fetchSalaryAdvanceDeductionByEmployee(['e4'], '2026-10');
     expect(result.has('e4')).toBe(false); // total === 0 -> not set, per this function's own "missing = 0" convention
+  });
+});
+
+// Refund-persistence hotfix (2026-11): Dashboard.tsx and Reports.tsx must
+// include a saved, active payroll_refund_drafts amount in an UNPROCESSED
+// month's estimate -- same table Payroll.tsx's own preview reads and
+// process_payroll_batch() re-reads at processing time.
+describe('fetchRefundByEmployee', () => {
+  beforeEach(() => {
+    fromMock.mockReset();
+  });
+
+  it('empty employeeIds short-circuits without calling Supabase at all', async () => {
+    const result = await fetchRefundByEmployee([], '2026-10');
+    expect(result.size).toBe(0);
+    expect(fromMock).not.toHaveBeenCalled();
+  });
+
+  it('employee with no saved draft is simply absent from the returned map (not present with 0)', async () => {
+    fromMock.mockImplementation((table: string) => {
+      if (table === 'payroll_refund_drafts') return chain({ data: [], error: null, count: 0 });
+      throw new Error(`unexpected table: ${table}`);
+    });
+    const result = await fetchRefundByEmployee(['e1'], '2026-10');
+    expect(result.has('e1')).toBe(false);
+  });
+
+  it('a pending draft with a positive amount is included', async () => {
+    fromMock.mockImplementation((table: string) => {
+      if (table === 'payroll_refund_drafts') {
+        return chain({ data: [{ employee_id: 'e1', amount: 15000, status: 'pending' }], error: null, count: 1 });
+      }
+      throw new Error(`unexpected table: ${table}`);
+    });
+    const result = await fetchRefundByEmployee(['e1'], '2026-10');
+    expect(result.get('e1')).toBe(15000);
+  });
+
+  it('a cancelled draft is excluded even though it has a positive amount', async () => {
+    fromMock.mockImplementation((table: string) => {
+      if (table === 'payroll_refund_drafts') {
+        return chain({ data: [{ employee_id: 'e1', amount: 15000, status: 'cancelled' }], error: null, count: 1 });
+      }
+      throw new Error(`unexpected table: ${table}`);
+    });
+    const result = await fetchRefundByEmployee(['e1'], '2026-10');
+    expect(result.has('e1')).toBe(false);
+  });
+
+  it('a zero-amount draft (e.g. drafted then cleared) is excluded, never set as a 0 entry', async () => {
+    fromMock.mockImplementation((table: string) => {
+      if (table === 'payroll_refund_drafts') {
+        return chain({ data: [{ employee_id: 'e1', amount: 0, status: 'pending' }], error: null, count: 1 });
+      }
+      throw new Error(`unexpected table: ${table}`);
+    });
+    const result = await fetchRefundByEmployee(['e1'], '2026-10');
+    expect(result.has('e1')).toBe(false);
+  });
+
+  it('a failed query propagates as a rejected promise -- callers are responsible for aborting the whole estimate, never silently degrading to "no refund"', async () => {
+    fromMock.mockImplementation((table: string) => {
+      if (table === 'payroll_refund_drafts') {
+        return chain({ data: null, error: new Error('network error'), count: undefined });
+      }
+      throw new Error(`unexpected table: ${table}`);
+    });
+    await expect(fetchRefundByEmployee(['e1'], '2026-10')).rejects.toThrow('network error');
+  });
+
+  it('is filtered to the requested month, not an employee\'s draft from a different month', async () => {
+    fromMock.mockImplementation((table: string, ..._rest: unknown[]) => {
+      if (table === 'payroll_refund_drafts') {
+        const builder = chain({ data: [{ employee_id: 'e1', amount: 15000, status: 'pending' }], error: null, count: 1 });
+        const originalEq = builder.eq;
+        builder.eq = (...args: unknown[]) => {
+          expect(args).toEqual(['month', '2026-10']);
+          return originalEq(...args);
+        };
+        return builder;
+      }
+      throw new Error(`unexpected table: ${table}`);
+    });
+    await fetchRefundByEmployee(['e1'], '2026-10');
+  });
+});
+
+describe('computeEstimatedNetPay -- refund addition (2026-11 hotfix)', () => {
+  const ZERO_RATES: PayrollRates = {
+    payeRate: 0,
+    payeThreshold: 0,
+    pensionEmployeeRate: 0,
+    uniformDeduction: 10000,
+    absentDeduction: 4200,
+    lateDeduction: 4200,
+    lectureDeduction: 3000,
+    lectureFullMonthDeduction: 15000,
+    appearanceDeduction: 0,
+  };
+  const NO_UNIFORM = new Map<string, boolean>([['Office Staff', false]]);
+
+  it('a saved refund is added to net_pay, never to gross_pay/paye/pension', () => {
+    const noRefund = computeEstimatedNetPay({
+      basicSalary: 300000, position: 'Office Staff', positionsRequiringUniform: NO_UNIFORM, payrollRates: ZERO_RATES,
+    });
+    const withRefund = computeEstimatedNetPay({
+      basicSalary: 300000, position: 'Office Staff', positionsRequiringUniform: NO_UNIFORM, payrollRates: ZERO_RATES,
+      refund: 15000,
+    });
+    expect(withRefund.gross_pay).toBe(noRefund.gross_pay);
+    expect(withRefund.paye).toBe(noRefund.paye);
+    expect(withRefund.pension).toBe(noRefund.pension);
+    expect(withRefund.net_pay).toBe(noRefund.net_pay + 15000);
+  });
+
+  it('refund and salary-advance deduction combine additively, each applied exactly once', () => {
+    const figures = computeEstimatedNetPay({
+      basicSalary: 300000, position: 'Office Staff', positionsRequiringUniform: NO_UNIFORM, payrollRates: ZERO_RATES,
+      salaryAdvanceDeduction: 50000,
+      refund: 15000,
+    });
+    expect(figures.net_pay).toBe(300000 - 50000 + 15000);
+  });
+
+  it('an undefined/omitted refund is treated as 0, not NaN or an error', () => {
+    const figures = computeEstimatedNetPay({
+      basicSalary: 300000, position: 'Office Staff', positionsRequiringUniform: NO_UNIFORM, payrollRates: ZERO_RATES,
+    });
+    expect(figures.net_pay).toBe(300000);
   });
 });

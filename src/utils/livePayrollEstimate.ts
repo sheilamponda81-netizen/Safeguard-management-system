@@ -48,6 +48,16 @@ export interface EstimatedNetPayInputs {
    *  fetchSalaryAdvanceDeductionByEmployee() below -- 0/undefined means
    *  "no active advance", never "unknown". */
   salaryAdvanceDeduction?: number;
+  /** Refund-persistence hotfix (2026-11): this employee/month's saved,
+   *  active (not cancelled) payroll_refund_drafts amount, e.g. from
+   *  fetchRefundByEmployee() below -- 0/undefined means "no saved refund
+   *  draft", never "unknown". Added at the net-pay level only, exactly
+   *  like Payroll.tsx's own calculatePayroll() and
+   *  process_payroll_batch() -- never into gross_pay/paye/pension (see
+   *  supabase/migrations/20261108000000_payroll_refund_adjustments.sql's
+   *  header for why a refund of a wrongly-withheld deduction is not
+   *  taxable new income the way a bonus is). */
+  refund?: number;
 }
 
 export interface EstimatedNetPayResult {
@@ -73,9 +83,10 @@ export interface EstimatedNetPayResult {
  * payrollDashboardReportsReconciliation.test.ts for the direct proof.
  *
  * gross_pay/paye/pension are returned EXACTLY as calculateLivePayroll()
- * computed them -- only net_pay is ever adjusted by the advance
- * subtraction, so a caller can never mistake a reduced net figure for a
- * changed gross/basic-salary metric.
+ * computed them -- only net_pay is ever adjusted, by the advance
+ * subtraction and (2026-11 refund-persistence hotfix) the refund
+ * addition, so a caller can never mistake a reduced/increased net figure
+ * for a changed gross/basic-salary metric.
  *
  * Callers MUST NOT apply this to an employee whose month is already
  * PROCESSED -- a processed `payroll` row's own stored net_pay already has
@@ -96,11 +107,12 @@ export function computeEstimatedNetPay(inputs: EstimatedNetPayInputs): Estimated
     appearanceDeduction: inputs.appearanceDeduction,
   });
   const salaryAdvanceDeduction = inputs.salaryAdvanceDeduction || 0;
+  const refund = inputs.refund || 0;
   return {
     gross_pay: live.grossPay,
     paye: live.paye,
     pension: live.pension,
-    net_pay: live.netPay - salaryAdvanceDeduction,
+    net_pay: live.netPay - salaryAdvanceDeduction + refund,
   };
 }
 
@@ -181,6 +193,49 @@ export async function fetchSalaryAdvanceDeductionByEmployee(
     const combinedMonthlyDeduction = combinedPlanByEmployee.get(employeeId) || 0;
     const { total } = calculatePooledAllocation(combinedMonthlyDeduction, advances);
     if (total > 0) result.set(employeeId, total);
+  });
+
+  return result;
+}
+
+/**
+ * Refund-persistence hotfix (2026-11): this month's saved, active refund
+ * draft amount per employee -- the SAME payroll_refund_drafts table
+ * Payroll.tsx's own live preview reads (see src/pages/Payroll.tsx's
+ * getDisplayPayroll()) and process_payroll_batch() independently
+ * re-reads at actual processing time (20261108000000_payroll_refund_
+ * adjustments.sql). Reusing that one source here, rather than inventing
+ * a second read of it, is what makes Dashboard.tsx's and Reports.tsx's
+ * estimates agree with Payroll.tsx's own preview for the same
+ * unprocessed employee/month -- not merely approximate it.
+ *
+ * An employee with no active (non-cancelled, nonzero) draft is simply
+ * absent from the returned map (not present with 0) -- same convention
+ * fetchSalaryAdvanceDeductionByEmployee() above already uses; callers
+ * must treat a missing entry as 0, never as "unknown".
+ */
+export async function fetchRefundByEmployee(
+  employeeIds: string[],
+  selectedMonth: string
+): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  if (employeeIds.length === 0) return result;
+
+  const draftRows = await fetchInEmployeeIdBatches<{ employee_id: string; amount: number; status: string }>(
+    employeeIds,
+    (batch, from, to, withCount) =>
+      supabase
+        .from('payroll_refund_drafts')
+        .select('employee_id, amount, status', withCount ? { count: 'exact' } : undefined)
+        .eq('month', selectedMonth)
+        .in('employee_id', batch)
+        .range(from, to)
+  );
+
+  draftRows.forEach(row => {
+    if (row.status === 'cancelled') return;
+    const amount = Number(row.amount) || 0;
+    if (amount > 0) result.set(row.employee_id, amount);
   });
 
   return result;

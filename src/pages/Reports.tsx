@@ -14,7 +14,7 @@ import { AttendanceCount } from '../utils/payrollCalculations';
 import { toCsvRow } from '../utils/csvExport';
 import { canAccess, PERMISSIONS } from '../utils/permissions';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
-import { computeEstimatedNetPay, fetchSalaryAdvanceDeductionByEmployee } from '../utils/livePayrollEstimate';
+import { computeEstimatedNetPay, fetchSalaryAdvanceDeductionByEmployee, fetchRefundByEmployee } from '../utils/livePayrollEstimate';
 import { reconcileMonthlyPayroll, ReconciliationEmployee, StoredPayrollRow, LiveEstimateInputs } from '../utils/payrollReconciliation';
 
 type ReportType = 'employee' | 'payroll' | 'attendance' | 'recruitment' | 'department' | 'company' | 'workstation';
@@ -144,6 +144,12 @@ export function ReportsPage() {
   // Only applied to getEmployeeFigures' live-calculation fallback below,
   // never to an already-processed payroll row's own stored net_pay.
   const [salaryAdvanceByEmployee, setSalaryAdvanceByEmployee] = useState<Map<string, number>>(new Map());
+  // Refund-persistence hotfix (2026-11): this month's saved, active
+  // payroll_refund_drafts amount per employee (missing entry = no saved
+  // draft) -- see fetchRefundByEmployee()'s own header. Same source
+  // Payroll.tsx's own preview reads, applied only to the live-estimate
+  // fallback below, never to an already-processed stored net_pay.
+  const [refundByEmployee, setRefundByEmployee] = useState<Map<string, number>>(new Map());
   // Financial-reliability patch: true when the most recent fetch failed
   // partway through (attendance/rates/positions/salary-advances) -- the
   // "Total Payroll" card must show an explicit Unavailable/Retry state
@@ -213,8 +219,9 @@ export function ReportsPage() {
       lectureDeduction: deduction?.lecture_deduction,
       appearanceDeduction: deduction?.appearance_deduction,
       salaryAdvanceDeduction: salaryAdvanceByEmployee.get(emp.id),
+      refund: refundByEmployee.get(emp.id),
     });
-  }, [payrollByEmployee, deductionsByEmployee, positionsRequiringUniform, payrollRates, attendanceCountsByEmployee, salaryAdvanceByEmployee]);
+  }, [payrollByEmployee, deductionsByEmployee, positionsRequiringUniform, payrollRates, attendanceCountsByEmployee, salaryAdvanceByEmployee, refundByEmployee]);
 
   // Real attendance rate for an employee this month -- 0% (not a random
   // percentage) when no attendance has been recorded yet.
@@ -417,9 +424,10 @@ export function ReportsPage() {
       payrollRates,
       salaryAdvanceByEmployeeId: salaryAdvanceByEmployee,
       deductionsByEmployeeId: deductionsByEmployee,
+      refundByEmployeeId: refundByEmployee,
     };
     return reconcileMonthlyPayroll(isHistoricalMonth, currentPayableEmployees, storedPayrollRows, liveEstimateInputs);
-  }, [selectedMonth, systemMonth, payrollRecords, activeEmployees, attendanceCountsByEmployee, positionsRequiringUniform, payrollRates, salaryAdvanceByEmployee, deductionsByEmployee]);
+  }, [selectedMonth, systemMonth, payrollRecords, activeEmployees, attendanceCountsByEmployee, positionsRequiringUniform, payrollRates, salaryAdvanceByEmployee, deductionsByEmployee, refundByEmployee]);
 
   const payrollSummary = useMemo(() => ({
     totalGross: payrollReconciliation.totals.gross_pay,
@@ -563,6 +571,7 @@ export function ReportsPage() {
       // incorrect total" this patch exists to prevent. See
       // payrollReconciliation.ts's own header for the shared contract.
       setSalaryAdvanceByEmployee(await fetchSalaryAdvanceDeductionByEmployee(employeeIds, selectedMonth));
+      setRefundByEmployee(await fetchRefundByEmployee(employeeIds, selectedMonth));
 
       // Report-scoped RPC (see 20260817000006) -- gated by
       // reports.recruitment.view, NOT recruitment.view, so this cannot be

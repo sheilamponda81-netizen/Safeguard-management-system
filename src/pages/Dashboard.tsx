@@ -24,7 +24,7 @@ import { countRegisteredAsOf, countPendingPayrollMonths } from '../utils/dashboa
 import { getPayrollRatesStrict } from '../utils/payrollSettings';
 import { AttendanceCount } from '../utils/payrollCalculations';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
-import { fetchSalaryAdvanceDeductionByEmployee } from '../utils/livePayrollEstimate';
+import { fetchSalaryAdvanceDeductionByEmployee, fetchRefundByEmployee } from '../utils/livePayrollEstimate';
 import { reconcileMonthlyPayroll, MonthProcessingState, ReconciliationEmployee, StoredPayrollRow } from '../utils/payrollReconciliation';
 import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
 
@@ -804,7 +804,7 @@ export function Dashboard() {
             // the "plausible but incorrect total" this patch exists to
             // prevent. See payrollReconciliation.ts's own header for the
             // full contract.
-            const [payrollRates, positionsRequiringUniformMap, attendanceRpcRows, salaryAdvanceByEmployeeId] = await Promise.all([
+            const [payrollRates, positionsRequiringUniformMap, attendanceRpcRows, salaryAdvanceByEmployeeId, refundByEmployeeId] = await Promise.all([
               // Fail-closed (payroll-settings patch): getPayrollRatesStrict()
               // never silently substitutes DEFAULT_RATES on a fetch error or
               // a corrupted configured value -- unwrapped to throw here so a
@@ -837,11 +837,19 @@ export function Dashboard() {
               // now propagates (no .catch()) so it aborts this ENTIRE
               // Promise.all, exactly like the other three required inputs.
               fetchSalaryAdvanceDeductionByEmployee(employeeIds, selectedMonth),
+              // Refund-persistence hotfix (2026-11): same saved-draft source
+              // Payroll.tsx's own preview and process_payroll_batch() read --
+              // see fetchRefundByEmployee()'s own header. Included in this
+              // SAME Promise.all (not a separate, independently-failable
+              // fetch) so a failure here also aborts the whole estimate
+              // rather than silently presenting a refund-less (overstated)
+              // net pay as if it were complete.
+              fetchRefundByEmployee(employeeIds, selectedMonth),
             ]);
             const attendanceByEmployeeId = new Map<string, AttendanceCount>(
               attendanceRpcRows.map(r => [r.employee_id, { absentDays: r.absent_days, lateDays: r.late_days }])
             );
-            liveEstimateInputs = { attendanceByEmployeeId, positionsRequiringUniform: positionsRequiringUniformMap, payrollRates, salaryAdvanceByEmployeeId };
+            liveEstimateInputs = { attendanceByEmployeeId, positionsRequiringUniform: positionsRequiringUniformMap, payrollRates, salaryAdvanceByEmployeeId, refundByEmployeeId };
           } catch (estimateErr) {
             console.error('Error fetching required inputs for the payroll estimate -- reconciliation will report unavailable:', estimateErr);
             liveEstimateInputs = undefined; // reconcileMonthlyPayroll() below sets unavailable:true for the affected employees

@@ -71,6 +71,16 @@ export interface LiveEstimateInputs {
    *  entirely, not by passing an empty map here. */
   salaryAdvanceByEmployeeId: Map<string, number>;
   deductionsByEmployeeId?: Map<string, { lecture_deduction?: number; appearance_deduction?: number }>;
+  /** Refund-persistence hotfix (2026-11): this month's saved, active
+   *  payroll_refund_drafts amount per employee -- see
+   *  fetchRefundByEmployee()'s own header. A missing entry means "no
+   *  saved refund draft", never "unknown"; omitted entirely, it simply
+   *  means no refund is added to any estimate this call produces (it is
+   *  NOT part of the `unavailable` fail-closed contract above, since a
+   *  missing refund draft is financially equivalent to a draft of 0, not
+   *  to a missing attendance/rate input that would make the whole
+   *  estimate untrustworthy). */
+  refundByEmployeeId?: Map<string, number>;
 }
 
 export type MonthProcessingState = 'unprocessed' | 'partial' | 'fully_processed';
@@ -157,6 +167,7 @@ export function reconcileMonthlyPayroll(
       lectureDeduction: deduction?.lecture_deduction,
       appearanceDeduction: deduction?.appearance_deduction,
       salaryAdvanceDeduction: liveEstimateInputs.salaryAdvanceByEmployeeId.get(id),
+      refund: liveEstimateInputs.refundByEmployeeId?.get(id),
     });
     employees.push({ employeeId: id, source: 'estimated', figures });
   }
