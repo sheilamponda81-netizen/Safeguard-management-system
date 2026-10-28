@@ -113,14 +113,6 @@ export const getPayrollRates = async (): Promise<PayrollRates> => {
 // configuration -- including an explicit 0 -- must never be silently
 // replaced by a hardcoded default, while continuing to support a tenant
 // that has never touched Settings at all:
-//   - A setting with NO ROW in system_settings at all -> uses the
-//     documented historical DEFAULT_* constant for that one field. This
-//     is long-standing, intentional, pre-existing behavior (see this
-//     file's own top-of-file comment: "Default rates match what
-//     calculatePayroll previously hardcoded, so existing payroll math
-//     doesn't change until an admin actually edits these") -- NOT the bug
-//     this patch fixes, and changing it would break every tenant that has
-//     never opened the Payroll Settings tab.
 //   - A setting whose row EXISTS but whose value is not a valid number
 //     (corrupted/malformed) -> the WHOLE result is `unavailable`. This is
 //     NOT the same as "never configured" -- someone explicitly set this
@@ -133,6 +125,33 @@ export const getPayrollRates = async (): Promise<PayrollRates> => {
 //     EXACTLY 0 -- `parseFloat('0') === 0`, never NaN -- is returned
 //     verbatim. This already worked correctly before this patch; it is
 //     restated here only to make the contract explicit.
+//   - A setting with NO ROW at all -> depends on WHICH field:
+//       - PAYE/pension (payeRate, payeThreshold, pensionEmployeeRate) --
+//         the three fields with direct statutory/compliance weight, and
+//         the exact subject of the business owner's "configured to zero
+//         pending Accountant review" directive -- NEVER configured is
+//         operationally the SAME risk as "the Accountant hasn't signed
+//         off yet", not a safe case to paper over with a guess. These
+//         three now also make the WHOLE result `unavailable` when absent,
+//         correcting this file's own earlier draft of this function
+//         (which treated "never configured" as safe to default for every
+//         field uniformly -- reconsidered and narrowed during release-
+//         gate review: defaulting an UNCONFIGURED tax/pension rate to a
+//         guessed 30%/5% and silently processing real payroll against it
+//         is exactly the "silently substitute guessed rates" outcome this
+//         whole patch exists to prevent, regardless of whether the gap is
+//         a fetch failure or a setting that was simply never entered).
+//       - Every other field (uniform/absent/late/lecture/lectureFullMonth/
+//         appearance -- company-internal deduction amounts, not tax
+//         compliance figures) -> still uses the documented historical
+//         DEFAULT_* constant for that one field, exactly as before. This
+//         is long-standing, intentional, pre-existing behavior (see this
+//         file's own top-of-file comment: "Default rates match what
+//         calculatePayroll previously hardcoded, so existing payroll math
+//         doesn't change until an admin actually edits these") -- changing
+//         it would break every tenant that has never opened the Payroll
+//         Settings tab, for a set of fields with materially lower stakes
+//         than PAYE/pension.
 export interface PayrollRatesUnavailable {
   status: 'unavailable';
   /** Human-readable reason, safe to show directly in an error banner. */
@@ -157,22 +176,44 @@ export async function getPayrollRatesStrict(): Promise<PayrollRatesResult> {
     }
 
     const byKey = new Map((data || []).map(row => [row.key, row.value]));
-    let malformedKey: string | null = null;
-    const parsedOrDefault = (key: string, fallback: number): number => {
+    let problemKey: string | null = null;
+    let problemReason: 'missing' | 'malformed' | null = null;
+
+    // PAYE/pension: no row at all is ALSO unavailable, not defaulted --
+    // see this function's own header for why these three are treated
+    // differently from the other six deduction fields below.
+    const parsedRequired = (key: string): number => {
       const raw = byKey.get(key);
-      if (raw === undefined) return fallback; // genuinely never configured -- the documented historical default
+      if (raw === undefined) {
+        if (!problemKey) { problemKey = key; problemReason = 'missing'; }
+        return 0; // discarded once problemKey is set; keeps this helper's return type a plain number
+      }
       const parsed = parseFloat(raw);
       if (isNaN(parsed)) {
-        malformedKey = key; // configured, but corrupted -- never silently defaulted
-        return fallback; // discarded below once malformedKey is set; keeps this helper's return type a plain number
+        if (!problemKey) { problemKey = key; problemReason = 'malformed'; }
+        return 0;
+      }
+      return parsed;
+    };
+
+    // The remaining six deduction fields: no row at all -> the documented
+    // historical default (unchanged, backward-compatible); a row that
+    // exists but is malformed is still never silently defaulted.
+    const parsedOrDefault = (key: string, fallback: number): number => {
+      const raw = byKey.get(key);
+      if (raw === undefined) return fallback;
+      const parsed = parseFloat(raw);
+      if (isNaN(parsed)) {
+        if (!problemKey) { problemKey = key; problemReason = 'malformed'; }
+        return fallback;
       }
       return parsed;
     };
 
     const rates: PayrollRates = {
-      payeRate: parsedOrDefault(KEYS.payeRate, DEFAULT_PAYE_RATE),
-      payeThreshold: parsedOrDefault(KEYS.payeThreshold, DEFAULT_PAYE_THRESHOLD),
-      pensionEmployeeRate: parsedOrDefault(KEYS.pensionEmployeeRate, DEFAULT_PENSION_EMPLOYEE_RATE),
+      payeRate: parsedRequired(KEYS.payeRate),
+      payeThreshold: parsedRequired(KEYS.payeThreshold),
+      pensionEmployeeRate: parsedRequired(KEYS.pensionEmployeeRate),
       uniformDeduction: parsedOrDefault(KEYS.uniformDeduction, DEFAULT_UNIFORM_DEDUCTION),
       absentDeduction: parsedOrDefault(KEYS.absentDeduction, DEFAULT_ABSENT_DEDUCTION),
       lateDeduction: parsedOrDefault(KEYS.lateDeduction, DEFAULT_LATE_DEDUCTION),
@@ -181,9 +222,14 @@ export async function getPayrollRatesStrict(): Promise<PayrollRatesResult> {
       appearanceDeduction: parsedOrDefault(KEYS.appearanceDeduction, DEFAULT_APPEARANCE_DEDUCTION),
     };
 
-    if (malformedKey) {
-      console.error(`getPayrollRatesStrict: setting "${malformedKey}" exists but is not a valid number -- reporting unavailable rather than defaulting.`);
-      return { status: 'unavailable', reason: `A payroll setting ("${malformedKey}") is configured but is not a valid number. Fix it in Settings before continuing.` };
+    if (problemKey) {
+      console.error(`getPayrollRatesStrict: setting "${problemKey}" is ${problemReason} -- reporting unavailable rather than defaulting or guessing.`);
+      return {
+        status: 'unavailable',
+        reason: problemReason === 'missing'
+          ? `Payroll setting "${problemKey}" has not been configured yet. An authorized user must set it in Settings (including an explicit 0, if that is the intended rate) before payroll can be previewed or processed.`
+          : `A payroll setting ("${problemKey}") is configured but is not a valid number. Fix it in Settings before continuing.`,
+      };
     }
 
     return { status: 'ok', rates };

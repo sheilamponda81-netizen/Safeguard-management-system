@@ -34,7 +34,7 @@ describe('getPayrollRatesStrict', () => {
 
   it('1. successfully loaded, explicit zero rates -- preserved exactly, never replaced by a default', async () => {
     fromMock.mockImplementation(() => chain({
-      data: [settingsRow('paye_rate', '0'), settingsRow('pension_employee_rate', '0')],
+      data: [settingsRow('paye_rate', '0'), settingsRow('paye_threshold', '0'), settingsRow('pension_employee_rate', '0')],
       error: null,
     }));
     const result = await getPayrollRatesStrict();
@@ -47,7 +47,7 @@ describe('getPayrollRatesStrict', () => {
 
   it('2. successfully loaded, nonzero configured rates -- used exactly as configured', async () => {
     fromMock.mockImplementation(() => chain({
-      data: [settingsRow('paye_rate', '0.25'), settingsRow('pension_employee_rate', '0.03')],
+      data: [settingsRow('paye_rate', '0.25'), settingsRow('paye_threshold', '50000'), settingsRow('pension_employee_rate', '0.03')],
       error: null,
     }));
     const result = await getPayrollRatesStrict();
@@ -58,25 +58,41 @@ describe('getPayrollRatesStrict', () => {
     }
   });
 
-  it('3. missing settings (query succeeds, zero rows for any key) -- falls back to the documented historical default, same as before this patch (backward compatible for a never-configured tenant)', async () => {
+  it('3. missing settings, query succeeds with zero rows at all -- PAYE is a required field, so the WHOLE result is unavailable, never defaulted to a guessed 30%/5% (release-gate correction)', async () => {
     fromMock.mockImplementation(() => chain({ data: [], error: null }));
     const result = await getPayrollRatesStrict();
-    expect(result.status).toBe('ok');
-    if (result.status === 'ok') {
-      expect(result.rates).toEqual(DEFAULT_RATES);
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') {
+      expect(result.reason).toMatch(/paye_rate/);
+      expect(result.reason).toMatch(/has not been configured/i);
     }
   });
 
-  it('3b. ONE key missing, others configured -- only the missing one defaults; the configured ones (including an explicit 0) are untouched', async () => {
+  it('3b. PAYE/pension configured (including an explicit 0), but a non-critical deduction field (e.g. appearance_deduction) has no row -- that ONE field still defaults; PAYE/pension are untouched', async () => {
     fromMock.mockImplementation(() => chain({
-      data: [settingsRow('paye_rate', '0')], // pension_employee_rate row absent
+      data: [settingsRow('paye_rate', '0'), settingsRow('paye_threshold', '0'), settingsRow('pension_employee_rate', '0')],
+      // appearance_deduction row absent
       error: null,
     }));
     const result = await getPayrollRatesStrict();
     expect(result.status).toBe('ok');
     if (result.status === 'ok') {
       expect(result.rates.payeRate).toBe(0);
-      expect(result.rates.pensionEmployeeRate).toBe(DEFAULT_RATES.pensionEmployeeRate);
+      expect(result.rates.pensionEmployeeRate).toBe(0);
+      expect(result.rates.appearanceDeduction).toBe(DEFAULT_RATES.appearanceDeduction);
+    }
+  });
+
+  it('3c. pension_employee_rate missing while PAYE is configured -- the WHOLE result is unavailable (pension is also a required field, not just PAYE)', async () => {
+    fromMock.mockImplementation(() => chain({
+      data: [settingsRow('paye_rate', '0'), settingsRow('paye_threshold', '0')],
+      // pension_employee_rate row absent
+      error: null,
+    }));
+    const result = await getPayrollRatesStrict();
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') {
+      expect(result.reason).toMatch(/pension_employee_rate/);
     }
   });
 
@@ -111,7 +127,7 @@ describe('getPayrollRatesStrict', () => {
 
   it('5b. an explicit zero is never itself treated as malformed (parseFloat("0") is a valid number, not NaN)', async () => {
     fromMock.mockImplementation(() => chain({
-      data: [settingsRow('paye_rate', '0'), settingsRow('pension_employee_rate', '0.00')],
+      data: [settingsRow('paye_rate', '0'), settingsRow('paye_threshold', '0'), settingsRow('pension_employee_rate', '0.00')],
       error: null,
     }));
     const result = await getPayrollRatesStrict();
@@ -119,7 +135,9 @@ describe('getPayrollRatesStrict', () => {
   });
 
   it('6. stale cached values -- two independent calls never bleed into each other; a later failure is not masked by an earlier success (no hidden memoization)', async () => {
-    fromMock.mockImplementationOnce(() => chain({ data: [settingsRow('paye_rate', '0.1')], error: null }));
+    const complete = (payeRate: string) => [settingsRow('paye_rate', payeRate), settingsRow('paye_threshold', '0'), settingsRow('pension_employee_rate', '0')];
+
+    fromMock.mockImplementationOnce(() => chain({ data: complete('0.1'), error: null }));
     const first = await getPayrollRatesStrict();
     expect(first.status).toBe('ok');
 
@@ -127,7 +145,7 @@ describe('getPayrollRatesStrict', () => {
     const second = await getPayrollRatesStrict();
     expect(second.status).toBe('unavailable'); // NOT the first call's cached success
 
-    fromMock.mockImplementationOnce(() => chain({ data: [settingsRow('paye_rate', '0.2')], error: null }));
+    fromMock.mockImplementationOnce(() => chain({ data: complete('0.2'), error: null }));
     const third = await getPayrollRatesStrict();
     expect(third.status).toBe('ok');
     if (third.status === 'ok') {
@@ -141,7 +159,7 @@ describe('getPayrollRatesStrict', () => {
       call += 1;
       // Alternate results per call to prove no shared/cross-talking state.
       return call % 2 === 1
-        ? chain({ data: [settingsRow('paye_rate', '0')], error: null })
+        ? chain({ data: [settingsRow('paye_rate', '0'), settingsRow('paye_threshold', '0'), settingsRow('pension_employee_rate', '0')], error: null })
         : chain({ data: null, error: new Error('concurrent failure') });
     });
     const [a, b] = await Promise.all([getPayrollRatesStrict(), getPayrollRatesStrict()]);
