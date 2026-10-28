@@ -17,6 +17,13 @@ export interface PayslipReconciliationInput {
   uniformDeduction: number;
   salaryAdvanceDeduction: number;
   netPay: number;
+  // Refund-persistence hotfix (2026-11): defaults to 0 for full backward
+  // compatibility with every existing caller/test. Deliberately NOT part
+  // of expectedGross below -- see
+  // supabase/migrations/20261108000000_payroll_refund_adjustments.sql's
+  // header for why a refund is added at the net-pay level only, never
+  // into the taxable gross/PAYE/pension base the way bonus is.
+  refund?: number;
 }
 
 export interface PayslipReconciliationResult {
@@ -42,7 +49,7 @@ export function checkPayslipReconciliation(input: PayslipReconciliationInput): P
   const expectedGross = input.basicSalary + input.allowances + input.overtime + input.bonus;
   const grossReconciles = Math.abs(input.grossPay - expectedGross) <= TOLERANCE;
 
-  const expectedNet = input.grossPay - input.paye - input.pension - input.uniformDeduction - input.salaryAdvanceDeduction;
+  const expectedNet = input.grossPay - input.paye - input.pension - input.uniformDeduction - input.salaryAdvanceDeduction + (input.refund || 0);
   const netReconciles = Math.abs(input.netPay - expectedNet) <= TOLERANCE;
 
   return { grossReconciles, netReconciles, reconciles: grossReconciles && netReconciles };
