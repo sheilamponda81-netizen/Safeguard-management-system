@@ -1,7 +1,7 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   Users, Wallet, UserMinus, ClipboardList, CheckCircle2, TrendingUp,
-  Bell, ShieldCheck, Shield, MapPin, Banknote,
+  Bell, ShieldCheck, Shield, MapPin, Banknote, Archive,
   ChevronLeft, ChevronRight, RefreshCw, AlertCircle, Building2, Home
 } from '../utils/icons';
 import { Card, StatCard, Button, Badge, Table, THead, TBody, TR, TH, TD } from '../components/ui';
@@ -20,13 +20,13 @@ import {
 import { showNotification } from '../utils/clickHandlers';
 import { getErrorMessage } from '../utils/errorHandler';
 import { resolveDashboardPermissions, buildPendingTasks, PendingTask } from '../utils/dashboardPermissions';
-import { countRegisteredAsOf, countPendingPayrollMonths } from '../utils/dashboardMetrics';
+import { countRegisteredAsOf, countPendingPayrollMonths, computeHeadcountStats } from '../utils/dashboardMetrics';
 import { getPayrollRatesStrict } from '../utils/payrollSettings';
 import { AttendanceCount } from '../utils/payrollCalculations';
 import { PAYABLE_EMPLOYEE_STATUSES } from '../utils/employeeStatus';
 import { fetchSalaryAdvanceDeductionByEmployee, fetchRefundByEmployee } from '../utils/livePayrollEstimate';
 import { reconcileMonthlyPayroll, MonthProcessingState, ReconciliationEmployee, StoredPayrollRow } from '../utils/payrollReconciliation';
-import { fetchInEmployeeIdBatches } from '../utils/employeeBatchFetch';
+import { fetchInEmployeeIdBatches, fetchAllPages } from '../utils/employeeBatchFetch';
 
 // ===== PERFORMANCE: Lazy load charts with dynamic import =====
 const COLORS = ['#081C3A', '#D4A017', '#3B82F6', '#10B981', '#EF4444', '#8B5CF6', '#F59E0B', '#64748B', '#06B6D4'];
@@ -115,6 +115,8 @@ export function Dashboard() {
   // ===== PERFORMANCE: Data state with progressive loading =====
   const [stats, setStats] = useState({
     total: 0,
+    active: 0,
+    deleted: 0,
     activeGuards: 0,
     supervisorsOnDuty: 0,
     sitesCount: 0,
@@ -403,17 +405,31 @@ export function Dashboard() {
       // "latest addition" under created_at ordering even though they
       // joined the workforce months ago. `nullsFirst: false` keeps a row
       // with no hire_date at all from wrongly sorting to the very top.
-      let employeesQuery = supabase
-        .from('employees_general')
-        .select('*')
-        .eq('is_deleted', false)
-        .order('hire_date', { ascending: false, nullsFirst: false });
-      
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
-      }
-      
-      const employeesRes = await employeesQuery;
+      // HOTFIX (same production visibility bug as Employees.tsx -- see
+      // PR #49): this used to be a single unpaginated `.select('*')`
+      // request, silently truncated at PostgREST's server-side max-rows
+      // cap once the tenant's employee population passed it. Every stat
+      // on this page derived from `employeesData` below (total headcount,
+      // active guards/supervisors, on-leave count, department pie chart,
+      // recent-hires list, and the live payroll-estimate population
+      // further down) was therefore silently computed over an incomplete,
+      // hire-date-biased subset. `fetchAllPages()` pages via `.range()`
+      // until the server's own exact count is fully met -- see
+      // src/utils/employeeBatchFetch.ts.
+      const employeesFull = await fetchAllPages<any>((rangeFrom, rangeTo, withExactCount) => {
+        let q = withExactCount
+          ? supabase.from('employees_general').select('*', { count: 'exact' })
+          : supabase.from('employees_general').select('*');
+        q = q.eq('is_deleted', false);
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          q = q.eq('region_id', userProfile.region_id);
+        }
+        // `id` is an explicit tiebreaker alongside `hire_date`: `.range()`
+        // pagination over a non-unique sort key can skip or repeat rows
+        // across page boundaries whenever two employees share a hire_date
+        // (including two NULLs).
+        return q.order('hire_date', { ascending: false, nullsFirst: false }).order('id').range(rangeFrom, rangeTo);
+      });
 
       // ===== Employee Growth history source -- deliberately a SEPARATE,
       // unfiltered-by-is_deleted fetch, not derived from `employeesData`
@@ -441,14 +457,21 @@ export function Dashboard() {
       // by reading employees_general's own definition) -- soft-deleted
       // rows are deliberately included too, since they were still real
       // registrations. Only `hire_date`/`region_id` are selected.
-      let growthHistoryQuery = supabase
-        .from('employees_general')
-        .select('hire_date, region_id');
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        growthHistoryQuery = growthHistoryQuery.eq('region_id', userProfile.region_id);
-      }
-      const growthHistoryRes = await growthHistoryQuery;
-      const growthHistoryEmployees = growthHistoryRes.data || [];
+      // Same unpaginated-request truncation risk as `employeesFull` above
+      // -- paged via `fetchAllPages()` so the Employee Growth chart's
+      // cumulative-registrations count can't silently understate history
+      // once the tenant's population passes the server's row cap.
+      const growthHistoryEmployees = await fetchAllPages<{ hire_date: string | null; region_id: string | null; id: string }>(
+        (rangeFrom, rangeTo, withExactCount) => {
+          let q = withExactCount
+            ? supabase.from('employees_general').select('hire_date, region_id, id', { count: 'exact' })
+            : supabase.from('employees_general').select('hire_date, region_id, id');
+          if (!userProfile?.is_super_admin && userProfile?.region_id) {
+            q = q.eq('region_id', userProfile.region_id);
+          }
+          return q.order('id').range(rangeFrom, rangeTo);
+        }
+      );
 
       // Applicant counts come from a counts-only RPC, not a direct
       // `applicants` SELECT -- Supervisor/Staff (role_level 3/4) are
@@ -495,14 +518,25 @@ export function Dashboard() {
       // without security_personnel.view never even issues this request.
       let licenseStatusRows: { license_status: string | null }[] = [];
       if (canViewSecurity) {
-        let licenseQuery = supabase
-          .from('employees_security')
-          .select('license_status')
-          .eq('is_deleted', false);
-        if (!userProfile?.is_super_admin && userProfile?.region_id) {
-          licenseQuery = licenseQuery.eq('region_id', userProfile.region_id);
+        // Same unpaginated-request truncation risk as the fetches above.
+        let licenseRes: { data: { license_status: string | null; id: string }[] | null; error: any };
+        try {
+          const rows = await fetchAllPages<{ license_status: string | null; id: string }>(
+            (rangeFrom, rangeTo, withExactCount) => {
+              let q = withExactCount
+                ? supabase.from('employees_security').select('license_status, id', { count: 'exact' })
+                : supabase.from('employees_security').select('license_status, id');
+              q = q.eq('is_deleted', false);
+              if (!userProfile?.is_super_admin && userProfile?.region_id) {
+                q = q.eq('region_id', userProfile.region_id);
+              }
+              return q.order('id').range(rangeFrom, rangeTo);
+            }
+          );
+          licenseRes = { data: rows, error: null };
+        } catch (licenseErr) {
+          licenseRes = { data: null, error: licenseErr };
         }
-        const licenseRes = await licenseQuery;
         if (licenseRes.error) {
           // Fails closed to zero, matching the applicant-counts RPC pattern
           // above -- a transient error must degrade this one stat, not the
@@ -514,25 +548,12 @@ export function Dashboard() {
         }
       }
 
-      const employeesData = employeesRes.data || [];
+      const employeesData = employeesFull;
       const employeeIds = employeesData.map((e: any) => e.id);
 
       // ===== ACCURATE STATS CALCULATIONS =====
-      const activeGuards = employeesData.filter((e: any) => 
-        (e.position?.toLowerCase().includes('guard') || 
-         e.position?.toLowerCase().includes('security') ||
-         e.position?.toLowerCase().includes('officer') ||
-         e.position?.toLowerCase().includes('patrol')) && 
-        e.status === 'Active'
-      ).length;
-      
-      const supervisorsOnDuty = employeesData.filter((e: any) => 
-        (e.position?.toLowerCase().includes('supervisor') || 
-         e.position?.toLowerCase().includes('manager') ||
-         e.position?.toLowerCase().includes('lead')) && 
-        e.status === 'Active'
-      ).length;
-      
+      const { active, onLeave, activeGuards, supervisorsOnDuty } = computeHeadcountStats(employeesData);
+
       const uniqueSites = [...new Set(employeesData.map((e: any) => e.workstation).filter(Boolean))];
       
       // ===== COUNT COMPANIES AND RESIDENTS =====
@@ -560,7 +581,32 @@ export function Dashboard() {
       // Monthly Payroll Trend chart below it calls the same real figure.
       const totalPayroll = 0;
 
-      const onLeave = employeesData.filter((e: any) => e.status === 'On Leave').length;
+      // `active`/`onLeave` are already computed above via
+      // computeHeadcountStats(). `deleted`: a separate, lightweight exact
+      // head-count (no rows fetched) against the same tenant/region scope
+      // -- `employeesData` above is already filtered to is_deleted=false,
+      // so it can never answer this on its own, and re-fetching every
+      // deleted row's full columns just to count them would be wasted
+      // bandwidth for a number nothing else on this page needs.
+      let deletedCount = 0;
+      {
+        let deletedCountQuery = supabase
+          .from('employees_general')
+          .select('id', { count: 'exact', head: true })
+          .eq('is_deleted', true);
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          deletedCountQuery = deletedCountQuery.eq('region_id', userProfile.region_id);
+        }
+        const { count: deletedCountResult, error: deletedCountError } = await deletedCountQuery;
+        if (deletedCountError) {
+          // Fails closed to zero, matching the applicant-counts/license
+          // pattern above -- a transient error must degrade this one stat,
+          // not the whole Dashboard.
+          console.error('Error fetching deleted employee count:', deletedCountError);
+        } else {
+          deletedCount = deletedCountResult || 0;
+        }
+      }
       
       // ===== ATTENDANCE — fetched ONCE for the full 6-month chart window,
       // then BOTH the current-month attendance rate AND the 6-month chart
@@ -640,6 +686,8 @@ export function Dashboard() {
 
       setStats({
         total: employeesData.length,
+        active,
+        deleted: deletedCount,
         activeGuards,
         supervisorsOnDuty,
         sitesCount: uniqueSites.length,
@@ -1227,6 +1275,7 @@ export function Dashboard() {
       {/* Stats Cards - Load immediately, no chart dependencies */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard title="Total Employees" value={String(stats.total)} icon={Users} accent="navy" sub={`${stats.activeGuards} Active Guards`} />
+        <StatCard title="Active" value={String(stats.active)} icon={CheckCircle2} accent="green" sub="Status = Active" />
         {canViewPayroll && (
           payrollCardLoading ? (
             // A new fetch (e.g. the user just changed months) is in
@@ -1275,6 +1324,7 @@ export function Dashboard() {
           )
         )}
         <StatCard title="On Leave" value={String(stats.onLeave)} icon={UserMinus} accent="red" sub="Currently on leave" />
+        <StatCard title="Deleted" value={String(stats.deleted)} icon={Archive} accent="red" sub="Soft-deleted, records preserved" />
         {canViewRecruitment && (
           <StatCard title="Pending Recruitment" value={String(stats.pendingRecruitment)} icon={ClipboardList} accent="blue" sub={`${stats.shortlistedRecruitment} shortlisted, ${stats.interviewedRecruitment} interviewed`} />
         )}

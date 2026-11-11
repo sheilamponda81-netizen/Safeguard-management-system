@@ -28,6 +28,65 @@ export function countRegisteredAsOf(employees: EmployeeRegistrationRecord[], mon
   return employees.filter(e => !!e.hire_date && e.hire_date <= monthEnd).length;
 }
 
+export interface HeadcountEmployee {
+  position: string | null;
+  status: string | null;
+}
+
+export interface HeadcountStats {
+  active: number;
+  onLeave: number;
+  activeGuards: number;
+  supervisorsOnDuty: number;
+}
+
+// Pure headcount breakdown over an ALREADY-FETCHED, already is_deleted=false
+// (and, for a non-super-admin, already region-scoped) employee population --
+// Dashboard.tsx is responsible for fetching that complete population (via
+// fetchAllPages(), which pages past Supabase/PostgREST's server-side
+// max-rows cap -- see employeeBatchFetch.ts) before calling this. Extracted
+// so the category math itself (which this repo's production incident
+// showed matters at exactly this scale: a 1,580-employee tenant whose
+// Dashboard previously showed 1,000) is unit-testable without a component
+// test harness. Mirrors Dashboard.tsx's own pre-extraction filter logic
+// exactly: `activeGuards`/`supervisorsOnDuty` are a loose, case-insensitive
+// substring match against free-text `position`, matching Active status
+// only -- not a lookup against the `positions` table -- and every category
+// here is evaluated independently (an employee matching none of them still
+// counts once in the population `total` the caller already has as
+// `employees.length`).
+export function computeHeadcountStats(employees: HeadcountEmployee[]): HeadcountStats {
+  let active = 0;
+  let onLeave = 0;
+  let activeGuards = 0;
+  let supervisorsOnDuty = 0;
+
+  for (const e of employees) {
+    const isActive = e.status === 'Active';
+    if (isActive) active++;
+    if (e.status === 'On Leave') onLeave++;
+
+    const position = e.position?.toLowerCase() || '';
+    if (isActive && (
+      position.includes('guard') ||
+      position.includes('security') ||
+      position.includes('officer') ||
+      position.includes('patrol')
+    )) {
+      activeGuards++;
+    }
+    if (isActive && (
+      position.includes('supervisor') ||
+      position.includes('manager') ||
+      position.includes('lead')
+    )) {
+      supervisorsOnDuty++;
+    }
+  }
+
+  return { active, onLeave, activeGuards, supervisorsOnDuty };
+}
+
 export interface PayrollRecordForApproval {
   month: string;
   approval_status: string;

@@ -30,7 +30,7 @@ import {
   processApprovedPayrollRequest,
   PayrollProcessingRequest,
 } from '../utils/payrollApprovalWorkflow';
-import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
+import { fetchInEmployeeIdBatches, dedupeById, fetchAllPages } from '../utils/employeeBatchFetch';
 import { approvePayrollRun } from '../utils/payrollApproval';
 import { buildPayrollReportCsv } from '../utils/payrollExport';
 import { AttendanceCount, deriveAttendanceCountsState, isPreviewBlocked, hasAnyBlockedPreview } from '../utils/payrollAttendanceCounts';
@@ -451,13 +451,19 @@ export function PayrollPage() {
       // regions' processing status, not this admin's own region.
       let employeeIds: string[] | null = null;
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        const { data: regionEmployees, error: empError } = await supabase
-          .from('employees')
-          .select('id')
-          .eq('region_id', userProfile.region_id)
-          .eq('is_deleted', false);
-        if (empError) throw empError;
-        employeeIds = (regionEmployees || []).map(e => e.id);
+        // Paged via fetchAllPages() -- same unpaginated-request truncation
+        // risk as every other direct employee fetch on this page.
+        const regionEmployees = await fetchAllPages<{ id: string }>((rangeFrom, rangeTo, withExactCount) => {
+          const q = withExactCount
+            ? supabase.from('employees').select('id', { count: 'exact' })
+            : supabase.from('employees').select('id');
+          return q
+            .eq('region_id', userProfile.region_id)
+            .eq('is_deleted', false)
+            .order('id')
+            .range(rangeFrom, rangeTo);
+        });
+        employeeIds = regionEmployees.map(e => e.id);
         if (employeeIds.length === 0) {
           setProcessedMonths([]);
           return;
@@ -574,11 +580,17 @@ export function PayrollPage() {
         // the database. This entire branch is read-only -- no UPDATE/
         // INSERT/DELETE happens anywhere on this path -- so viewing a past
         // month can never reprocess, recalculate, or mutate it.
-        const { data: rawHistoricalPayroll, error: payrollError } = await supabase
-          .from('payroll')
-          .select('*')
-          .eq('month', selectedMonth);
-        if (payrollError) throw payrollError;
+        // Paged via fetchAllPages() -- a single unpaginated `.select('*')`
+        // would otherwise be silently truncated at PostgREST's server-side
+        // max-rows cap once a month's processed payroll run passes it
+        // (1,399 payable employees today), hiding real stored rows from
+        // view with no error. Purely a read -- never writes to `payroll`.
+        const rawHistoricalPayroll = await fetchAllPages<PayrollRecord>((rangeFrom, rangeTo, withExactCount) => {
+          const q = withExactCount
+            ? supabase.from('payroll').select('*', { count: 'exact' })
+            : supabase.from('payroll').select('*');
+          return q.eq('month', selectedMonth).order('id').range(rangeFrom, rangeTo);
+        });
 
         const allHistoricalPayroll = dedupeById(rawHistoricalPayroll || []);
         const historicalEmployeeIds = [...new Set(allHistoricalPayroll.map(r => r.employee_id))];
@@ -629,19 +641,21 @@ export function PayrollPage() {
         // start including a future/other non-payable status (e.g.
         // "Suspended") the moment it's added to the employees table --
         // see src/utils/employeeStatus.ts.
-        let employeesQuery = supabase
-          .from('employees')
-          .select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id, company, workstation')
-          .eq('is_deleted', false)
-          .in('status', PAYABLE_EMPLOYEE_STATUSES);
-
-        if (!userProfile?.is_super_admin && userProfile?.region_id) {
-          employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
-        }
-
-        const { data: rosterData, error: empError } = await employeesQuery;
-        if (empError) throw empError;
-        employeesData = rosterData || [];
+        // Paged via fetchAllPages() -- same unpaginated-request truncation
+        // risk as the historical branch above: once the payable roster
+        // passes the server's row cap, this used to silently drop
+        // employees from the live preview/process-payroll population.
+        const rosterData = await fetchAllPages<Employee>((rangeFrom, rangeTo, withExactCount) => {
+          let q = withExactCount
+            ? supabase.from('employees').select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id, company, workstation', { count: 'exact' })
+            : supabase.from('employees').select('id, employee_number, full_name, position, department, basic_salary, status, is_deleted, uniform_deduction, region_id, company, workstation');
+          q = q.eq('is_deleted', false).in('status', PAYABLE_EMPLOYEE_STATUSES);
+          if (!userProfile?.is_super_admin && userProfile?.region_id) {
+            q = q.eq('region_id', userProfile.region_id);
+          }
+          return q.order('id').range(rangeFrom, rangeTo);
+        });
+        employeesData = rosterData;
       }
 
       setEmployees(employeesData);

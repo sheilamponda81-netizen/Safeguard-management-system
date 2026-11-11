@@ -1,7 +1,98 @@
 import { describe, it, expect } from 'vitest';
-import { countRegisteredAsOf, countPendingPayrollMonths, estimateMonthlyPayrollTotal } from './dashboardMetrics';
+import { countRegisteredAsOf, countPendingPayrollMonths, estimateMonthlyPayrollTotal, computeHeadcountStats, HeadcountEmployee } from './dashboardMetrics';
 import { DEFAULT_RATES } from './payrollSettings';
 import { AttendanceCount } from './payrollCalculations';
+
+// Regression coverage for the Dashboard production incident: "Total
+// Employees" (and every other headcount stat derived from the same
+// fetch -- On Leave, Active Guards, Active Supervisors) was computed from
+// an unpaginated `employees_general` fetch that Supabase/PostgREST
+// silently truncated at 1,000 rows once the tenant's population passed it
+// -- confirmed in production at exactly this scale: 1,580 total employees,
+// 1,399 Active/On Leave, Dashboard showing 1,000. Dashboard.tsx now fetches
+// the complete population via fetchAllPages() (see
+// employeeBatchFetch.test.ts for that fix's own regression coverage) before
+// calling computeHeadcountStats() -- these tests cover the CATEGORY MATH
+// itself at and beyond that same scale, independent of how the data was
+// fetched.
+describe('computeHeadcountStats', () => {
+  it('reconciles to the exact production baseline: 1,399 Active/On Leave (1,224 Active + 175 On Leave) within a 1,580-employee population, never capped at 1,000', () => {
+    const employees: HeadcountEmployee[] = [
+      ...Array.from({ length: 1224 }, () => ({ position: 'Guard', status: 'Active' })),
+      ...Array.from({ length: 175 }, () => ({ position: 'Guard', status: 'On Leave' })),
+      // The remaining 181 are deleted in production and never reach this
+      // function at all (Dashboard.tsx fetches employees_general with
+      // is_deleted=false) -- not represented here, since
+      // computeHeadcountStats has no is_deleted concept of its own.
+    ];
+    const stats = computeHeadcountStats(employees);
+    expect(employees.length).toBe(1399); // past the old 1,000-row cap
+    expect(stats.active).toBe(1224);
+    expect(stats.onLeave).toBe(175);
+    expect(stats.active + stats.onLeave).toBe(1399);
+  });
+
+  it('a 1,580-employee population (the exact production row count) is fully reconciled by status, with every category counted past the old 1,000-row cap', () => {
+    const employees: HeadcountEmployee[] = [
+      ...Array.from({ length: 1224 }, (_, i) => ({ position: i % 2 === 0 ? 'Guard' : 'Supervisor', status: 'Active' })),
+      ...Array.from({ length: 175 }, () => ({ position: 'Guard', status: 'On Leave' })),
+      ...Array.from({ length: 181 }, () => ({ position: 'Guard', status: 'Deleted' })), // mirrors is_deleted=true rows if ever passed in
+    ];
+    expect(employees.length).toBe(1580);
+    const stats = computeHeadcountStats(employees);
+    expect(stats.active).toBe(1224);
+    expect(stats.onLeave).toBe(175);
+    // 'Deleted' status rows count toward neither active nor on-leave --
+    // confirms deleted employees are never silently counted as payable/
+    // active even if a caller ever passed them in.
+    expect(stats.active + stats.onLeave).toBe(1399);
+    expect(stats.activeGuards + stats.supervisorsOnDuty).toBe(1224); // every Active row matches exactly one of the two position buckets here
+  });
+
+  it('activeGuards/supervisorsOnDuty only count status === "Active", never On Leave or Deleted, even with a matching position', () => {
+    const employees: HeadcountEmployee[] = [
+      { position: 'Senior Guard', status: 'Active' },
+      { position: 'Senior Guard', status: 'On Leave' },
+      { position: 'Senior Guard', status: 'Deleted' },
+      { position: 'Site Supervisor', status: 'Active' },
+      { position: 'Site Supervisor', status: 'On Leave' },
+    ];
+    const stats = computeHeadcountStats(employees);
+    expect(stats.activeGuards).toBe(1);
+    expect(stats.supervisorsOnDuty).toBe(1);
+    expect(stats.active).toBe(2);
+    expect(stats.onLeave).toBe(2);
+  });
+
+  it('position matching is case-insensitive substring matching, consistent with Dashboard.tsx\'s pre-extraction logic', () => {
+    const employees: HeadcountEmployee[] = [
+      { position: 'DOG HANDLER', status: 'Active' }, // no match (doesn't contain guard/security/officer/patrol)
+      { position: 'SITE COMMANDER', status: 'Active' }, // no match
+      { position: 'Security Officer', status: 'Active' }, // matches both 'security' and 'officer'
+      { position: 'night patrol', status: 'Active' },
+      { position: 'OPERATIONS MANAGER', status: 'Active' },
+    ];
+    const stats = computeHeadcountStats(employees);
+    expect(stats.activeGuards).toBe(2); // Security Officer, night patrol
+    expect(stats.supervisorsOnDuty).toBe(1); // OPERATIONS MANAGER
+  });
+
+  it('a null/missing position never throws and matches no category', () => {
+    const employees: HeadcountEmployee[] = [
+      { position: null, status: 'Active' },
+      { position: '', status: 'Active' },
+    ];
+    expect(() => computeHeadcountStats(employees)).not.toThrow();
+    const stats = computeHeadcountStats(employees);
+    expect(stats.activeGuards).toBe(0);
+    expect(stats.supervisorsOnDuty).toBe(0);
+    expect(stats.active).toBe(2);
+  });
+
+  it('an empty population returns all-zero stats', () => {
+    expect(computeHeadcountStats([])).toEqual({ active: 0, onLeave: 0, activeGuards: 0, supervisorsOnDuty: 0 });
+  });
+});
 
 // Regression coverage for the real semantic finding: the Employee Growth
 // chart cannot prove real historical ACTIVE headcount at all, because there
