@@ -18,6 +18,7 @@ import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
 import { checkEmployeeIdentifierConflicts, formatIdentifierConflictMessage, identifierColumnFromUniqueViolation } from '../utils/employeeConflicts';
 import { validateEmployeeForm, resolveEmployeeFormRegionId, resolveEmployeeUpdateRegionId } from '../utils/employeeFormValidation';
+import { fetchAllPages } from '../utils/employeeBatchFetch';
 
 interface Employee {
   id: string;
@@ -426,23 +427,45 @@ export function EmployeesPage() {
       // employees_general: non-sensitive employee read surface (Design B2) --
       // confirmed the Employees module never references any guard/security-
       // only column.
-      let query = supabase.from('employees_general').select('*');
-      
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        query = query.eq('region_id', userProfile.region_id);
-      }
-      
-      if (filterRegionId && userProfile?.is_super_admin) {
-        query = query.eq('region_id', filterRegionId);
-      }
-      if (debouncedFilterCompany) query = query.ilike('company', `%${debouncedFilterCompany}%`);
-      if (debouncedFilterWorkstation) query = query.ilike('workstation', `%${debouncedFilterWorkstation}%`);
-      if (filterPayPoint) query = query.eq('pay_point', filterPayPoint);
-      
-      const { data, error } = await query.order('full_name');
-      if (error) throw error;
-      
-      const mappedEmployees = (data || []).map((emp: EmployeeRow) => ({
+      //
+      // PRODUCTION HOTFIX (employee visibility): this used to be a single
+      // unpaginated `.select('*')` request. PostgREST/Supabase applies a
+      // server-side max-rows cap to any request that doesn't explicitly
+      // page with `.range()` -- with the tenant's employee population now
+      // past that cap, the single request was silently truncated to the
+      // first page (in `full_name` order), so employees sorting after the
+      // cutoff never reached `employees` state at all. Both the summary
+      // counts and the search box (which filter this in-memory array, not
+      // the database -- see the `filtered`/`activeEmployees` useMemo above)
+      // silently excluded those employees with no error. Paging with
+      // `fetchAllPages()` (src/utils/employeeBatchFetch.ts -- the same
+      // anti-truncation core `fetchInEmployeeIdBatches` already uses
+      // elsewhere in this codebase) until the complete matching set is
+      // fetched fixes this without changing any filtering, search, or RLS
+      // behavior.
+      const allRows = await fetchAllPages<EmployeeRow>((rangeFrom, rangeTo, withExactCount) => {
+        let q = withExactCount
+          ? supabase.from('employees_general').select('*', { count: 'exact' })
+          : supabase.from('employees_general').select('*');
+
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          q = q.eq('region_id', userProfile.region_id);
+        }
+        if (filterRegionId && userProfile?.is_super_admin) {
+          q = q.eq('region_id', filterRegionId);
+        }
+        if (debouncedFilterCompany) q = q.ilike('company', `%${debouncedFilterCompany}%`);
+        if (debouncedFilterWorkstation) q = q.ilike('workstation', `%${debouncedFilterWorkstation}%`);
+        if (filterPayPoint) q = q.eq('pay_point', filterPayPoint);
+
+        // `id` is an explicit tiebreaker alongside the existing `full_name`
+        // sort: `.range()` pagination over a non-unique sort key can skip
+        // or repeat rows across page boundaries whenever two employees
+        // share the same full_name.
+        return q.order('full_name').order('id').range(rangeFrom, rangeTo);
+      });
+
+      const mappedEmployees = allRows.map((emp: EmployeeRow) => ({
         id: emp.id,
         employeeNumber: emp.employee_number,
         fullName: emp.full_name,
