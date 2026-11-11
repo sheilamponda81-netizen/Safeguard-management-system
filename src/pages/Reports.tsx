@@ -3,6 +3,7 @@ import { FileDown, FileSpreadsheet, Users, DollarSign, Calendar, UserCheck, Buil
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
+import { fetchAllPages } from '../utils/employeeBatchFetch';
 import { getCurrentProfile } from '../utils/currentProfile';
 import { getAvailableMonthsFromSystem, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
@@ -466,30 +467,39 @@ export function ReportsPage() {
       // CRITICAL: Exclude deleted employees
       // employees_general: non-sensitive employee read surface (Design B2) --
       // confirmed no report tab references any guard/security-only column.
-      let employeesQuery = supabase
-        .from('employees_general')
-        .select('*')
-        .eq('is_deleted', false);
-      
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
-      }
-      
-      const { data: employeesData, error: empError } = await employeesQuery;
-      if (empError) throw empError;
-      setEmployees(employeesData || []);
-      
-      let payrollQuery = supabase.from('payroll').select('*').eq('month', selectedMonth);
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        const employeeIds = (employeesData || []).map(e => e.id);
-        if (employeeIds.length > 0) {
-          payrollQuery = payrollQuery.in('employee_id', employeeIds);
+      // Paged via fetchAllPages() -- same unpaginated-request truncation
+      // risk as Employees.tsx/Dashboard.tsx/Payroll.tsx: a single
+      // unpaginated `.select('*')` is silently truncated at PostgREST's
+      // server-side max-rows cap once the tenant's population passes it,
+      // and every figure this report computes (financials, department/
+      // workstation rollups, attendance-derived deductions) derives from
+      // `employeesData` below.
+      const employeesData = await fetchAllPages<Employee>((rangeFrom, rangeTo, withExactCount) => {
+        let q = withExactCount
+          ? supabase.from('employees_general').select('*', { count: 'exact' })
+          : supabase.from('employees_general').select('*');
+        q = q.eq('is_deleted', false);
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          q = q.eq('region_id', userProfile.region_id);
         }
-      }
-      
-      const { data: payrollData, error: payError } = await payrollQuery;
-      if (payError) throw payError;
-      setPayrollRecords(payrollData || []);
+        return q.order('id').range(rangeFrom, rangeTo);
+      });
+      setEmployees(employeesData);
+
+      // Same truncation risk on `payroll` itself: a month with 1,000+
+      // processed rows would otherwise be silently cut off.
+      const employeeIds = employeesData.map(e => e.id);
+      const payrollData = await fetchAllPages<PayrollRecord>((rangeFrom, rangeTo, withExactCount) => {
+        let q = withExactCount
+          ? supabase.from('payroll').select('*', { count: 'exact' })
+          : supabase.from('payroll').select('*');
+        q = q.eq('month', selectedMonth);
+        if (!userProfile?.is_super_admin && userProfile?.region_id && employeeIds.length > 0) {
+          q = q.in('employee_id', employeeIds);
+        }
+        return q.order('id').range(rangeFrom, rangeTo);
+      });
+      setPayrollRecords(payrollData);
 
       // ===== Real payroll rates, uniform eligibility, attendance, and
       // lecture/appearance deductions -- so any employee without a processed
@@ -513,8 +523,6 @@ export function ReportsPage() {
       setPositionsRequiringUniform(
         new Map((positionsData || []).map(p => [p.name, p.requires_uniform !== false]))
       );
-
-      const employeeIds = (employeesData || []).map(e => e.id);
 
       const deductionCounts = new Map<string, AttendanceCount>();
       const rateStats = new Map<string, { present: number; total: number }>();
