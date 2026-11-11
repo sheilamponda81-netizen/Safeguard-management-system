@@ -65,24 +65,43 @@ export type BatchQueryBuilder<T> = (
   withExactCount: boolean
 ) => PromiseLike<BatchPageResult<T>>;
 
-async function fetchOneBatch<T>(
-  batch: string[],
-  buildQuery: BatchQueryBuilder<T>,
-  pageSize: number
+// Same shape as `BatchQueryBuilder` minus the id-batch argument -- for a
+// caller paginating ONE filtered query over its entire matching result set
+// (no id-list batching involved), e.g. a page listing every row a tenant/
+// region is allowed to see.
+export type PageQueryBuilder<T> = (
+  rangeFrom: number,
+  rangeTo: number,
+  withExactCount: boolean
+) => PromiseLike<BatchPageResult<T>>;
+
+// Pages through `buildQuery` via `.range()` until the server's own exact
+// count (taken once, from the first page) is fully met, concatenating every
+// page's rows. This is the shared anti-truncation core both
+// `fetchInEmployeeIdBatches` (below, scoped to one id-batch at a time) and
+// any single-query caller (via the exported wrapper below it) rely on: a
+// request that doesn't page with `.range()` is silently capped at
+// PostgREST's server-side max-rows setting, and advancing by the ACTUAL
+// number of rows a page returned (not the requested `pageSize`) means that
+// cap can never cause a silently incomplete result even if it's lower than
+// `pageSize`.
+export async function fetchAllPages<T>(
+  buildQuery: PageQueryBuilder<T>,
+  pageSize: number = DEFAULT_PAGE_SIZE
 ): Promise<T[]> {
   const records: T[] = [];
   let offset = 0;
   // Unknown until the first page's exact count comes back. Using this
-  // (rather than "did the last page come back full") to decide when a
-  // batch is exhausted means raising `pageSize` can never silently drop
+  // (rather than "did the last page come back full") to decide when the
+  // fetch is exhausted means raising `pageSize` can never silently drop
   // rows: even if a server-side cap returns fewer rows than requested for
-  // some page, the loop still knows the batch's TRUE total from the first
-  // page's exact count and keeps paging until it's actually met.
+  // some page, the loop still knows the TRUE total from the first page's
+  // exact count and keeps paging until it's actually met.
   let total = Infinity;
 
   while (offset < total) {
     const wantCount = total === Infinity;
-    const { data, error, count } = await buildQuery(batch, offset, offset + pageSize - 1, wantCount);
+    const { data, error, count } = await buildQuery(offset, offset + pageSize - 1, wantCount);
     if (error) throw error;
 
     const page = data || [];
@@ -91,16 +110,16 @@ async function fetchOneBatch<T>(
     }
 
     if (page.length === 0) {
-      // A legitimately empty batch (total === 0, e.g. no rows match at all)
-      // ends up here too on its first and only iteration -- `offset < total`
-      // is false in that case (0 < 0), so it's treated as a normal, expected
-      // end of data below. Only throw when the known true total says more
-      // rows genuinely exist at this offset but the server just returned
-      // none -- silently stopping in THAT case would hand back an
+      // A legitimately empty result (total === 0, e.g. no rows match at
+      // all) ends up here too on its first and only iteration -- `offset <
+      // total` is false in that case (0 < 0), so it's treated as a normal,
+      // expected end of data below. Only throw when the known true total
+      // says more rows genuinely exist at this offset but the server just
+      // returned none -- silently stopping in THAT case would hand back an
       // incomplete result with no indication anything went wrong.
       if (offset < total) {
         throw new Error(
-          `fetchInEmployeeIdBatches: expected more rows at offset ${offset} (known total ${total}) but the server returned none`
+          `fetchAllPages: expected more rows at offset ${offset} (known total ${total}) but the server returned none`
         );
       }
       break;
@@ -120,6 +139,17 @@ async function fetchOneBatch<T>(
   }
 
   return records;
+}
+
+function fetchOneBatch<T>(
+  batch: string[],
+  buildQuery: BatchQueryBuilder<T>,
+  pageSize: number
+): Promise<T[]> {
+  return fetchAllPages<T>(
+    (rangeFrom, rangeTo, withExactCount) => buildQuery(batch, rangeFrom, rangeTo, withExactCount),
+    pageSize
+  );
 }
 
 // Runs `buildQuery` once per employee-id batch (batches of `employeeBatchSize`

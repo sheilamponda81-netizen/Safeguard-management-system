@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { fetchInEmployeeIdBatches, dedupeById, BatchQueryBuilder } from './employeeBatchFetch';
+import { fetchInEmployeeIdBatches, dedupeById, fetchAllPages, BatchQueryBuilder, PageQueryBuilder } from './employeeBatchFetch';
 
 // Regression coverage for the giant-URL fix applied to TerminalDues.tsx,
 // SalaryAdvances.tsx, and (this pass) Payroll.tsx's own salary-advance
@@ -208,6 +208,76 @@ describe('fetchInEmployeeIdBatches', () => {
     await expect(fetchInEmployeeIdBatches(ids, buildQuery, { concurrency: 1 })).rejects.toThrow(
       'simulated PostgREST failure'
     );
+  });
+});
+
+describe('fetchAllPages', () => {
+  // Regression coverage for the Employees page production bug: a single
+  // unpaginated `.select('*')` request against `employees_general` was
+  // silently truncated at PostgREST's server-side max-rows cap once the
+  // tenant's employee population passed it, dropping every employee sorted
+  // after the cutoff (confirmed in production: a 1,580-row table, capped at
+  // 1,000, truncated the Employees page to showing only 885 active/on-leave
+  // employees and made search unable to find anyone past the cutoff).
+  // fetchEmployees() in src/pages/Employees.tsx now builds its query
+  // through this helper instead of a single unpaginated request.
+
+  it('a result set past a 1,000-row server cap is fetched in full, not silently truncated to the first page', async () => {
+    const TOTAL = 1580; // matches the production row count that exposed the bug
+    const SERVER_CAP = 1000; // PostgREST's own server-side max-rows cap
+    let queryCallCount = 0;
+    const buildQuery: PageQueryBuilder<{ id: number }> = async (from, to, withExactCount) => {
+      queryCallCount++;
+      const cappedTo = Math.min(to, from + SERVER_CAP - 1, TOTAL - 1);
+      const page = Array.from({ length: Math.max(0, cappedTo - from + 1) }, (_, i) => ({ id: from + i }));
+      return { data: page, error: null, count: withExactCount ? TOTAL : null };
+    };
+    const result = await fetchAllPages(buildQuery);
+    expect(result).toHaveLength(TOTAL);
+    expect(result.map(r => r.id)).toEqual(Array.from({ length: TOTAL }, (_, i) => i));
+    expect(queryCallCount).toBeGreaterThan(1);
+  });
+
+  it('requests an exact count only on the first page, never repeating it on later pages', async () => {
+    const TOTAL = 2500;
+    const exactCountRequests: boolean[] = [];
+    const buildQuery: PageQueryBuilder<{ id: number }> = async (from, to, withExactCount) => {
+      exactCountRequests.push(withExactCount);
+      const cappedTo = Math.min(to, TOTAL - 1);
+      const page = Array.from({ length: Math.max(0, cappedTo - from + 1) }, (_, i) => ({ id: from + i }));
+      return { data: page, error: null, count: withExactCount ? TOTAL : null };
+    };
+    await fetchAllPages(buildQuery, 1000);
+    expect(exactCountRequests).toEqual([true, false, false]); // 2500 rows / 1000 page size = 3 pages
+  });
+
+  it('an empty, genuinely-zero-row result is returned as [] without throwing', async () => {
+    const buildQuery: PageQueryBuilder<{ id: number }> = async (_from, _to, withExactCount) => ({
+      data: [],
+      error: null,
+      count: withExactCount ? 0 : null,
+    });
+    const result = await fetchAllPages(buildQuery);
+    expect(result).toEqual([]);
+  });
+
+  it('propagates a query error instead of returning a silent partial result', async () => {
+    const buildQuery: PageQueryBuilder<{ id: number }> = async () => ({
+      data: null,
+      error: new Error('simulated PostgREST failure'),
+      count: null,
+    });
+    await expect(fetchAllPages(buildQuery)).rejects.toThrow('simulated PostgREST failure');
+  });
+
+  it('throws instead of silently returning an incomplete result if the server stops short of the known total', async () => {
+    const buildQuery: PageQueryBuilder<{ id: number }> = async (from, _to, withExactCount) => {
+      if (from === 0) {
+        return { data: [{ id: 0 }], error: null, count: withExactCount ? 5 : null };
+      }
+      return { data: [], error: null, count: null }; // server returns nothing even though 4 more rows are known to exist
+    };
+    await expect(fetchAllPages(buildQuery)).rejects.toThrow(/expected more rows/);
   });
 });
 
