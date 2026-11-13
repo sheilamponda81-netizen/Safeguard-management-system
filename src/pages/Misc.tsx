@@ -3,7 +3,6 @@ import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar, Shield
 import { Card, Button, Badge, PageHeader, Modal, Tabs, Input } from '../components/ui';
 import { formatKwacha } from '../data';
 import { UserManagement } from '../components/UserManagement';
-import { OneTimeEmployeeCorrection261110 } from '../components/OneTimeEmployeeCorrection261110';
 import { supabase } from '../lib/supabase';
 // ===== Import audit logger =====
 import { logAudit } from '../utils/auditLogger';
@@ -1657,12 +1656,7 @@ const handleDeletePosition = async (position: Position) => {
         </Card>
       )}
 
-      {tab === 'users' && (
-        <>
-          <UserManagement />
-          <OneTimeEmployeeCorrection261110 />
-        </>
-      )}
+      {tab === 'users' && <UserManagement />}
       
       {tab === 'roles' && (
         <div className="space-y-4">
