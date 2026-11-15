@@ -3,6 +3,7 @@ import { Plus, Trash2, Edit2, CheckCircle, Percent, CreditCard, Calendar, Shield
 import { Card, Button, Badge, PageHeader, Modal, Tabs, Input } from '../components/ui';
 import { formatKwacha } from '../data';
 import { UserManagement } from '../components/UserManagement';
+import { CorrectLilongwe50Employees } from '../components/CorrectLilongwe50Employees';
 import { supabase } from '../lib/supabase';
 // ===== Import audit logger =====
 import { logAudit } from '../utils/auditLogger';
@@ -1656,7 +1657,12 @@ const handleDeletePosition = async (position: Position) => {
         </Card>
       )}
 
-      {tab === 'users' && <UserManagement />}
+      {tab === 'users' && (
+        <>
+          <UserManagement />
+          <CorrectLilongwe50Employees />
+        </>
+      )}
       
       {tab === 'roles' && (
         <div className="space-y-4">
