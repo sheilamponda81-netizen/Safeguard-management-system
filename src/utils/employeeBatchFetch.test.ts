@@ -279,6 +279,45 @@ describe('fetchAllPages', () => {
     };
     await expect(fetchAllPages(buildQuery)).rejects.toThrow(/expected more rows/);
   });
+
+  // PR #55 final release review: pin exact boundary totals around the
+  // 1,000-row server cap (not just arbitrary 1,580/2,500 totals above) --
+  // 1,000 (exactly one full page, must stop without an extra empty-page
+  // request), 1,001 (one row past a full page, forces a second page of
+  // exactly 1 row), 1,500 (a realistic production-sized population), and
+  // 5,000 (an exact multiple of the page size, must stop after its 5th full
+  // page without a wasted 6th request). Every one of this PR's 6 call sites
+  // shares this exact loop, so proving it here covers all of them.
+  it.each([1000, 1001, 1500, 5000])(
+    'fetches exactly %i rows with no missing or duplicated ids and no wasted trailing request',
+    async (TOTAL) => {
+      let queryCallCount = 0;
+      const buildQuery: PageQueryBuilder<{ id: number }> = async (from, to, withExactCount) => {
+        queryCallCount++;
+        const cappedTo = Math.min(to, TOTAL - 1);
+        const page = Array.from({ length: Math.max(0, cappedTo - from + 1) }, (_, i) => ({ id: from + i }));
+        return { data: page, error: null, count: withExactCount ? TOTAL : null };
+      };
+      const result = await fetchAllPages(buildQuery);
+      expect(result).toHaveLength(TOTAL);
+      expect(new Set(result.map(r => r.id)).size).toBe(TOTAL); // no duplicates
+      expect(result.map(r => r.id)).toEqual(Array.from({ length: TOTAL }, (_, i) => i)); // deterministic order preserved
+      expect(queryCallCount).toBe(Math.ceil(TOTAL / 1000)); // no extra trailing request once the known total is met
+    }
+  );
+
+  it('REGRESSION: an error on a LATER page (not just the first) still propagates and never returns the partial rows already accumulated', async () => {
+    const buildQuery: PageQueryBuilder<{ id: number }> = async (from, _to, withExactCount) => {
+      if (from === 0) {
+        // Page 1 succeeds with 1,000 rows and reports a total of 1,500.
+        const page = Array.from({ length: 1000 }, (_, i) => ({ id: i }));
+        return { data: page, error: null, count: withExactCount ? 1500 : null };
+      }
+      // Page 2 (the remaining 500 rows) fails.
+      return { data: null, error: new Error('simulated page-2 failure'), count: null };
+    };
+    await expect(fetchAllPages(buildQuery)).rejects.toThrow('simulated page-2 failure');
+  });
 });
 
 describe('dedupeById', () => {
