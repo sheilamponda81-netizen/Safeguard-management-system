@@ -57,25 +57,107 @@ describe('isoToBlantyreDateStr', () => {
   });
 });
 
+// PRODUCTION HOTFIX regression coverage: fetchDistinctWorkstations now pages
+// through fetchAllPages() instead of a single unbounded query, so its mock
+// chain must support .order().range() as the terminal (resolving) call, and
+// tests must exercise the >1000-row pagination path, not just a single page.
+// `pages` is consumed in order across however many times `.from()` is
+// invoked -- fetchAllPages calls buildQuery (and therefore supabase.from())
+// once per page, sharing this closure's callIndex across those calls.
+interface ChainableMock {
+  select: (...args: unknown[]) => ChainableMock;
+  not: (...args: unknown[]) => ChainableMock;
+  eq: (...args: unknown[]) => ChainableMock;
+  or: (...args: unknown[]) => ChainableMock;
+  order: (...args: unknown[]) => ChainableMock;
+  range: (...args: unknown[]) => Promise<{ data: unknown; error: unknown; count?: number | null }>;
+}
+
+function mockPaginatedFrom(pages: Array<{ data: unknown; error: unknown; count?: number | null }>) {
+  let callIndex = 0;
+  return () => {
+    const builder: ChainableMock = {
+      select: () => builder,
+      not: () => builder,
+      eq: () => builder,
+      or: () => builder,
+      order: () => builder,
+      range: () => {
+        const page = pages[Math.min(callIndex, pages.length - 1)];
+        callIndex++;
+        return Promise.resolve(page);
+      },
+    };
+    return builder;
+  };
+}
+
 describe('fetchDistinctWorkstations', () => {
   beforeEach(() => fromMock.mockReset());
 
-  it('returns distinct, sorted, non-empty workstation values for active non-deleted employees', async () => {
-    fromMock.mockImplementationOnce(() => ({
-      select: () => ({ not: () => ({ eq: () => ({ eq: () => Promise.resolve({
+  it('returns distinct, sorted, non-empty workstation values for active non-deleted employees (fewer than 1,000 matches, single page)', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      {
         data: [{ workstation: 'Gate 2' }, { workstation: 'Gate 1' }, { workstation: 'Gate 1' }, { workstation: '' }, { workstation: null }],
         error: null,
-      }) }) }) }),
-    }));
+        count: 5,
+      },
+    ]));
     const result = await fetchDistinctWorkstations();
     expect(result).toEqual(['Gate 1', 'Gate 2']);
   });
 
   it('propagates a query error rather than swallowing it', async () => {
-    fromMock.mockImplementationOnce(() => ({
-      select: () => ({ not: () => ({ eq: () => ({ eq: () => Promise.resolve({ data: null, error: { message: 'boom' } }) }) }) }),
-    }));
+    fromMock.mockImplementation(mockPaginatedFrom([{ data: null, error: { message: 'boom' }, count: null }]));
     await expect(fetchDistinctWorkstations()).rejects.toBeTruthy();
+  });
+
+  it('REGRESSION (PostgREST 1,000-row cap): pages past 1,000 matching employees instead of silently truncating at the first page', async () => {
+    // Page 1: exactly 1,000 rows (the server's response cap), total count
+    // 1,200 -- proves the loop does not stop just because a page came back
+    // full. Page 2: the remaining 200 rows, including the exact page
+    // boundary's workstation value, to catch an off-by-one in the range.
+    const page1 = Array.from({ length: 1000 }, (_, i) => ({ workstation: `Gate ${i}` }));
+    const page2 = [{ workstation: 'Gate 999' }, { workstation: 'Gate 1199' }];
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: page1, error: null, count: 1002 },
+      { data: page2, error: null, count: null },
+    ]));
+    const result = await fetchDistinctWorkstations();
+    // 1000 distinct "Gate 0".."Gate 999" values from page 1 plus the new
+    // "Gate 1199" from page 2 -- "Gate 999" on page 2 is a duplicate of
+    // page 1's own row and must not appear twice.
+    expect(result).toHaveLength(1001);
+    expect(result.filter((w) => w === 'Gate 999')).toHaveLength(1);
+    expect(result).toContain('Gate 1199');
+    expect(fromMock.mock.calls.length).toBe(2);
+  });
+
+  it('exact status/is_deleted filters are preserved on every page of a paginated fetch', async () => {
+    const seenFilters: Array<{ method: string }> = [];
+    let callIndex = 0;
+    const pages = [{ data: [], error: null, count: 0 }];
+    fromMock.mockImplementation(() => {
+      const builder: ChainableMock = {
+        select: () => builder,
+        not: (...args: unknown[]) => { seenFilters.push({ method: `not:${JSON.stringify(args)}` }); return builder; },
+        eq: (...args: unknown[]) => { seenFilters.push({ method: `eq:${JSON.stringify(args)}` }); return builder; },
+        or: () => builder,
+        order: () => builder,
+        range: () => {
+          const page = pages[Math.min(callIndex, pages.length - 1)];
+          callIndex++;
+          return Promise.resolve(page);
+        },
+      };
+      return builder;
+    });
+    await fetchDistinctWorkstations();
+    expect(seenFilters).toEqual([
+      { method: `not:${JSON.stringify(['workstation', 'is', null])}` },
+      { method: `eq:${JSON.stringify(['status', 'Active'])}` },
+      { method: `eq:${JSON.stringify(['is_deleted', false])}` },
+    ]);
   });
 });
 
