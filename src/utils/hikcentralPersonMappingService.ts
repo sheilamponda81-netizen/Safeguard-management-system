@@ -7,6 +7,7 @@
 // hikcentralImportService.ts (never-throws, discriminated-outcome RPC
 // wrapper) and the rest of this app's direct supabase.from() queries.
 import { supabase } from '../lib/supabase';
+import { fetchAllPages } from './employeeBatchFetch';
 import {
   IdentifiedRawEventRow,
   EmployeeLite,
@@ -44,21 +45,47 @@ export async function fetchAnonymousEventCount(): Promise<number> {
   return count ?? 0;
 }
 
-export async function fetchActiveNonDeletedEmployees(): Promise<EmployeeLite[]> {
-  const { data, error } = await supabase
-    .from('employees')
-    .select('id, employee_number, full_name, workstation, status, is_deleted')
-    .eq('status', 'Active')
-    .or('is_deleted.is.null,is_deleted.eq.false');
-  if (error) throw error;
-  return (data || []).map((row) => ({
+interface EmployeeLiteRow {
+  id: string;
+  employee_number: string;
+  full_name: string;
+  workstation: string | null;
+  status: string | null;
+  is_deleted: boolean | null;
+}
+
+const EMPLOYEE_LITE_COLUMNS = 'id, employee_number, full_name, workstation, status, is_deleted';
+
+function toEmployeeLite(row: EmployeeLiteRow): EmployeeLite {
+  return {
     id: row.id,
     employeeNumber: row.employee_number,
     fullName: row.full_name,
     workstation: row.workstation,
     status: row.status,
     isDeleted: row.is_deleted,
-  }));
+  };
+}
+
+export async function fetchActiveNonDeletedEmployees(): Promise<EmployeeLite[]> {
+  // PRODUCTION HOTFIX: was a single unpaginated query -- PostgREST's
+  // 1000-row cap silently truncated the Active employee population
+  // (already past 1000), meaning some employees' real fingerprint scans
+  // could never be matched against this candidate pool. fetchAllPages()
+  // (see Employees.tsx's identical fix) pages through `.range()` until
+  // the server's own exact count is fully met. `id` is a unique,
+  // deterministic order for stable page boundaries.
+  const rows = await fetchAllPages<EmployeeLiteRow>((rangeFrom, rangeTo, withExactCount) => {
+    const q = withExactCount
+      ? supabase.from('employees').select(EMPLOYEE_LITE_COLUMNS, { count: 'exact' })
+      : supabase.from('employees').select(EMPLOYEE_LITE_COLUMNS);
+    return q
+      .eq('status', 'Active')
+      .or('is_deleted.is.null,is_deleted.eq.false')
+      .order('id')
+      .range(rangeFrom, rangeTo);
+  });
+  return rows.map(toEmployeeLite);
 }
 
 /**
@@ -68,18 +95,21 @@ export async function fetchActiveNonDeletedEmployees(): Promise<EmployeeLite[]> 
  * matches, which always uses fetchActiveNonDeletedEmployees() above.
  */
 export async function fetchAllEmployeesById(): Promise<Map<string, EmployeeLite>> {
-  const { data, error } = await supabase
-    .from('employees')
-    .select('id, employee_number, full_name, workstation, status, is_deleted');
-  if (error) throw error;
-  return new Map((data || []).map((row) => [row.id, {
-    id: row.id,
-    employeeNumber: row.employee_number,
-    fullName: row.full_name,
-    workstation: row.workstation,
-    status: row.status,
-    isDeleted: row.is_deleted,
-  }]));
+  // PRODUCTION HOTFIX: was a single unpaginated query -- PostgREST's
+  // 1000-row cap silently truncated the full employee population
+  // (already past 1000, with no filter at all), meaning lookups for an
+  // arbitrary subset of employee ids (Postgres's default row order is
+  // unspecified without an explicit sort) would silently come back
+  // undefined. fetchAllPages() (see Employees.tsx's identical fix) pages
+  // through `.range()` until the server's own exact count is fully met.
+  // `id` is a unique, deterministic order for stable page boundaries.
+  const rows = await fetchAllPages<EmployeeLiteRow>((rangeFrom, rangeTo, withExactCount) => {
+    const q = withExactCount
+      ? supabase.from('employees').select(EMPLOYEE_LITE_COLUMNS, { count: 'exact' })
+      : supabase.from('employees').select(EMPLOYEE_LITE_COLUMNS);
+    return q.order('id').range(rangeFrom, rangeTo);
+  });
+  return new Map(rows.map((row) => [row.id, toEmployeeLite(row)]));
 }
 
 export async function fetchActiveHikCentralPersonMappings(): Promise<ActiveMappingRow[]> {

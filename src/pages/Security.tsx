@@ -17,6 +17,7 @@ import { toCsvRow } from '../utils/csvExport';
 import { generateGuardId, generateGuardIdServerSide } from '../utils/guardIdGeneration';
 import { UserProfile, UserProfileRegion } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
+import { fetchAllPages } from '../utils/employeeBatchFetch';
 
 // Raw `employees` row shape -- only the columns this file actually reads
 // (query below is `select('*')`). No generated Supabase types exist in
@@ -1070,14 +1071,24 @@ function AddGuardForm({ onAdd, onCancel, shiftsList, supervisorsList, uniformSta
     const fetchEmployees = async () => {
       setLoadingEmployees(true);
       try {
-        const { data, error } = await supabase
-          .from('employees')
-          .select('id, full_name, employee_number, position, phone, company, workstation, status, region_id')
-          .eq('is_deleted', false)
-          .order('full_name');
-
-        if (error) throw error;
-        setAllEmployees(data || []);
+        // PRODUCTION HOTFIX: was a single unpaginated query -- PostgREST's
+        // 1000-row cap silently truncated the non-deleted employee
+        // population (already past 1000) alphabetically, making roughly
+        // the last third of employees by full_name impossible to find in
+        // this search (e.g. to promote an existing employee to a security
+        // guard record) with no error shown. fetchAllPages() (see
+        // Employees.tsx's identical fix) pages through `.range()` until
+        // the server's own exact count is fully met. `id` is an explicit
+        // tiebreaker alongside `full_name` to keep page boundaries
+        // deterministic when names repeat.
+        const columns = 'id, full_name, employee_number, position, phone, company, workstation, status, region_id';
+        const data = await fetchAllPages<EmployeeSearchResult>((rangeFrom, rangeTo, withExactCount) => {
+          const q = withExactCount
+            ? supabase.from('employees').select(columns, { count: 'exact' })
+            : supabase.from('employees').select(columns);
+          return q.eq('is_deleted', false).order('full_name').order('id').range(rangeFrom, rangeTo);
+        });
+        setAllEmployees(data);
       } catch (err) {
         console.error('Error fetching employees:', err);
       } finally {

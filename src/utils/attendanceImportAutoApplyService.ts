@@ -10,6 +10,7 @@
 // hikcentralImportService.ts's importHikCentralRawEvents().
 import { supabase } from '../lib/supabase';
 import { AFRICA_BLANTYRE_OFFSET_MINUTES } from './hikcentralExcelParser';
+import { fetchAllPages } from './employeeBatchFetch';
 
 const RPC_NOT_FOUND_CODE = 'PGRST202';
 
@@ -58,15 +59,28 @@ export function isoToBlantyreDateStr(iso: string): string {
 
 /** Distinct, non-empty `employees.workstation` values for the caller's own tenant (RLS-scoped) -- used to populate the import page's "which workstations does this export cover" checklist. Read-only. */
 export async function fetchDistinctWorkstations(): Promise<string[]> {
-  const { data, error } = await supabase
-    .from('employees')
-    .select('workstation')
-    .not('workstation', 'is', null)
-    .eq('status', 'Active')
-    .eq('is_deleted', false);
-  if (error) throw error;
+  // PRODUCTION HOTFIX: was a single unpaginated query -- PostgREST's
+  // 1000-row cap silently truncated the Active, non-deleted employee
+  // population (already past 1000), meaning a workstation name that only
+  // appeared among employees past the cap could silently vanish from this
+  // checklist. fetchAllPages() (see Employees.tsx's identical fix) pages
+  // through `.range()` until the server's own exact count is fully met.
+  // `id` is a unique, deterministic order for stable page boundaries --
+  // `workstation` itself is not unique and is the only other column
+  // selected.
+  const rows = await fetchAllPages<{ workstation: string | null }>((rangeFrom, rangeTo, withExactCount) => {
+    const q = withExactCount
+      ? supabase.from('employees').select('workstation', { count: 'exact' })
+      : supabase.from('employees').select('workstation');
+    return q
+      .not('workstation', 'is', null)
+      .eq('status', 'Active')
+      .eq('is_deleted', false)
+      .order('id')
+      .range(rangeFrom, rangeTo);
+  });
   const values = new Set<string>();
-  (data || []).forEach((r: { workstation: string | null }) => {
+  rows.forEach((r) => {
     const v = (r.workstation || '').trim();
     if (v) values.add(v);
   });

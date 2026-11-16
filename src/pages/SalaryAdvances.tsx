@@ -11,7 +11,7 @@ import { Pagination } from '../components/Pagination';
 import { getDefaultPageSize } from '../utils/uiSettings';
 import { getSystemCurrentMonth, getMonthLabel } from '../utils/currentMonth';
 import { getErrorMessage } from '../utils/errorHandler';
-import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
+import { fetchAllPages, fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import {
   calculateAdvanceSchedule,
   AdvanceScheduleValidationError,
@@ -398,20 +398,32 @@ export function SalaryAdvancesPage() {
 
   const fetchEmployees = useCallback(async () => {
     try {
-      let query = supabase
-        .from('employees')
-        .select('id, employee_number, full_name, position, department, basic_salary, hire_date, region_id, workstation, status, is_deleted, regions(name)')
-        .eq('status', 'Active')
-        .eq('is_deleted', false);
+      // PRODUCTION HOTFIX: was a single unpaginated query -- PostgREST's
+      // 1000-row cap silently truncated the Active, non-deleted employee
+      // population (already past 1000) alphabetically, making roughly the
+      // last third of employees by full_name impossible to select for a
+      // new salary advance with no error shown. fetchAllPages() (see
+      // Employees.tsx's identical fix) pages through `.range()` until the
+      // server's own exact count is fully met. `id` is an explicit
+      // tiebreaker alongside `full_name`: `.range()` pagination over a
+      // non-unique sort key can skip or repeat rows across page boundaries
+      // whenever two employees share the same full_name.
+      const columns = 'id, employee_number, full_name, position, department, basic_salary, hire_date, region_id, workstation, status, is_deleted, regions(name)';
+      const data = await fetchAllPages<unknown>((rangeFrom, rangeTo, withExactCount) => {
+        let q = withExactCount
+          ? supabase.from('employees').select(columns, { count: 'exact' })
+          : supabase.from('employees').select(columns);
 
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        query = query.eq('region_id', userProfile.region_id);
-      }
+        q = q.eq('status', 'Active').eq('is_deleted', false);
 
-      const { data, error } = await query.order('full_name');
-      if (error) throw error;
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          q = q.eq('region_id', userProfile.region_id);
+        }
 
-      const mapped = ((data || []) as unknown as EmployeeRow[]).map((emp): Employee => ({
+        return q.order('full_name').order('id').range(rangeFrom, rangeTo);
+      });
+
+      const mapped = (data as unknown as EmployeeRow[]).map((emp): Employee => ({
         id: emp.id,
         employeeNumber: emp.employee_number || '',
         fullName: emp.full_name || '',

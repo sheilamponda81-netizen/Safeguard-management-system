@@ -18,7 +18,7 @@ import { UserProfile } from '../utils/currentProfile';
 import { getErrorMessage } from '../utils/errorHandler';
 import { toCsvRow } from '../utils/csvExport';
 import { calculateAttendanceDeductions } from '../utils/attendanceDeductions';
-import { fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
+import { fetchAllPages, fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { resolveAttendanceWritePermissions, canEditAttendanceInRegion } from '../utils/attendancePermissions';
 import { filterAttendanceEmployees } from '../utils/attendanceFilters';
 
@@ -626,19 +626,30 @@ function MonthlyRegisterTab() {
     setLoading(true);
     setError(null);
     try {
-      let employeesQuery = supabase
-        .from('employees')
-        .select('id, employee_number, full_name, position, department, status, region_id, company, workstation')
-        .eq('is_deleted', false);
-        
-      if (!userProfile?.is_super_admin && userProfile?.region_id) {
-        employeesQuery = employeesQuery.eq('region_id', userProfile.region_id);
-      }
-      
-      const { data: employeesData, error: empError } = await employeesQuery;
-      if (empError) throw empError;
-      
-      setEmployees(employeesData || []);
+      // PRODUCTION HOTFIX: was a single unpaginated query -- PostgREST's
+      // 1000-row cap silently truncated the non-deleted employee
+      // population for a Super Admin (no region filter applies), who
+      // would see attendance for only part of the workforce with no
+      // error shown. fetchAllPages() (see Employees.tsx's identical fix)
+      // pages through `.range()` until the server's own exact count is
+      // fully met. `id` is an explicit tiebreaker so page boundaries stay
+      // deterministic.
+      const columns = 'id, employee_number, full_name, position, department, status, region_id, company, workstation';
+      const employeesData = await fetchAllPages<Employee>((rangeFrom, rangeTo, withExactCount) => {
+        let q = withExactCount
+          ? supabase.from('employees').select(columns, { count: 'exact' })
+          : supabase.from('employees').select(columns);
+
+        q = q.eq('is_deleted', false);
+
+        if (!userProfile?.is_super_admin && userProfile?.region_id) {
+          q = q.eq('region_id', userProfile.region_id);
+        }
+
+        return q.order('id').range(rangeFrom, rangeTo);
+      });
+
+      setEmployees(employeesData);
       
       const datesArr = getDatesForMonth(selectedMonth);
       if (datesArr.length > 0 && employeesData && employeesData.length > 0) {
