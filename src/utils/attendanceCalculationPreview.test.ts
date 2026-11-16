@@ -6,7 +6,7 @@ import {
   buildAttendanceCalculationPreviewRows, filterAttendancePreviewRows, buildSiteAlertCasesFromRows,
 } from './attendanceCalculationPreview';
 import { NormalizedFingerprintEvent } from './attendanceCalculationEngine';
-import { DateAssignmentRow, OffDayPatternRow } from './rosterSchedule';
+import { DateAssignmentRow, OffDayPatternRow, ShiftPatternRow } from './rosterSchedule';
 import { EmployeeLite } from './hikcentralPersonMapping';
 import { aggregateSiteAlerts } from './attendanceSiteAlerts';
 
@@ -104,6 +104,23 @@ describe('collectEmployeeIdsWithRosterEvidence / FingerprintEvidence / hasAnyEmp
   it('an employee with zero events contributes no fingerprint evidence', () => {
     const fingerprintIds = collectEmployeeIdsWithFingerprintEvidence(new Map([['emp-1', []]]));
     expect(fingerprintIds.has('emp-1')).toBe(false);
+  });
+
+  // PRODUCTION HOTFIX (Attendance Review repair): roster evidence must
+  // also come from the recurring Day/Night shift-pattern baseline, not
+  // just dated assignments and off-day patterns -- see
+  // attendanceCalculationPreviewService.ts/buildAttendanceCalculationPreviewRows's
+  // own comments for the full defect this closes (an employee scheduled
+  // ONLY via a recurring pattern was previously invisible here).
+  it('finds evidence from a recurring Day/Night shift pattern alone, with no dated assignment and no off-day pattern at all', () => {
+    const shiftPatterns: ShiftPatternRow[] = [{ employeeId: 'c', shiftType: 'day', effectiveFrom: '2026-10-01', isActive: true }];
+    const ids = collectEmployeeIdsWithRosterEvidence([], [], shiftPatterns);
+    expect(ids.has('c')).toBe(true);
+  });
+
+  it('omitting shiftPatterns entirely (back-compat default []) finds no shift-pattern-only employee', () => {
+    const ids = collectEmployeeIdsWithRosterEvidence([], []);
+    expect(ids.size).toBe(0);
   });
 });
 
@@ -298,6 +315,180 @@ describe('buildAttendanceCalculationPreviewRows -- roster resolution, shift date
     });
     expect(rows[0].calculation.status).toBe('present');
     expect(rows[0].calculation.basis).toBe('check_in_only_provisional');
+  });
+
+  // PRODUCTION HOTFIX regression coverage: the Attendance Review repair.
+  // These exercise shiftPatterns end-to-end through
+  // buildAttendanceCalculationPreviewRows (not just resolveScheduleForDate's
+  // own already-tested precedence in rosterSchedule.test.ts), proving the
+  // integration -- never a simplified roster algorithm of this module's
+  // own -- matches the server-authoritative roster_resolve_schedule()
+  // precedence exactly: dated assignment > off-day pattern > recurring
+  // shift pattern > unassigned.
+  describe('recurring shift-pattern integration (Attendance Review repair)', () => {
+    it('recurring pattern without any dated assignment: an employee scheduled ONLY via a shift pattern still gets a real Day/Night row, never Unassigned', () => {
+      const shiftPatterns: ShiftPatternRow[] = [{ employeeId: 'emp-1', shiftType: 'day', effectiveFrom: '2026-10-01', isActive: true }];
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-05'],
+        datedAssignments: [],
+        patterns: [],
+        shiftPatterns,
+        eventsByEmployeeId: new Map(),
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows[0].resolvedShift).toBe('day');
+      expect(rows[0].calculation.status).toBe('pending'); // no coverage confirmed -- never a false Absent
+    });
+
+    it('off-day suppression: a recurring shift pattern is correctly overridden by a matching recurring off-day pattern on the same weekday', () => {
+      // 2026-10-05 is a Monday (weekday 1).
+      const shiftPatterns: ShiftPatternRow[] = [{ employeeId: 'emp-1', shiftType: 'day', effectiveFrom: '2026-10-01', isActive: true }];
+      const offPatterns: OffDayPatternRow[] = [{ employeeId: 'emp-1', weekday: 1, effectiveFrom: '2026-10-01', isActive: true }];
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-05'],
+        datedAssignments: [],
+        patterns: offPatterns,
+        shiftPatterns,
+        eventsByEmployeeId: new Map(),
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows[0].resolvedShift).toBe('off');
+    });
+
+    it('explicit dated override: a dated assignment wins over a contradicting recurring shift pattern for that one date only', () => {
+      const shiftPatterns: ShiftPatternRow[] = [{ employeeId: 'emp-1', shiftType: 'day', effectiveFrom: '2026-10-01', isActive: true }];
+      const datedOverride: DateAssignmentRow[] = [{ employeeId: 'emp-1', assignmentDate: '2026-10-05', assignmentType: 'night', isActive: true }];
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-04', '2026-10-05'],
+        datedAssignments: datedOverride,
+        patterns: [],
+        shiftPatterns,
+        eventsByEmployeeId: new Map(),
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows[0].resolvedShift).toBe('day'); // Oct 4: pattern applies, no override
+      expect(rows[1].resolvedShift).toBe('night'); // Oct 5: dated override wins over the Day pattern
+    });
+
+    it('overnight shift resolved purely from a recurring Night pattern (no dated assignment) still matches events on the following calendar date', () => {
+      const shiftPatterns: ShiftPatternRow[] = [{ employeeId: 'emp-1', shiftType: 'night', effectiveFrom: '2026-10-01', isActive: true }];
+      const events = new Map([['emp-1', [ev('2026-10-06T14:05:00.000Z'), ev('2026-10-07T03:00:00.000Z')]]]);
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-06'],
+        datedAssignments: [],
+        patterns: [],
+        shiftPatterns,
+        eventsByEmployeeId: events,
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows[0].resolvedShift).toBe('night');
+      expect(rows[0].calculation.status).toBe('present');
+    });
+
+    it('pattern effective-date boundary: a shift pattern has no effect before its own effectiveFrom date', () => {
+      const shiftPatterns: ShiftPatternRow[] = [{ employeeId: 'emp-1', shiftType: 'day', effectiveFrom: '2026-10-10', isActive: true }];
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-09', '2026-10-10'],
+        datedAssignments: [],
+        patterns: [],
+        shiftPatterns,
+        eventsByEmployeeId: new Map(),
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows[0].resolvedShift).toBe('unassigned'); // before effectiveFrom: no fictional schedule
+      expect(rows[1].resolvedShift).toBe('day'); // on effectiveFrom: applies
+    });
+
+    it('pattern effective-date boundary: a later superseding pattern row wins over an earlier one for a date on/after its own effectiveFrom, never an earlier-vs-later ordering mistake', () => {
+      const shiftPatterns: ShiftPatternRow[] = [
+        { employeeId: 'emp-1', shiftType: 'day', effectiveFrom: '2026-09-01', isActive: true },
+        { employeeId: 'emp-1', shiftType: 'night', effectiveFrom: '2026-10-05', isActive: true },
+      ];
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-04', '2026-10-05'],
+        datedAssignments: [],
+        patterns: [],
+        shiftPatterns,
+        eventsByEmployeeId: new Map(),
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows[0].resolvedShift).toBe('day'); // still under the Sep 1 pattern
+      expect(rows[1].resolvedShift).toBe('night'); // the Oct 5 pattern now takes over
+    });
+
+    it('overlapping schedule evidence: a dated assignment, an off-day pattern, and a shift pattern can all exist for the same employee without ever producing more than one resolved value per date (no duplicate-shift double counting)', () => {
+      const datedAssignments: DateAssignmentRow[] = [{ employeeId: 'emp-1', assignmentDate: '2026-10-07', assignmentType: 'day', isActive: true }];
+      const offPatterns: OffDayPatternRow[] = [{ employeeId: 'emp-1', weekday: 1, effectiveFrom: '2026-10-01', isActive: true }]; // Monday
+      const shiftPatterns: ShiftPatternRow[] = [{ employeeId: 'emp-1', shiftType: 'night', effectiveFrom: '2026-09-01', isActive: true }];
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-05', '2026-10-06', '2026-10-07'], // Mon, Tue, Wed
+        datedAssignments,
+        patterns: offPatterns,
+        shiftPatterns,
+        eventsByEmployeeId: new Map(),
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows).toHaveLength(3); // exactly one row per date -- never duplicated
+      expect(rows[0].resolvedShift).toBe('off'); // Monday: off-day pattern wins over the Night shift pattern
+      expect(rows[1].resolvedShift).toBe('night'); // Tuesday: falls through to the recurring Night pattern
+      expect(rows[2].resolvedShift).toBe('day'); // Wednesday: the explicit dated override wins over everything
+    });
+
+    it('missing schedule: an employee with no dated assignment, no off-day pattern, and no shift pattern at all resolves Unassigned -- never a fictional Day/Night schedule', () => {
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-05'],
+        datedAssignments: [],
+        patterns: [],
+        shiftPatterns: [],
+        eventsByEmployeeId: new Map(),
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows[0].resolvedShift).toBe('unassigned');
+      expect(rows[0].calculation.status).toBe('unassigned'); // never a fabricated Day/Night/Absent result
+    });
+
+    it('an INACTIVE shift pattern (is_active: false) is never consulted, even when it would otherwise be the most recent effectiveFrom', () => {
+      const shiftPatterns: ShiftPatternRow[] = [
+        { employeeId: 'emp-1', shiftType: 'day', effectiveFrom: '2026-09-01', isActive: true },
+        { employeeId: 'emp-1', shiftType: 'night', effectiveFrom: '2026-10-01', isActive: false },
+      ];
+      const rows = buildAttendanceCalculationPreviewRows({
+        employees: [employee()],
+        shiftDates: ['2026-10-05'],
+        datedAssignments: [],
+        patterns: [],
+        shiftPatterns,
+        eventsByEmployeeId: new Map(),
+        coveragePolicy: noActivePolicy,
+        officialStatusByKey: new Map(),
+        employeeIdsWithActiveMapping: allMapped([employee()]),
+      });
+      expect(rows[0].resolvedShift).toBe('day'); // the inactive Night row is skipped; Sep 1 Day pattern still applies
+    });
   });
 });
 

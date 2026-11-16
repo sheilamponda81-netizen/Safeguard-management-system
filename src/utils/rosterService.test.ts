@@ -1,6 +1,18 @@
-import { describe, it, expect } from 'vitest';
-import { filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex, humanizeRosterError } from './rosterService';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { EmployeeLite } from './hikcentralPersonMapping';
+
+const fromMock = vi.fn();
+
+vi.mock('../lib/supabase', () => ({
+  supabase: {
+    from: (...args: unknown[]) => fromMock(...args),
+  },
+}));
+
+const {
+  filterEmployeesForSearch, formatEmployeeLabel, moveHighlightedIndex, humanizeRosterError,
+  fetchActiveOffDayPatterns, fetchActiveShiftPatterns, fetchActiveDateAssignments,
+} = await import('./rosterService');
 
 function emp(overrides: Partial<EmployeeLite> = {}): EmployeeLite {
   return {
@@ -141,5 +153,179 @@ describe('humanizeRosterError (Phase 2B.2C: substitute a known employee UUID in 
 
   it('handles an empty or undefined-ish message without throwing', () => {
     expect(humanizeRosterError('', employees)).toBe('');
+  });
+});
+
+// PRODUCTION HOTFIX (Attendance Review repair): fetchActiveOffDayPatterns,
+// fetchActiveShiftPatterns, and fetchActiveDateAssignments now page
+// through fetchAllPages() instead of a single unbounded query, exactly
+// the same fix already applied to the 6 employee-list call sites in
+// PR #55 -- see that PR's own test files for the established
+// ChainableMock/mockPaginatedFrom convention this mirrors.
+interface ChainableMock {
+  select: (...args: unknown[]) => ChainableMock;
+  eq: (...args: unknown[]) => ChainableMock;
+  gte: (...args: unknown[]) => ChainableMock;
+  lte: (...args: unknown[]) => ChainableMock;
+  order: (...args: unknown[]) => ChainableMock;
+  range: (...args: unknown[]) => Promise<{ data: unknown; error: unknown; count?: number | null }>;
+}
+
+function mockPaginatedFrom(pages: Array<{ data: unknown; error: unknown; count?: number | null }>) {
+  let callIndex = 0;
+  return () => {
+    const builder: ChainableMock = {
+      select: () => builder,
+      eq: () => builder,
+      gte: () => builder,
+      lte: () => builder,
+      order: () => builder,
+      range: () => {
+        const page = pages[Math.min(callIndex, pages.length - 1)];
+        callIndex++;
+        return Promise.resolve(page);
+      },
+    };
+    return builder;
+  };
+}
+
+describe('fetchActiveOffDayPatterns', () => {
+  beforeEach(() => fromMock.mockReset());
+
+  it('maps rows to OffDayPatternRow shape (fewer than 1,000 matches, single page)', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: [{ employee_id: 'e1', weekday: 1, effective_from: '2026-10-01', is_active: true }], error: null, count: 1 },
+    ]));
+    const result = await fetchActiveOffDayPatterns();
+    expect(result).toEqual([{ employeeId: 'e1', weekday: 1, effectiveFrom: '2026-10-01', isActive: true }]);
+  });
+
+  it('REGRESSION (PostgREST 1,000-row cap): pages past 1,000 active patterns with no missing or duplicated rows at the boundary', async () => {
+    const page1 = Array.from({ length: 1000 }, (_, i) => ({ employee_id: `e${i}`, weekday: i % 7, effective_from: '2026-10-01', is_active: true }));
+    const page2 = [{ employee_id: 'e1000', weekday: 2, effective_from: '2026-10-01', is_active: true }];
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: page1, error: null, count: 1001 },
+      { data: page2, error: null, count: null },
+    ]));
+    const result = await fetchActiveOffDayPatterns();
+    expect(result).toHaveLength(1001);
+    expect(result.map((r) => r.employeeId)).toContain('e999');
+    expect(result.map((r) => r.employeeId)).toContain('e1000');
+    expect(fromMock.mock.calls.length).toBe(2);
+  });
+
+  it('propagates a query error rather than returning a partial pattern list', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([{ data: null, error: { message: 'boom' }, count: null }]));
+    await expect(fetchActiveOffDayPatterns()).rejects.toBeTruthy();
+  });
+});
+
+describe('fetchActiveShiftPatterns', () => {
+  beforeEach(() => fromMock.mockReset());
+
+  it('maps rows to ShiftPatternRow shape (fewer than 1,000 matches, single page)', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: [{ employee_id: 'e1', shift_type: 'night', effective_from: '2026-10-01', is_active: true }], error: null, count: 1 },
+    ]));
+    const result = await fetchActiveShiftPatterns();
+    expect(result).toEqual([{ employeeId: 'e1', shiftType: 'night', effectiveFrom: '2026-10-01', isActive: true }]);
+  });
+
+  it('REGRESSION (PostgREST 1,000-row cap): pages past 1,000 active patterns -- the exact defect that made "Scheduled shifts" undercount on the Attendance Review page', async () => {
+    const page1 = Array.from({ length: 1000 }, (_, i) => ({ employee_id: `e${i}`, shift_type: i % 2 === 0 ? 'day' : 'night', effective_from: '2026-10-01', is_active: true }));
+    const page2 = [{ employee_id: 'e1000', shift_type: 'day', effective_from: '2026-10-01', is_active: true }];
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: page1, error: null, count: 1001 },
+      { data: page2, error: null, count: null },
+    ]));
+    const result = await fetchActiveShiftPatterns();
+    expect(result).toHaveLength(1001);
+    expect(new Set(result.map((r) => r.employeeId)).size).toBe(1001); // no duplicates
+    expect(fromMock.mock.calls.length).toBe(2);
+  });
+
+  it('propagates a query error rather than returning a partial pattern list', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([{ data: null, error: { message: 'boom' }, count: null }]));
+    await expect(fetchActiveShiftPatterns()).rejects.toBeTruthy();
+  });
+
+  it('filters to is_active=true only, on every page -- never broadens to inactive/superseded patterns', async () => {
+    const seenCalls: string[] = [];
+    let callIndex = 0;
+    const pages = [{ data: [], error: null, count: 0 }];
+    fromMock.mockImplementation(() => {
+      const builder: ChainableMock = {
+        select: () => builder,
+        eq: (...args: unknown[]) => { seenCalls.push(`eq:${JSON.stringify(args)}`); return builder; },
+        gte: () => builder,
+        lte: () => builder,
+        order: () => builder,
+        range: () => {
+          const page = pages[Math.min(callIndex, pages.length - 1)];
+          callIndex++;
+          return Promise.resolve(page);
+        },
+      };
+      return builder;
+    });
+    await fetchActiveShiftPatterns();
+    expect(seenCalls).toEqual([`eq:${JSON.stringify(['is_active', true])}`]);
+  });
+});
+
+describe('fetchActiveDateAssignments', () => {
+  beforeEach(() => fromMock.mockReset());
+
+  it('maps rows to DateAssignmentRow shape, bounded by the given date range (fewer than 1,000 matches, single page)', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: [{ employee_id: 'e1', assignment_date: '2026-10-05', assignment_type: 'day', is_active: true }], error: null, count: 1 },
+    ]));
+    const result = await fetchActiveDateAssignments('2026-10-01', '2026-10-31');
+    expect(result).toEqual([{ employeeId: 'e1', assignmentDate: '2026-10-05', assignmentType: 'day', isActive: true }]);
+  });
+
+  it('REGRESSION (PostgREST 1,000-row cap): a wide date range across many employees can exceed 1,000 rows even with the date-range bound already in place -- pages past it with no missing/duplicated rows', async () => {
+    const page1 = Array.from({ length: 1000 }, (_, i) => ({ employee_id: `e${i}`, assignment_date: '2026-10-05', assignment_type: 'day', is_active: true }));
+    const page2 = [{ employee_id: 'e1000', assignment_date: '2026-10-06', assignment_type: 'night', is_active: true }];
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: page1, error: null, count: 1001 },
+      { data: page2, error: null, count: null },
+    ]));
+    const result = await fetchActiveDateAssignments('2026-10-01', '2026-10-31');
+    expect(result).toHaveLength(1001);
+    expect(fromMock.mock.calls.length).toBe(2);
+  });
+
+  it('propagates a query error rather than returning a partial assignment list', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([{ data: null, error: { message: 'boom' }, count: null }]));
+    await expect(fetchActiveDateAssignments('2026-10-01', '2026-10-31')).rejects.toBeTruthy();
+  });
+
+  it('preserves the exact is_active + date-range filters on every page', async () => {
+    const seenCalls: string[] = [];
+    let callIndex = 0;
+    const pages = [{ data: [], error: null, count: 0 }];
+    fromMock.mockImplementation(() => {
+      const builder: ChainableMock = {
+        select: () => builder,
+        eq: (...args: unknown[]) => { seenCalls.push(`eq:${JSON.stringify(args)}`); return builder; },
+        gte: (...args: unknown[]) => { seenCalls.push(`gte:${JSON.stringify(args)}`); return builder; },
+        lte: (...args: unknown[]) => { seenCalls.push(`lte:${JSON.stringify(args)}`); return builder; },
+        order: () => builder,
+        range: () => {
+          const page = pages[Math.min(callIndex, pages.length - 1)];
+          callIndex++;
+          return Promise.resolve(page);
+        },
+      };
+      return builder;
+    });
+    await fetchActiveDateAssignments('2026-10-01', '2026-10-31');
+    expect(seenCalls).toEqual([
+      `eq:${JSON.stringify(['is_active', true])}`,
+      `gte:${JSON.stringify(['assignment_date', '2026-10-01'])}`,
+      `lte:${JSON.stringify(['assignment_date', '2026-10-31'])}`,
+    ]);
   });
 });

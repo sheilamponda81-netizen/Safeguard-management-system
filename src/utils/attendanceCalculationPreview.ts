@@ -19,7 +19,7 @@
 // never assumes cover anyone's assigned workstation -- stays
 // 'insufficient', which the Stage A engine already turns into Pending
 // rather than a false Absent.
-import { DAY_SHIFT, NIGHT_SHIFT, DateAssignmentRow, OffDayPatternRow, ResolvedSchedule, resolveScheduleForDate } from './rosterSchedule';
+import { DAY_SHIFT, NIGHT_SHIFT, DateAssignmentRow, OffDayPatternRow, ShiftPatternRow, ResolvedSchedule, resolveScheduleForDate } from './rosterSchedule';
 import {
   AttendanceCalculationResult,
   AttendanceCalculationStatus,
@@ -93,11 +93,28 @@ export interface AttendanceCalculationPreviewRow {
   hasActiveMapping: boolean;
 }
 
-/** Every employeeId appearing in at least one active dated assignment or recurring Off pattern -- "has roster evidence" for the empty-state check and the row-candidate union below. */
-export function collectEmployeeIdsWithRosterEvidence(datedAssignments: DateAssignmentRow[], patterns: OffDayPatternRow[]): Set<string> {
+/**
+ * Every employeeId appearing in at least one active dated assignment,
+ * recurring Off pattern, or recurring Day/Night shift pattern -- "has
+ * roster evidence" for the empty-state check and the row-candidate union
+ * below. PRODUCTION HOTFIX: previously omitted the recurring shift
+ * pattern (the third, lowest-priority tier roster_resolve_schedule/
+ * resolveScheduleForDate already resolve from), so an employee scheduled
+ * ONLY via a recurring Day/Night pattern (no per-date override, no
+ * fingerprint scan yet) was invisible to this collector and therefore
+ * excluded from candidateEmployees entirely -- "Scheduled shifts" could
+ * undercount, including down to zero for a date range with no per-date
+ * overrides at all even though recurring patterns existed.
+ */
+export function collectEmployeeIdsWithRosterEvidence(
+  datedAssignments: DateAssignmentRow[],
+  patterns: OffDayPatternRow[],
+  shiftPatterns: ShiftPatternRow[] = []
+): Set<string> {
   const ids = new Set<string>();
   for (const a of datedAssignments) ids.add(a.employeeId);
   for (const p of patterns) ids.add(p.employeeId);
+  for (const p of shiftPatterns) ids.add(p.employeeId);
   return ids;
 }
 
@@ -161,13 +178,15 @@ export function buildAttendanceCalculationPreviewRows(params: {
   shiftDates: string[];
   datedAssignments: DateAssignmentRow[];
   patterns: OffDayPatternRow[];
+  /** The recurring Day/Night baseline -- see resolveScheduleForDate's precedence (dated assignment > off-day pattern > this > unassigned), identical to the server-authoritative roster_resolve_schedule(). Defaults to [] only so existing callers/tests that genuinely have none don't need to pass an empty array explicitly; the real preview page always supplies the full fetched set. */
+  shiftPatterns?: ShiftPatternRow[];
   eventsByEmployeeId: Map<string, NormalizedFingerprintEvent[]>;
   coveragePolicy: ResolvedCoveragePolicy;
   officialStatusByKey: Map<string, string>;
   /** Employees with NO active HikCentral Person Mapping always get forced 'insufficient' coverage, regardless of any operator workstation confirmation -- their zero events reflect an unresolved mapping, never an observed absence. */
   employeeIdsWithActiveMapping: Set<string>;
 }): AttendanceCalculationPreviewRow[] {
-  const { employees, shiftDates, datedAssignments, patterns, eventsByEmployeeId, coveragePolicy, officialStatusByKey, employeeIdsWithActiveMapping } = params;
+  const { employees, shiftDates, datedAssignments, patterns, shiftPatterns = [], eventsByEmployeeId, coveragePolicy, officialStatusByKey, employeeIdsWithActiveMapping } = params;
   const rows: AttendanceCalculationPreviewRow[] = [];
 
   for (const employee of employees) {
@@ -177,7 +196,7 @@ export function buildAttendanceCalculationPreviewRows(params: {
       ? coverageForWorkstationKey(coveragePolicy, normalizeWorkstationKey(employee.workstation || ''))
       : ({ status: 'insufficient' } as const);
     for (const shiftDate of shiftDates) {
-      const resolvedShift = resolveScheduleForDate(employee.id, shiftDate, datedAssignments, patterns);
+      const resolvedShift = resolveScheduleForDate(employee.id, shiftDate, datedAssignments, patterns, shiftPatterns);
       const calculation = calculateAttendanceStatus({ shiftDate, resolvedShift, events, coverage });
       rows.push({
         employeeId: employee.id,

@@ -12,14 +12,24 @@
 import { supabase } from '../lib/supabase';
 import { AssignmentType, DateAssignmentRow, OffDayPatternRow, ShiftPatternRow } from './rosterSchedule';
 import { EmployeeLite } from './hikcentralPersonMapping';
+import { fetchAllPages } from './employeeBatchFetch';
 
 export async function fetchActiveOffDayPatterns(): Promise<OffDayPatternRow[]> {
-  const { data, error } = await supabase
-    .from('roster_off_day_patterns')
-    .select('employee_id, weekday, effective_from, is_active')
-    .eq('is_active', true);
-  if (error) throw error;
-  return (data || []).map((row) => ({
+  // PRODUCTION HOTFIX: was a single unpaginated query -- PostgREST's
+  // 1000-row cap would silently truncate the active Off-day pattern
+  // population once it grows past 1000 (see the identical fix in
+  // Employees.tsx/PR#49). fetchAllPages() pages through `.range()` until
+  // the server's own exact count is fully met. `id` is a unique,
+  // deterministic order for stable page boundaries.
+  const rows = await fetchAllPages<{ employee_id: string; weekday: number; effective_from: string; is_active: boolean }>(
+    (rangeFrom, rangeTo, withExactCount) => {
+      const q = withExactCount
+        ? supabase.from('roster_off_day_patterns').select('employee_id, weekday, effective_from, is_active', { count: 'exact' })
+        : supabase.from('roster_off_day_patterns').select('employee_id, weekday, effective_from, is_active');
+      return q.eq('is_active', true).order('id').range(rangeFrom, rangeTo);
+    }
+  );
+  return rows.map((row) => ({
     employeeId: row.employee_id,
     weekday: row.weekday,
     effectiveFrom: row.effective_from,
@@ -29,12 +39,17 @@ export async function fetchActiveOffDayPatterns(): Promise<OffDayPatternRow[]> {
 
 /** Stage C Step 6B: recurring Day/Night baseline, symmetric to fetchActiveOffDayPatterns above. */
 export async function fetchActiveShiftPatterns(): Promise<ShiftPatternRow[]> {
-  const { data, error } = await supabase
-    .from('roster_shift_patterns')
-    .select('employee_id, shift_type, effective_from, is_active')
-    .eq('is_active', true);
-  if (error) throw error;
-  return (data || []).map((row) => ({
+  // PRODUCTION HOTFIX: same 1000-row-cap fix as fetchActiveOffDayPatterns
+  // above -- see that function's comment.
+  const rows = await fetchAllPages<{ employee_id: string; shift_type: string; effective_from: string; is_active: boolean }>(
+    (rangeFrom, rangeTo, withExactCount) => {
+      const q = withExactCount
+        ? supabase.from('roster_shift_patterns').select('employee_id, shift_type, effective_from, is_active', { count: 'exact' })
+        : supabase.from('roster_shift_patterns').select('employee_id, shift_type, effective_from, is_active');
+      return q.eq('is_active', true).order('id').range(rangeFrom, rangeTo);
+    }
+  );
+  return rows.map((row) => ({
     employeeId: row.employee_id,
     shiftType: row.shift_type as 'day' | 'night',
     effectiveFrom: row.effective_from,
@@ -44,14 +59,19 @@ export async function fetchActiveShiftPatterns(): Promise<ShiftPatternRow[]> {
 
 /** Bounded by a date range (required) -- never an unbounded fetch of every dated assignment ever made. */
 export async function fetchActiveDateAssignments(dateFrom: string, dateTo: string): Promise<DateAssignmentRow[]> {
-  const { data, error } = await supabase
-    .from('roster_date_assignments')
-    .select('employee_id, assignment_date, assignment_type, is_active')
-    .eq('is_active', true)
-    .gte('assignment_date', dateFrom)
-    .lte('assignment_date', dateTo);
-  if (error) throw error;
-  return (data || []).map((row) => ({
+  // PRODUCTION HOTFIX: was a single unpaginated query -- a wide enough
+  // date range across enough employees can exceed PostgREST's 1000-row
+  // cap even with the date-range bound already in place. Same
+  // fetchAllPages() fix as the two functions above.
+  const rows = await fetchAllPages<{ employee_id: string; assignment_date: string; assignment_type: string; is_active: boolean }>(
+    (rangeFrom, rangeTo, withExactCount) => {
+      const q = withExactCount
+        ? supabase.from('roster_date_assignments').select('employee_id, assignment_date, assignment_type, is_active', { count: 'exact' })
+        : supabase.from('roster_date_assignments').select('employee_id, assignment_date, assignment_type, is_active');
+      return q.eq('is_active', true).gte('assignment_date', dateFrom).lte('assignment_date', dateTo).order('id').range(rangeFrom, rangeTo);
+    }
+  );
+  return rows.map((row) => ({
     employeeId: row.employee_id,
     assignmentDate: row.assignment_date,
     assignmentType: row.assignment_type as AssignmentType,

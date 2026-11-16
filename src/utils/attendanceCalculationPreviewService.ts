@@ -7,19 +7,21 @@
 // unchanged rather than re-querying the same tables a second way.
 import { supabase } from '../lib/supabase';
 import { fetchInEmployeeIdBatches } from './employeeBatchFetch';
-import { fetchActiveDateAssignments, fetchActiveOffDayPatterns, fetchActiveEmployeesForRoster } from './rosterService';
+import { fetchActiveDateAssignments, fetchActiveOffDayPatterns, fetchActiveShiftPatterns, fetchActiveEmployeesForRoster } from './rosterService';
 import { fetchIdentifiedEventsInRange } from './hikcentralAttendancePreviewService';
 import { splitByActiveMapping, blantyreDateRangeToUtcBounds } from './hikcentralAttendancePreview';
 import { fetchActiveHikCentralPersonMappings } from './hikcentralPersonMappingService';
 import { normalizeStoredFingerprintEventsForEmployee } from './attendanceFingerprintAdapters';
 import { NormalizedFingerprintEvent } from './attendanceCalculationEngine';
-import { DateAssignmentRow, OffDayPatternRow, addDays } from './rosterSchedule';
+import { DateAssignmentRow, OffDayPatternRow, ShiftPatternRow, addDays } from './rosterSchedule';
 import { EmployeeLite } from './hikcentralPersonMapping';
 
 export interface AttendanceCalculationPreviewData {
   employees: EmployeeLite[];
   datedAssignments: DateAssignmentRow[];
   patterns: OffDayPatternRow[];
+  /** PRODUCTION HOTFIX: the recurring Day/Night baseline (roster_resolve_schedule's own third resolution tier, server-authoritative) -- previously never fetched here at all, so this preview undercounted (sometimes to zero) any employee whose schedule comes only from a recurring pattern rather than an explicit per-date override. See resolveScheduleForDate's precedence: dated assignment > off-day pattern > this > unassigned. */
+  shiftPatterns: ShiftPatternRow[];
   eventsByEmployeeId: Map<string, NormalizedFingerprintEvent[]>;
   officialStatusByKey: Map<string, string>;
   /** Every employeeId with at least one ACTIVE HikCentral Person Mapping -- i.e. an employee this preview could ever observe a scan for at all. An employee absent from this set has zero events for an entirely different reason than "didn't scan": nobody has confirmed which HikCentral identity is theirs yet. See attendanceCalculationPreview.ts's use of this set -- it must never be treated as equivalent to a confirmed absence. */
@@ -45,10 +47,11 @@ export interface AttendanceCalculationPreviewData {
 export async function fetchAttendanceCalculationPreviewData(dateFrom: string, dateTo: string): Promise<AttendanceCalculationPreviewData> {
   const widenedTo = addDays(dateTo, 1);
 
-  const [employees, datedAssignments, patterns, mappings] = await Promise.all([
+  const [employees, datedAssignments, patterns, shiftPatterns, mappings] = await Promise.all([
     fetchActiveEmployeesForRoster(),
     fetchActiveDateAssignments(dateFrom, dateTo),
     fetchActiveOffDayPatterns(),
+    fetchActiveShiftPatterns(),
     fetchActiveHikCentralPersonMappings(),
   ]);
 
@@ -71,7 +74,7 @@ export async function fetchAttendanceCalculationPreviewData(dateFrom: string, da
 
   const employeeIdsWithActiveMapping = new Set(mappings.map((m) => m.employeeId));
 
-  return { employees, datedAssignments, patterns, eventsByEmployeeId, officialStatusByKey, employeeIdsWithActiveMapping };
+  return { employees, datedAssignments, patterns, shiftPatterns, eventsByEmployeeId, officialStatusByKey, employeeIdsWithActiveMapping };
 }
 
 /** Read-only -- `${employeeId}|${date}` -> the existing official attendance.status code, for display/comparison only. */
