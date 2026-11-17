@@ -142,6 +142,13 @@ function EvidenceDetailPanel({ row, state }: { row: AttendanceCalculationPreview
                 Coverage confirmed {formatLocalTime(c.confirmedAt)}, declared through {formatLocalTime(c.coversThroughIso)}
                 {c.workstations.length > 0 ? ` for ${c.workstations.join(', ')}` : ''}
                 {c.revokedAt ? ` — REVOKED ${formatLocalTime(c.revokedAt)}${c.revokedReason ? `: ${c.revokedReason}` : ''}` : ''}.
+                {c.exceedsObservedEvidence && (
+                  <span className="text-amber-700 font-medium">
+                    {' '}⚠ Declared coverage exceeded the latest observed fingerprint evidence
+                    {c.latestObservedEventAtIso ? ` (last observed scan: ${formatLocalTime(c.latestObservedEventAtIso)})` : ' (no scan observed at all in this window)'}
+                    {c.overrideReason ? ` — override reason: "${c.overrideReason}"` : ' — no override reason recorded'}.
+                  </span>
+                )}
               </p>
             ))}
           </div>

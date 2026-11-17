@@ -138,6 +138,25 @@ describe('fetchCoverageConfirmationsOverlapping', () => {
     fromMock.mockImplementation(mockPaginatedFrom([{ data: null, error: { message: 'boom' }, count: null }]));
     await expect(fetchCoverageConfirmationsOverlapping('2026-10-22T00:00:00.000Z', '2026-10-23T00:00:00.000Z')).rejects.toBeTruthy();
   });
+
+  it('Phase 3: surfaces the evidence-override fields when a confirmation exceeded observed evidence', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: [{ confirmed_at: '2026-10-22T07:16:49.000Z', covers_from: '2026-10-10T22:00:00.000Z', covers_through: '2026-10-22T21:59:00.000Z', export_time_declared: '2026-10-22T21:59:00.000Z', access_points: ['Gate 1'], workstations: [], revoked_at: null, revoked_reason: null, latest_observed_event_at: '2026-10-22T07:16:00.000Z', exceeds_observed_evidence: true, override_reason: 'Vendor confirmed export complete despite device clock lag.' }], error: null, count: 1 },
+    ]));
+    const result = await fetchCoverageConfirmationsOverlapping('2026-10-22T00:00:00.000Z', '2026-10-23T00:00:00.000Z');
+    expect(result[0].exceedsObservedEvidence).toBe(true);
+    expect(result[0].latestObservedEventAtIso).toBe('2026-10-22T07:16:00.000Z');
+    expect(result[0].overrideReason).toBe('Vendor confirmed export complete despite device clock lag.');
+  });
+
+  it('Phase 3: defaults exceedsObservedEvidence to false for confirmations created before this field existed', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: [{ confirmed_at: '2026-09-01T00:00:00.000Z', covers_from: '2026-09-01T00:00:00.000Z', covers_through: '2026-09-02T00:00:00.000Z', export_time_declared: null, access_points: ['Gate 1'], workstations: [], revoked_at: null, revoked_reason: null, latest_observed_event_at: null, exceeds_observed_evidence: null, override_reason: null }], error: null, count: 1 },
+    ]));
+    const result = await fetchCoverageConfirmationsOverlapping('2026-09-01T00:00:00.000Z', '2026-09-02T00:00:00.000Z');
+    expect(result[0].exceedsObservedEvidence).toBe(false);
+    expect(result[0].latestObservedEventAtIso).toBeNull();
+  });
 });
 
 describe('fetchImportBatchesByIds', () => {

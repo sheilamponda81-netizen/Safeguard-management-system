@@ -42,7 +42,7 @@ import { importHikCentralRawEvents, computeFileFingerprint, HikCentralImportResu
 import {
   processHikCentralImportBatch, isoToBlantyreDateStr,
   ProcessImportBatchResult, fetchCoverageTimeline, CoverageTimelineEntry,
-  fetchSiteAbsenceAlerts, acknowledgeSiteAlert, SiteAbsenceAlert,
+  fetchSiteAbsenceAlerts, acknowledgeSiteAlert, SiteAbsenceAlert, CoverageEvidenceWarning,
 } from '../utils/attendanceImportAutoApplyService';
 import { fetchActiveHikCentralPersonMappings } from '../utils/hikcentralPersonMappingService';
 
@@ -102,6 +102,10 @@ export default function HikCentralImportPage() {
   // what's missing before (and after) uploading. Degrades silently (empty
   // list) in an environment where this migration isn't applied yet, same
   // convention as processHikCentralImportBatch's own missing_rpc outcome.
+  // Phase 3: a human-authored reason, typed only when the server reports
+  // the declared period exceeds the observed fingerprint evidence --
+  // never pre-filled, never carried over to a new file.
+  const [overrideReason, setOverrideReason] = useState('');
   const [coverageTimeline, setCoverageTimeline] = useState<CoverageTimelineEntry[]>([]);
   const [siteAlerts, setSiteAlerts] = useState<SiteAbsenceAlert[]>([]);
   const [ackNotes, setAckNotes] = useState<Record<string, string>>({});
@@ -163,6 +167,7 @@ export default function HikCentralImportPage() {
     setPeriodFrom('');
     setPeriodTo('');
     setConfirmCoverageAccurate(false);
+    setOverrideReason('');
   }, []);
 
   const handleFileSelect = useCallback(async (file: File) => {
@@ -252,6 +257,10 @@ export default function HikCentralImportPage() {
         // was true before this upload.
         await reloadCoverageTimeline();
         await reloadSiteAlerts();
+      } else if (autoApply.outcome === 'needs_override_reason') {
+        // Phase 3: a normal, expected stop (not a failure) -- its own
+        // dedicated warning card below prompts for a reason or a
+        // narrower period, instead of a generic error notification.
       } else {
         showNotification(`Raw events were imported, but automatic attendance processing failed: ${autoApply.error || 'unknown error'}`, 'error');
       }
@@ -286,13 +295,50 @@ export default function HikCentralImportPage() {
         showNotification(`Applied ${autoApply.appliedCount} attendance record(s) across ${autoApply.employeeCount} employee(s).`, 'success');
         await reloadCoverageTimeline();
         await reloadSiteAlerts();
-      } else {
+      } else if (autoApply.outcome !== 'needs_override_reason') {
         showNotification(`Automatic attendance processing still failed: ${autoApply.error || 'unknown error'}`, 'error');
       }
     } finally {
       setRetrying(false);
     }
   }, [importResult, summary, periodFrom, periodTo, reloadCoverageTimeline, reloadSiteAlerts]);
+
+  // Phase 3: the operator has read the evidence-gap warning (below) and
+  // explicitly typed a reason to confirm the declared coverage anyway.
+  // Re-runs the SAME processing call, with that reason attached, for the
+  // SAME already-imported batch -- this never re-imports raw events, and
+  // is a distinct, visible, user-gated action, not a hidden retrigger.
+  const handleConfirmOverride = useCallback(async () => {
+    if (!importResult?.batchId || !summary) return;
+    const reason = overrideReason.trim();
+    if (!reason) {
+      showNotification('A reason is required to confirm coverage beyond the observed fingerprint evidence.', 'error');
+      return;
+    }
+    setRetrying(true);
+    try {
+      const autoApply = await processHikCentralImportBatch({
+        importBatchId: importResult.batchId,
+        periodFromDate: periodFrom,
+        periodToDate: periodTo,
+        dateFrom: periodFrom,
+        dateTo: periodTo,
+        accessPoints: summary.accessPoints,
+        overrideReason: reason,
+      });
+      setAutoApplyResult(autoApply);
+      if (autoApply.success) {
+        showNotification(`Applied ${autoApply.appliedCount} attendance record(s) across ${autoApply.employeeCount} employee(s).`, 'success');
+        setOverrideReason('');
+        await reloadCoverageTimeline();
+        await reloadSiteAlerts();
+      } else if (autoApply.outcome !== 'needs_override_reason') {
+        showNotification(`Automatic attendance processing still failed: ${autoApply.error || 'unknown error'}`, 'error');
+      }
+    } finally {
+      setRetrying(false);
+    }
+  }, [importResult, summary, periodFrom, periodTo, overrideReason, reloadCoverageTimeline, reloadSiteAlerts]);
 
   if (!permissionsLoaded) {
     return <div className="p-8 text-center text-slate-400">Loading...</div>;
@@ -570,14 +616,14 @@ export default function HikCentralImportPage() {
           )}
 
           {importResult?.success && autoApplyResult && (
-            <Card className={`p-6 border ${autoApplyResult.success ? 'bg-emerald-50 border-emerald-200' : 'bg-red-50 border-red-200'}`}>
+            <Card className={`p-6 border ${autoApplyResult.success ? 'bg-emerald-50 border-emerald-200' : autoApplyResult.outcome === 'needs_override_reason' ? 'bg-amber-50 border-amber-200' : 'bg-red-50 border-red-200'}`}>
               <div className="flex items-start gap-3">
                 {autoApplyResult.success
                   ? <CheckCircle2 size={20} className="text-emerald-600 shrink-0 mt-0.5" />
-                  : <AlertCircle size={20} className="text-red-600 shrink-0 mt-0.5" />}
+                  : <AlertCircle size={20} className={`shrink-0 mt-0.5 ${autoApplyResult.outcome === 'needs_override_reason' ? 'text-amber-600' : 'text-red-600'}`} />}
                 <div className="space-y-1 w-full">
-                  <p className={`text-sm font-medium ${autoApplyResult.success ? 'text-emerald-800' : 'text-red-800'}`}>
-                    {autoApplyResult.success ? 'Attendance calculated and applied automatically' : 'Automatic attendance processing failed'}
+                  <p className={`text-sm font-medium ${autoApplyResult.success ? 'text-emerald-800' : autoApplyResult.outcome === 'needs_override_reason' ? 'text-amber-800' : 'text-red-800'}`}>
+                    {autoApplyResult.success ? 'Attendance calculated and applied automatically' : autoApplyResult.outcome === 'needs_override_reason' ? 'Confirmation needed: declared coverage exceeds observed evidence' : 'Automatic attendance processing failed'}
                   </p>
                   {autoApplyResult.success ? (
                     <>
@@ -604,6 +650,14 @@ export default function HikCentralImportPage() {
                         </div>
                       )}
                     </>
+                  ) : autoApplyResult.outcome === 'needs_override_reason' ? (
+                    <CoverageEvidenceWarningPanel
+                      warning={autoApplyResult.coverageEvidenceWarning}
+                      overrideReason={overrideReason}
+                      onOverrideReasonChange={setOverrideReason}
+                      onConfirm={handleConfirmOverride}
+                      confirming={retrying}
+                    />
                   ) : (
                     <>
                       <p className="text-sm text-red-700">
@@ -629,6 +683,48 @@ export default function HikCentralImportPage() {
         />
       )}
     </div>
+  );
+}
+
+// Phase 3: shown in place of a generic failure when the server reports
+// needs_override_reason -- nothing has been written yet (no confirmation
+// row, no attendance calculation); raw fingerprint data already imported
+// is untouched either way. The operator chooses to narrow the declared
+// period above to match the evidence, or to type an explicit reason and
+// confirm the coverage anyway.
+function CoverageEvidenceWarningPanel({
+  warning, overrideReason, onOverrideReasonChange, onConfirm, confirming,
+}: {
+  warning: CoverageEvidenceWarning | undefined;
+  overrideReason: string;
+  onOverrideReasonChange: (value: string) => void;
+  onConfirm: () => void;
+  confirming: boolean;
+}) {
+  return (
+    <>
+      <p className="text-sm text-amber-700">
+        {warning?.latestObservedEventAtIso
+          ? `The latest fingerprint scan actually recorded for ${(warning.accessPoints || []).join(', ')} in this period was ${new Date(warning.latestObservedEventAtIso).toLocaleString()}, but the declared coverage period extends to ${warning ? new Date(warning.declaredCoversThroughIso).toLocaleString() : ''}.`
+          : `No fingerprint scans were found at all for ${(warning?.accessPoints || []).join(', ')} in this declared period.`}
+        {' '}This has not been recorded as coverage and no attendance has been calculated -- the imported raw fingerprint data is unaffected. Narrow the declared period above to match the evidence, or provide an explicit reason below to confirm this coverage anyway.
+      </p>
+      <label className="block text-xs text-slate-600 space-y-1 mt-2">
+        <span className="block font-medium">Reason for confirming coverage beyond the observed evidence</span>
+        <textarea
+          value={overrideReason}
+          onChange={(e) => onOverrideReasonChange(e.target.value)}
+          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+          rows={2}
+          placeholder="e.g. device clock known to lag; export confirmed complete by vendor support ticket #1234"
+        />
+      </label>
+      <div className="flex justify-end mt-2">
+        <Button onClick={onConfirm} disabled={confirming || !overrideReason.trim()}>
+          {confirming ? 'Confirming...' : 'Confirm coverage anyway'}
+        </Button>
+      </div>
+    </>
   );
 }
 

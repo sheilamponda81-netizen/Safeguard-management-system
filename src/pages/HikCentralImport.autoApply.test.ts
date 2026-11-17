@@ -27,18 +27,24 @@ describe('HikCentralImport: importing automatically calculates and applies atten
     expect(body.indexOf('importHikCentralRawEvents(')).toBeLessThan(body.indexOf('processHikCentralImportBatch({'));
   });
 
-  it('Stage C Step 8B/11: both processHikCentralImportBatch call sites pass the file\'s own detected access points as the required scope, not employees.workstation', () => {
+  it('Stage C Step 8B/11: all processHikCentralImportBatch call sites pass the file\'s own detected access points as the required scope, not employees.workstation', () => {
     const calls = source.match(/processHikCentralImportBatch\(\{[\s\S]*?\}\);/g) || [];
-    expect(calls.length).toBe(2);
+    // Three: handleImport's automatic call, handleRetryAutoApply's
+    // explicit retry-only call, and Phase 3's handleConfirmOverride call.
+    expect(calls.length).toBe(3);
     for (const call of calls) {
       expect(call).toMatch(/accessPoints: summary\.accessPoints/);
     }
   });
 
-  it('does not call processHikCentralImportBatch from any handler other than handleImport/handleRetryAutoApply (no hidden second trigger)', () => {
+  it('does not call processHikCentralImportBatch from any handler other than handleImport/handleRetryAutoApply/handleConfirmOverride (no hidden extra trigger)', () => {
     const callSites = (source.match(/processHikCentralImportBatch\(\{/g) || []).length;
-    // Exactly two: the automatic call inside handleImport, and the explicit retry-only call inside handleRetryAutoApply.
-    expect(callSites).toBe(2);
+    // Exactly three: the automatic call inside handleImport, the
+    // explicit retry-only call inside handleRetryAutoApply, and Phase 3's
+    // explicit, user-gated override-confirmation call inside
+    // handleConfirmOverride (typing a reason and clicking a dedicated
+    // button -- never triggered implicitly).
+    expect(callSites).toBe(3);
   });
 
   it('there is only ONE primary action button driving the whole import -- the Import Raw Events button -- never a separate "Apply" confirmation button for the normal flow', () => {
@@ -193,5 +199,49 @@ describe('Stage C Step 11: centralized HikCentral terminal model -- simplified i
 
   it('the coverage-confirmation checkbox label now refers to detected access points, not a chosen workstation list', () => {
     expect(source).toMatch(/complete coverage for the detected access point\(s\) above/);
+  });
+});
+
+describe('Phase 3: fingerprint coverage evidence validation -- override-reason flow', () => {
+  it('imports the CoverageEvidenceWarning type alongside the other auto-apply service imports', () => {
+    expect(source).toMatch(/SiteAbsenceAlert, CoverageEvidenceWarning,/);
+  });
+
+  it('handleImport and handleRetryAutoApply treat needs_override_reason as a distinct, non-error outcome (no generic failure notification for it)', () => {
+    const importHandler = source.match(/const handleImport = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    const retryHandler = source.match(/const handleRetryAutoApply = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(importHandler).toMatch(/autoApply\.outcome === 'needs_override_reason'/);
+    expect(retryHandler).toMatch(/autoApply\.outcome !== 'needs_override_reason'/);
+  });
+
+  it('handleConfirmOverride requires a non-empty trimmed reason before calling the RPC, and passes it as overrideReason', () => {
+    const handler = source.match(/const handleConfirmOverride = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(handler, 'expected to find handleConfirmOverride').toBeTruthy();
+    expect(handler).toMatch(/const reason = overrideReason\.trim\(\);/);
+    expect(handler).toMatch(/if \(!reason\)/);
+    expect(handler).toMatch(/overrideReason: reason/);
+    expect(handler).toMatch(/processHikCentralImportBatch\(\{/);
+  });
+
+  it('handleConfirmOverride never re-imports raw events -- it only calls processHikCentralImportBatch, never importHikCentralRawEvents', () => {
+    const handler = source.match(/const handleConfirmOverride = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(handler).not.toMatch(/importHikCentralRawEvents/);
+  });
+
+  it('resets overrideReason for every new file, same as the other scope fields', () => {
+    const resetFn = source.match(/const resetForNewFile = useCallback\(\(\) => \{[\s\S]*?\}, \[\]\);/)?.[0] ?? '';
+    expect(resetFn).toMatch(/setOverrideReason\(''\)/);
+  });
+
+  it('renders the CoverageEvidenceWarningPanel only for the needs_override_reason outcome, distinct from the generic failure branch', () => {
+    expect(source).toMatch(/autoApplyResult\.outcome === 'needs_override_reason' \? \(\s*<CoverageEvidenceWarningPanel/);
+  });
+
+  it('the warning panel never claims proof of a gap it cannot support -- it reports what was observed, not a status, and never writes anything implicitly', () => {
+    const panelMatch = source.match(/function CoverageEvidenceWarningPanel\([\s\S]*?\nfunction SummaryStat/);
+    expect(panelMatch, 'expected to find CoverageEvidenceWarningPanel').toBeTruthy();
+    const panel = panelMatch![0];
+    expect(panel).toMatch(/This has not been recorded as coverage and no attendance has been calculated/);
+    expect(panel).not.toMatch(/\.insert\(|\.update\(|\.upsert\(|\.delete\(/);
   });
 });

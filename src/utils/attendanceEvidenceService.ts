@@ -75,6 +75,11 @@ export interface EvidenceCoverageConfirmation {
   workstations: string[];
   revokedAt: string | null;
   revokedReason: string | null;
+  /** Phase 3: the latest actual hikcentral_raw_events timestamp observed for this confirmation's access points/window at the moment it was created -- diagnostic only, never proof by itself. Null on confirmations created before Phase 3, or when no event was found at all. */
+  latestObservedEventAtIso: string | null;
+  /** Phase 3: true when this confirmation's declared covers_through was recorded even though it reached meaningfully beyond latestObservedEventAtIso -- always paired with a non-empty overrideReason. */
+  exceedsObservedEvidence: boolean;
+  overrideReason: string | null;
 }
 
 /** Every coverage confirmation (revoked or not -- revocation is shown, never hidden) whose own [covers_from, covers_through] overlaps the given window. Realistically a handful of rows per day; not expected to approach the page cap, but paginated on the same principle as the rest of this file. */
@@ -88,8 +93,11 @@ export async function fetchCoverageConfirmationsOverlapping(fromUtcIso: string, 
     workstations: string[] | null;
     revoked_at: string | null;
     revoked_reason: string | null;
+    latest_observed_event_at: string | null;
+    exceeds_observed_evidence: boolean | null;
+    override_reason: string | null;
   }>((rangeFrom, rangeTo, withExactCount) => {
-    const columns = 'confirmed_at, covers_from, covers_through, export_time_declared, access_points, workstations, revoked_at, revoked_reason';
+    const columns = 'confirmed_at, covers_from, covers_through, export_time_declared, access_points, workstations, revoked_at, revoked_reason, latest_observed_event_at, exceeds_observed_evidence, override_reason';
     const q = withExactCount
       ? supabase.from('fingerprint_coverage_confirmations').select(columns, { count: 'exact' })
       : supabase.from('fingerprint_coverage_confirmations').select(columns);
@@ -108,6 +116,9 @@ export async function fetchCoverageConfirmationsOverlapping(fromUtcIso: string, 
     workstations: row.workstations || [],
     revokedAt: row.revoked_at,
     revokedReason: row.revoked_reason,
+    latestObservedEventAtIso: row.latest_observed_event_at,
+    exceedsObservedEvidence: row.exceeds_observed_evidence ?? false,
+    overrideReason: row.override_reason,
   }));
 }
 
