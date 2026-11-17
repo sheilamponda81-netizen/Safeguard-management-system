@@ -68,6 +68,8 @@ export async function fetchRawEventsForPersonInRange(
 
 export interface EvidenceCoverageConfirmation {
   confirmedAt: string;
+  /** The profile id of the administrator who created this confirmation -- durable, immutable (the append-only guard forbids ever changing it), never null. Shown as-is, same convention as attendance_audit_log's changedBy -- this module does not resolve it to a display name. */
+  confirmedBy: string;
   coversFromIso: string;
   coversThroughIso: string;
   exportTimeDeclaredIso: string | null;
@@ -86,6 +88,7 @@ export interface EvidenceCoverageConfirmation {
 export async function fetchCoverageConfirmationsOverlapping(fromUtcIso: string, toUtcIsoExclusive: string): Promise<EvidenceCoverageConfirmation[]> {
   const rows = await fetchAllPages<{
     confirmed_at: string;
+    confirmed_by: string;
     covers_from: string;
     covers_through: string;
     export_time_declared: string | null;
@@ -97,7 +100,7 @@ export async function fetchCoverageConfirmationsOverlapping(fromUtcIso: string, 
     exceeds_observed_evidence: boolean | null;
     override_reason: string | null;
   }>((rangeFrom, rangeTo, withExactCount) => {
-    const columns = 'confirmed_at, covers_from, covers_through, export_time_declared, access_points, workstations, revoked_at, revoked_reason, latest_observed_event_at, exceeds_observed_evidence, override_reason';
+    const columns = 'confirmed_at, confirmed_by, covers_from, covers_through, export_time_declared, access_points, workstations, revoked_at, revoked_reason, latest_observed_event_at, exceeds_observed_evidence, override_reason';
     const q = withExactCount
       ? supabase.from('fingerprint_coverage_confirmations').select(columns, { count: 'exact' })
       : supabase.from('fingerprint_coverage_confirmations').select(columns);
@@ -109,6 +112,7 @@ export async function fetchCoverageConfirmationsOverlapping(fromUtcIso: string, 
   }, PAGE_SIZE);
   return rows.map((row) => ({
     confirmedAt: row.confirmed_at,
+    confirmedBy: row.confirmed_by,
     coversFromIso: row.covers_from,
     coversThroughIso: row.covers_through,
     exportTimeDeclaredIso: row.export_time_declared,

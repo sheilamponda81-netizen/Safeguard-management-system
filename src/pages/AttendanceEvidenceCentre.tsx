@@ -139,7 +139,7 @@ function EvidenceDetailPanel({ row, state }: { row: AttendanceCalculationPreview
           <div className="mt-2 text-xs text-slate-500 space-y-1">
             {detail.coverageConfirmations.map((c, i) => (
               <p key={i}>
-                Coverage confirmed {formatLocalTime(c.confirmedAt)}, declared through {formatLocalTime(c.coversThroughIso)}
+                Coverage confirmed {formatLocalTime(c.confirmedAt)} by {c.confirmedBy}, declared through {formatLocalTime(c.coversThroughIso)}
                 {c.workstations.length > 0 ? ` for ${c.workstations.join(', ')}` : ''}
                 {c.revokedAt ? ` — REVOKED ${formatLocalTime(c.revokedAt)}${c.revokedReason ? `: ${c.revokedReason}` : ''}` : ''}.
                 {c.exceedsObservedEvidence && (

@@ -65,4 +65,8 @@ describe('AttendanceEvidenceCentre.tsx: strictly read-only, no new permission, n
   it('reuses the existing server-authoritative recalculation RPC wrapper for the "calculated result" comparison, never a client-only approximation standing in for it', () => {
     expect(evidenceCentreSource).toMatch(/fetchAttendanceEvidenceDetail/);
   });
+
+  it('Phase 3 safety review: displays WHO confirmed coverage -- durable attribution in the database must also be visible to a reviewing administrator', () => {
+    expect(evidenceCentreSource).toMatch(/by \{c\.confirmedBy\}/);
+  });
 });

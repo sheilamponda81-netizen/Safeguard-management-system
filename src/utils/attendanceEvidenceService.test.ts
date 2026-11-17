@@ -117,12 +117,20 @@ describe('fetchCoverageConfirmationsOverlapping', () => {
 
   it('maps rows including revocation fields', async () => {
     fromMock.mockImplementation(mockPaginatedFrom([
-      { data: [{ confirmed_at: '2026-10-22T07:16:49.000Z', covers_from: '2026-10-10T22:00:00.000Z', covers_through: '2026-10-22T21:59:00.000Z', export_time_declared: '2026-10-22T21:59:00.000Z', access_points: ['Gate 1'], workstations: [], revoked_at: null, revoked_reason: null }], error: null, count: 1 },
+      { data: [{ confirmed_at: '2026-10-22T07:16:49.000Z', confirmed_by: 'admin-1', covers_from: '2026-10-10T22:00:00.000Z', covers_through: '2026-10-22T21:59:00.000Z', export_time_declared: '2026-10-22T21:59:00.000Z', access_points: ['Gate 1'], workstations: [], revoked_at: null, revoked_reason: null }], error: null, count: 1 },
     ]));
     const result = await fetchCoverageConfirmationsOverlapping('2026-10-22T00:00:00.000Z', '2026-10-23T00:00:00.000Z');
     expect(result).toHaveLength(1);
     expect(result[0].revokedAt).toBeNull();
     expect(result[0].accessPoints).toEqual(['Gate 1']);
+  });
+
+  it('exposes confirmedBy so the durable administrator attribution is visible to a reviewer, not just stored in the database', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: [{ confirmed_at: '2026-10-22T07:16:49.000Z', confirmed_by: 'admin-42', covers_from: '2026-10-10T22:00:00.000Z', covers_through: '2026-10-22T21:59:00.000Z', export_time_declared: null, access_points: ['Gate 1'], workstations: [], revoked_at: null, revoked_reason: null }], error: null, count: 1 },
+    ]));
+    const result = await fetchCoverageConfirmationsOverlapping('2026-10-22T00:00:00.000Z', '2026-10-23T00:00:00.000Z');
+    expect(result[0].confirmedBy).toBe('admin-42');
   });
 
   it('surfaces a revoked confirmation rather than hiding it', async () => {
