@@ -139,9 +139,17 @@ function EvidenceDetailPanel({ row, state }: { row: AttendanceCalculationPreview
           <div className="mt-2 text-xs text-slate-500 space-y-1">
             {detail.coverageConfirmations.map((c, i) => (
               <p key={i}>
-                Coverage confirmed {formatLocalTime(c.confirmedAt)}, declared through {formatLocalTime(c.coversThroughIso)}
+                Coverage confirmed {formatLocalTime(c.confirmedAt)} by {c.confirmedBy}, declared through {formatLocalTime(c.coversThroughIso)}
                 {c.workstations.length > 0 ? ` for ${c.workstations.join(', ')}` : ''}
                 {c.revokedAt ? ` — REVOKED ${formatLocalTime(c.revokedAt)}${c.revokedReason ? `: ${c.revokedReason}` : ''}` : ''}.
+                {c.exceedsObservedEvidence && (
+                  <span className="text-amber-700 font-medium">
+                    {' '}⚠ Declared coverage exceeded the latest observed fingerprint evidence
+                    {c.latestObservedEventAtIso ? ` (last observed scan: ${formatLocalTime(c.latestObservedEventAtIso)})` : ' (no scan observed at all in this window)'}
+                    {c.overrideReason ? ` — override reason: "${c.overrideReason}"` : ' — no override reason recorded'}
+                    {c.independentlyVerified ? ' — administrator attested independent verification against HikCentral/the site.' : ' — NOT independently verified (should not be possible; flag for review).'}
+                  </span>
+                )}
               </p>
             ))}
           </div>

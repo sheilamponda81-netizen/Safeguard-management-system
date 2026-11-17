@@ -250,11 +250,26 @@ export async function acknowledgeSiteAlert(alertId: string, note: string): Promi
   return mapSiteAbsenceAlertRow(data as SiteAbsenceAlertRpcRow);
 }
 
-export type ProcessImportBatchOutcome = 'success' | 'unauthorized' | 'missing_rpc' | 'network_error' | 'unexpected_response';
+export type ProcessImportBatchOutcome = 'success' | 'unauthorized' | 'missing_rpc' | 'network_error' | 'unexpected_response' | 'needs_override_reason';
 
 export interface NeedsTerminalConfigurationEmployee {
   employeeId: string;
   fullName: string;
+}
+
+/**
+ * Phase 3: present only when outcome === 'needs_override_reason'. Nothing
+ * has been written yet when this comes back -- no confirmation row, no
+ * attendance calculation -- the declared coverage period reaches further
+ * than the latest fingerprint event actually observed (for these access
+ * points, within the declared window) supports. latestObservedEventAtIso
+ * is diagnostic evidence only, per the corrected design principle -- it
+ * is shown to help a human decide, never treated as proof either way.
+ */
+export interface CoverageEvidenceWarning {
+  latestObservedEventAtIso: string | null;
+  declaredCoversThroughIso: string;
+  accessPoints: string[];
 }
 
 export interface ProcessImportBatchResult {
@@ -275,6 +290,7 @@ export interface ProcessImportBatchResult {
    * going unnoticed.
    */
   needsTerminalConfiguration?: NeedsTerminalConfigurationEmployee[];
+  coverageEvidenceWarning?: CoverageEvidenceWarning;
 }
 
 interface ProcessImportBatchRpcResponse {
@@ -295,6 +311,17 @@ function isProcessImportBatchRpcResponse(data: unknown): data is ProcessImportBa
     typeof (data as { employee_count?: unknown }).employee_count === 'number' &&
     typeof (data as { applied_count?: unknown }).applied_count === 'number'
   );
+}
+
+interface NeedsOverrideReasonRpcResponse {
+  status: 'needs_override_reason';
+  latest_observed_event_at: string | null;
+  declared_covers_through: string;
+  access_points: string[];
+}
+
+function isNeedsOverrideReasonRpcResponse(data: unknown): data is NeedsOverrideReasonRpcResponse {
+  return typeof data === 'object' && data !== null && (data as { status?: unknown }).status === 'needs_override_reason';
 }
 
 /**
@@ -324,6 +351,23 @@ export async function processHikCentralImportBatch(params: {
   notes?: string;
   /** Optional, legacy, additive scope-inclusion only -- see this function's header. */
   workstations?: string[];
+  /**
+   * Phase 3: an explicit, human-authored reason confirming the declared
+   * coverage period is correct even though it reaches beyond the latest
+   * fingerprint evidence actually observed. Only consulted by the server
+   * when that gap is actually detected; omit on a normal call. Blank/
+   * whitespace-only is treated as not supplied (never silently accepted
+   * as a reason). NEVER sufficient by itself -- see independentlyVerified.
+   */
+  overrideReason?: string;
+  /**
+   * Phase 3: a SEPARATE, required, explicit attestation that the
+   * administrator actually checked the export's completeness against
+   * HikCentral or the relevant site -- never inferred from overrideReason
+   * merely being non-empty. The server rejects an override that supplies
+   * a reason but not this flag, exactly as if neither were supplied.
+   */
+  independentlyVerified?: boolean;
 }): Promise<ProcessImportBatchResult> {
   const { coversFromIso, coversThroughIso } = periodToCoverageWindow(params.periodFromDate, params.periodToDate);
   try {
@@ -336,6 +380,8 @@ export async function processHikCentralImportBatch(params: {
       p_date_to: params.dateTo,
       p_notes: params.notes ?? null,
       p_workstations: params.workstations && params.workstations.length > 0 ? params.workstations : null,
+      p_override_reason: params.overrideReason && params.overrideReason.trim() ? params.overrideReason.trim() : null,
+      p_independently_verified: params.independentlyVerified === true,
     });
 
     if (error) {
@@ -347,6 +393,19 @@ export async function processHikCentralImportBatch(params: {
         };
       }
       return { success: false, outcome: 'unauthorized', error: error.message };
+    }
+
+    if (isNeedsOverrideReasonRpcResponse(data)) {
+      return {
+        success: false,
+        outcome: 'needs_override_reason',
+        error: 'The declared coverage period extends beyond the latest fingerprint evidence observed for these access points. Narrow the declared period to match the evidence, or provide an explicit reason to confirm this coverage anyway.',
+        coverageEvidenceWarning: {
+          latestObservedEventAtIso: data.latest_observed_event_at,
+          declaredCoversThroughIso: data.declared_covers_through,
+          accessPoints: data.access_points || [],
+        },
+      };
     }
 
     if (!isProcessImportBatchRpcResponse(data)) {

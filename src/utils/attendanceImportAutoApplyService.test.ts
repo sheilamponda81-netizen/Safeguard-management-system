@@ -225,6 +225,8 @@ describe('processHikCentralImportBatch', () => {
       p_date_to: '2026-10-04',
       p_notes: null,
       p_workstations: null,
+      p_override_reason: null,
+      p_independently_verified: false,
     });
     expect(result).toEqual({
       success: true,
@@ -280,6 +282,103 @@ describe('processHikCentralImportBatch', () => {
       importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-01', periodToDate: '2026-10-01', dateFrom: '2026-10-01', dateTo: '2026-10-01',
     });
     expect(result.needsTerminalConfiguration).toEqual([{ employeeId: 'e1', fullName: 'Jane Doe' }]);
+  });
+
+  it('Phase 3: trims and passes a supplied override reason; omitting it sends null', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
+      error: null,
+    });
+    await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-22', periodToDate: '2026-10-22', dateFrom: '2026-10-22', dateTo: '2026-10-22',
+      overrideReason: '  Vendor confirmed export complete.  ',
+    });
+    expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
+      p_override_reason: 'Vendor confirmed export complete.',
+    }));
+  });
+
+  it('Phase 3: a whitespace-only override reason is sent as null, never accepted as a real reason', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
+      error: null,
+    });
+    await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-22', periodToDate: '2026-10-22', dateFrom: '2026-10-22', dateTo: '2026-10-22',
+      overrideReason: '   ',
+    });
+    expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
+      p_override_reason: null,
+    }));
+  });
+
+  it('Phase 3 safety review: independentlyVerified defaults to false and is sent as a literal boolean, never inferred from overrideReason alone', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
+      error: null,
+    });
+    await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-22', periodToDate: '2026-10-22', dateFrom: '2026-10-22', dateTo: '2026-10-22',
+      overrideReason: 'Vendor confirmed export complete.',
+      // independentlyVerified deliberately omitted -- a reason alone must never imply it.
+    });
+    expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
+      p_override_reason: 'Vendor confirmed export complete.',
+      p_independently_verified: false,
+    }));
+  });
+
+  it('Phase 3 safety review: passes independentlyVerified=true only when explicitly set', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
+      error: null,
+    });
+    await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-22', periodToDate: '2026-10-22', dateFrom: '2026-10-22', dateTo: '2026-10-22',
+      overrideReason: 'Vendor confirmed export complete.',
+      independentlyVerified: true,
+    });
+    expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
+      p_independently_verified: true,
+    }));
+  });
+
+  it('Phase 3: maps a needs_override_reason RPC response to a distinct outcome, writing nothing', async () => {
+    rpcMock.mockResolvedValue({
+      data: {
+        status: 'needs_override_reason',
+        latest_observed_event_at: '2026-10-22T07:16:00.000Z',
+        declared_covers_through: '2026-10-22T21:59:00.000Z',
+        access_points: ['Gate 1'],
+      },
+      error: null,
+    });
+    const result = await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['Gate 1'], periodFromDate: '2026-10-22', periodToDate: '2026-10-22', dateFrom: '2026-10-22', dateTo: '2026-10-22',
+    });
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe('needs_override_reason');
+    expect(result.coverageEvidenceWarning).toEqual({
+      latestObservedEventAtIso: '2026-10-22T07:16:00.000Z',
+      declaredCoversThroughIso: '2026-10-22T21:59:00.000Z',
+      accessPoints: ['Gate 1'],
+    });
+  });
+
+  it('Phase 3: a needs_override_reason response with no observed event at all surfaces a null latestObservedEventAtIso, never fabricating a timestamp', async () => {
+    rpcMock.mockResolvedValue({
+      data: {
+        status: 'needs_override_reason',
+        latest_observed_event_at: null,
+        declared_covers_through: '2026-10-22T21:59:00.000Z',
+        access_points: ['Gate 1'],
+      },
+      error: null,
+    });
+    const result = await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['Gate 1'], periodFromDate: '2026-10-22', periodToDate: '2026-10-22', dateFrom: '2026-10-22', dateTo: '2026-10-22',
+    });
+    expect(result.coverageEvidenceWarning?.latestObservedEventAtIso).toBeNull();
   });
 
   it('reports a distinct missing_rpc outcome when the migration is not yet applied', async () => {
