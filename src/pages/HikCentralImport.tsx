@@ -106,6 +106,11 @@ export default function HikCentralImportPage() {
   // the declared period exceeds the observed fingerprint evidence --
   // never pre-filled, never carried over to a new file.
   const [overrideReason, setOverrideReason] = useState('');
+  // Phase 3 safety review: a SEPARATE, explicit attestation checkbox --
+  // deliberately distinct from the reason textarea above, since a typed
+  // reason alone must never silently imply the export was independently
+  // checked against HikCentral/the site. Reset with the reason.
+  const [independentlyVerified, setIndependentlyVerified] = useState(false);
   const [coverageTimeline, setCoverageTimeline] = useState<CoverageTimelineEntry[]>([]);
   const [siteAlerts, setSiteAlerts] = useState<SiteAbsenceAlert[]>([]);
   const [ackNotes, setAckNotes] = useState<Record<string, string>>({});
@@ -168,6 +173,7 @@ export default function HikCentralImportPage() {
     setPeriodTo('');
     setConfirmCoverageAccurate(false);
     setOverrideReason('');
+    setIndependentlyVerified(false);
   }, []);
 
   const handleFileSelect = useCallback(async (file: File) => {
@@ -308,11 +314,22 @@ export default function HikCentralImportPage() {
   // Re-runs the SAME processing call, with that reason attached, for the
   // SAME already-imported batch -- this never re-imports raw events, and
   // is a distinct, visible, user-gated action, not a hidden retrigger.
+  //
+  // Phase 3 safety review: a typed reason ALONE is never sufficient --
+  // independentlyVerified is a SEPARATE, required checkbox (never
+  // inferred from the reason text existing) attesting the administrator
+  // actually checked the export's completeness against HikCentral or the
+  // relevant site. Both gates are enforced again here, client-side, even
+  // though the server (the real authority) already enforces them too.
   const handleConfirmOverride = useCallback(async () => {
     if (!importResult?.batchId || !summary) return;
     const reason = overrideReason.trim();
     if (!reason) {
       showNotification('A reason is required to confirm coverage beyond the observed fingerprint evidence.', 'error');
+      return;
+    }
+    if (!independentlyVerified) {
+      showNotification('You must explicitly confirm that you independently checked the export\'s completeness against HikCentral or the relevant site before overriding this warning.', 'error');
       return;
     }
     setRetrying(true);
@@ -325,11 +342,13 @@ export default function HikCentralImportPage() {
         dateTo: periodTo,
         accessPoints: summary.accessPoints,
         overrideReason: reason,
+        independentlyVerified: true,
       });
       setAutoApplyResult(autoApply);
       if (autoApply.success) {
         showNotification(`Applied ${autoApply.appliedCount} attendance record(s) across ${autoApply.employeeCount} employee(s).`, 'success');
         setOverrideReason('');
+        setIndependentlyVerified(false);
         await reloadCoverageTimeline();
         await reloadSiteAlerts();
       } else if (autoApply.outcome !== 'needs_override_reason') {
@@ -338,7 +357,7 @@ export default function HikCentralImportPage() {
     } finally {
       setRetrying(false);
     }
-  }, [importResult, summary, periodFrom, periodTo, overrideReason, reloadCoverageTimeline, reloadSiteAlerts]);
+  }, [importResult, summary, periodFrom, periodTo, overrideReason, independentlyVerified, reloadCoverageTimeline, reloadSiteAlerts]);
 
   if (!permissionsLoaded) {
     return <div className="p-8 text-center text-slate-400">Loading...</div>;
@@ -655,6 +674,8 @@ export default function HikCentralImportPage() {
                       warning={autoApplyResult.coverageEvidenceWarning}
                       overrideReason={overrideReason}
                       onOverrideReasonChange={setOverrideReason}
+                      independentlyVerified={independentlyVerified}
+                      onIndependentlyVerifiedChange={setIndependentlyVerified}
                       onConfirm={handleConfirmOverride}
                       confirming={retrying}
                     />
@@ -693,11 +714,13 @@ export default function HikCentralImportPage() {
 // period above to match the evidence, or to type an explicit reason and
 // confirm the coverage anyway.
 function CoverageEvidenceWarningPanel({
-  warning, overrideReason, onOverrideReasonChange, onConfirm, confirming,
+  warning, overrideReason, onOverrideReasonChange, independentlyVerified, onIndependentlyVerifiedChange, onConfirm, confirming,
 }: {
   warning: CoverageEvidenceWarning | undefined;
   overrideReason: string;
   onOverrideReasonChange: (value: string) => void;
+  independentlyVerified: boolean;
+  onIndependentlyVerifiedChange: (value: boolean) => void;
   onConfirm: () => void;
   confirming: boolean;
 }) {
@@ -719,8 +742,19 @@ function CoverageEvidenceWarningPanel({
           placeholder="e.g. device clock known to lag; export confirmed complete by vendor support ticket #1234"
         />
       </label>
+      <label className="flex items-start gap-2 text-xs text-amber-900 bg-amber-100 border border-amber-300 rounded-lg p-3 mt-2 cursor-pointer">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={independentlyVerified}
+          onChange={(e) => onIndependentlyVerifiedChange(e.target.checked)}
+        />
+        <span>
+          I confirm I have independently checked this export&apos;s completeness directly against HikCentral or the relevant terminal/site -- not merely typed a reason above -- and that the coverage declared here is genuinely complete.
+        </span>
+      </label>
       <div className="flex justify-end mt-2">
-        <Button onClick={onConfirm} disabled={confirming || !overrideReason.trim()}>
+        <Button onClick={onConfirm} disabled={confirming || !overrideReason.trim() || !independentlyVerified}>
           {confirming ? 'Confirming...' : 'Confirm coverage anyway'}
         </Button>
       </div>

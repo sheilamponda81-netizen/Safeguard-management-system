@@ -146,7 +146,8 @@ function EvidenceDetailPanel({ row, state }: { row: AttendanceCalculationPreview
                   <span className="text-amber-700 font-medium">
                     {' '}⚠ Declared coverage exceeded the latest observed fingerprint evidence
                     {c.latestObservedEventAtIso ? ` (last observed scan: ${formatLocalTime(c.latestObservedEventAtIso)})` : ' (no scan observed at all in this window)'}
-                    {c.overrideReason ? ` — override reason: "${c.overrideReason}"` : ' — no override reason recorded'}.
+                    {c.overrideReason ? ` — override reason: "${c.overrideReason}"` : ' — no override reason recorded'}
+                    {c.independentlyVerified ? ' — administrator attested independent verification against HikCentral/the site.' : ' — NOT independently verified (should not be possible; flag for review).'}
                   </span>
                 )}
               </p>

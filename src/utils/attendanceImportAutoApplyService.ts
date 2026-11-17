@@ -357,9 +357,17 @@ export async function processHikCentralImportBatch(params: {
    * fingerprint evidence actually observed. Only consulted by the server
    * when that gap is actually detected; omit on a normal call. Blank/
    * whitespace-only is treated as not supplied (never silently accepted
-   * as a reason).
+   * as a reason). NEVER sufficient by itself -- see independentlyVerified.
    */
   overrideReason?: string;
+  /**
+   * Phase 3: a SEPARATE, required, explicit attestation that the
+   * administrator actually checked the export's completeness against
+   * HikCentral or the relevant site -- never inferred from overrideReason
+   * merely being non-empty. The server rejects an override that supplies
+   * a reason but not this flag, exactly as if neither were supplied.
+   */
+  independentlyVerified?: boolean;
 }): Promise<ProcessImportBatchResult> {
   const { coversFromIso, coversThroughIso } = periodToCoverageWindow(params.periodFromDate, params.periodToDate);
   try {
@@ -373,6 +381,7 @@ export async function processHikCentralImportBatch(params: {
       p_notes: params.notes ?? null,
       p_workstations: params.workstations && params.workstations.length > 0 ? params.workstations : null,
       p_override_reason: params.overrideReason && params.overrideReason.trim() ? params.overrideReason.trim() : null,
+      p_independently_verified: params.independentlyVerified === true,
     });
 
     if (error) {

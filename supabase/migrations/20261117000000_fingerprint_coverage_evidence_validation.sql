@@ -34,18 +34,22 @@
 -- data already imported is never touched either way.
 --
 -- SCOPE (additive only):
---   PART 1: three new nullable/defaulted columns on the existing,
+--   PART 1: four new nullable/defaulted columns on the existing,
 --     already-append-only fingerprint_coverage_confirmations table, plus
 --     a CHECK constraint and an updated append-only guard trigger.
---   PART 2: attendance_process_import_batch gains one new, optional,
---     trailing parameter (p_override_reason) -- CREATE OR REPLACE only,
---     no DROP, since Postgres allows appending a new DEFAULTed parameter
---     without changing any existing parameter's name/type/position. When
---     the declared coverage exceeds the observed evidence by more than a
---     documented threshold and no override reason was supplied, the
+--   PART 2: attendance_process_import_batch gains two new, optional,
+--     trailing parameters (p_override_reason, p_independently_verified).
+--     When the declared coverage exceeds the observed evidence by more
+--     than a documented threshold and EITHER a reason is missing OR
+--     independent verification is not explicitly asserted true, the
 --     function now returns a distinct 'needs_override_reason' JSON
 --     response and returns BEFORE inserting anything or calling
---     attendance_apply_automatic -- fail-closed, not fail-open.
+--     attendance_apply_automatic -- fail-closed, not fail-open. A typed
+--     reason ALONE is never sufficient: p_independently_verified must be
+--     explicitly true (never inferred from the reason text existing) --
+--     this is a SEPARATE, required, explicit attestation that the
+--     administrator actually checked the export's completeness against
+--     HikCentral or the relevant site, not merely a free-text comment.
 --
 -- NOTHING else changes: roster resolution, the attendance engine, manual-
 -- correction precedence, approved-payroll protection, tenant isolation,
@@ -60,20 +64,27 @@
 ALTER TABLE fingerprint_coverage_confirmations
   ADD COLUMN IF NOT EXISTS latest_observed_event_at TIMESTAMPTZ NULL,
   ADD COLUMN IF NOT EXISTS exceeds_observed_evidence BOOLEAN NOT NULL DEFAULT false,
-  ADD COLUMN IF NOT EXISTS override_reason TEXT NULL;
+  ADD COLUMN IF NOT EXISTS override_reason TEXT NULL,
+  ADD COLUMN IF NOT EXISTS independently_verified BOOLEAN NOT NULL DEFAULT false;
 
 -- Fail-closed at the data layer too, not only in the RPC: a row can
--- never claim exceeds_observed_evidence=true without a non-empty
--- override_reason recorded alongside it, regardless of what inserts it.
--- Existing rows all default exceeds_observed_evidence=false, so this
--- validates instantly against current data with no table rewrite.
+-- never claim exceeds_observed_evidence=true without BOTH a non-empty
+-- override_reason AND independently_verified=true recorded alongside it,
+-- regardless of what inserts it. A typed reason alone is deliberately
+-- NOT sufficient on its own -- independently_verified is a separate
+-- explicit attestation (never inferred from the reason text merely
+-- existing) that the administrator actually checked the export's
+-- completeness against HikCentral or the relevant site, not just
+-- documented a belief. Existing rows all default both to
+-- false, so this validates instantly against current data with no
+-- table rewrite.
 ALTER TABLE fingerprint_coverage_confirmations
   DROP CONSTRAINT IF EXISTS fingerprint_coverage_confirmations_override_reason_required;
 ALTER TABLE fingerprint_coverage_confirmations
   ADD CONSTRAINT fingerprint_coverage_confirmations_override_reason_required
-  CHECK (NOT exceeds_observed_evidence OR btrim(COALESCE(override_reason, '')) <> '');
+  CHECK (NOT exceeds_observed_evidence OR (btrim(COALESCE(override_reason, '')) <> '' AND independently_verified));
 
--- The append-only guard must treat the three new columns the same as
+-- The append-only guard must treat the four new columns the same as
 -- every other identity/content column (immutable after creation --
 -- only revoked_at/revoked_by/revoked_reason may ever change).
 CREATE OR REPLACE FUNCTION fingerprint_coverage_confirmation_guard()
@@ -98,6 +109,7 @@ BEGIN
      OR NEW.latest_observed_event_at IS DISTINCT FROM OLD.latest_observed_event_at
      OR NEW.exceeds_observed_evidence IS DISTINCT FROM OLD.exceeds_observed_evidence
      OR NEW.override_reason IS DISTINCT FROM OLD.override_reason
+     OR NEW.independently_verified IS DISTINCT FROM OLD.independently_verified
   THEN
     RAISE EXCEPTION 'Coverage confirmations are append-only: identity/content columns cannot be modified -- revoke and create a new confirmation instead' USING ERRCODE = '42501';
   END IF;
@@ -136,7 +148,13 @@ CREATE OR REPLACE FUNCTION attendance_process_import_batch(
   p_date_to DATE,
   p_notes TEXT DEFAULT NULL,
   p_workstations TEXT[] DEFAULT NULL,
-  p_override_reason TEXT DEFAULT NULL
+  p_override_reason TEXT DEFAULT NULL,
+  -- Must be explicitly TRUE to override an evidence-gap warning -- never
+  -- inferred from p_override_reason being non-empty. Defaults to false
+  -- (fail-closed): an older or forgotten caller that only sends a reason
+  -- is still rejected by the gate below, exactly like sending no reason
+  -- at all.
+  p_independently_verified BOOLEAN DEFAULT false
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -230,7 +248,12 @@ BEGIN
     v_exceeds_evidence := (v_latest_observed_event_at IS NULL)
       OR (p_covers_through - v_latest_observed_event_at > v_evidence_gap_threshold);
 
-    IF v_exceeds_evidence AND btrim(COALESCE(p_override_reason, '')) = '' THEN
+    -- A typed reason ALONE is never sufficient to override: COALESCE(p_independently_verified, false)
+    -- must be explicitly TRUE too -- this is a separate, required attestation
+    -- that the administrator actually checked the export's completeness
+    -- against HikCentral or the relevant site, never inferred merely from
+    -- the reason text existing.
+    IF v_exceeds_evidence AND (btrim(COALESCE(p_override_reason, '')) = '' OR NOT COALESCE(p_independently_verified, false)) THEN
       -- FAIL CLOSED: return the warning, write nothing at all -- no
       -- confirmation row, no attendance calculation. Raw fingerprint
       -- events already imported for this batch are completely untouched
@@ -245,11 +268,12 @@ BEGIN
 
     INSERT INTO fingerprint_coverage_confirmations (
       tenant_id, confirmed_by, workstations, access_points, covers_from, covers_through,
-      export_time_declared, notes, latest_observed_event_at, exceeds_observed_evidence, override_reason
+      export_time_declared, notes, latest_observed_event_at, exceeds_observed_evidence, override_reason, independently_verified
     ) VALUES (
       v_tenant_id, v_caller_id, COALESCE(p_workstations, ARRAY[]::TEXT[]), p_access_points, p_covers_from, p_covers_through,
       p_covers_through, p_notes, v_latest_observed_event_at, v_exceeds_evidence,
-      CASE WHEN btrim(COALESCE(p_override_reason, '')) = '' THEN NULL ELSE btrim(p_override_reason) END
+      CASE WHEN btrim(COALESCE(p_override_reason, '')) = '' THEN NULL ELSE btrim(p_override_reason) END,
+      COALESCE(p_independently_verified, false)
     )
     RETURNING id INTO v_confirmation_id;
   END IF;
@@ -356,5 +380,5 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAMPTZ, TIMESTAMPTZ, DATE, DATE, TEXT, TEXT[], TEXT) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAMPTZ, TIMESTAMPTZ, DATE, DATE, TEXT, TEXT[], TEXT) TO authenticated;
+REVOKE ALL ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAMPTZ, TIMESTAMPTZ, DATE, DATE, TEXT, TEXT[], TEXT, BOOLEAN) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAMPTZ, TIMESTAMPTZ, DATE, DATE, TEXT, TEXT[], TEXT, BOOLEAN) TO authenticated;

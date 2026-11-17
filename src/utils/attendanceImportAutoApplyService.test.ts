@@ -226,6 +226,7 @@ describe('processHikCentralImportBatch', () => {
       p_notes: null,
       p_workstations: null,
       p_override_reason: null,
+      p_independently_verified: false,
     });
     expect(result).toEqual({
       success: true,
@@ -308,6 +309,37 @@ describe('processHikCentralImportBatch', () => {
     });
     expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
       p_override_reason: null,
+    }));
+  });
+
+  it('Phase 3 safety review: independentlyVerified defaults to false and is sent as a literal boolean, never inferred from overrideReason alone', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
+      error: null,
+    });
+    await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-22', periodToDate: '2026-10-22', dateFrom: '2026-10-22', dateTo: '2026-10-22',
+      overrideReason: 'Vendor confirmed export complete.',
+      // independentlyVerified deliberately omitted -- a reason alone must never imply it.
+    });
+    expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
+      p_override_reason: 'Vendor confirmed export complete.',
+      p_independently_verified: false,
+    }));
+  });
+
+  it('Phase 3 safety review: passes independentlyVerified=true only when explicitly set', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 1, applied_count: 1, unchanged_count: 0, skipped_count: 0, failed_count: 0, rows: [] },
+      error: null,
+    });
+    await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-10-22', periodToDate: '2026-10-22', dateFrom: '2026-10-22', dateTo: '2026-10-22',
+      overrideReason: 'Vendor confirmed export complete.',
+      independentlyVerified: true,
+    });
+    expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', expect.objectContaining({
+      p_independently_verified: true,
     }));
   });
 

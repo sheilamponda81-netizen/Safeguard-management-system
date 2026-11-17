@@ -82,6 +82,8 @@ export interface EvidenceCoverageConfirmation {
   /** Phase 3: true when this confirmation's declared covers_through was recorded even though it reached meaningfully beyond latestObservedEventAtIso -- always paired with a non-empty overrideReason. */
   exceedsObservedEvidence: boolean;
   overrideReason: string | null;
+  /** Phase 3 safety review: whether the administrator explicitly attested to having independently checked the export's completeness against HikCentral/the relevant site -- a separate, required flag, never inferred from overrideReason alone. False for any confirmation that never needed an override. */
+  independentlyVerified: boolean;
 }
 
 /** Every coverage confirmation (revoked or not -- revocation is shown, never hidden) whose own [covers_from, covers_through] overlaps the given window. Realistically a handful of rows per day; not expected to approach the page cap, but paginated on the same principle as the rest of this file. */
@@ -99,8 +101,9 @@ export async function fetchCoverageConfirmationsOverlapping(fromUtcIso: string, 
     latest_observed_event_at: string | null;
     exceeds_observed_evidence: boolean | null;
     override_reason: string | null;
+    independently_verified: boolean | null;
   }>((rangeFrom, rangeTo, withExactCount) => {
-    const columns = 'confirmed_at, confirmed_by, covers_from, covers_through, export_time_declared, access_points, workstations, revoked_at, revoked_reason, latest_observed_event_at, exceeds_observed_evidence, override_reason';
+    const columns = 'confirmed_at, confirmed_by, covers_from, covers_through, export_time_declared, access_points, workstations, revoked_at, revoked_reason, latest_observed_event_at, exceeds_observed_evidence, override_reason, independently_verified';
     const q = withExactCount
       ? supabase.from('fingerprint_coverage_confirmations').select(columns, { count: 'exact' })
       : supabase.from('fingerprint_coverage_confirmations').select(columns);
@@ -123,6 +126,7 @@ export async function fetchCoverageConfirmationsOverlapping(fromUtcIso: string, 
     latestObservedEventAtIso: row.latest_observed_event_at,
     exceedsObservedEvidence: row.exceeds_observed_evidence ?? false,
     overrideReason: row.override_reason,
+    independentlyVerified: row.independently_verified ?? false,
   }));
 }
 

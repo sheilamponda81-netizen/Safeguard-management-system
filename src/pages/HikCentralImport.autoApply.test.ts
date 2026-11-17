@@ -245,3 +245,37 @@ describe('Phase 3: fingerprint coverage evidence validation -- override-reason f
     expect(panel).not.toMatch(/\.insert\(|\.update\(|\.upsert\(|\.delete\(/);
   });
 });
+
+describe('Phase 3 safety review: an override reason alone must never imply independent verification', () => {
+  it('declares a SEPARATE independentlyVerified state, distinct from overrideReason, reset together', () => {
+    expect(source).toMatch(/const \[independentlyVerified, setIndependentlyVerified\] = useState\(false\);/);
+    const resetFn = source.match(/const resetForNewFile = useCallback\(\(\) => \{[\s\S]*?\}, \[\]\);/)?.[0] ?? '';
+    expect(resetFn).toMatch(/setIndependentlyVerified\(false\)/);
+  });
+
+  it('handleConfirmOverride refuses to proceed without independentlyVerified=true, even when a reason is present -- checked as its OWN distinct guard, not folded into the reason check', () => {
+    const handler = source.match(/const handleConfirmOverride = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    const reasonGuardIndex = handler.indexOf('if (!reason)');
+    const verifiedGuardIndex = handler.indexOf('if (!independentlyVerified)');
+    const rpcCallIndex = handler.indexOf('processHikCentralImportBatch({');
+    expect(reasonGuardIndex).toBeGreaterThanOrEqual(0);
+    expect(verifiedGuardIndex).toBeGreaterThan(reasonGuardIndex);
+    expect(rpcCallIndex).toBeGreaterThan(verifiedGuardIndex);
+  });
+
+  it('handleConfirmOverride passes independentlyVerified: true literally to the RPC call -- never derives it from the reason text', () => {
+    const handler = source.match(/const handleConfirmOverride = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(handler).toMatch(/independentlyVerified: true,/);
+  });
+
+  it('the Confirm button stays disabled unless BOTH the reason is non-empty AND the attestation checkbox is checked', () => {
+    expect(source).toMatch(/disabled=\{confirming \|\| !overrideReason\.trim\(\) \|\| !independentlyVerified\}/);
+  });
+
+  it('the attestation is a dedicated checkbox input, not reused from the reason textarea or the unrelated confirmCoverageAccurate checkbox', () => {
+    const panelMatch = source.match(/function CoverageEvidenceWarningPanel\([\s\S]*?\nfunction SummaryStat/);
+    const panel = panelMatch?.[0] ?? '';
+    expect(panel).toMatch(/type="checkbox"[\s\S]*?checked=\{independentlyVerified\}/);
+    expect(panel).toMatch(/independently checked this export&apos;s completeness directly against HikCentral or the relevant terminal\/site/);
+  });
+});
