@@ -1501,6 +1501,7 @@ const AttendanceCalculationPreviewPage = lazy(() => import('./AttendanceCalculat
 const HikCentralAttendancePreviewPage = lazy(() => import('./HikCentralAttendancePreview'));
 const AttendanceServerCalculationPreviewPage = lazy(() => import('./AttendanceServerCalculationPreview'));
 const AttendanceWhatIfSimulationPage = lazy(() => import('./AttendanceWhatIfSimulation'));
+const AttendanceEvidenceCentrePage = lazy(() => import('./AttendanceEvidenceCentre'));
 
 function PreviewLoadingFallback() {
   return <div className="p-8 text-center text-slate-400">Loading...</div>;
@@ -1578,7 +1579,7 @@ function AttendanceReviewTab() {
   );
 }
 
-type AttendanceTabId = 'register' | 'review';
+type AttendanceTabId = 'register' | 'review' | 'evidence';
 
 /**
  * Attendance Interface Consolidation: the single sidebar entry point for
@@ -1586,10 +1587,12 @@ type AttendanceTabId = 'register' | 'review';
  * official page (MonthlyRegisterTab, unchanged) -- every Admin/HR/
  * Accountant/Operations user who could already reach Attendance still
  * lands here first, with identical editing behavior and permissions.
- * "Attendance Review" (AttendanceReviewTab, read-only) is gated on the
- * SAME permission its two constituent pages already required
- * (attendance.map_hikcentral_persons) -- a user without it never even
- * sees the tab, and MonthlyRegisterTab's own write permissions
+ * "Attendance Review" (AttendanceReviewTab, read-only) and "Evidence
+ * Centre" (AttendanceEvidenceCentrePage, read-only v1 -- no dispute
+ * correction or coverage-validation writes) are both gated on the SAME
+ * permission (attendance.map_hikcentral_persons) the Review tab's own
+ * constituent pages already required -- a user without it never even
+ * sees either tab, and MonthlyRegisterTab's own write permissions
  * (attendance.create/attendance.edit) are completely untouched by any
  * of this, so this consolidation neither widens nor narrows any
  * existing access.
@@ -1606,10 +1609,11 @@ export default function AttendancePage() {
     })();
   }, []);
 
-  // Never render the Review tab's content for a user who lacks the
-  // permission, even if `activeTab` were somehow already 'review' (e.g.
-  // a stale value from before a permission change) -- the tab button
-  // itself is also simply absent below for the same user.
+  // Never render the Review/Evidence Centre tabs' content for a user who
+  // lacks the permission, even if `activeTab` were somehow already set to
+  // one of them (e.g. a stale value from before a permission change) --
+  // the tab buttons themselves are also simply absent below for the same
+  // user.
   const effectiveTab: AttendanceTabId = canReview ? activeTab : 'register';
 
   return (
@@ -1619,12 +1623,19 @@ export default function AttendancePage() {
           tabs={[
             { id: 'register', label: 'Monthly Register', icon: CalendarCheck },
             { id: 'review', label: 'Attendance Review', icon: Eye },
+            { id: 'evidence', label: 'Evidence Centre', icon: Search },
           ]}
           active={effectiveTab}
           onChange={(id) => setActiveTab(id as AttendanceTabId)}
         />
       )}
-      {effectiveTab === 'register' ? <MonthlyRegisterTab /> : <AttendanceReviewTab />}
+      {effectiveTab === 'register' && <MonthlyRegisterTab />}
+      {effectiveTab === 'review' && <AttendanceReviewTab />}
+      {effectiveTab === 'evidence' && (
+        <Suspense fallback={<PreviewLoadingFallback />}>
+          <AttendanceEvidenceCentrePage />
+        </Suspense>
+      )}
     </div>
   );
 }
