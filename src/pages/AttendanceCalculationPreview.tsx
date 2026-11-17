@@ -147,7 +147,7 @@ export default function AttendanceCalculationPreviewPage() {
   );
 
   const rosterIds = useMemo(
-    () => (data ? collectEmployeeIdsWithRosterEvidence(data.datedAssignments, data.patterns) : new Set<string>()),
+    () => (data ? collectEmployeeIdsWithRosterEvidence(data.datedAssignments, data.patterns, data.shiftPatterns) : new Set<string>()),
     [data]
   );
   const fingerprintIds = useMemo(
@@ -188,6 +188,7 @@ export default function AttendanceCalculationPreviewPage() {
       shiftDates,
       datedAssignments: data.datedAssignments,
       patterns: data.patterns,
+      shiftPatterns: data.shiftPatterns,
       eventsByEmployeeId: data.eventsByEmployeeId,
       coveragePolicy,
       officialStatusByKey: data.officialStatusByKey,
