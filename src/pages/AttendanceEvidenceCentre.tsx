@@ -44,7 +44,6 @@ import { classifyRawEventsForEvidence, deriveEvidenceCompleteness, EvidenceCompl
 import { blantyreDateRangeToUtcBounds } from '../utils/hikcentralAttendancePreview';
 
 const MAX_RANGE_DAYS = 31;
-const MAX_RENDERED_ROWS = 500;
 const PAGE_SIZE = 25;
 
 /** Maps an official P/A/L code onto the same status space row.calculation.status already uses, for the "Discrepancies only" filter -- LV/SL/'-' have no calculated-status analog and are never treated as a discrepancy. */
@@ -317,12 +316,19 @@ export default function AttendanceEvidenceCentrePage() {
   // the underlying data fetch is already bounded (MAX_RANGE_DAYS calendar
   // days, RLS-scoped employees only), and this page's own row-building
   // needs the full roster/fingerprint data for the range regardless of
-  // which page is being viewed, same as the existing MAX_RENDERED_ROWS
-  // cap below already assumed.
-  const totalPages = Math.max(1, Math.ceil(Math.min(filteredRows.length, MAX_RENDERED_ROWS) / PAGE_SIZE));
+  // which page is being viewed.
+  //
+  // Final Phase 2 release review: this used to also slice to a fixed
+  // 500-row cap before paginating, with a "narrow the filters to see
+  // more" message for anything past it -- a leftover from before
+  // pagination existed. That meant Previous/Next could never reach a
+  // row past position 500 at all, no matter how a user paged, silently
+  // defeating pagination's own purpose for any result set bigger than
+  // 500 rows. Removed: pagination alone is now what makes an
+  // arbitrarily large, fully-filtered result set reachable.
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
-  const visibleRows = filteredRows.slice(0, MAX_RENDERED_ROWS).slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-  const truncated = filteredRows.length > MAX_RENDERED_ROWS;
+  const visibleRows = filteredRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   useEffect(() => { setPage(1); }, [siteFilter, shiftFilter, resultFilter, employeeSearch, evidenceFilter, sourceFilter, discrepancyOnly, fromDate, toDate]);
 
@@ -505,9 +511,7 @@ export default function AttendanceEvidenceCentrePage() {
           </table>
           <div className="flex items-center justify-between p-3 border-t border-slate-100">
             <p className="text-xs text-slate-400">
-              {truncated
-                ? `Showing the first ${MAX_RENDERED_ROWS} of ${filteredRows.length} matching rows -- narrow the filters to see more.`
-                : `${filteredRows.length} matching row${filteredRows.length === 1 ? '' : 's'}`}
+              {filteredRows.length} matching row{filteredRows.length === 1 ? '' : 's'}
               {totalPages > 1 ? ` -- page ${currentPage} of ${totalPages}` : ''}
             </p>
             {totalPages > 1 && (

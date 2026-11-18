@@ -7,6 +7,7 @@ import { getCurrentProfile } from '../utils/currentProfile';
 import { getAvailableMonthsFromSystem, getActualCurrentMonth, getSystemCurrentMonth, getMonthLabel, getNextMonth, getPreviousMonth } from '../utils/currentMonth';
 import { EmptyState } from '../components/EmptyState';
 import { CopyFromPreviousModal } from '../components/CopyFromPreviousModal';
+import { AttendanceReasonModal } from '../components/AttendanceReasonModal';
 import { sanitizeInput } from '../utils/securityHeaders';
 import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
@@ -541,6 +542,17 @@ function MonthlyRegisterTab() {
   const [selectedEmployee, setSelectedEmployee] = useState<Employee | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showCopyModal, setShowCopyModal] = useState(false);
+  // Final Phase 2 release review: the grid's click-to-cycle reason
+  // prompt (required since attendance_correct's mandatory-reason
+  // migration) now collects the reason via AttendanceReasonModal
+  // instead of window.prompt(). updateAttendance stops right after
+  // computing nextStatus and opens this instead; confirmReasonAndUpdate
+  // (below) carries out everything the old post-prompt code did, using
+  // this state for the employee/date/status context a click already
+  // determined.
+  const [reasonPrompt, setReasonPrompt] = useState<{
+    employeeId: string; date: string; currentStatus: string; nextStatus: string; employeeName: string;
+  } | null>(null);
   const [hasData, setHasData] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [updating, setUpdating] = useState<Record<string, boolean>>({});
@@ -862,7 +874,7 @@ function MonthlyRegisterTab() {
   }, [processSingleUpdate]);
 
   // ===== OPTIMIZED: UPDATE ATTENDANCE WITH OPTIMISTIC UI =====
-  const updateAttendance = useCallback(async (employeeId: string, date: string, currentStatus: string) => {
+  const updateAttendance = useCallback((employeeId: string, date: string, currentStatus: string) => {
     // Defense-in-depth: the grid's own click handler already gates on
     // canModifyAttendance before ever calling this function, but this
     // guard means no INSERT/UPDATE request can be issued from here even
@@ -889,30 +901,35 @@ function MonthlyRegisterTab() {
     const nextIndex = (currentIndex + 1) % statusCycle.length;
     const nextStatus = statusCycle[nextIndex];
 
-    // Task 3 (Phase 2 completion): a reason is now required by the
+    // Final Phase 2 release review: a reason is required by the
     // database for every manual correction (attendance_correct), not
-    // only enforced client-side -- this prompt is what keeps the
-    // grid's fast click-to-cycle workflow working at all under that
-    // requirement, asked once per click rather than via a full modal
-    // so the rest of this optimistic-update flow is unchanged. A
-    // cancelled or blank reason aborts before anything (UI state or
-    // server) is touched.
-    const reason = window.prompt(
-      `Reason for changing ${employee?.full_name || 'this employee'}'s attendance on ${date} from ${currentStatus} to ${nextStatus}:`
-    );
-    if (reason === null) return;
-    const trimmedReason = reason.trim();
-    if (!trimmedReason) {
-      showNotification('A reason is required to change attendance.', 'error');
-      return;
-    }
+    // only enforced client-side. Collected via AttendanceReasonModal,
+    // an accessible dialog built from this app's own Modal/Input/
+    // Button primitives (see that component's own header for why it
+    // replaced the previous native-dialog approach). This function
+    // stops here; a cancelled or blank reason in the dialog aborts
+    // before anything (UI state or server) is touched, and
+    // confirmReasonAndUpdate below carries out everything the old
+    // post-prompt code did.
+    setReasonPrompt({
+      employeeId, date, currentStatus, nextStatus,
+      employeeName: employee?.full_name || 'this employee',
+    });
+  }, [canModifyAttendance, employees, userProfile, selectedMonth, systemMonth]);
+
+  const confirmReasonAndUpdate = useCallback(async (reason: string) => {
+    if (!reasonPrompt) return;
+    const { employeeId, date, currentStatus, nextStatus } = reasonPrompt;
+    setReasonPrompt(null);
+
+    const employee = employees.find(e => e.id === employeeId);
 
     // ===== PERFORMANCE: Optimistic update - change UI immediately =====
     const updateKey = `${employeeId}-${date}`;
     if (updating[updateKey]) return; // Prevent double clicks
 
     setUpdating(prev => ({ ...prev, [updateKey]: true }));
-    
+
     // Update local state immediately for fast UI response
     setAttendance(prev => {
       const existingIndex = prev.findIndex(a => a.employee_id === employeeId && a.date === date);
@@ -924,22 +941,22 @@ function MonthlyRegisterTab() {
         return [...prev, { id: '', employee_id: employeeId, date, status: nextStatus }];
       }
     });
-    
+
     // Queue the update for background processing
-    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus, previousStatus: currentStatus, reason: trimmedReason });
-    
+    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus, previousStatus: currentStatus, reason });
+
     // Trigger queue processing
     if (!isProcessingUpdate.current) {
       setTimeout(processUpdateQueue, 50);
     }
-    
+
     // Log audit in background
     try {
       await logAudit({
         action: 'UPDATE',
         entity_type: 'attendance',
-        new_data: { 
-          status: nextStatus, 
+        new_data: {
+          status: nextStatus,
           employee_id: employeeId,
           employee_name: employee?.full_name || 'Unknown',
           employee_number: employee?.employee_number || 'N/A',
@@ -957,7 +974,7 @@ function MonthlyRegisterTab() {
         return newState;
       });
     }
-  }, [canModifyAttendance, employees, userProfile, selectedMonth, systemMonth, updating, processUpdateQueue]);
+  }, [reasonPrompt, employees, userProfile, selectedMonth, updating, processUpdateQueue]);
 
   // ===== DEBOUNCED UPDATE (per cell) =====
   // A single shared debounce instance (as this used to be, memoized on
@@ -1504,6 +1521,15 @@ function MonthlyRegisterTab() {
         onConfirm={copyFromPreviousMonth}
         currentMonth={selectedMonth}
         availableMonths={availableMonths.filter(m => m < selectedMonth)}
+      />
+      <AttendanceReasonModal
+        open={reasonPrompt !== null}
+        onClose={() => setReasonPrompt(null)}
+        onConfirm={confirmReasonAndUpdate}
+        employeeName={reasonPrompt?.employeeName ?? ''}
+        date={reasonPrompt?.date ?? ''}
+        fromStatus={reasonPrompt?.currentStatus ?? ''}
+        toStatus={reasonPrompt?.nextStatus ?? ''}
       />
     </div>
   );

@@ -113,12 +113,26 @@ export async function fetchAllEmployeesById(): Promise<Map<string, EmployeeLite>
 }
 
 export async function fetchActiveHikCentralPersonMappings(): Promise<ActiveMappingRow[]> {
-  const { data, error } = await supabase
-    .from('hikcentral_person_mappings')
-    .select('id, hikcentral_person_no, employee_id, match_method, confirmed_by, confirmed_at, created_at')
-    .eq('is_active', true);
-  if (error) throw error;
-  return (data || []).map((row) => ({
+  // Final Phase 2 release review: was a single unpaginated query -- the
+  // exact same PostgREST 1000-row-cap silent-truncation risk already
+  // fixed for fetchActiveNonDeletedEmployees/fetchAllEmployeesById just
+  // above in this file (and Employees.tsx/PR#49, and the roster
+  // functions in rosterService.ts). Active mappings trend 1:1 with the
+  // active employee population (currently ~935 per rosterService.ts's
+  // own count), so this was already within reach of the cap, not a
+  // theoretical risk. A silent truncation here would feed directly into
+  // the Evidence Centre's (and every other caller's) "automatic vs.
+  // manual" reasoning via attendanceCalculationPreviewService.ts, so
+  // this is fixed with the same fetchAllPages() pattern.
+  const rows = await fetchAllPages<{ id: string; hikcentral_person_no: string; employee_id: string; match_method: string; confirmed_by: string | null; confirmed_at: string | null; created_at: string }>(
+    (rangeFrom, rangeTo, withExactCount) => {
+      const q = withExactCount
+        ? supabase.from('hikcentral_person_mappings').select('id, hikcentral_person_no, employee_id, match_method, confirmed_by, confirmed_at, created_at', { count: 'exact' })
+        : supabase.from('hikcentral_person_mappings').select('id, hikcentral_person_no, employee_id, match_method, confirmed_by, confirmed_at, created_at');
+      return q.eq('is_active', true).order('id').range(rangeFrom, rangeTo);
+    }
+  );
+  return rows.map((row) => ({
     id: row.id,
     hikcentralPersonNo: row.hikcentral_person_no,
     employeeId: row.employee_id,

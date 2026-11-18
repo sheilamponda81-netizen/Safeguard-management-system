@@ -98,4 +98,11 @@ describe('AttendanceEvidenceCentre.tsx: Task 3 completion -- discrepancy filter,
     expect(evidenceCentreSource).toMatch(/onClick=\{\(\) => setPage\(\(p\) => Math\.max\(1, p - 1\)\)\} disabled=\{currentPage === 1\}/);
     expect(evidenceCentreSource).toMatch(/onClick=\{\(\) => setPage\(\(p\) => Math\.min\(totalPages, p \+ 1\)\)\} disabled=\{currentPage === totalPages\}/);
   });
+
+  it('REGRESSION (final Phase 2 release review): pagination covers the complete filtered result set -- no leftover row cap (e.g. a fixed 500-row ceiling) can make a row past some fixed position permanently unreachable via Previous/Next', () => {
+    expect(evidenceCentreSource).not.toMatch(/MAX_RENDERED_ROWS/);
+    expect(evidenceCentreSource).not.toMatch(/narrow the filters to see more/);
+    expect(evidenceCentreSource).toMatch(/const totalPages = Math\.max\(1, Math\.ceil\(filteredRows\.length \/ PAGE_SIZE\)\);/);
+    expect(evidenceCentreSource).toMatch(/const visibleRows = filteredRows\.slice\(\(currentPage - 1\) \* PAGE_SIZE, currentPage \* PAGE_SIZE\);/);
+  });
 });

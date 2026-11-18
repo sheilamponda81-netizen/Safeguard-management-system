@@ -111,14 +111,30 @@ describe('Monthly Register: individual manual edits are routed through attendanc
     expect(attendanceSource).not.toMatch(/p_new_basis\s*:/);
   });
 
-  it('Task 3 (Phase 2 completion): a reason is now mandatory, database-enforced -- the grid prompts for one before the optimistic update or the RPC call, and a cancelled/blank reason aborts both', () => {
+  it('Final Phase 2 release review: a reason is mandatory, database-enforced -- the grid opens an accessible AttendanceReasonModal (not window.prompt) before either the optimistic update or the RPC call, and updateAttendance itself never touches attendance/UI state directly', () => {
     const updateAttendanceBody = attendanceSource.slice(
       attendanceSource.indexOf('const updateAttendance = useCallback'),
-      attendanceSource.indexOf('// ===== PERFORMANCE: Optimistic update')
+      attendanceSource.indexOf('const confirmReasonAndUpdate = useCallback')
     );
-    expect(updateAttendanceBody).toMatch(/const reason = window\.prompt\(/);
-    expect(updateAttendanceBody).toMatch(/if \(reason === null\) return;/);
-    expect(updateAttendanceBody).toMatch(/if \(!trimmedReason\) \{/);
+    expect(updateAttendanceBody).not.toMatch(/window\.prompt/);
+    expect(updateAttendanceBody).toMatch(/setReasonPrompt\(\{/);
+    expect(updateAttendanceBody).not.toMatch(/setAttendance\(/);
+    expect(updateAttendanceBody).not.toMatch(/updateQueue\.current\.set/);
+  });
+
+  it('AttendanceReasonModal is rendered gated on reasonPrompt, and a cancelled dialog (onClose) never reaches confirmReasonAndUpdate', () => {
+    expect(attendanceSource).toMatch(/import \{ AttendanceReasonModal \} from '\.\.\/components\/AttendanceReasonModal';/);
+    expect(attendanceSource).toMatch(/<AttendanceReasonModal\s*\n\s*open=\{reasonPrompt !== null\}\s*\n\s*onClose=\{\(\) => setReasonPrompt\(null\)\}\s*\n\s*onConfirm=\{confirmReasonAndUpdate\}/);
+  });
+
+  it('confirmReasonAndUpdate performs the optimistic update and queues the already-confirmed reason only after a reasonPrompt exists, and clears it immediately so a second confirm cannot double-fire', () => {
+    const confirmBody = attendanceSource.slice(
+      attendanceSource.indexOf('const confirmReasonAndUpdate = useCallback'),
+      attendanceSource.indexOf('}, [reasonPrompt, employees, userProfile, selectedMonth, updating, processUpdateQueue]);')
+    );
+    expect(confirmBody).toMatch(/if \(!reasonPrompt\) return;/);
+    expect(confirmBody).toMatch(/setReasonPrompt\(null\);/);
+    expect(confirmBody.indexOf('setReasonPrompt(null);')).toBeLessThan(confirmBody.indexOf('setAttendance('));
   });
 
   it('no longer writes directly to the attendance table from the grid edit path', () => {
@@ -141,9 +157,9 @@ describe('Monthly Register: individual manual edits are routed through attendanc
     expect(processSingleUpdateBody).toMatch(/reverted\[existingIndex\] = \{ \.\.\.reverted\[existingIndex\], status: previousStatus \}/);
   });
 
-  it('threads previousStatus AND the now-mandatory reason from the click handler through the queue into processSingleUpdate', () => {
+  it('threads previousStatus AND the now-mandatory, already-confirmed reason from confirmReasonAndUpdate through the queue into processSingleUpdate', () => {
     expect(attendanceSource).toMatch(
-      /updateQueue\.current\.set\(updateKey, \{ employeeId, date, status: nextStatus, previousStatus: currentStatus, reason: trimmedReason \}\)/
+      /updateQueue\.current\.set\(updateKey, \{ employeeId, date, status: nextStatus, previousStatus: currentStatus, reason \}\)/
     );
     expect(attendanceSource).toMatch(
       /await processSingleUpdate\(update\.employeeId, update\.date, update\.status, update\.previousStatus, update\.reason\)/

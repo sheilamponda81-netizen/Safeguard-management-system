@@ -8,7 +8,7 @@ vi.mock('../lib/supabase', () => ({
   },
 }));
 
-const { fetchActiveNonDeletedEmployees, fetchAllEmployeesById } = await import('./hikcentralPersonMappingService');
+const { fetchActiveNonDeletedEmployees, fetchAllEmployeesById, fetchActiveHikCentralPersonMappings } = await import('./hikcentralPersonMappingService');
 
 // PRODUCTION HOTFIX regression coverage: both functions now page through
 // fetchAllPages() instead of a single unbounded query. `pages` is consumed
@@ -169,5 +169,85 @@ describe('fetchAllEmployeesById', () => {
     });
     await fetchAllEmployeesById();
     expect(seenCalls).toEqual([]);
+  });
+});
+
+function mappingRow(overrides: Partial<{
+  id: string; hikcentral_person_no: string; employee_id: string; match_method: string;
+  confirmed_by: string | null; confirmed_at: string | null; created_at: string;
+}> = {}) {
+  return {
+    id: 'map-1',
+    hikcentral_person_no: '1001',
+    employee_id: 'emp-1',
+    match_method: 'manual',
+    confirmed_by: 'profile-1',
+    confirmed_at: '2026-11-01T00:00:00Z',
+    created_at: '2026-11-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
+describe('fetchActiveHikCentralPersonMappings', () => {
+  beforeEach(() => fromMock.mockReset());
+
+  it('maps rows to ActiveMappingRow shape (fewer than 1,000 matches, single page)', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: [mappingRow(), mappingRow({ id: 'map-2', employee_id: 'emp-2', hikcentral_person_no: '1002' })], error: null, count: 2 },
+    ]));
+    const result = await fetchActiveHikCentralPersonMappings();
+    expect(result).toEqual([
+      { id: 'map-1', hikcentralPersonNo: '1001', employeeId: 'emp-1', matchMethod: 'manual', confirmedBy: 'profile-1', confirmedAt: '2026-11-01T00:00:00Z', createdAt: '2026-11-01T00:00:00Z' },
+      { id: 'map-2', hikcentralPersonNo: '1002', employeeId: 'emp-2', matchMethod: 'manual', confirmedBy: 'profile-1', confirmedAt: '2026-11-01T00:00:00Z', createdAt: '2026-11-01T00:00:00Z' },
+    ]);
+  });
+
+  // Final Phase 2 release review: this function was a single unpaginated
+  // query until this review -- same PostgREST 1,000-row-cap risk already
+  // fixed for fetchActiveNonDeletedEmployees/fetchAllEmployeesById above
+  // in this same file. Active mappings trend close to the active
+  // employee population, so this was a real, reachable risk, not
+  // theoretical.
+  it('REGRESSION (PostgREST 1,000-row cap): pages past 1,000 active mappings with no missing or duplicated rows at the page boundary', async () => {
+    const page1 = Array.from({ length: 1000 }, (_, i) => mappingRow({ id: `map-${i}`, employee_id: `emp-${i}`, hikcentral_person_no: `${1000 + i}` }));
+    const page2 = [mappingRow({ id: 'map-1000', employee_id: 'emp-1000', hikcentral_person_no: '2000' })];
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: page1, error: null, count: 1001 },
+      { data: page2, error: null, count: null },
+    ]));
+    const result = await fetchActiveHikCentralPersonMappings();
+    expect(result).toHaveLength(1001);
+    const ids = result.map((m) => m.id);
+    expect(new Set(ids).size).toBe(1001); // no duplicates
+    expect(ids).toContain('map-999'); // last row of page 1 (exact boundary)
+    expect(ids).toContain('map-1000'); // first row of page 2 (exact boundary)
+    expect(fromMock.mock.calls.length).toBe(2);
+  });
+
+  it('propagates a query error rather than returning a partial mapping list', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([{ data: null, error: { message: 'boom' }, count: null }]));
+    await expect(fetchActiveHikCentralPersonMappings()).rejects.toBeTruthy();
+  });
+
+  it('filters to is_active=true on every page -- never broadens scope to superseded mappings', async () => {
+    const seenCalls: string[] = [];
+    let callIndex = 0;
+    const pages = [{ data: [], error: null, count: 0 }];
+    fromMock.mockImplementation(() => {
+      const builder: ChainableMock = {
+        select: () => builder,
+        eq: (...args: unknown[]) => { seenCalls.push(`eq:${JSON.stringify(args)}`); return builder; },
+        or: () => builder,
+        order: () => builder,
+        range: () => {
+          const page = pages[Math.min(callIndex, pages.length - 1)];
+          callIndex++;
+          return Promise.resolve(page);
+        },
+      };
+      return builder;
+    });
+    await fetchActiveHikCentralPersonMappings();
+    expect(seenCalls).toEqual([`eq:${JSON.stringify(['is_active', true])}`]);
   });
 });
