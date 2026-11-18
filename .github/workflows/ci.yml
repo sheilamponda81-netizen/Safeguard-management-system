@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Type-check, lint, test, build
+    runs-on: ubuntu-latest
+    # Disposable Postgres for this job only -- NEVER production. Built
+    # from scratch on every run by supabase/ci/apply_ci_schema.sh from
+    # this repo's own real, unmodified migration files. Destroyed with
+    # the runner when the job ends.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      # Turns "no reachable database" in the attendance engine parity/
+      # integration suites into a hard test failure instead of a silent
+      # skip -- see those files' own headers.
+      ATTENDANCE_PARITY_REQUIRE_DB: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build disposable schema from this repo's own migrations
+        run: bash supabase/ci/apply_ci_schema.sh
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

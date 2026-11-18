@@ -8,23 +8,32 @@
 // SQL mirror at all -- see that file's "WHY A SERVER-SIDE SQL MIRROR"
 // comment.
 //
-// REQUIRES a reachable Postgres with that migration (and its full
-// dependency chain -- the base schema, functional-role/permission
-// foundation, and roster foundation migrations) already applied. This
-// is NEVER true in the normal `npm test` CI run for this repo (no
-// Postgres service is configured there), so every test in this file
-// is SKIPPED, not failed, when no such database is reachable --
-// checked once via a synchronous `SELECT 1` through `psql` before
-// anything else runs. To actually exercise this file locally:
+// REQUIRES a reachable Postgres with the repo's full migration chain
+// already applied -- see supabase/ci/apply_ci_schema.sh, which builds
+// exactly that (a disposable Postgres, NEVER production) from the real,
+// unmodified files in supabase/migrations/. CI (.github/workflows/ci.yml)
+// runs that script against a disposable `postgres:16` service container
+// on every PR/push and always runs this file for real against it -- see
+// that workflow and ATTENDANCE_PARITY_REQUIRE_DB below for how CI turns
+// "no reachable database" into a hard failure rather than a silent skip.
+//
+// Locally, with no such database reachable (the common case -- most
+// contributors don't have one standing), every test in this file is
+// SKIPPED, not failed, checked once via a synchronous `SELECT 1` through
+// `psql` before anything else runs, so `npm test` still passes without
+// one. To actually exercise this file locally:
 //   1. Stand up a disposable Postgres (e.g. `service postgresql start`
 //      on a box with postgresql-16 installed, or any throwaway instance).
-//   2. Apply the full migration chain in supabase/migrations/ up to and
-//      including 20261012000000_attendance_automation_foundation.sql
-//      (stub `auth.uid()`/`auth.email()`/`auth.users` and an
-//      `extensions` schema with pgcrypto first -- see this engagement's
-//      Stage C Step 1 report for the exact stub SQL used).
-//   3. Run with PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE pointed at
-//      that database (standard libpq env vars, read directly by `psql`).
+//   2. Run `supabase/ci/apply_ci_schema.sh` against it (PGHOST/PGPORT/
+//      PGUSER/PGPASSWORD/PGDATABASE -- standard libpq env vars, read
+//      directly by `psql` -- pointed at that database).
+//   3. Run this file with the same PG* env vars still set.
+//
+// ATTENDANCE_PARITY_REQUIRE_DB=1 (set only in CI -- see the workflow)
+// makes a database that is NOT reachable a hard test FAILURE instead of
+// a skip, so this suite can never silently stop running in CI without
+// that being itself a failing, visible signal (e.g. the service
+// container misconfigured, or the schema-build step failing earlier).
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'child_process';
 import { calculateAttendanceStatus, AttendanceCalculationInput } from './attendanceCalculationEngine';
@@ -78,10 +87,22 @@ function callSqlEngine(input: AttendanceCalculationInput): { status: string; bas
 }
 
 const dbAvailable = databaseReachable();
+// CI sets this so a database that silently becomes unreachable (a
+// misconfigured service container, a schema-build step that failed
+// earlier in the job, ...) turns into a loud, failing test here --
+// never a quietly-skipped suite that looks like a pass. Never set
+// locally, where most contributors have no such database at all.
+const dbRequired = process.env.ATTENDANCE_PARITY_REQUIRE_DB === '1';
 
-describe.skipIf(!dbAvailable)('attendance_engine_calculate() SQL/TypeScript parity', () => {
+describe.skipIf(!dbAvailable && !dbRequired)('attendance_engine_calculate() SQL/TypeScript parity', () => {
   beforeAll(() => {
     if (!dbAvailable) {
+      if (dbRequired) {
+        throw new Error(
+          'ATTENDANCE_PARITY_REQUIRE_DB=1 is set but no Postgres is reachable -- this suite must run for real in CI, never silently skip. ' +
+          'See this file\'s header and supabase/ci/apply_ci_schema.sh.'
+        );
+      }
       console.warn('attendanceEngineSqlParity.test.ts: no reachable Postgres -- skipping (see this file\'s header for setup).');
     }
   });
