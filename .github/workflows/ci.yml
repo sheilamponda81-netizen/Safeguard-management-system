@@ -42,7 +42,15 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # jsdom@30 (a transitive test dependency) declares
+          # "engines": { "node": "^22.22.2 || ^24.15.0 || >=26.0.0" } --
+          # Node 20 loads it anyway (npm doesn't enforce engines by
+          # default) but its vendored undici is missing a webidl
+          # internal jsdom needs, so three jsdom-environment test files
+          # fail outright with "webidl.util.markAsUncloneable is not a
+          # function". '22' resolves to the latest 22.x, comfortably
+          # inside jsdom's supported range.
+          node-version: '22'
           cache: npm
 
       - name: Install dependencies
