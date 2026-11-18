@@ -20,6 +20,26 @@
 -- throughout this project's manual migration rehearsals.
 -- ============================================================
 
+-- Supabase pre-provisions the `anon` and `authenticated` database
+-- roles that a real project's migrations GRANT/REVOKE against (e.g.
+-- "REVOKE ALL ON FUNCTION ... FROM anon"); a vanilla postgres:16
+-- container has neither. CREATE ROLE has no IF NOT EXISTS, so guard
+-- each with a catalog check -- idempotent for a rehearsal run against
+-- a Postgres that already defines them (e.g. a real local Supabase
+-- stack) and a no-op either way for actual login/authorization, since
+-- no test in this repo connects to the database AS anon/authenticated
+-- (every RPC call runs as the bootstrap's own superuser, with
+-- auth.uid() stubbed via set_caller() instead).
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    CREATE ROLE anon;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    CREATE ROLE authenticated;
+  END IF;
+END $$;
+
 CREATE SCHEMA IF NOT EXISTS extensions;
 CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
 -- Supabase's own default search_path includes "extensions" ahead of
