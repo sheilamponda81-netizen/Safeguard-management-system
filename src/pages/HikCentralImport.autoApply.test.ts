@@ -93,7 +93,7 @@ describe('HikCentralImport: importing automatically calculates and applies atten
 describe('Stage C Step 10: batch continuity, explicit coverage confirmation, and site absence alerts', () => {
   it('imports the new Step 10 service functions', () => {
     expect(source).toMatch(/fetchCoverageTimeline, CoverageTimelineEntry,/);
-    expect(source).toMatch(/fetchSiteAbsenceAlerts, acknowledgeSiteAlert, SiteAbsenceAlert,/);
+    expect(source).toMatch(/fetchSiteAbsenceAlerts, acknowledgeSiteAlert, bulkAcknowledgeSiteAlerts,/);
   });
 
   it('requires an explicit, separate confirmCoverageAccurate affirmation (not merely a chosen period) to enable import', () => {
@@ -109,37 +109,50 @@ describe('Stage C Step 10: batch continuity, explicit coverage confirmation, and
     expect(resetFn).toMatch(/setConfirmCoverageAccurate\(false\)/);
   });
 
-  it('loads the coverage timeline and open site alerts on mount, and re-loads both after a successful import/retry', () => {
+  it('loads the coverage timeline on mount, open site alerts via the status-filter effect, and re-loads both after a successful import/retry', () => {
     expect(source).toMatch(/const reloadCoverageTimeline = useCallback/);
     expect(source).toMatch(/const reloadSiteAlerts = useCallback/);
-    const mountEffect = source.match(/useEffect\(\(\) => \{[\s\S]*?\}, \[reloadCoverageTimeline, reloadSiteAlerts\]\);/)?.[0] ?? '';
+    const mountEffect = source.match(/useEffect\(\(\) => \{[\s\S]*?\}, \[reloadCoverageTimeline\]\);/)?.[0] ?? '';
     expect(mountEffect).toMatch(/await reloadCoverageTimeline\(\);/);
-    expect(mountEffect).toMatch(/await reloadSiteAlerts\(\);/);
+
+    // Import redesign: site alerts now load per the active status filter
+    // (default 'open'), which fires on mount via its own effect since
+    // alertStatusFilter is a dependency -- not a second call bundled into
+    // the permissions-loading mount effect above.
+    const filterEffect = source.match(/useEffect\(\(\) => \{\s*setSelectedAlertIds\(new Set\(\)\);[\s\S]*?\}, \[alertStatusFilter, reloadSiteAlerts\]\);/)?.[0] ?? '';
+    expect(filterEffect).toMatch(/reloadSiteAlerts\(alertStatusFilter\);/);
 
     const importHandler = source.match(/const handleImport = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
     expect(importHandler).toMatch(/await reloadCoverageTimeline\(\);/);
-    expect(importHandler).toMatch(/await reloadSiteAlerts\(\);/);
+    expect(importHandler).toMatch(/await reloadSiteAlerts\(alertStatusFilter\);/);
   });
 
-  it('renders a missing-coverage warning per scope entry, listing the missing dates, only when gaps exist', () => {
-    const timelineBlock = source.slice(source.indexOf('coverageTimeline.length > 0'), source.indexOf('siteAlerts.length > 0'));
-    expect(timelineBlock).toMatch(/entry\.missingDates\.length > 0/);
-    expect(timelineBlock).toMatch(/Missing export coverage for \{entry\.scopeKey\} on: \{entry\.missingDates\.join\(', '\)\}/);
-    expect(timelineBlock).toMatch(/Attendance will not be marked Absent for these dates/);
-    expect(timelineBlock).toMatch(/Last confirmed:/);
-    expect(timelineBlock).toMatch(/Next expected:/);
+  it('renders a missing-coverage warning per scope entry, listing grouped missing-date ranges, only when gaps exist', () => {
+    const panelMatch = source.match(/function CoverageTabPanel\([\s\S]*?\n\}\n/);
+    expect(panelMatch, 'expected to find CoverageTabPanel').toBeTruthy();
+    const panel = panelMatch![0];
+    expect(panel).toMatch(/const hasGaps = entry\.missingDates\.length > 0;/);
+    expect(panel).toMatch(/groupConsecutiveDates\(entry\.missingDates\)\.map/);
+    expect(panel).toMatch(/Attendance will not be marked Absent for \{entry\.scopeKey\} on these dates/);
+    expect(panel).toMatch(/First Covered/);
+    expect(panel).toMatch(/Next Expected/);
   });
 
-  it('renders open site absence alerts with site, date, live count, and affected employees', () => {
-    const alertsBlock = source.slice(source.indexOf('siteAlerts.length > 0'), source.indexOf('<Card className="p-6">\n        <label htmlFor="hikcentral-file-input"'));
-    expect(alertsBlock).toMatch(/\{alert\.site\} &mdash; \{alert\.alertDate\}: \{alert\.currentAbsentCount\} absent/);
-    expect(alertsBlock).toMatch(/alert\.affectedEmployees\.map/);
+  it('renders site absence alerts with site, date, live count, and affected employees, in a compact table', () => {
+    const panelMatch = source.match(/function AlertsTabPanel\([\s\S]*?\n\}\n/);
+    expect(panelMatch, 'expected to find AlertsTabPanel').toBeTruthy();
+    const panel = panelMatch![0];
+    expect(panel).toMatch(/<TD>\{alert\.site\}<\/TD>/);
+    expect(panel).toMatch(/<TD>\{alert\.alertDate\}<\/TD>/);
+    expect(panel).toMatch(/<TD>\{alert\.currentAbsentCount\}<\/TD>/);
+    expect(panel).toMatch(/alert\.affectedEmployees\.slice\(0, 3\)\.map/);
   });
 
-  it('gates the acknowledge control on attendance.manage_site_alerts, loaded as its own permission', () => {
+  it('gates the acknowledge controls (bulk and single) on attendance.manage_site_alerts, loaded as its own permission', () => {
     expect(source).toMatch(/setCanManageSiteAlerts\(await hasPermission\(PERMISSIONS\.ATTENDANCE_MANAGE_SITE_ALERTS\)\)/);
-    const alertsBlock = source.slice(source.indexOf('siteAlerts.length > 0'), source.indexOf('<Card className="p-6">\n        <label htmlFor="hikcentral-file-input"'));
-    expect(alertsBlock).toMatch(/\{canManageSiteAlerts && \(/);
+    const panelMatch = source.match(/function AlertsTabPanel\([\s\S]*?\n\}\n/);
+    const panel = panelMatch?.[0] ?? '';
+    expect(panel.match(/\{canManageSiteAlerts && \(/g)?.length).toBeGreaterThanOrEqual(2);
   });
 
   it('requires a note before acknowledging, and never silently no-ops', () => {
@@ -277,5 +290,138 @@ describe('Phase 3 safety review: an override reason alone must never imply indep
     const panel = panelMatch?.[0] ?? '';
     expect(panel).toMatch(/type="checkbox"[\s\S]*?checked=\{independentlyVerified\}/);
     expect(panel).toMatch(/independently checked this export&apos;s completeness directly against HikCentral or the relevant terminal\/site/);
+  });
+});
+
+describe('Import redesign: four tabs (Import/Coverage/Alerts/History), reusing the existing Tabs component', () => {
+  it('declares exactly the four tabs, Import first/default', () => {
+    expect(source).toMatch(/const \[activeTab, setActiveTab\] = useState<ImportTabId>\('import'\);/);
+    const tabsCall = source.match(/<Tabs\s+tabs=\{\[[\s\S]*?\]\}/)?.[0] ?? '';
+    expect(tabsCall).toMatch(/id: 'import', label: 'Import'/);
+    expect(tabsCall).toMatch(/id: 'coverage', label: 'Coverage'/);
+    expect(tabsCall).toMatch(/id: 'alerts', label: 'Alerts'/);
+    expect(tabsCall).toMatch(/id: 'history', label: 'History'/);
+  });
+
+  it('reuses the existing ui.tsx Tabs/Table/Select components rather than hand-rolling new ones (responsive behavior -- overflow-x-auto and side scrolling are those components\' own concern)', () => {
+    expect(source).toMatch(/import \{ Card, Button, Badge, PageHeader, EmptyState, Tabs, Select, Table, THead, TBody, TR, TH, TD \} from '\.\.\/components\/ui';/);
+    expect(source).not.toMatch(/<table\b/); // never a raw <table> -- always the shared Table component
+  });
+
+  it('the Import tab\'s own permission banner, upload dropzone, and empty state only render when activeTab is import', () => {
+    const importBlock = source.match(/\{activeTab === 'import' && \(\s*<div className="space-y-6">[\s\S]*?\n {6}\}\s*\n\)\}/)?.[0]
+      ?? source.slice(source.indexOf("activeTab === 'import'"), source.indexOf("activeTab === 'coverage'"));
+    expect(importBlock).toMatch(/View Only/);
+    expect(importBlock).toMatch(/No file selected yet/);
+  });
+});
+
+describe('Import redesign: Coverage tab', () => {
+  it('shows an EmptyState when there is no coverage history at all', () => {
+    const panel = source.match(/function CoverageTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/if \(coverageTimeline\.length === 0\) \{/);
+    expect(panel).toMatch(/icon=\{Calendar\}/);
+  });
+
+  it('expands/collapses grouped missing-date ranges per scope, only when that scope has gaps', () => {
+    const panel = source.match(/function CoverageTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/onClick=\{hasGaps \? \(\) => onToggle\(key\) : undefined\}/);
+    expect(panel).toMatch(/\{hasGaps && expanded && \(/);
+    expect(panel).toMatch(/formatDateRange\(range\)/);
+  });
+
+  it('imports groupConsecutiveDates/formatDateRange from the new pure date-range-grouping utility', () => {
+    expect(source).toMatch(/import \{ groupConsecutiveDates, formatDateRange \} from '\.\.\/utils\/dateRangeGrouping';/);
+  });
+});
+
+describe('Import redesign: Alerts tab -- filtering, bulk selection, failure handling, attribution', () => {
+  it('the status filter defaults to open, with exactly Open/Acknowledged/Resolved options', () => {
+    expect(source).toMatch(/const \[alertStatusFilter, setAlertStatusFilter\] = useState<AlertStatusFilter>\('open'\);/);
+    const panel = source.match(/function AlertsTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/\{ label: 'Open', value: 'open' \}/);
+    expect(panel).toMatch(/\{ label: 'Acknowledged', value: 'acknowledged' \}/);
+    expect(panel).toMatch(/\{ label: 'Resolved', value: 'resolved' \}/);
+  });
+
+  it('acknowledged vs. resolved are distinguished by closedBy (human attribution vs. automatic) -- never shown identically', () => {
+    const panel = source.match(/function AlertsTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/alert\.closedBy\s*\n?\s*\? <Badge color="blue">Acknowledged<\/Badge>\s*\n?\s*: <Badge color="emerald">Resolved automatically<\/Badge>/);
+  });
+
+  it('reloadSiteAlerts maps the closed list by closedBy to split acknowledged (human) from resolved (automatic)', () => {
+    expect(source).toMatch(/closed\.filter\(\(a\) => \(filter === 'acknowledged' \? a\.closedBy !== null : a\.closedBy === null\)\)/);
+  });
+
+  it('never shows an open/active alert below the 5-employee threshold, even defensively', () => {
+    expect(source).toMatch(/open\.filter\(\(a\) => a\.currentAbsentCount >= 5\)/);
+  });
+
+  it('supports select-all-visible and per-row selection, disabled for already-closed alerts', () => {
+    expect(source).toMatch(/const toggleSelectAllVisibleAlerts = useCallback/);
+    expect(source).toMatch(/const toggleAlertSelected = useCallback/);
+    const panel = source.match(/function AlertsTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/checked=\{allVisibleSelected\}/);
+    expect(panel).toMatch(/disabled=\{alert\.status === 'closed'\}/);
+  });
+
+  it('bulk acknowledgement requires both a selection and a note, never silently no-ops', () => {
+    const handler = source.match(/const handleBulkAcknowledge = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(handler).toMatch(/Select at least one alert to acknowledge\./);
+    expect(handler).toMatch(/A note is required to acknowledge alerts\./);
+    expect(handler).toMatch(/await bulkAcknowledgeSiteAlerts\(ids, note\);/);
+  });
+
+  it('reports a truthful partial failure -- distinct acknowledged vs. failed counts, never a blanket success banner when some failed', () => {
+    const handler = source.match(/const handleBulkAcknowledge = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(handler).toMatch(/const acknowledgedCount = results\.filter\(\(r\) => r\.outcome === 'acknowledged'\)\.length;/);
+    expect(handler).toMatch(/const failedCount = results\.length - acknowledgedCount;/);
+    expect(handler).toMatch(/if \(failedCount === 0\) \{/);
+    expect(handler).toMatch(/could not be acknowledged -- see details below\./);
+  });
+
+  it('never creates or modifies attendance or payroll from alert acknowledgement -- only ever calls the alert RPCs', () => {
+    const handler = source.match(/const handleBulkAcknowledge = useCallback\(async \(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(handler).not.toMatch(/attendance|payroll/i);
+  });
+
+  it('shows an EmptyState with a filter-specific message when there are no matching alerts', () => {
+    const panel = source.match(/function AlertsTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/No open site absence alerts/);
+    expect(panel).toMatch(/No acknowledged alerts/);
+    expect(panel).toMatch(/No automatically resolved alerts/);
+  });
+});
+
+describe('Import redesign: History tab -- pagination, access control, honesty about what is/isn\'t stored', () => {
+  it('fetches a page lazily only once the History tab is activated', () => {
+    expect(source).toMatch(/if \(activeTab === 'history'\) reloadHistory\(historyPage\);/);
+  });
+
+  it('surfaces the RPC\'s own authorization error directly rather than duplicating a client-side permission check', () => {
+    const fn = source.match(/const reloadHistory = useCallback\(async \(page: number\) => \{[\s\S]*?\n {2}\}, \[\]\);/)?.[0] ?? '';
+    expect(fn).toMatch(/setHistoryError\(err instanceof Error \? err\.message : 'Could not load import history\.'\);/);
+  });
+
+  it('paginates with Previous/Next, disabled at the first/last page respectively', () => {
+    const panel = source.match(/function HistoryTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/onClick=\{\(\) => onPageChange\(Math\.max\(0, page - 1\)\)\} disabled=\{page === 0\}/);
+    expect(panel).toMatch(/onClick=\{\(\) => onPageChange\(page \+ 1\)\} disabled=\{page \+ 1 >= totalPages\}/);
+  });
+
+  it('never fabricates a declared coverage interval or processing outcome for a historical batch -- says so explicitly', () => {
+    const panel = source.match(/function HistoryTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/not stored for past batches/);
+  });
+
+  it('shows an empty state distinguishing "no history yet" from "no permission"', () => {
+    const panel = source.match(/function HistoryTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/canImport \? 'Imported HikCentral exports will appear here\.' : 'You do not have permission to import HikCentral exports\.'/);
+  });
+
+  it('expands/collapses a batch\'s own error message, only when one exists', () => {
+    const panel = source.match(/function HistoryTabPanel\([\s\S]*?\n\}\n/)?.[0] ?? '';
+    expect(panel).toMatch(/onClick=\{batch\.errorMessage \? \(\) => onToggleExpanded\(batch\.id\) : undefined\}/);
+    expect(panel).toMatch(/\{batch\.errorMessage && expanded && \(/);
   });
 });

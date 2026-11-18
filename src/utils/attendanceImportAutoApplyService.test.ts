@@ -23,6 +23,7 @@ const {
   periodToCoverageWindow, isoToBlantyreDateStr, fetchDistinctWorkstations, processHikCentralImportBatch,
   fetchCoverageTimeline, fetchSiteAbsenceAlerts, acknowledgeSiteAlert,
   fetchEmployeeTerminalAssignments, setEmployeeHikCentralTerminals,
+  fetchImportBatchHistory, bulkAcknowledgeSiteAlerts,
 } = await import('./attendanceImportAutoApplyService');
 
 describe('periodToCoverageWindow', () => {
@@ -465,6 +466,86 @@ describe('processHikCentralImportBatch', () => {
       rpcMock.mockResolvedValue({ data: null, error: { message: 'boom' } });
       await expect(fetchSiteAbsenceAlerts()).rejects.toBeTruthy();
       await expect(acknowledgeSiteAlert('a1', 'note')).rejects.toBeTruthy();
+    });
+  });
+
+  describe('Import redesign: fetchImportBatchHistory', () => {
+    it('maps RPC rows from snake_case to camelCase, including the derived access points/event range, and reads total_count from the first row', async () => {
+      rpcMock.mockResolvedValue({
+        data: [
+          {
+            id: 'b1', filename: 'oct-week1.xlsx', status: 'completed', created_at: '2026-10-01T08:00:00Z', completed_at: '2026-10-01T08:00:05Z',
+            total_rows: 500, authorization_count: 480, failed_count: 20, with_person_no_count: 450, without_person_no_count: 30,
+            raw_events_inserted: 480, exact_duplicates_ignored: 0, error_message: null,
+            access_points: ['Main Gate'], earliest_event_at: '2026-10-01T06:00:00Z', latest_event_at: '2026-10-01T17:00:00Z',
+            total_count: 3,
+          },
+        ],
+        error: null,
+      });
+      const result = await fetchImportBatchHistory(20, 0);
+      expect(rpcMock).toHaveBeenCalledWith('hikcentral_import_batch_history', { p_limit: 20, p_offset: 0 });
+      expect(result.totalCount).toBe(3);
+      expect(result.batches[0]).toEqual({
+        id: 'b1', filename: 'oct-week1.xlsx', status: 'completed', createdAt: '2026-10-01T08:00:00Z', completedAt: '2026-10-01T08:00:05Z',
+        totalRows: 500, authorizationCount: 480, failedCount: 20, withPersonNoCount: 450, withoutPersonNoCount: 30,
+        rawEventsInserted: 480, exactDuplicatesIgnored: 0, errorMessage: null,
+        accessPoints: ['Main Gate'], earliestEventAt: '2026-10-01T06:00:00Z', latestEventAt: '2026-10-01T17:00:00Z',
+      });
+    });
+
+    it('returns an empty page with totalCount 0 when there are no batches at all, rather than throwing', async () => {
+      rpcMock.mockResolvedValue({ data: [], error: null });
+      const result = await fetchImportBatchHistory(20, 0);
+      expect(result).toEqual({ batches: [], totalCount: 0 });
+    });
+
+    it('never fabricates access points or an event range for a batch with none -- defaults to an empty array / null', async () => {
+      rpcMock.mockResolvedValue({
+        data: [{
+          id: 'b2', filename: 'bad-file.xlsx', status: 'failed', created_at: '2026-10-09T08:00:00Z', completed_at: null,
+          total_rows: 0, authorization_count: 0, failed_count: 0, with_person_no_count: 0, without_person_no_count: 0,
+          raw_events_inserted: 0, exact_duplicates_ignored: 0, error_message: 'Could not parse workbook',
+          access_points: null, earliest_event_at: null, latest_event_at: null, total_count: 1,
+        }],
+        error: null,
+      });
+      const result = await fetchImportBatchHistory(20, 0);
+      expect(result.batches[0].accessPoints).toEqual([]);
+      expect(result.batches[0].earliestEventAt).toBeNull();
+      expect(result.batches[0].latestEventAt).toBeNull();
+    });
+
+    it('propagates an RPC error (including an authorization refusal) rather than swallowing it', async () => {
+      rpcMock.mockResolvedValue({ data: null, error: { message: 'Not authorized to view HikCentral import history' } });
+      await expect(fetchImportBatchHistory(20, 0)).rejects.toBeTruthy();
+    });
+  });
+
+  describe('Import redesign: bulkAcknowledgeSiteAlerts', () => {
+    it('passes the id array and shared note, and maps each row\'s distinct outcome from snake_case', async () => {
+      rpcMock.mockResolvedValue({
+        data: [
+          { alert_id: 'a1', outcome: 'acknowledged', site: 'HEAD OFFICE', alert_date: '2026-10-01', status: 'closed' },
+          { alert_id: 'a2', outcome: 'already_closed', site: 'LIMBE', alert_date: '2026-10-02', status: 'closed' },
+          { alert_id: 'a3', outcome: 'not_found', site: null, alert_date: null, status: null },
+          { alert_id: 'a4', outcome: 'unauthorized', site: null, alert_date: null, status: null },
+        ],
+        error: null,
+      });
+      const result = await bulkAcknowledgeSiteAlerts(['a1', 'a2', 'a3', 'a4'], 'Bulk-reviewed.');
+      expect(rpcMock).toHaveBeenCalledWith('attendance_site_alerts_bulk_acknowledge', { p_alert_ids: ['a1', 'a2', 'a3', 'a4'], p_note: 'Bulk-reviewed.' });
+      expect(result).toEqual([
+        { alertId: 'a1', outcome: 'acknowledged', site: 'HEAD OFFICE', alertDate: '2026-10-01', status: 'closed' },
+        { alertId: 'a2', outcome: 'already_closed', site: 'LIMBE', alertDate: '2026-10-02', status: 'closed' },
+        { alertId: 'a3', outcome: 'not_found', site: null, alertDate: null, status: null },
+        { alertId: 'a4', outcome: 'unauthorized', site: null, alertDate: null, status: null },
+      ]);
+    });
+
+    it('throws rather than swallowing a call-level RPC error (e.g. empty note/id list, not authorized at all)', async () => {
+      rpcMock.mockResolvedValue({ data: null, error: { message: 'A note is required to acknowledge site absence alerts' } });
+      await expect(bulkAcknowledgeSiteAlerts(['a1'], '')).rejects.toBeTruthy();
     });
   });
 
