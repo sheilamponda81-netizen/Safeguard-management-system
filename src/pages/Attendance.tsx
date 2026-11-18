@@ -578,7 +578,7 @@ function MonthlyRegisterTab() {
   // previousStatus is carried alongside the queued write so a failed RPC
   // call can revert the optimistic UI change it caused -- the grid applies
   // the new status immediately on click, before the write is confirmed.
-  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string; previousStatus: string }>>(new Map());
+  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string; previousStatus: string; reason: string }>>(new Map());
   const isProcessingUpdate = useRef(false);
 
   // ===== HELPER FUNCTIONS =====
@@ -789,12 +789,13 @@ function MonthlyRegisterTab() {
   // month already has a payroll record. On failure, the optimistic UI
   // change made in updateAttendance is reverted back to previousStatus so
   // the grid never shows an edit that didn't actually save.
-  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string, previousStatus: string) => {
+  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string, previousStatus: string, reason: string) => {
     try {
       const { data, error } = await supabase.rpc('attendance_correct', {
         p_employee_id: employeeId,
         p_date: date,
         p_status: nextStatus,
+        p_reason: reason,
       });
 
       if (error) throw error;
@@ -834,7 +835,7 @@ function MonthlyRegisterTab() {
       updateQueue.current.clear();
 
       // Group updates by employee for efficiency
-      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string; previousStatus: string }[]> = {};
+      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string; previousStatus: string; reason: string }[]> = {};
       for (const entry of entries) {
         if (!groupedUpdates[entry.employeeId]) {
           groupedUpdates[entry.employeeId] = [];
@@ -845,7 +846,7 @@ function MonthlyRegisterTab() {
       // Process each employee's updates
       for (const updates of Object.values(groupedUpdates)) {
         for (const update of updates) {
-          await processSingleUpdate(update.employeeId, update.date, update.status, update.previousStatus);
+          await processSingleUpdate(update.employeeId, update.date, update.status, update.previousStatus, update.reason);
         }
       }
     } catch (err) {
@@ -887,11 +888,29 @@ function MonthlyRegisterTab() {
     const currentIndex = statusCycle.indexOf(currentStatus);
     const nextIndex = (currentIndex + 1) % statusCycle.length;
     const nextStatus = statusCycle[nextIndex];
-    
+
+    // Task 3 (Phase 2 completion): a reason is now required by the
+    // database for every manual correction (attendance_correct), not
+    // only enforced client-side -- this prompt is what keeps the
+    // grid's fast click-to-cycle workflow working at all under that
+    // requirement, asked once per click rather than via a full modal
+    // so the rest of this optimistic-update flow is unchanged. A
+    // cancelled or blank reason aborts before anything (UI state or
+    // server) is touched.
+    const reason = window.prompt(
+      `Reason for changing ${employee?.full_name || 'this employee'}'s attendance on ${date} from ${currentStatus} to ${nextStatus}:`
+    );
+    if (reason === null) return;
+    const trimmedReason = reason.trim();
+    if (!trimmedReason) {
+      showNotification('A reason is required to change attendance.', 'error');
+      return;
+    }
+
     // ===== PERFORMANCE: Optimistic update - change UI immediately =====
     const updateKey = `${employeeId}-${date}`;
     if (updating[updateKey]) return; // Prevent double clicks
-    
+
     setUpdating(prev => ({ ...prev, [updateKey]: true }));
     
     // Update local state immediately for fast UI response
@@ -907,7 +926,7 @@ function MonthlyRegisterTab() {
     });
     
     // Queue the update for background processing
-    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus, previousStatus: currentStatus });
+    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus, previousStatus: currentStatus, reason: trimmedReason });
     
     // Trigger queue processing
     if (!isProcessingUpdate.current) {

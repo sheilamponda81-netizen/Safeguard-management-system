@@ -94,3 +94,33 @@ async function fetchOfficialAttendanceStatusByKey(employeeIds: string[], dateFro
   for (const row of rows) byKey.set(`${row.employee_id}|${row.date}`, row.status);
   return byKey;
 }
+
+/**
+ * Task 3 (Phase 2 completion): the Evidence Centre's own "automatic vs.
+ * manual" filter needs to know HOW the official attendance row was
+ * decided, not just what it says. Deliberately a SEPARATE, additive
+ * export rather than widening fetchOfficialAttendanceStatusByKey's own
+ * return shape -- that function (and officialStatusByKey's plain
+ * Map<string, string> type) is shared by three other pages
+ * (AttendanceCalculationPreview, AttendanceServerCalculationPreview,
+ * AttendanceWhatIfSimulation) that have no use for this and should
+ * never need to change just because the Evidence Centre grew a new
+ * filter. Read-only -- same RLS-scoped plain SELECT, same batching
+ * utility, as its sibling above.
+ */
+export async function fetchOfficialAttendanceSourceByKey(employeeIds: string[], dateFrom: string, dateTo: string): Promise<Map<string, string | null>> {
+  const rows = await fetchInEmployeeIdBatches<{ employee_id: string; date: string; source: string | null }>(
+    employeeIds,
+    (batch, from, to, withCount) =>
+      supabase
+        .from('attendance')
+        .select('employee_id, date, source', withCount ? { count: 'exact' } : undefined)
+        .gte('date', dateFrom)
+        .lte('date', dateTo)
+        .in('employee_id', batch)
+        .range(from, to)
+  );
+  const byKey = new Map<string, string | null>();
+  for (const row of rows) byKey.set(`${row.employee_id}|${row.date}`, row.source);
+  return byKey;
+}

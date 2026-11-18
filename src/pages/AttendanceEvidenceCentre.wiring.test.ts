@@ -70,3 +70,32 @@ describe('AttendanceEvidenceCentre.tsx: strictly read-only, no new permission, n
     expect(evidenceCentreSource).toMatch(/by \{c\.confirmedBy\}/);
   });
 });
+
+describe('AttendanceEvidenceCentre.tsx: Task 3 completion -- discrepancy filter, decision-source filter, pagination', () => {
+  it('fetches decision source via a SEPARATE, additive service export, never widening the shared officialStatusByKey type other pages also consume', () => {
+    expect(evidenceCentreSource).toMatch(/import \{ fetchAttendanceCalculationPreviewData, fetchOfficialAttendanceSourceByKey \} from '\.\.\/utils\/attendanceCalculationPreviewService';/);
+    expect(evidenceCentreSource).toMatch(/const sourceByKey = await fetchOfficialAttendanceSourceByKey\(/);
+  });
+
+  it('offers an Automatic/Manual decision-source filter, applied against the fetched source map', () => {
+    expect(evidenceCentreSource).toMatch(/type SourceFilter = 'automatic' \| 'manual' \| '';/);
+    expect(evidenceCentreSource).toMatch(/officialSourceByKey\.get\(`\$\{r\.employeeId\}\|\$\{r\.shiftDate\}`\) === sourceFilter/);
+    expect(evidenceCentreSource).toMatch(/\{ label: 'Automatic only', value: 'automatic' \}/);
+    expect(evidenceCentreSource).toMatch(/\{ label: 'Manual only', value: 'manual' \}/);
+  });
+
+  it('offers a Discrepancies-only filter, comparing the official status against this page\'s own calculation -- never the (separate, per-row, server-side) live recalculation check', () => {
+    expect(evidenceCentreSource).toMatch(/const OFFICIAL_TO_CALC_STATUS: Partial<Record<string, AttendanceCalculationStatus>> = \{ P: 'present', A: 'absent', L: 'late' \};/);
+    const discrepancyFilterBody = evidenceCentreSource.match(/if \(discrepancyOnly\) \{[\s\S]*?\n {4}\}/)?.[0] ?? '';
+    expect(discrepancyFilterBody).toMatch(/expected !== undefined && expected !== r\.calculation\.status/);
+  });
+
+  it('a date/filter change resets pagination back to page 1, never leaving the view stuck on a now out-of-range page', () => {
+    expect(evidenceCentreSource).toMatch(/useEffect\(\(\) => \{ setPage\(1\); \}, \[siteFilter, shiftFilter, resultFilter, employeeSearch, evidenceFilter, sourceFilter, discrepancyOnly, fromDate, toDate\]\);/);
+  });
+
+  it('paginates the already-fetched, already-filtered rows with Previous/Next, correctly disabled at the first/last page', () => {
+    expect(evidenceCentreSource).toMatch(/onClick=\{\(\) => setPage\(\(p\) => Math\.max\(1, p - 1\)\)\} disabled=\{currentPage === 1\}/);
+    expect(evidenceCentreSource).toMatch(/onClick=\{\(\) => setPage\(\(p\) => Math\.min\(totalPages, p \+ 1\)\)\} disabled=\{currentPage === totalPages\}/);
+  });
+});
