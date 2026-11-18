@@ -250,6 +250,142 @@ export async function acknowledgeSiteAlert(alertId: string, note: string): Promi
   return mapSiteAbsenceAlertRow(data as SiteAbsenceAlertRpcRow);
 }
 
+// ---- Import redesign: paginated batch history ----
+
+export interface ImportBatchHistoryEntry {
+  id: string;
+  filename: string | null;
+  status: string;
+  createdAt: string;
+  completedAt: string | null;
+  totalRows: number;
+  authorizationCount: number;
+  failedCount: number;
+  withPersonNoCount: number;
+  withoutPersonNoCount: number;
+  rawEventsInserted: number;
+  exactDuplicatesIgnored: number;
+  errorMessage: string | null;
+  /**
+   * Derived (diagnostic display only) from this batch's own raw events --
+   * hikcentral_import_batches itself never stores the declared coverage
+   * interval or the automatic-processing outcome for a past batch (those
+   * exist only transiently in processHikCentralImportBatch's own response
+   * for the import just completed). A batch with zero raw events (e.g. a
+   * failed parse) legitimately has an empty array here, never fabricated.
+   */
+  accessPoints: string[];
+  earliestEventAt: string | null;
+  latestEventAt: string | null;
+}
+
+export interface ImportBatchHistoryPage {
+  batches: ImportBatchHistoryEntry[];
+  totalCount: number;
+}
+
+interface ImportBatchHistoryRpcRow {
+  id: string;
+  filename: string | null;
+  status: string;
+  created_at: string;
+  completed_at: string | null;
+  total_rows: number;
+  authorization_count: number;
+  failed_count: number;
+  with_person_no_count: number;
+  without_person_no_count: number;
+  raw_events_inserted: number;
+  exact_duplicates_ignored: number;
+  error_message: string | null;
+  access_points: string[] | null;
+  earliest_event_at: string | null;
+  latest_event_at: string | null;
+  total_count: number | string;
+}
+
+/**
+ * One page of this tenant's HikCentral import history, newest first.
+ * Throws on error (including on an unauthorized caller) -- callers decide
+ * how to degrade; the History tab shows its own permission/empty states
+ * rather than crashing.
+ */
+export async function fetchImportBatchHistory(limit = 20, offset = 0): Promise<ImportBatchHistoryPage> {
+  const { data, error } = await supabase.rpc('hikcentral_import_batch_history', { p_limit: limit, p_offset: offset });
+  if (error) throw error;
+  const rows = (data || []) as ImportBatchHistoryRpcRow[];
+  return {
+    batches: rows.map((r) => ({
+      id: r.id,
+      filename: r.filename,
+      status: r.status,
+      createdAt: r.created_at,
+      completedAt: r.completed_at,
+      totalRows: r.total_rows,
+      authorizationCount: r.authorization_count,
+      failedCount: r.failed_count,
+      withPersonNoCount: r.with_person_no_count,
+      withoutPersonNoCount: r.without_person_no_count,
+      rawEventsInserted: r.raw_events_inserted,
+      exactDuplicatesIgnored: r.exact_duplicates_ignored,
+      errorMessage: r.error_message,
+      accessPoints: r.access_points || [],
+      earliestEventAt: r.earliest_event_at,
+      latestEventAt: r.latest_event_at,
+    })),
+    totalCount: rows.length > 0 ? Number(rows[0].total_count) : 0,
+  };
+}
+
+// ---- Import redesign: bulk site-absence-alert acknowledgement ----
+
+export type BulkAcknowledgeOutcome = 'acknowledged' | 'already_closed' | 'not_found' | 'unauthorized';
+
+export interface BulkAcknowledgeResultRow {
+  alertId: string;
+  outcome: BulkAcknowledgeOutcome;
+  site: string | null;
+  alertDate: string | null;
+  status: string | null;
+}
+
+interface BulkAcknowledgeRpcRow {
+  alert_id: string;
+  outcome: BulkAcknowledgeOutcome;
+  site: string | null;
+  alert_date: string | null;
+  status: string | null;
+}
+
+/**
+ * Acknowledges (closes) many site absence alerts with one shared, required
+ * note in a single call -- reuses the exact authorization/validation of
+ * the single-alert attendance_site_alert_acknowledge RPC, but reports a
+ * DISTINCT outcome per alert id ('acknowledged' | 'already_closed' |
+ * 'not_found' | 'unauthorized') instead of an all-or-nothing result, so a
+ * partial failure (e.g. one id from a stale list) is reported truthfully
+ * rather than silently dropped or made to look like total success. Throws
+ * only on a call-level problem (not authenticated/authorized, no note,
+ * empty id list) -- never for an individual alert's own outcome, which is
+ * always a value in the returned array. Never touches attendance,
+ * payroll, employees, or rosters -- only this table's own status/closed_*
+ * columns, identical in effect to acknowledging each alert one at a time.
+ */
+export async function bulkAcknowledgeSiteAlerts(alertIds: string[], note: string): Promise<BulkAcknowledgeResultRow[]> {
+  const { data, error } = await supabase.rpc('attendance_site_alerts_bulk_acknowledge', {
+    p_alert_ids: alertIds,
+    p_note: note,
+  });
+  if (error) throw error;
+  return ((data || []) as BulkAcknowledgeRpcRow[]).map((r) => ({
+    alertId: r.alert_id,
+    outcome: r.outcome,
+    site: r.site,
+    alertDate: r.alert_date,
+    status: r.status,
+  }));
+}
+
 export type ProcessImportBatchOutcome = 'success' | 'unauthorized' | 'missing_rpc' | 'network_error' | 'unexpected_response' | 'needs_override_reason';
 
 export interface NeedsTerminalConfigurationEmployee {
