@@ -163,6 +163,28 @@ describe.skipIf(!dbAvailable && !dbRequired)('Month-end attendance protection (r
     expect(Number(openFlags)).toBeGreaterThanOrEqual(1);
   });
 
+  // Final Phase 2 release review: every other test in this file calls
+  // attendance_month_end_summary as a super-admin fixture caller
+  // (createFixture's own convention) -- none actually exercised the
+  // permission bar itself. Confirms it empirically, not just by
+  // reading that it mirrors get_payroll_attendance_counts' own
+  // already-reviewed check.
+  it('attendance_month_end_summary rejects a caller with no payroll.view permission, no legacy role_level<=2, and no super-admin flag', () => {
+    const tenantId = randomUUID();
+    const callerId = randomUUID();
+    exec(`INSERT INTO tenants (id, name, code) VALUES ('${tenantId}', 'Permission Test Tenant', 'PTT-${tenantId.slice(0, 8)}')`);
+    exec(`INSERT INTO auth.users (id) VALUES ('${callerId}')`);
+    exec(`INSERT INTO profiles (id, tenant_id, is_super_admin, is_active, role_level) VALUES ('${callerId}', '${tenantId}', false, true, 99)`);
+    exec(`SELECT set_caller('${callerId}')`);
+    try {
+      execFileSync('psql', ['-v', 'ON_ERROR_STOP=1', '-c', `SELECT * FROM attendance_month_end_summary('2026-11')`], { stdio: ['ignore', 'pipe', 'pipe'] });
+      throw new Error('Expected attendance_month_end_summary to reject an unauthorized caller, but it succeeded.');
+    } catch (err) {
+      const stderr = (err as { stderr?: Buffer }).stderr?.toString() ?? '';
+      expect(stderr).toContain('You do not have permission to view the month-end attendance summary');
+    }
+  });
+
   it('a Nov 30 overnight shift resolves correctly once its Dec 1 checkout evidence arrives -- the automatic reconciliation window rolls over a month/year boundary with no special-casing needed', () => {
     const fixture = createFixture('NIGHT SITE');
     exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'night', '2026-11-01', NULL)`);
