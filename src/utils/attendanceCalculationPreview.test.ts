@@ -4,6 +4,7 @@ import {
   collectEmployeeIdsWithRosterEvidence, collectEmployeeIdsWithFingerprintEvidence,
   hasAnyEmployeeWithBothRosterAndFingerprintEvidence, describeDateExtent, expectedShiftTimesFor,
   buildAttendanceCalculationPreviewRows, filterAttendancePreviewRows, buildSiteAlertCasesFromRows,
+  classifyAttendanceReviewSignal,
 } from './attendanceCalculationPreview';
 import { NormalizedFingerprintEvent } from './attendanceCalculationEngine';
 import { DateAssignmentRow, OffDayPatternRow, ShiftPatternRow } from './rosterSchedule';
@@ -632,5 +633,74 @@ describe('buildSiteAlertCasesFromRows -- site alert wiring (reuses Stage A aggre
     expect(rows.every((r) => r.calculation.status === 'pending')).toBe(true);
     const { cases } = buildSiteAlertCasesFromRows(rows);
     expect(aggregateSiteAlerts(cases)).toHaveLength(0);
+  });
+});
+
+// Attendance Review usability redesign: "Needs Review" filter semantics.
+// See classifyAttendanceReviewSignal's own header comment for the exact
+// three-way distinction this pins -- 'uncertain' (evidence not yet
+// confirmed one way or the other) must never collapse into
+// 'contradiction' (a genuine, confirmed disagreement).
+describe('classifyAttendanceReviewSignal', () => {
+  const datedAssignments: DateAssignmentRow[] = [
+    { employeeId: 'emp-1', assignmentDate: '2026-10-05', assignmentType: 'day', isActive: true },
+  ];
+  const noActivePolicy = resolveCoveragePolicy({ exportTimeBlantyreLocal: '', confirmedWorkstationsRaw: '', operatorConfirmed: false });
+
+  function rowFor(params: { events?: Map<string, NormalizedFingerprintEvent[]>; officialStatus?: string; coveragePolicy?: ReturnType<typeof resolveCoveragePolicy> }) {
+    const rows = buildAttendanceCalculationPreviewRows({
+      employees: [employee()],
+      shiftDates: ['2026-10-05'],
+      datedAssignments,
+      patterns: [],
+      eventsByEmployeeId: params.events ?? new Map(),
+      coveragePolicy: params.coveragePolicy ?? noActivePolicy,
+      officialStatusByKey: params.officialStatus ? new Map([['emp-1|2026-10-05', params.officialStatus]]) : new Map(),
+      employeeIdsWithActiveMapping: allMapped([employee()]),
+    });
+    return rows[0];
+  }
+
+  it('is "none" when there is no official status at all to compare against', () => {
+    const row = rowFor({});
+    expect(row.officialStatus).toBeNull();
+    expect(classifyAttendanceReviewSignal(row)).toBe('none');
+  });
+
+  it('is "none" for an official status with no calculated-status analog (Leave/Sick Leave/Not marked)', () => {
+    expect(classifyAttendanceReviewSignal(rowFor({ officialStatus: 'LV' }))).toBe('none');
+    expect(classifyAttendanceReviewSignal(rowFor({ officialStatus: 'SL' }))).toBe('none');
+    expect(classifyAttendanceReviewSignal(rowFor({ officialStatus: '-' }))).toBe('none');
+  });
+
+  it('is "none" when a CONFIRMED calculated result genuinely agrees with the official status', () => {
+    const events = new Map([['emp-1', [ev('2026-10-05T04:05:00.000Z'), ev('2026-10-05T14:30:00.000Z')]]]);
+    const row = rowFor({ events, officialStatus: 'P' });
+    expect(row.calculation.status).toBe('present');
+    expect(row.calculation.basis).toBe('confirmed');
+    expect(classifyAttendanceReviewSignal(row)).toBe('none');
+  });
+
+  it('is "contradiction" when a CONFIRMED calculated result genuinely disagrees with the official status', () => {
+    const events = new Map([['emp-1', [ev('2026-10-05T04:05:00.000Z'), ev('2026-10-05T14:30:00.000Z')]]]);
+    const row = rowFor({ events, officialStatus: 'A' }); // official says Absent, calculation confirms Present
+    expect(row.calculation.status).toBe('present');
+    expect(row.calculation.basis).toBe('confirmed');
+    expect(classifyAttendanceReviewSignal(row)).toBe('contradiction');
+  });
+
+  it('is "uncertain" -- NEVER "contradiction" -- when the calculation is still Pending (incomplete evidence), even though an official status already exists', () => {
+    const row = rowFor({ officialStatus: 'P' }); // no events at all -> Pending
+    expect(row.calculation.status).toBe('pending');
+    expect(classifyAttendanceReviewSignal(row)).toBe('uncertain');
+  });
+
+  it('is "uncertain" -- NEVER "contradiction" -- when the calculation is only a provisional single-scan credit, even though it currently agrees with the official status', () => {
+    const policy = resolveCoveragePolicy({ exportTimeBlantyreLocal: '2026-10-05T14:00', confirmedWorkstationsRaw: 'CHIRIMBA', operatorConfirmed: true });
+    const events = new Map([['emp-1', [ev('2026-10-05T04:05:00.000Z')]]]); // check-in only, no checkout yet
+    const row = rowFor({ events, officialStatus: 'P', coveragePolicy: policy });
+    expect(row.calculation.status).toBe('present');
+    expect(row.calculation.basis).toBe('check_in_only_provisional');
+    expect(classifyAttendanceReviewSignal(row)).toBe('uncertain');
   });
 });
