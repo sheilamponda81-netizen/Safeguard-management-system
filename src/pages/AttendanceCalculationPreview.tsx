@@ -1,11 +1,12 @@
-// Safeguard HikCentral Attendance MVP -- Phase 2C, Stage B: read-only
-// Attendance Calculation Preview.
+// Safeguard HikCentral Attendance MVP -- Phase 2C, Stage B, plus the
+// Attendance Review usability redesign.
 //
 // Shows what the Stage A pure engine (attendanceCalculationEngine.ts)
 // WOULD calculate for each employee/shift-date, using real roster
 // resolution and real fingerprint data -- but writes nothing. There is
 // no save/apply/confirm action anywhere on this page. The existing
-// official `attendance.status` is shown purely for read-only comparison.
+// official `attendance.status` (and its decision source) is shown
+// purely for read-only comparison.
 //
 // COVERAGE: an administrator-entered export time is never, by itself,
 // treated as proof that fingerprint data is complete -- see
@@ -13,28 +14,40 @@
 // explicit operator confirmation, naming specific workstations, turns
 // it into real coverage for those workstations. Every other employee's
 // shift stays Pending rather than silently becoming a false Absent.
+//
+// USABILITY REDESIGN (this pass): replaces the former stacked-card list
+// with a compact register (Table/THead/TBody/TR/TH/TD, genuine
+// Previous/Next pagination over the COMPLETE filtered result -- no
+// row-count cap of any kind), adds a decision-source column/filter, a
+// documented "Needs Review" filter (see classifyAttendanceReviewSignal's
+// own header for its exact, deliberately non-misleading semantics), and
+// moves the Details view into a Modal so the default row stays concise.
+// Still strictly read-only: no new write path of any kind is added.
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   Eye, Search, AlertTriangle, RefreshCw, Clock, MapPin, CalendarDays, ClipboardCheck,
-  ShieldCheck, ChevronDown, ChevronUp, Info, CheckCircle2, XCircle, HelpCircle,
+  ShieldCheck, ChevronDown, ChevronUp, Info, CheckCircle2, XCircle, HelpCircle, History, User,
 } from '../utils/icons';
-import { Card, Button, Badge, PageHeader, EmptyState, Input, Select, StatCard } from '../components/ui';
+import { Card, Button, Badge, PageHeader, EmptyState, Input, Select, StatCard, Modal, Table, THead, TBody, TR, TH, TD } from '../components/ui';
 import { hasPermission, PERMISSIONS } from '../utils/permissions';
 import { expandDateRange, ResolvedSchedule } from '../utils/rosterSchedule';
 import { AttendanceCalculationStatus } from '../utils/attendanceCalculationEngine';
 import {
   resolveCoveragePolicy, collectEmployeeIdsWithRosterEvidence, collectEmployeeIdsWithFingerprintEvidence,
   hasAnyEmployeeWithBothRosterAndFingerprintEvidence, describeDateExtent, buildAttendanceCalculationPreviewRows,
-  filterAttendancePreviewRows, buildSiteAlertCasesFromRows, AttendanceCalculationPreviewRow,
+  filterAttendancePreviewRows, buildSiteAlertCasesFromRows, classifyAttendanceReviewSignal,
+  AttendanceCalculationPreviewRow, AttendanceReviewSignal,
 } from '../utils/attendanceCalculationPreview';
 import { aggregateSiteAlerts, SiteAlert } from '../utils/attendanceSiteAlerts';
-import { fetchAttendanceCalculationPreviewData } from '../utils/attendanceCalculationPreviewService';
+import { fetchAttendanceCalculationPreviewData, fetchOfficialAttendanceSourceByKey } from '../utils/attendanceCalculationPreviewService';
+import { fetchAuditTimelineForEmployeeDate, AttendanceAuditEntry } from '../utils/attendanceEvidenceService';
+import { fetchProfileFullNamesById } from '../utils/hikcentralPersonMappingService';
 
 // This page joins employees x roster x fingerprint x official-attendance
 // per date, which is heavier per day than the simpler scan-grouping
 // preview -- a tighter range cap than that page's 92 days.
 const MAX_RANGE_DAYS = 31;
-const MAX_RENDERED_ROWS = 500;
+const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
 
 const RESULT_LABELS: Record<AttendanceCalculationStatus, string> = {
   present: 'Present',
@@ -57,6 +70,20 @@ const RESULT_COLORS: Record<AttendanceCalculationStatus, 'green' | 'gold' | 'red
 const OFFICIAL_STATUS_LABELS: Record<string, string> = {
   P: 'Present', A: 'Absent', L: 'Late', LV: 'Leave', SL: 'Sick Leave', '-': 'Not marked',
 };
+
+/** 'automatic' | 'manual' | null (no source recorded, e.g. a row from before this column existed) -- never guessed from a preview/official mismatch. */
+type SourceFilter = 'automatic' | 'manual' | '';
+/** See classifyAttendanceReviewSignal's own header for exactly what each of these means and why 'uncertain' is kept separate from 'contradiction'. */
+type ReviewFilter = '' | 'any' | 'contradiction' | 'uncertain';
+
+function sourceLabel(source: string | null | undefined, hasOfficialStatus: boolean): string {
+  if (source === 'automatic') return 'Automatic';
+  if (source === 'manual') return 'Manual';
+  // No source recorded at all. Only ambiguous ("Unknown") when there IS
+  // an official status to have a source for -- otherwise there's simply
+  // nothing to attribute yet, which is not the same claim.
+  return hasOfficialStatus ? 'Unknown' : '—';
+}
 
 function toDateInputValue(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -82,6 +109,160 @@ function formatLocalTime(iso: string | null): string {
   return d.toISOString().slice(11, 16);
 }
 
+function rowKeyOf(row: AttendanceCalculationPreviewRow): string {
+  return `${row.employeeId}|${row.shiftDate}`;
+}
+
+type ManualDetailState =
+  | { status: 'loading' }
+  | { status: 'ready'; entries: AttendanceAuditEntry[]; reviewerNameById: Map<string, string> }
+  | { status: 'error'; message: string };
+
+/**
+ * Compact detail Modal for one employee-day -- deliberately LIGHTER than
+ * the Attendance Evidence Centre's own per-row drill-down (raw scan
+ * lists, coverage-confirmation history, the server's own recalculation
+ * RPC): this page's job is everyday review, not forensic investigation.
+ * For a manual decision, fetches ONLY this employee-day's own audit
+ * timeline (never a tenant-wide query) plus a best-effort reviewer name
+ * -- lazily, only while the modal for THAT row is open, and only once
+ * per row per page load (cached by key). Never invents a reviewer,
+ * reason, or timestamp that wasn't actually recorded.
+ */
+function AttendanceReviewDetailsModal({
+  row, open, onClose, officialSource, reviewSignal, manualDetail,
+}: {
+  row: AttendanceCalculationPreviewRow | null;
+  open: boolean;
+  onClose: () => void;
+  officialSource: string | null;
+  reviewSignal: AttendanceReviewSignal;
+  manualDetail: ManualDetailState | null;
+}) {
+  if (!row) return <Modal open={open} onClose={onClose} title="Attendance details" size="lg"><p className="text-sm text-slate-500">No row selected.</p></Modal>;
+
+  const mappingProblem = !row.hasActiveMapping && (row.resolvedShift === 'day' || row.resolvedShift === 'night');
+  const isProvisional = row.calculation.basis === 'check_in_only_provisional';
+  const coverageText =
+    row.coverage.status === 'confirmed_complete'
+      ? `Confirmed complete through ${formatLocalTime(row.coverage.verifiedThroughIso ?? null)} (Blantyre)`
+      : !row.hasActiveMapping
+      ? 'Insufficient -- no HikCentral person mapping confirmed for this employee yet'
+      : 'Insufficient -- no coverage confirmed for this workstation';
+
+  return (
+    <Modal open={open} onClose={onClose} title={`${row.employeeName} (${row.employeeNumber})`} size="lg">
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center gap-2 text-sm text-slate-500">
+          <span className="inline-flex items-center gap-1"><CalendarDays size={13} /> {row.shiftDate}</span>
+          <span>&middot;</span>
+          <span className="inline-flex items-center gap-1"><MapPin size={13} /> {row.workstation || '—'}</span>
+          <span>&middot;</span>
+          <span className="capitalize">{row.resolvedShift}</span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+          <div>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Expected shift start / end</p>
+            <p className="text-slate-700">{row.expectedShiftTimes ? `${row.expectedShiftTimes.scheduledStart} – ${row.expectedShiftTimes.scheduledEnd}` : '—'}</p>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Actual matched scans</p>
+            <p className="text-slate-700 flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="inline-flex items-center gap-1"><Clock size={11} className="text-slate-400" /> Check-in: {formatLocalTime(row.calculation.checkInIso)}</span>
+              <span className="inline-flex items-center gap-1"><Clock size={11} className="text-slate-400" /> Checkout: {formatLocalTime(row.calculation.checkOutIso)}</span>
+            </p>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Fingerprint coverage state</p>
+            <p className="text-slate-700">{coverageText}</p>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Calculated result</p>
+            <p className="flex items-center gap-2">
+              <Badge color={RESULT_COLORS[row.calculation.status]}>{RESULT_LABELS[row.calculation.status]}</Badge>
+              {isProvisional && (
+                <span title="Credited from a single valid check-in alone, before the checkout window closed -- not yet a confirmed result.">
+                  <Badge color="gold">Provisional</Badge>
+                </span>
+              )}
+            </p>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Official attendance status</p>
+            <p className="text-slate-700">{row.officialStatus ? (OFFICIAL_STATUS_LABELS[row.officialStatus] ?? row.officialStatus) : 'Not marked'}</p>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Official decision source</p>
+            <p className="text-slate-700">{sourceLabel(officialSource, !!row.officialStatus)}</p>
+          </div>
+        </div>
+
+        <div>
+          <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Calculation explanation</p>
+          <p className="text-sm text-slate-600">{row.calculation.reason}</p>
+          {mappingProblem && (
+            <p className="text-amber-700 text-sm mt-1 flex items-start gap-1">
+              <AlertTriangle size={13} className="shrink-0 mt-0.5" />
+              No HikCentral person mapping confirmed yet for this employee -- zero scans here does not mean they were absent.
+            </p>
+          )}
+        </div>
+
+        {reviewSignal !== 'none' && (
+          <div className={reviewSignal === 'contradiction' ? 'rounded-lg border border-red-200 bg-red-50 p-3' : 'rounded-lg border border-amber-200 bg-amber-50 p-3'}>
+            <p className={reviewSignal === 'contradiction' ? 'text-sm text-red-800 flex items-start gap-2' : 'text-sm text-amber-800 flex items-start gap-2'}>
+              <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+              {reviewSignal === 'contradiction'
+                ? "The official record and this page's own calculation disagree. This is a read-only investigation signal, not proof the official record is wrong -- it does not change official Attendance or Payroll."
+                : "This page's own calculation cannot yet confirm or dispute the official record (fingerprint evidence is still incomplete or only provisional) -- this is a gap in current evidence, not a confirmed conflict."}
+            </p>
+          </div>
+        )}
+
+        {officialSource === 'manual' && (
+          <div>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1 flex items-center gap-1"><History size={13} /> Manual decision history</p>
+            {manualDetail === null || manualDetail.status === 'loading' ? (
+              <p className="text-sm text-slate-400">Loading audit history…</p>
+            ) : manualDetail.status === 'error' ? (
+              <p className="text-sm text-red-600">Could not load audit history: {manualDetail.message}</p>
+            ) : manualDetail.entries.length === 0 ? (
+              <p className="text-sm text-amber-700">Historical source unavailable -- no audit record was found for this employee-day.</p>
+            ) : (
+              <ul className="text-sm space-y-2">
+                {manualDetail.entries.map((entry, i) => (
+                  <li key={i} className="border-t border-slate-100 pt-2">
+                    <p className="text-slate-700">
+                      {formatLocalTime(entry.changedAtIso)} on {entry.changedAtIso.slice(0, 10)} &middot;{' '}
+                      {entry.oldStatus ? (OFFICIAL_STATUS_LABELS[entry.oldStatus] ?? entry.oldStatus) : '(none)'} &rarr;{' '}
+                      {OFFICIAL_STATUS_LABELS[entry.newStatus] ?? entry.newStatus}
+                    </p>
+                    <p className="text-xs text-slate-500 flex items-center gap-1 mt-0.5">
+                      <User size={11} />
+                      Reviewer: {entry.changedBy ? (manualDetail.reviewerNameById.get(entry.changedBy) ?? 'Unknown (name not available)') : 'Unknown'}
+                    </p>
+                    {entry.reason ? (
+                      <p className="text-xs text-slate-600 mt-0.5">Reason: "{entry.reason}"</p>
+                    ) : (
+                      <p className="text-xs text-amber-600 mt-0.5">No reason recorded for this change.</p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        <p className="text-xs text-slate-400 border-t border-slate-100 pt-3">
+          This is a read-only summary. For raw fingerprint scans, coverage-confirmation history, and the server's own
+          recalculation for this employee-day, use the Evidence Centre tab.
+        </p>
+      </div>
+    </Modal>
+  );
+}
+
 export default function AttendanceCalculationPreviewPage() {
   const [canView, setCanView] = useState(false);
   const [permissionsLoaded, setPermissionsLoaded] = useState(false);
@@ -93,6 +274,9 @@ export default function AttendanceCalculationPreviewPage() {
   const [siteFilter, setSiteFilter] = useState('');
   const [shiftFilter, setShiftFilter] = useState<ResolvedSchedule | ''>('');
   const [resultFilter, setResultFilter] = useState<AttendanceCalculationStatus | ''>('');
+  const [officialStatusFilter, setOfficialStatusFilter] = useState('');
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('');
+  const [reviewFilter, setReviewFilter] = useState<ReviewFilter>('');
   // Default view: scheduled Day/Night shifts only -- Off/Unassigned days
   // are real, correct results (never a bug), but repeating them for
   // every employee on every date would flood the list. This toggle is
@@ -100,7 +284,8 @@ export default function AttendanceCalculationPreviewPage() {
   // or how many rows exist underneath.
   const [showOffUnassigned, setShowOffUnassigned] = useState(false);
   const [coverageSectionOpen, setCoverageSectionOpen] = useState(false);
-  const [expandedRowKey, setExpandedRowKey] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(PAGE_SIZE_OPTIONS[0]);
 
   // Coverage workflow inputs -- see attendanceCalculationPreview.ts's
   // resolveCoveragePolicy for why typing an export time alone never
@@ -112,7 +297,11 @@ export default function AttendanceCalculationPreviewPage() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [data, setData] = useState<Awaited<ReturnType<typeof fetchAttendanceCalculationPreviewData>> | null>(null);
+  const [officialSourceByKey, setOfficialSourceByKey] = useState<Map<string, string | null>>(new Map());
   const [expandedAlertIndex, setExpandedAlertIndex] = useState<number | null>(null);
+
+  const [detailsRow, setDetailsRow] = useState<AttendanceCalculationPreviewRow | null>(null);
+  const [manualDetailByKey, setManualDetailByKey] = useState<Map<string, ManualDetailState>>(new Map());
 
   const rangeTooWide = daySpan(fromDate, toDate) > MAX_RANGE_DAYS;
   const rangeInvalid = fromDate > toDate;
@@ -129,9 +318,12 @@ export default function AttendanceCalculationPreviewPage() {
     setLoading(true);
     setLoadError(null);
     try {
-      setData(await fetchAttendanceCalculationPreviewData(fromDate, toDate));
+      const result = await fetchAttendanceCalculationPreviewData(fromDate, toDate);
+      const sourceByKey = await fetchOfficialAttendanceSourceByKey(result.employees.map((e) => e.id), fromDate, toDate);
+      setData(result);
+      setOfficialSourceByKey(sourceByKey);
     } catch (err) {
-      setLoadError(err instanceof Error ? err.message : 'Could not load the Attendance Calculation Preview.');
+      setLoadError(err instanceof Error ? err.message : 'Could not load the Attendance Review.');
     } finally {
       setLoading(false);
     }
@@ -203,13 +395,44 @@ export default function AttendanceCalculationPreviewPage() {
   // "Show Off/Unassigned" toggle or by picking "Off"/"Unassigned"
   // directly in the Shift filter -- an explicit choice always wins.
   const filteredRows = useMemo(() => {
-    const explicitlyFiltered = filterAttendancePreviewRows(rows, { siteFilter, shiftFilter, resultFilter, employeeSearch });
-    if (showOffUnassigned || shiftFilter === 'off' || shiftFilter === 'unassigned') return explicitlyFiltered;
-    return explicitlyFiltered.filter((r) => r.resolvedShift === 'day' || r.resolvedShift === 'night');
-  }, [rows, siteFilter, shiftFilter, resultFilter, employeeSearch, showOffUnassigned]);
+    let base = filterAttendancePreviewRows(rows, { siteFilter, shiftFilter, resultFilter, employeeSearch });
+    if (!(showOffUnassigned || shiftFilter === 'off' || shiftFilter === 'unassigned')) {
+      base = base.filter((r) => r.resolvedShift === 'day' || r.resolvedShift === 'night');
+    }
+    if (officialStatusFilter) {
+      base = base.filter((r) => r.officialStatus === officialStatusFilter);
+    }
+    if (sourceFilter) {
+      base = base.filter((r) => officialSourceByKey.get(rowKeyOf(r)) === sourceFilter);
+    }
+    if (reviewFilter) {
+      base = base.filter((r) => {
+        const signal = classifyAttendanceReviewSignal(r);
+        if (reviewFilter === 'any') return signal !== 'none';
+        return signal === reviewFilter;
+      });
+    }
+    return base;
+  }, [rows, siteFilter, shiftFilter, resultFilter, employeeSearch, showOffUnassigned, officialStatusFilter, sourceFilter, reviewFilter, officialSourceByKey]);
 
-  const visibleRows = filteredRows.slice(0, MAX_RENDERED_ROWS);
-  const truncated = filteredRows.length > MAX_RENDERED_ROWS;
+  // Genuine pagination over the COMPLETE filtered result -- there is no
+  // row-count cap anywhere above this. The underlying data fetch is
+  // already bounded (MAX_RANGE_DAYS calendar days, RLS-scoped employees
+  // only) and already exhaustively paginated at the network layer
+  // (fetchAllPages/fetchInEmployeeIdBatches), so building every row for
+  // the selected range and paginating the resulting in-memory array is a
+  // proven, non-truncating architecture -- the same one the Evidence
+  // Centre uses, fixed there during the Phase 2 release review after an
+  // earlier version of this exact page still capped display at 500 rows
+  // underneath a later-added "page 1 of N" label. Never repeat that: no
+  // slice() of any kind happens before totalPages/visibleRows below.
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const visibleRows = filteredRows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [siteFilter, shiftFilter, resultFilter, employeeSearch, showOffUnassigned, officialStatusFilter, sourceFilter, reviewFilter, fromDate, toDate, pageSize]);
 
   const siteAlerts: SiteAlert[] = useMemo(() => {
     if (rows.length === 0) return [];
@@ -219,11 +442,11 @@ export default function AttendanceCalculationPreviewPage() {
 
   // Summary counts are deliberately computed from `rows` -- every row
   // calculated for the selected date range -- NOT from `filteredRows`/
-  // `visibleRows`. They are therefore unaffected by the site/shift/
-  // result filters or the Off/Unassigned toggle below, and by the
-  // MAX_RENDERED_ROWS display cap; the label under the stat cards makes
+  // `visibleRows`. They are therefore unaffected by any filter, the
+  // Off/Unassigned toggle, or pagination. These are CALCULATED PREVIEW
+  // totals, not official attendance totals -- the subtitle below makes
   // this explicit per the "clearly label if filters/pagination limit
-  // scope" requirement.
+  // scope, and never conflate preview with official" requirement.
   const summaryCounts = useMemo(() => {
     const counts = { scheduled: 0, present: 0, late: 0, absent: 0, pending: 0 };
     for (const row of rows) {
@@ -242,6 +465,30 @@ export default function AttendanceCalculationPreviewPage() {
     return map;
   }, [candidateEmployees]);
 
+  /** Toggles resultFilter when a summary card for that result is clicked -- clicking the same one again clears it. Only Present/Late/Absent/Pending map onto a calculated-result value; Scheduled/Site alerts don't and are not clickable. */
+  const toggleResultFilter = useCallback((status: AttendanceCalculationStatus) => {
+    setResultFilter((current) => (current === status ? '' : status));
+  }, []);
+
+  const openDetails = useCallback((row: AttendanceCalculationPreviewRow) => {
+    setDetailsRow(row);
+    const key = rowKeyOf(row);
+    const source = officialSourceByKey.get(key);
+    if (source === 'manual' && !manualDetailByKey.has(key)) {
+      setManualDetailByKey((prev) => new Map(prev).set(key, { status: 'loading' }));
+      (async () => {
+        try {
+          const entries = await fetchAuditTimelineForEmployeeDate(row.employeeId, row.shiftDate);
+          const reviewerIds = entries.map((e) => e.changedBy).filter((id): id is string => !!id);
+          const reviewerNameById = await fetchProfileFullNamesById(reviewerIds);
+          setManualDetailByKey((prev) => new Map(prev).set(key, { status: 'ready', entries, reviewerNameById }));
+        } catch (err) {
+          setManualDetailByKey((prev) => new Map(prev).set(key, { status: 'error', message: err instanceof Error ? err.message : 'Unknown error' }));
+        }
+      })();
+    }
+  }, [officialSourceByKey, manualDetailByKey]);
+
   if (!permissionsLoaded) {
     return <div className="p-8 text-center text-slate-400">Loading...</div>;
   }
@@ -249,13 +496,15 @@ export default function AttendanceCalculationPreviewPage() {
   if (!canView) {
     return (
       <div className="space-y-6">
-        <PageHeader title="Attendance Review" subtitle="Read-only preview of calculated attendance results." />
+        <PageHeader title="Attendance Review" subtitle="Calculated Present/Late/Absent/Pending results, compared against the official attendance record -- read-only." />
         <Card className="p-6 bg-amber-50 border-amber-200 border">
           <p className="text-sm text-amber-800">You do not have permission to view Attendance Review.</p>
         </Card>
       </div>
     );
   }
+
+  const detailsKey = detailsRow ? rowKeyOf(detailsRow) : null;
 
   return (
     <div className="space-y-6">
@@ -278,14 +527,30 @@ export default function AttendanceCalculationPreviewPage() {
 
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         <StatCard title="Scheduled shifts" value={summaryCounts.scheduled.toLocaleString()} icon={CalendarDays} accent="navy" />
-        <StatCard title="Present" value={summaryCounts.present.toLocaleString()} icon={CheckCircle2} accent="green" />
-        <StatCard title="Late" value={summaryCounts.late.toLocaleString()} icon={Clock} accent="gold" />
-        <StatCard title="Absent" value={summaryCounts.absent.toLocaleString()} icon={XCircle} accent="red" />
-        <StatCard title="Pending" value={summaryCounts.pending.toLocaleString()} icon={HelpCircle} accent="blue" />
+        {(['present', 'late', 'absent', 'pending'] as const).map((status) => (
+          <button
+            key={status}
+            type="button"
+            onClick={() => toggleResultFilter(status)}
+            className="text-left rounded-xl focus:outline-none focus:ring-2 focus:ring-[#081C3A]"
+            aria-pressed={resultFilter === status}
+            title={`Filter the register to Calculated result = ${RESULT_LABELS[status]}`}
+          >
+            <StatCard
+              title={RESULT_LABELS[status]}
+              value={summaryCounts[status].toLocaleString()}
+              icon={status === 'present' ? CheckCircle2 : status === 'late' ? Clock : status === 'absent' ? XCircle : HelpCircle}
+              accent={status === 'present' ? 'green' : status === 'late' ? 'gold' : status === 'absent' ? 'red' : 'blue'}
+              sub={resultFilter === status ? 'Filter active -- click to clear' : undefined}
+            />
+          </button>
+        ))}
         <StatCard title="Site alerts" value={siteAlerts.length.toLocaleString()} icon={AlertTriangle} accent={siteAlerts.length > 0 ? 'red' : 'navy'} />
       </div>
       <p className="text-xs text-slate-400 -mt-1">
-        Totals cover every shift calculated for {fromDate} to {toDate} -- they are not affected by the site/shift/result filters, the Off/Unassigned toggle, or the row display limit below.
+        Totals cover every shift <strong>calculated</strong> for {fromDate} to {toDate} -- they are calculation-preview
+        totals, not official attendance totals, and are not affected by any filter, the Off/Unassigned toggle, or
+        pagination below. Click Present, Late, Absent, or Pending to filter the register to that calculated result.
       </p>
 
       <Card className="p-4">
@@ -299,6 +564,8 @@ export default function AttendanceCalculationPreviewPage() {
             onChange={(e) => setSiteFilter(e.target.value)}
             options={[{ label: 'All sites', value: '' }, ...siteOptions.map((s) => ({ label: s, value: s }))]}
           />
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mt-3">
           <Select
             label="Shift"
             value={shiftFilter}
@@ -317,76 +584,55 @@ export default function AttendanceCalculationPreviewPage() {
             onChange={(e) => setResultFilter(e.target.value as AttendanceCalculationStatus | '')}
             options={[{ label: 'All results', value: '' }, ...Object.entries(RESULT_LABELS).map(([value, label]) => ({ label, value }))]}
           />
+          <Select
+            label="Official status"
+            value={officialStatusFilter}
+            onChange={(e) => setOfficialStatusFilter(e.target.value)}
+            options={[{ label: 'All official statuses', value: '' }, ...Object.entries(OFFICIAL_STATUS_LABELS).map(([value, label]) => ({ label, value }))]}
+          />
+          <Select
+            label="Official decision source"
+            value={sourceFilter}
+            onChange={(e) => setSourceFilter(e.target.value as SourceFilter)}
+            options={[
+              { label: 'Automatic or manual', value: '' },
+              { label: 'Automatic only', value: 'automatic' },
+              { label: 'Manual only', value: 'manual' },
+            ]}
+          />
         </div>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mt-3">
+          <Select
+            label="Needs review"
+            value={reviewFilter}
+            onChange={(e) => setReviewFilter(e.target.value as ReviewFilter)}
+            options={[
+              { label: 'All rows', value: '' },
+              { label: 'Needs review (any reason)', value: 'any' },
+              { label: 'Confirmed discrepancy only', value: 'contradiction' },
+              { label: 'Unconfirmed evidence only', value: 'uncertain' },
+            ]}
+          />
+          <Select
+            label="Page size"
+            value={String(pageSize)}
+            onChange={(e) => setPageSize(Number(e.target.value))}
+            options={PAGE_SIZE_OPTIONS.map((n) => ({ label: `${n} per page`, value: String(n) }))}
+          />
+          <label className="flex items-center gap-2 text-sm text-slate-600 self-end pb-2.5">
+            <input type="checkbox" checked={showOffUnassigned} onChange={(e) => setShowOffUnassigned(e.target.checked)} />
+            Show Off / Unassigned days
+          </label>
+        </div>
+        <p className="text-xs text-slate-400 mt-2">
+          "Needs review" compares this page's own calculation against the official record. A disagreement here is a
+          read-only investigation signal, never proof the official record is wrong -- "Unconfirmed evidence" means the
+          calculation can't yet confirm or dispute the official record (e.g. still Pending or only a provisional
+          single-scan credit), which is different from a confirmed "Discrepancy".
+        </p>
         {rangeInvalid && <p className="text-xs text-red-600 mt-2">The "From" date must not be after the "To" date.</p>}
         {!rangeInvalid && rangeTooWide && (
           <p className="text-xs text-red-600 mt-2">That range spans more than {MAX_RANGE_DAYS} days. Please narrow it.</p>
-        )}
-        <label className="flex items-center gap-2 mt-3 text-sm text-slate-600 border-t border-slate-100 pt-3">
-          <input type="checkbox" checked={showOffUnassigned} onChange={(e) => setShowOffUnassigned(e.target.checked)} />
-          Show Off / Unassigned days (hidden by default)
-        </label>
-      </Card>
-
-      <Card className="p-4">
-        <button onClick={() => setCoverageSectionOpen((v) => !v)} className="w-full flex items-center justify-between gap-3 text-left">
-          <span className="flex items-center gap-2">
-            <ShieldCheck size={16} className="text-slate-500" />
-            <span className="text-sm font-semibold text-slate-700">Fingerprint coverage settings</span>
-          </span>
-          <span className="flex items-center gap-2">
-            {coveragePolicy.isActive ? (
-              <Badge color="green">Confirmed for {coveragePolicy.confirmedWorkstationKeys.size} workstation(s)</Badge>
-            ) : (
-              <Badge color="gray">Not confirmed -- missing evidence shows Pending</Badge>
-            )}
-            {coverageSectionOpen ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
-          </span>
-        </button>
-        {coverageSectionOpen && (
-          <div className="mt-4 pt-4 border-t border-slate-100">
-            <p className="text-xs text-slate-500 mb-3">
-              An export time by itself is <strong>not</strong> proof that fingerprint data is complete. A shift with a missing
-              checkout stays <strong>Pending</strong> (never a false Absent) unless an authorized operator explicitly confirms,
-              below, that data is complete through a given time for specific, named workstations.
-            </p>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <Input
-                label="Export time supplied by administrator (Blantyre local)"
-                type="datetime-local"
-                value={exportTimeBlantyreLocal}
-                onChange={(e) => setExportTimeBlantyreLocal(e.target.value)}
-              />
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">Confirmed-coverage workstations (comma or newline separated)</label>
-                <textarea
-                  value={confirmedWorkstationsRaw}
-                  onChange={(e) => setConfirmedWorkstationsRaw(e.target.value)}
-                  placeholder="e.g. CHIRIMBA, HEAD OFFICE"
-                  rows={2}
-                  className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent outline-none bg-white"
-                />
-              </div>
-            </div>
-            <label className="flex items-start gap-2 mt-3 text-sm text-slate-700">
-              <input
-                type="checkbox"
-                checked={operatorConfirmed}
-                onChange={(e) => setOperatorConfirmed(e.target.checked)}
-                className="mt-0.5"
-              />
-              <span>
-                I am an authorized operator and I confirm fingerprint data is complete through the time above, for exactly the
-                workstation(s) named above. Unnamed workstations -- including the HikCentral access points, which are not assumed
-                to cover every employee's assigned workstation -- remain Pending for missing evidence.
-              </span>
-            </label>
-            {coveragePolicy.isActive ? (
-              <p className="text-xs text-green-700 mt-2 flex items-center gap-1"><ShieldCheck size={12} /> Coverage confirmed for {coveragePolicy.confirmedWorkstationKeys.size} workstation(s) through {exportTimeBlantyreLocal || '—'} (Blantyre).</p>
-            ) : (
-              <p className="text-xs text-slate-500 mt-2 flex items-center gap-1"><Info size={12} /> No coverage confirmed yet -- every shift with missing evidence will show Pending.</p>
-            )}
-          </div>
         )}
       </Card>
 
@@ -397,7 +643,7 @@ export default function AttendanceCalculationPreviewPage() {
       )}
 
       {loading ? (
-        <div className="p-8 text-center text-slate-400">Loading...</div>
+        <div className="p-8 text-center text-slate-400" role="status">Loading...</div>
       ) : candidateEmployees.length === 0 ? (
         <EmptyState
           icon={CalendarDays}
@@ -466,92 +712,170 @@ export default function AttendanceCalculationPreviewPage() {
               title="No rows match the current filters"
               description={
                 showOffUnassigned || shiftFilter === 'off' || shiftFilter === 'unassigned'
-                  ? 'Try widening the site, shift, or result filters.'
-                  : 'Try widening the site/shift/result filters, or turn on "Show Off / Unassigned days" above -- Day/Night shifts are hidden if none match.'
+                  ? 'Try widening the filters above.'
+                  : 'Try widening the filters above, or turn on "Show Off / Unassigned days" -- Day/Night shifts are hidden if none match.'
               }
             />
           ) : (
-            <>
-              {truncated && (
-                <Card className="p-3 bg-amber-50 border-amber-200 border">
-                  <p className="text-xs text-amber-800">
-                    Showing the first {MAX_RENDERED_ROWS.toLocaleString()} of {filteredRows.length.toLocaleString()} matching rows. Narrow the date range or filters to see the rest.
-                  </p>
-                </Card>
-              )}
-              <div className="space-y-1.5">
-                {visibleRows.map((row) => {
-                  const rowKey = `${row.employeeId}|${row.shiftDate}`;
-                  const expanded = expandedRowKey === rowKey;
-                  const mappingProblem = !row.hasActiveMapping && (row.resolvedShift === 'day' || row.resolvedShift === 'night');
-                  return (
-                    <div key={rowKey} className="border border-slate-200 rounded-lg bg-white">
-                      <button
-                        onClick={() => setExpandedRowKey(expanded ? null : rowKey)}
-                        className="w-full flex items-center gap-3 px-3 py-2.5 text-left hover:bg-slate-50 rounded-lg"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <p className="font-medium text-slate-800 text-sm truncate">{row.employeeName}</p>
-                          <p className="text-xs text-slate-400 truncate">
-                            {row.employeeNumber} &middot; {row.workstation || '—'} &middot; {row.shiftDate} &middot; <span className="capitalize">{row.resolvedShift}</span>
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          {mappingProblem && (
-                            <span title="No HikCentral person mapping confirmed yet">
-                              <AlertTriangle size={14} className="text-amber-500" />
-                            </span>
-                          )}
-                          {row.calculation.basis === 'check_in_only_provisional' && <Badge color="gold">Provisional</Badge>}
-                          <Badge color={RESULT_COLORS[row.calculation.status]}>{RESULT_LABELS[row.calculation.status]}</Badge>
-                          {expanded ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
-                        </div>
-                      </button>
-                      {expanded && (
-                        <div className="px-3 pb-3 pt-1 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
-                          <div>
-                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Expected shift times</p>
-                            <p className="text-slate-700">{row.expectedShiftTimes ? `${row.expectedShiftTimes.scheduledStart}–${row.expectedShiftTimes.scheduledEnd}` : '—'}</p>
-                          </div>
-                          <div>
-                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Fingerprint evidence</p>
-                            <p className="text-slate-700 flex flex-wrap items-center gap-x-3 gap-y-1">
-                              <span className="inline-flex items-center gap-1"><Clock size={11} className="text-slate-400" /> Check-in: {formatLocalTime(row.calculation.checkInIso)}</span>
-                              <span className="inline-flex items-center gap-1"><Clock size={11} className="text-slate-400" /> Checkout: {formatLocalTime(row.calculation.checkOutIso)}</span>
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Calculation basis</p>
-                            <p className="text-slate-700">
-                              {row.calculation.basis === 'confirmed' && 'Confirmed -- both check-in and checkout observed, or coverage genuinely confirmed.'}
-                              {row.calculation.basis === 'check_in_only_provisional' && 'Provisional -- credited from an on-time/late check-in alone, before the checkout window closed.'}
-                              {row.calculation.basis === 'not_applicable' && 'Not applicable to this result.'}
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Official attendance status (read-only)</p>
-                            <p className="text-slate-700">{row.officialStatus ? (OFFICIAL_STATUS_LABELS[row.officialStatus] ?? row.officialStatus) : 'Not marked'}</p>
-                          </div>
-                          <div className="sm:col-span-2">
-                            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Full explanation</p>
-                            <p className="text-slate-600">{row.calculation.reason}</p>
+            <Card className="p-0 overflow-hidden">
+              <Table>
+                <THead>
+                  <TR hover={false}>
+                    <TH>Employee</TH>
+                    <TH>Date</TH>
+                    <TH>Site</TH>
+                    <TH>Shift</TH>
+                    <TH>Calculated</TH>
+                    <TH>Official status</TH>
+                    <TH>Decision source</TH>
+                    <TH>Details</TH>
+                  </TR>
+                </THead>
+                <TBody>
+                  {visibleRows.map((row) => {
+                    const key = rowKeyOf(row);
+                    const source = officialSourceByKey.get(key) ?? null;
+                    const signal = classifyAttendanceReviewSignal(row);
+                    const mappingProblem = !row.hasActiveMapping && (row.resolvedShift === 'day' || row.resolvedShift === 'night');
+                    return (
+                      <TR key={key}>
+                        <TD className="font-medium text-slate-800">
+                          <span className="flex items-center gap-1.5">
+                            {row.employeeName}
                             {mappingProblem && (
-                              <p className="text-amber-700 mt-1 flex items-start gap-1">
-                                <AlertTriangle size={13} className="shrink-0 mt-0.5" />
-                                No HikCentral person mapping confirmed yet for this employee -- zero events here does not mean they were absent.
-                              </p>
+                              <span title="No HikCentral person mapping confirmed yet for this employee">
+                                <AlertTriangle size={13} className="text-amber-500" />
+                              </span>
                             )}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+                          </span>
+                          <span className="block text-xs text-slate-400">{row.employeeNumber}</span>
+                        </TD>
+                        <TD>{row.shiftDate}</TD>
+                        <TD>{row.workstation || '—'}</TD>
+                        <TD className="capitalize">{row.resolvedShift}</TD>
+                        <TD>
+                          <span className="flex items-center gap-1.5">
+                            <Badge color={RESULT_COLORS[row.calculation.status]}>{RESULT_LABELS[row.calculation.status]}</Badge>
+                            {row.calculation.basis === 'check_in_only_provisional' && (
+                              <span title="Credited from a single valid check-in alone, before the checkout window closed -- not yet a confirmed result.">
+                                <Badge color="gold">Provisional</Badge>
+                              </span>
+                            )}
+                          </span>
+                        </TD>
+                        <TD>
+                          <span className="flex items-center gap-1.5">
+                            {row.officialStatus ? (OFFICIAL_STATUS_LABELS[row.officialStatus] ?? row.officialStatus) : '—'}
+                            {signal === 'contradiction' && (
+                              <span title="Confirmed discrepancy -- the official record and this page's own calculation disagree. Read-only investigation signal only.">
+                                <AlertTriangle size={13} className="text-red-500" />
+                              </span>
+                            )}
+                            {signal === 'uncertain' && (
+                              <span title="Evidence is still incomplete or only provisional -- this page cannot yet confirm or dispute the official record.">
+                                <HelpCircle size={13} className="text-amber-500" />
+                              </span>
+                            )}
+                          </span>
+                        </TD>
+                        <TD className="text-xs">{sourceLabel(source, !!row.officialStatus)}</TD>
+                        <TD>
+                          <Button variant="ghost" size="sm" onClick={() => openDetails(row)}>
+                            <Eye size={14} /> Details
+                          </Button>
+                        </TD>
+                      </TR>
+                    );
+                  })}
+                </TBody>
+              </Table>
+              <div className="flex flex-wrap items-center justify-between gap-2 p-3 border-t border-slate-100">
+                <p className="text-xs text-slate-400">
+                  {filteredRows.length.toLocaleString()} matching row{filteredRows.length === 1 ? '' : 's'}
+                  {totalPages > 1 ? ` -- page ${currentPage} of ${totalPages}` : ''}
+                </p>
+                {totalPages > 1 && (
+                  <div className="flex gap-2">
+                    <Button variant="outline" size="sm" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={currentPage === 1}>Previous</Button>
+                    <Button variant="outline" size="sm" onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>Next</Button>
+                  </div>
+                )}
               </div>
-            </>
+            </Card>
           )}
         </>
       )}
+
+      <Card className="p-4">
+        <button onClick={() => setCoverageSectionOpen((v) => !v)} className="w-full flex items-center justify-between gap-3 text-left">
+          <span className="flex items-center gap-2">
+            <ShieldCheck size={16} className="text-slate-500" />
+            <span className="text-sm font-semibold text-slate-700">Advanced: fingerprint coverage settings</span>
+          </span>
+          <span className="flex items-center gap-2">
+            {coveragePolicy.isActive ? (
+              <Badge color="green">Confirmed for {coveragePolicy.confirmedWorkstationKeys.size} workstation(s)</Badge>
+            ) : (
+              <Badge color="gray">Not confirmed -- missing evidence shows Pending</Badge>
+            )}
+            {coverageSectionOpen ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
+          </span>
+        </button>
+        {coverageSectionOpen && (
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <p className="text-xs text-slate-500 mb-3">
+              An export time by itself is <strong>not</strong> proof that fingerprint data is complete. A shift with a missing
+              checkout stays <strong>Pending</strong> (never a false Absent) unless an authorized operator explicitly confirms,
+              below, that data is complete through a given time for specific, named workstations.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <Input
+                label="Export time supplied by administrator (Blantyre local)"
+                type="datetime-local"
+                value={exportTimeBlantyreLocal}
+                onChange={(e) => setExportTimeBlantyreLocal(e.target.value)}
+              />
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1.5">Confirmed-coverage workstations (comma or newline separated)</label>
+                <textarea
+                  value={confirmedWorkstationsRaw}
+                  onChange={(e) => setConfirmedWorkstationsRaw(e.target.value)}
+                  placeholder="e.g. CHIRIMBA, HEAD OFFICE"
+                  rows={2}
+                  className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A] focus:border-transparent outline-none bg-white"
+                />
+              </div>
+            </div>
+            <label className="flex items-start gap-2 mt-3 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={operatorConfirmed}
+                onChange={(e) => setOperatorConfirmed(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                I am an authorized operator and I confirm fingerprint data is complete through the time above, for exactly the
+                workstation(s) named above. Unnamed workstations -- including the HikCentral access points, which are not assumed
+                to cover every employee's assigned workstation -- remain Pending for missing evidence.
+              </span>
+            </label>
+            {coveragePolicy.isActive ? (
+              <p className="text-xs text-green-700 mt-2 flex items-center gap-1"><ShieldCheck size={12} /> Coverage confirmed for {coveragePolicy.confirmedWorkstationKeys.size} workstation(s) through {exportTimeBlantyreLocal || '—'} (Blantyre).</p>
+            ) : (
+              <p className="text-xs text-slate-500 mt-2 flex items-center gap-1"><Info size={12} /> No coverage confirmed yet -- every shift with missing evidence will show Pending.</p>
+            )}
+          </div>
+        )}
+      </Card>
+
+      <AttendanceReviewDetailsModal
+        row={detailsRow}
+        open={detailsRow !== null}
+        onClose={() => setDetailsRow(null)}
+        officialSource={detailsKey ? (officialSourceByKey.get(detailsKey) ?? null) : null}
+        reviewSignal={detailsRow ? classifyAttendanceReviewSignal(detailsRow) : 'none'}
+        manualDetail={detailsKey ? (manualDetailByKey.get(detailsKey) ?? null) : null}
+      />
     </div>
   );
 }

@@ -91,6 +91,17 @@ export interface AttendanceCalculationPreviewRow {
   officialStatus: string | null;
   /** False means this employee has no active HikCentral Person Mapping at all -- zero events is a MAPPING gap, not evidence of absence, so coverage is always forced 'insufficient' for them regardless of any operator confirmation (see buildAttendanceCalculationPreviewRows). */
   hasActiveMapping: boolean;
+  /**
+   * Attendance Review usability redesign: the exact ShiftCoverage this
+   * row's calculation was performed WITH -- the same value
+   * coverageForWorkstationKey/hasActiveMapping already compute inside
+   * the builder below, now also carried on the row itself so a detail
+   * view can show "why" (e.g. "Insufficient -- no coverage confirmed"
+   * vs "Confirmed complete through <time>") without recomputing it
+   * from coveragePolicy a second time and risking drift from what was
+   * actually used.
+   */
+  coverage: ShiftCoverage;
 }
 
 /**
@@ -209,10 +220,55 @@ export function buildAttendanceCalculationPreviewRows(params: {
         calculation,
         officialStatus: officialStatusByKey.get(`${employee.id}|${shiftDate}`) ?? null,
         hasActiveMapping,
+        coverage,
       });
     }
   }
   return rows;
+}
+
+/**
+ * Attendance Review usability redesign -- "Needs Review" filter.
+ *
+ * DOCUMENTED COMPARISON SEMANTICS (the task's own explicit requirement):
+ * a difference between this preview's calculation and the official
+ * attendance record is NOT, by itself, proof that the official result
+ * was wrong or manually entered -- it is only ever a read-only
+ * investigation signal. Three outcomes, not two:
+ *
+ *   'none'         -- no official record to compare against, or the
+ *                      official status has no calculated-status analog
+ *                      (LV/SL/'-'), or the two genuinely agree.
+ *   'uncertain'     -- the CALCULATED side is not yet a confirmed
+ *                      answer (status is still 'pending', or the
+ *                      calculation is only a provisional single-scan
+ *                      credit) while an official status already
+ *                      exists. This is a gap in CURRENT EVIDENCE, not
+ *                      a confirmed contradiction -- official=Present
+ *                      with calculated=Pending means "we can't yet
+ *                      confirm or dispute Present from fingerprint
+ *                      data," never "the official record is wrong."
+ *   'contradiction' -- the calculated side IS a confirmed, definitive
+ *                      answer, and it genuinely disagrees with the
+ *                      official record.
+ *
+ * Never used to auto-correct anything; purely a label for a human
+ * reviewer, and the two outcomes above are deliberately kept distinct
+ * so a nontechnical HR user is never shown routine missing/incomplete
+ * evidence as if it were a confirmed conflict.
+ */
+export type AttendanceReviewSignal = 'none' | 'uncertain' | 'contradiction';
+
+/** Official P/A/L code -> this module's own calculated-status space. LV/SL/'-' have no calculated-status analog and are never compared. */
+const OFFICIAL_TO_CALCULATED_STATUS: Partial<Record<string, AttendanceCalculationStatus>> = { P: 'present', A: 'absent', L: 'late' };
+
+export function classifyAttendanceReviewSignal(row: AttendanceCalculationPreviewRow): AttendanceReviewSignal {
+  if (!row.officialStatus) return 'none';
+  const expected = OFFICIAL_TO_CALCULATED_STATUS[row.officialStatus];
+  if (expected === undefined) return 'none';
+  const evidenceStillUncertain = row.calculation.status === 'pending' || row.calculation.basis === 'check_in_only_provisional';
+  if (evidenceStillUncertain) return 'uncertain';
+  return row.calculation.status === expected ? 'none' : 'contradiction';
 }
 
 export interface AttendancePreviewRowFilters {
