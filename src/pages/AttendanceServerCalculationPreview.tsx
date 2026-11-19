@@ -178,6 +178,15 @@ export default function AttendanceServerCalculationPreview() {
         shiftDates,
         datedAssignments: previewData.datedAssignments,
         patterns: previewData.patterns,
+        // Stage C roster fix: this was missing, so any employee whose
+        // schedule comes from the recurring Day/Night baseline (rather
+        // than a per-date dated assignment) fell through
+        // resolveScheduleForDate's precedence straight to 'unassigned' on
+        // this JS side only -- the server's own roster_resolve_schedule()
+        // was never affected, so this was a display-only mismatch, not a
+        // calculation-engine discrepancy. Matches what the Main Attendance
+        // Review already passes.
+        shiftPatterns: previewData.shiftPatterns,
         eventsByEmployeeId: previewData.eventsByEmployeeId,
         coveragePolicy,
         officialStatusByKey: previewData.officialStatusByKey,
