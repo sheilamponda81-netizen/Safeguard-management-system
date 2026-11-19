@@ -86,7 +86,7 @@ describe('Monthly Register: the INITIAL selected month defaults to current_payro
 
   it('REGRESSION: the per-cell attendance write still targets the real calendar date of that cell, never selectedMonth/systemMonth -- confirms this fix changed only which month initially DISPLAYS, not what a write is keyed to, so no October record can be rewritten into July', () => {
     expect(attendanceSource).toMatch(
-      /supabase\.rpc\('attendance_correct', \{\s*p_employee_id: employeeId,\s*p_date: date,\s*p_status: nextStatus,\s*\}\)/
+      /supabase\.rpc\('attendance_correct', \{\s*p_employee_id: employeeId,\s*p_date: date,\s*p_status: nextStatus,\s*p_reason: reason,\s*\}\)/
     );
     expect(attendanceSource).not.toMatch(/p_date:\s*selectedMonth/);
     expect(attendanceSource).not.toMatch(/p_date:\s*systemMonth/);
@@ -99,9 +99,9 @@ describe('Monthly Register: the INITIAL selected month defaults to current_payro
 });
 
 describe('Monthly Register: individual manual edits are routed through attendance_correct', () => {
-  it('processSingleUpdate calls supabase.rpc(\'attendance_correct\', ...) with employee/date/status only -- never a source or basis', () => {
+  it('processSingleUpdate calls supabase.rpc(\'attendance_correct\', ...) with employee/date/status/reason only -- never a source or basis', () => {
     expect(attendanceSource).toMatch(
-      /supabase\.rpc\('attendance_correct', \{\s*p_employee_id: employeeId,\s*p_date: date,\s*p_status: nextStatus,\s*\}\)/
+      /supabase\.rpc\('attendance_correct', \{\s*p_employee_id: employeeId,\s*p_date: date,\s*p_status: nextStatus,\s*p_reason: reason,\s*\}\)/
     );
     // Manual-priority protection depends on the client NEVER being able to
     // claim source='automatic' -- attendance_correct hardcodes 'manual'
@@ -109,6 +109,32 @@ describe('Monthly Register: individual manual edits are routed through attendanc
     // its signature, so the client cannot pass one even if it tried.
     expect(attendanceSource).not.toMatch(/p_source\s*:/);
     expect(attendanceSource).not.toMatch(/p_new_basis\s*:/);
+  });
+
+  it('Final Phase 2 release review: a reason is mandatory, database-enforced -- the grid opens an accessible AttendanceReasonModal (not window.prompt) before either the optimistic update or the RPC call, and updateAttendance itself never touches attendance/UI state directly', () => {
+    const updateAttendanceBody = attendanceSource.slice(
+      attendanceSource.indexOf('const updateAttendance = useCallback'),
+      attendanceSource.indexOf('const confirmReasonAndUpdate = useCallback')
+    );
+    expect(updateAttendanceBody).not.toMatch(/window\.prompt/);
+    expect(updateAttendanceBody).toMatch(/setReasonPrompt\(\{/);
+    expect(updateAttendanceBody).not.toMatch(/setAttendance\(/);
+    expect(updateAttendanceBody).not.toMatch(/updateQueue\.current\.set/);
+  });
+
+  it('AttendanceReasonModal is rendered gated on reasonPrompt, and a cancelled dialog (onClose) never reaches confirmReasonAndUpdate', () => {
+    expect(attendanceSource).toMatch(/import \{ AttendanceReasonModal \} from '\.\.\/components\/AttendanceReasonModal';/);
+    expect(attendanceSource).toMatch(/<AttendanceReasonModal\s*\n\s*open=\{reasonPrompt !== null\}\s*\n\s*onClose=\{\(\) => setReasonPrompt\(null\)\}\s*\n\s*onConfirm=\{confirmReasonAndUpdate\}/);
+  });
+
+  it('confirmReasonAndUpdate performs the optimistic update and queues the already-confirmed reason only after a reasonPrompt exists, and clears it immediately so a second confirm cannot double-fire', () => {
+    const confirmBody = attendanceSource.slice(
+      attendanceSource.indexOf('const confirmReasonAndUpdate = useCallback'),
+      attendanceSource.indexOf('}, [reasonPrompt, employees, userProfile, selectedMonth, updating, processUpdateQueue]);')
+    );
+    expect(confirmBody).toMatch(/if \(!reasonPrompt\) return;/);
+    expect(confirmBody).toMatch(/setReasonPrompt\(null\);/);
+    expect(confirmBody.indexOf('setReasonPrompt(null);')).toBeLessThan(confirmBody.indexOf('setAttendance('));
   });
 
   it('no longer writes directly to the attendance table from the grid edit path', () => {
@@ -131,12 +157,12 @@ describe('Monthly Register: individual manual edits are routed through attendanc
     expect(processSingleUpdateBody).toMatch(/reverted\[existingIndex\] = \{ \.\.\.reverted\[existingIndex\], status: previousStatus \}/);
   });
 
-  it('threads previousStatus from the click handler through the queue into processSingleUpdate', () => {
+  it('threads previousStatus AND the now-mandatory, already-confirmed reason from confirmReasonAndUpdate through the queue into processSingleUpdate', () => {
     expect(attendanceSource).toMatch(
-      /updateQueue\.current\.set\(updateKey, \{ employeeId, date, status: nextStatus, previousStatus: currentStatus \}\)/
+      /updateQueue\.current\.set\(updateKey, \{ employeeId, date, status: nextStatus, previousStatus: currentStatus, reason \}\)/
     );
     expect(attendanceSource).toMatch(
-      /await processSingleUpdate\(update\.employeeId, update\.date, update\.status, update\.previousStatus\)/
+      /await processSingleUpdate\(update\.employeeId, update\.date, update\.status, update\.previousStatus, update\.reason\)/
     );
   });
 

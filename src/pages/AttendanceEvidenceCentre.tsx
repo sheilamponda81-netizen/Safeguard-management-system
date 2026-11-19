@@ -36,7 +36,7 @@ import {
   resolveCoveragePolicy, collectEmployeeIdsWithRosterEvidence, buildAttendanceCalculationPreviewRows,
   filterAttendancePreviewRows, AttendanceCalculationPreviewRow,
 } from '../utils/attendanceCalculationPreview';
-import { fetchAttendanceCalculationPreviewData } from '../utils/attendanceCalculationPreviewService';
+import { fetchAttendanceCalculationPreviewData, fetchOfficialAttendanceSourceByKey } from '../utils/attendanceCalculationPreviewService';
 import {
   fetchAttendanceEvidenceDetail, AttendanceEvidenceDetail,
 } from '../utils/attendanceEvidenceService';
@@ -44,7 +44,12 @@ import { classifyRawEventsForEvidence, deriveEvidenceCompleteness, EvidenceCompl
 import { blantyreDateRangeToUtcBounds } from '../utils/hikcentralAttendancePreview';
 
 const MAX_RANGE_DAYS = 31;
-const MAX_RENDERED_ROWS = 500;
+const PAGE_SIZE = 25;
+
+/** Maps an official P/A/L code onto the same status space row.calculation.status already uses, for the "Discrepancies only" filter -- LV/SL/'-' have no calculated-status analog and are never treated as a discrepancy. */
+const OFFICIAL_TO_CALC_STATUS: Partial<Record<string, AttendanceCalculationStatus>> = { P: 'present', A: 'absent', L: 'late' };
+
+type SourceFilter = 'automatic' | 'manual' | '';
 
 const RESULT_LABELS: Record<AttendanceCalculationStatus, string> = {
   present: 'Present', late: 'Late', absent: 'Absent', pending: 'Pending', off: 'Off', unassigned: 'Unassigned',
@@ -207,10 +212,14 @@ export default function AttendanceEvidenceCentrePage() {
   const [shiftFilter, setShiftFilter] = useState<ResolvedSchedule | ''>('');
   const [resultFilter, setResultFilter] = useState<AttendanceCalculationStatus | ''>('');
   const [evidenceFilter, setEvidenceFilter] = useState<EvidenceCompleteness | ''>('');
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('');
+  const [discrepancyOnly, setDiscrepancyOnly] = useState(false);
+  const [page, setPage] = useState(1);
 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [data, setData] = useState<Awaited<ReturnType<typeof fetchAttendanceCalculationPreviewData>> | null>(null);
+  const [officialSourceByKey, setOfficialSourceByKey] = useState<Map<string, string | null>>(new Map());
 
   const [expandedRowKey, setExpandedRowKey] = useState<string | null>(null);
   const [detailByRowKey, setDetailByRowKey] = useState<Map<string, DetailState>>(new Map());
@@ -230,7 +239,10 @@ export default function AttendanceEvidenceCentrePage() {
     setLoading(true);
     setLoadError(null);
     try {
-      setData(await fetchAttendanceCalculationPreviewData(fromDate, toDate));
+      const result = await fetchAttendanceCalculationPreviewData(fromDate, toDate);
+      const sourceByKey = await fetchOfficialAttendanceSourceByKey(result.employees.map((e) => e.id), fromDate, toDate);
+      setData(result);
+      setOfficialSourceByKey(sourceByKey);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Could not load Attendance Evidence Centre data.');
     } finally {
@@ -282,14 +294,43 @@ export default function AttendanceEvidenceCentrePage() {
   }, [data, candidateEmployees, shiftDates, coveragePolicy]);
 
   const filteredRows = useMemo(() => {
-    const base = filterAttendancePreviewRows(rows, { siteFilter, shiftFilter, resultFilter, employeeSearch })
+    let base = filterAttendancePreviewRows(rows, { siteFilter, shiftFilter, resultFilter, employeeSearch })
       .filter((r) => r.resolvedShift === 'day' || r.resolvedShift === 'night');
-    if (!evidenceFilter) return base;
-    return base.filter((r) => deriveEvidenceCompleteness(r.calculation.checkInIso, r.calculation.checkOutIso) === evidenceFilter);
-  }, [rows, siteFilter, shiftFilter, resultFilter, employeeSearch, evidenceFilter]);
+    if (evidenceFilter) {
+      base = base.filter((r) => deriveEvidenceCompleteness(r.calculation.checkInIso, r.calculation.checkOutIso) === evidenceFilter);
+    }
+    if (sourceFilter) {
+      base = base.filter((r) => officialSourceByKey.get(`${r.employeeId}|${r.shiftDate}`) === sourceFilter);
+    }
+    if (discrepancyOnly) {
+      base = base.filter((r) => {
+        const expected = r.officialStatus ? OFFICIAL_TO_CALC_STATUS[r.officialStatus] : undefined;
+        return expected !== undefined && expected !== r.calculation.status;
+      });
+    }
+    return base;
+  }, [rows, siteFilter, shiftFilter, resultFilter, employeeSearch, evidenceFilter, sourceFilter, discrepancyOnly, officialSourceByKey]);
 
-  const visibleRows = filteredRows.slice(0, MAX_RENDERED_ROWS);
-  const truncated = filteredRows.length > MAX_RENDERED_ROWS;
+  // Client-side pagination over the already-fetched, already-filtered
+  // rows -- a real server-side paginated fetch isn't justified here:
+  // the underlying data fetch is already bounded (MAX_RANGE_DAYS calendar
+  // days, RLS-scoped employees only), and this page's own row-building
+  // needs the full roster/fingerprint data for the range regardless of
+  // which page is being viewed.
+  //
+  // Final Phase 2 release review: this used to also slice to a fixed
+  // 500-row cap before paginating, with a "narrow the filters to see
+  // more" message for anything past it -- a leftover from before
+  // pagination existed. That meant Previous/Next could never reach a
+  // row past position 500 at all, no matter how a user paged, silently
+  // defeating pagination's own purpose for any result set bigger than
+  // 500 rows. Removed: pagination alone is now what makes an
+  // arbitrarily large, fully-filtered result set reachable.
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const visibleRows = filteredRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
+  useEffect(() => { setPage(1); }, [siteFilter, shiftFilter, resultFilter, employeeSearch, evidenceFilter, sourceFilter, discrepancyOnly, fromDate, toDate]);
 
   const siteOptions = useMemo(() => Array.from(new Set(rows.map((r) => r.workstation))).sort(), [rows]);
 
@@ -390,6 +431,22 @@ export default function AttendanceEvidenceCentrePage() {
             ]}
           />
         </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
+          <Select
+            label="Decision source"
+            value={sourceFilter}
+            onChange={(e) => setSourceFilter(e.target.value as SourceFilter)}
+            options={[
+              { label: 'Automatic or manual', value: '' },
+              { label: 'Automatic only', value: 'automatic' },
+              { label: 'Manual only', value: 'manual' },
+            ]}
+          />
+          <label className="flex items-center gap-2 text-sm text-slate-700 self-end pb-2.5 cursor-pointer">
+            <input type="checkbox" checked={discrepancyOnly} onChange={(e) => setDiscrepancyOnly(e.target.checked)} />
+            Discrepancies only (official status doesn&apos;t match this page&apos;s own calculation)
+          </label>
+        </div>
         {rangeInvalid && <p className="text-xs text-red-600 mt-2">The "From" date must not be after the "To" date.</p>}
         {!rangeInvalid && rangeTooWide && <p className="text-xs text-red-600 mt-2">Date range cannot exceed {MAX_RANGE_DAYS} days.</p>}
       </Card>
@@ -410,7 +467,7 @@ export default function AttendanceEvidenceCentrePage() {
             <thead className="bg-slate-50 text-left text-xs text-slate-500">
               <tr>
                 <th className="p-3">Employee</th><th>Date</th><th>Site</th><th>Shift</th>
-                <th>Official</th><th>Calculated</th><th>Evidence</th><th></th>
+                <th>Official</th><th>Source</th><th>Calculated</th><th>Evidence</th><th></th>
               </tr>
             </thead>
             <tbody>
@@ -426,6 +483,7 @@ export default function AttendanceEvidenceCentrePage() {
                       <td className="flex items-center gap-1"><MapPin size={12} className="text-slate-300" />{row.workstation || '—'}</td>
                       <td className="capitalize">{row.resolvedShift}</td>
                       <td>{row.officialStatus ? OFFICIAL_STATUS_LABELS[row.officialStatus] || row.officialStatus : '—'}</td>
+                      <td className="text-xs capitalize">{officialSourceByKey.get(`${row.employeeId}|${row.shiftDate}`) || '—'}</td>
                       <td>
                         {row.calculation.status === 'present' && <Badge color="green">Present</Badge>}
                         {row.calculation.status === 'late' && <Badge color="gold">Late</Badge>}
@@ -441,7 +499,7 @@ export default function AttendanceEvidenceCentrePage() {
                     </tr>
                     {expanded && (
                       <tr>
-                        <td colSpan={8} className="p-0">
+                        <td colSpan={9} className="p-0">
                           <EvidenceDetailPanel row={row} state={detailByRowKey.get(key) ?? { status: 'loading' }} />
                         </td>
                       </tr>
@@ -451,11 +509,18 @@ export default function AttendanceEvidenceCentrePage() {
               })}
             </tbody>
           </table>
-          {truncated && (
-            <p className="text-xs text-slate-400 p-3 border-t border-slate-100">
-              Showing the first {MAX_RENDERED_ROWS} of {filteredRows.length} matching rows -- narrow the filters to see more.
+          <div className="flex items-center justify-between p-3 border-t border-slate-100">
+            <p className="text-xs text-slate-400">
+              {filteredRows.length} matching row{filteredRows.length === 1 ? '' : 's'}
+              {totalPages > 1 ? ` -- page ${currentPage} of ${totalPages}` : ''}
             </p>
-          )}
+            {totalPages > 1 && (
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={currentPage === 1}>Previous</Button>
+                <Button variant="outline" size="sm" onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>Next</Button>
+              </div>
+            )}
+          </div>
         </Card>
       )}
     </div>
