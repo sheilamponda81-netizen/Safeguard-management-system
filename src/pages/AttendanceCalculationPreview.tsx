@@ -36,10 +36,10 @@ import {
   resolveCoveragePolicy, collectEmployeeIdsWithRosterEvidence, collectEmployeeIdsWithFingerprintEvidence,
   hasAnyEmployeeWithBothRosterAndFingerprintEvidence, describeDateExtent, buildAttendanceCalculationPreviewRows,
   filterAttendancePreviewRows, buildSiteAlertCasesFromRows, classifyAttendanceReviewSignal,
-  AttendanceCalculationPreviewRow, AttendanceReviewSignal,
+  AttendanceCalculationPreviewRow, AttendanceReviewSignal, ServerCoverageEvidence,
 } from '../utils/attendanceCalculationPreview';
 import { aggregateSiteAlerts, SiteAlert } from '../utils/attendanceSiteAlerts';
-import { fetchAttendanceCalculationPreviewData, fetchOfficialAttendanceSourceByKey } from '../utils/attendanceCalculationPreviewService';
+import { fetchAttendanceCalculationPreviewData, fetchOfficialAttendanceSourceByKey, fetchAttendanceCoverageExplain } from '../utils/attendanceCalculationPreviewService';
 import { fetchAuditTimelineForEmployeeDate, AttendanceAuditEntry } from '../utils/attendanceEvidenceService';
 import { fetchProfileFullNamesById } from '../utils/hikcentralPersonMappingService';
 
@@ -130,7 +130,7 @@ type ManualDetailState =
  * reason, or timestamp that wasn't actually recorded.
  */
 function AttendanceReviewDetailsModal({
-  row, open, onClose, officialSource, reviewSignal, manualDetail,
+  row, open, onClose, officialSource, reviewSignal, manualDetail, serverCoverage,
 }: {
   row: AttendanceCalculationPreviewRow | null;
   open: boolean;
@@ -138,17 +138,31 @@ function AttendanceReviewDetailsModal({
   officialSource: string | null;
   reviewSignal: AttendanceReviewSignal;
   manualDetail: ManualDetailState | null;
+  serverCoverage: ServerCoverageEvidence | null;
 }) {
   if (!row) return <Modal open={open} onClose={onClose} title="Attendance details" size="lg"><p className="text-sm text-slate-500">No row selected.</p></Modal>;
 
   const mappingProblem = !row.hasActiveMapping && (row.resolvedShift === 'day' || row.resolvedShift === 'night');
   const isProvisional = row.calculation.basis === 'check_in_only_provisional';
+  // Attendance coverage-consistency improvement: prefer explaining
+  // coverage with the real, persisted, server-evidence reason whenever
+  // one exists for this employee-day -- this is the SAME trustworthy
+  // explanation attendance_coverage_explain gives Stage C, so HR sees
+  // one consistent story rather than a bare "confirmed"/"insufficient"
+  // toggle. An operator's own live, session-typed confirmation (this
+  // page's existing coverage-settings section, still below) can still
+  // independently reach 'confirmed_complete' even when server evidence
+  // alone would not -- that case is called out explicitly rather than
+  // overwritten by the server's own (here, insufficient) reason.
+  const coverageFromServer = row.coverage.status === 'confirmed_complete' && serverCoverage?.confirmedThroughIso === row.coverage.verifiedThroughIso;
   const coverageText =
     row.coverage.status === 'confirmed_complete'
-      ? `Confirmed complete through ${formatLocalTime(row.coverage.verifiedThroughIso ?? null)} (Blantyre)`
+      ? coverageFromServer
+        ? `${serverCoverage!.reason} (confirmed through ${formatLocalTime(serverCoverage!.confirmedThroughIso)}, Blantyre)`
+        : `Confirmed complete through ${formatLocalTime(row.coverage.verifiedThroughIso ?? null)} (Blantyre) -- operator-confirmed this session`
       : !row.hasActiveMapping
       ? 'Insufficient -- no HikCentral person mapping confirmed for this employee yet'
-      : 'Insufficient -- no coverage confirmed for this workstation';
+      : serverCoverage?.reason ?? 'Insufficient -- no coverage confirmed for this workstation';
 
   return (
     <Modal open={open} onClose={onClose} title={`${row.employeeName} (${row.employeeNumber})`} size="lg">
@@ -298,6 +312,7 @@ export default function AttendanceCalculationPreviewPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [data, setData] = useState<Awaited<ReturnType<typeof fetchAttendanceCalculationPreviewData>> | null>(null);
   const [officialSourceByKey, setOfficialSourceByKey] = useState<Map<string, string | null>>(new Map());
+  const [serverCoverageByKey, setServerCoverageByKey] = useState<Map<string, ServerCoverageEvidence>>(new Map());
   const [expandedAlertIndex, setExpandedAlertIndex] = useState<number | null>(null);
 
   const [detailsRow, setDetailsRow] = useState<AttendanceCalculationPreviewRow | null>(null);
@@ -319,9 +334,13 @@ export default function AttendanceCalculationPreviewPage() {
     setLoadError(null);
     try {
       const result = await fetchAttendanceCalculationPreviewData(fromDate, toDate);
-      const sourceByKey = await fetchOfficialAttendanceSourceByKey(result.employees.map((e) => e.id), fromDate, toDate);
+      const [sourceByKey, coverageByKey] = await Promise.all([
+        fetchOfficialAttendanceSourceByKey(result.employees.map((e) => e.id), fromDate, toDate),
+        fetchAttendanceCoverageExplain(result.employees.map((e) => e.id), fromDate, toDate),
+      ]);
       setData(result);
       setOfficialSourceByKey(sourceByKey);
+      setServerCoverageByKey(coverageByKey);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Could not load the Attendance Review.');
     } finally {
@@ -385,8 +404,9 @@ export default function AttendanceCalculationPreviewPage() {
       coveragePolicy,
       officialStatusByKey: data.officialStatusByKey,
       employeeIdsWithActiveMapping: data.employeeIdsWithActiveMapping,
+      serverCoverageByKey,
     });
-  }, [data, candidateEmployees, shiftDates, coveragePolicy]);
+  }, [data, candidateEmployees, shiftDates, coveragePolicy, serverCoverageByKey]);
 
   const siteOptions = useMemo(() => Array.from(new Set(rows.map((r) => r.workstation))).sort(), [rows]);
 
@@ -824,9 +844,12 @@ export default function AttendanceCalculationPreviewPage() {
         {coverageSectionOpen && (
           <div className="mt-4 pt-4 border-t border-slate-100">
             <p className="text-xs text-slate-500 mb-3">
-              An export time by itself is <strong>not</strong> proof that fingerprint data is complete. A shift with a missing
-              checkout stays <strong>Pending</strong> (never a false Absent) unless an authorized operator explicitly confirms,
-              below, that data is complete through a given time for specific, named workstations.
+              This page now also checks the real, persisted, evidence-checked coverage the server itself trusts -- a shift can
+              show calculated <strong>Absent</strong> without typing anything below if that server evidence is genuinely
+              sufficient. An export time typed here by itself is still <strong>not</strong> proof that fingerprint data is
+              complete, though: a shift with a missing checkout stays <strong>Pending</strong> (never a false Absent) unless
+              either that server evidence is sufficient, or an authorized operator explicitly confirms, below, that data is
+              complete through a given time for specific, named workstations.
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <Input
@@ -875,6 +898,7 @@ export default function AttendanceCalculationPreviewPage() {
         officialSource={detailsKey ? (officialSourceByKey.get(detailsKey) ?? null) : null}
         reviewSignal={detailsRow ? classifyAttendanceReviewSignal(detailsRow) : 'none'}
         manualDetail={detailsKey ? (manualDetailByKey.get(detailsKey) ?? null) : null}
+        serverCoverage={detailsKey ? (serverCoverageByKey.get(detailsKey) ?? null) : null}
       />
     </div>
   );
