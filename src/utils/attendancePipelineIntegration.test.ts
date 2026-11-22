@@ -192,8 +192,11 @@ describe.skipIf(!dbAvailable && !dbRequired)('Attendance pipeline integration (r
     // processing would otherwise resolve this date as a genuine,
     // confirmed Absent, directly conflicting with the manual 'P' above.
     exec(
-      `INSERT INTO fingerprint_coverage_confirmations (tenant_id, confirmed_by, workstations, access_points, covers_from, covers_through) ` +
-      `VALUES ('${fixture.tenantId}', '${fixture.callerId}', ARRAY[]::TEXT[], ARRAY['GATE1'], '2026-11-20T00:00:00Z', '2026-11-20T23:59:00Z')`
+      `INSERT INTO fingerprint_coverage_confirmations (tenant_id, confirmed_by, workstations, access_points, covers_from, covers_through, latest_observed_event_at) ` +
+      // Attendance coverage-trust fix (20261122000000): attendance_resolve_and_calculate
+      // now requires evidence-backing, not just a bare declaration -- latest_observed_event_at
+      // makes this fixture genuinely evidence-backed, same real-world shape a trustworthy confirmation has.
+      `VALUES ('${fixture.tenantId}', '${fixture.callerId}', ARRAY[]::TEXT[], ARRAY['GATE1'], '2026-11-20T00:00:00Z', '2026-11-20T23:59:00Z', '2026-11-20T17:50:00Z')`
     );
 
     const [outcome] = queryRow(`SELECT outcome FROM attendance_apply_automatic(ARRAY['${fixture.employeeId}']::uuid[], '2026-11-20'::date, '2026-11-20'::date)`);
@@ -207,8 +210,9 @@ describe.skipIf(!dbAvailable && !dbRequired)('Attendance pipeline integration (r
     exec(`INSERT INTO payroll (tenant_id, employee_id, month, approval_status) VALUES ('${fixture.tenantId}', '${fixture.employeeId}', '2026-11', 'approved')`);
 
     exec(
-      `INSERT INTO fingerprint_coverage_confirmations (tenant_id, confirmed_by, workstations, access_points, covers_from, covers_through) ` +
-      `VALUES ('${fixture.tenantId}', '${fixture.callerId}', ARRAY[]::TEXT[], ARRAY['GATE1'], '2026-11-05T00:00:00Z', '2026-11-05T23:59:00Z')`
+      `INSERT INTO fingerprint_coverage_confirmations (tenant_id, confirmed_by, workstations, access_points, covers_from, covers_through, latest_observed_event_at) ` +
+      // Attendance coverage-trust fix (20261122000000): genuinely evidence-backed, not a bare declaration.
+      `VALUES ('${fixture.tenantId}', '${fixture.callerId}', ARRAY[]::TEXT[], ARRAY['GATE1'], '2026-11-05T00:00:00Z', '2026-11-05T23:59:00Z', '2026-11-05T17:50:00Z')`
     );
 
     const [outcome, , , payrollFlag] = queryRow(`SELECT outcome, old_status, new_status, payroll_flag FROM attendance_apply_automatic(ARRAY['${fixture.employeeId}']::uuid[], '2026-11-05'::date, '2026-11-05'::date)`);
