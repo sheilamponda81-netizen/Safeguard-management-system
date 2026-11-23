@@ -91,6 +91,13 @@ CREATE TABLE IF NOT EXISTS employee_exits (
   cancelled_by UUID REFERENCES profiles(id) ON DELETE SET NULL,
   cancelled_at TIMESTAMPTZ,
   cancellation_reason TEXT,
+  -- Captured by finalize_employee_exit at the moment it changes
+  -- employees.status to 'Exited' -- the employee's status immediately
+  -- before that change (e.g. 'Active' or 'On Leave'). cancel_employee_exit
+  -- restores THIS value, never a hardcoded 'Active', so cancelling a
+  -- finalized exit for an employee who was actually on leave at the time
+  -- does not incorrectly reactivate them as plain 'Active'.
+  pre_finalize_employee_status TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   -- finalized_at is intentionally NOT tied to status = 'finalized' alone:
@@ -282,6 +289,18 @@ BEGIN
     RAISE EXCEPTION 'Cannot correct a % exit record -- only a scheduled (not yet finalized) exit can be corrected; cancel and record a new one instead', v_row.status;
   END IF;
 
+  -- A still-'scheduled' exit can already be linked (via terminal_dues.
+  -- employee_exit_id) to a submitted draft that has since been approved
+  -- or paid. Changing this record's date/category after that point could
+  -- silently imply a different set of facts than the ones that settlement
+  -- was actually calculated and approved against, so it is blocked the
+  -- same way cancellation is.
+  IF EXISTS (
+    SELECT 1 FROM terminal_dues WHERE employee_exit_id = p_exit_id AND status IN ('approved', 'paid')
+  ) THEN
+    RAISE EXCEPTION 'Cannot correct this exit -- it is linked to a Terminal Due that has already been approved or paid. Resolve that settlement (via its own return/correction workflow) before correcting the exit record.';
+  END IF;
+
   UPDATE employee_exits SET
     effective_exit_date = p_effective_exit_date,
     exit_category = p_exit_category,
@@ -358,9 +377,14 @@ BEGIN
     status = 'finalized',
     finalized_by = v_caller_id,
     finalized_at = NOW(),
+    pre_finalize_employee_status = v_old_employee_status,
     updated_at = NOW()
   WHERE id = p_exit_id;
 
+  -- Transaction-local flag (see guard_employee_exited_status_transition()
+  -- below) -- the ONLY way employees.status is allowed to move into/out
+  -- of 'Exited'. Clears itself at the end of this RPC's transaction.
+  PERFORM set_config('app.exit_status_change_allowed', 'on', true);
   UPDATE employees SET status = 'Exited' WHERE id = v_row.employee_id;
 
   INSERT INTO audit_logs (tenant_id, user_id, action, entity_type, entity_id, old_data, new_data)
@@ -395,6 +419,7 @@ DECLARE
   v_tenant_id UUID;
   v_row RECORD;
   v_employee_status TEXT;
+  v_restored_status TEXT;
 BEGIN
   IF v_caller_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
@@ -425,6 +450,21 @@ BEGIN
     RAISE EXCEPTION 'This exit record is already cancelled';
   END IF;
 
+  -- An exit linked (via terminal_dues.employee_exit_id) to a settlement
+  -- that has already been approved or paid cannot be cancelled -- doing
+  -- so would leave that settlement financially orphaned from the
+  -- employee's real status (paid out "as if" they left, while the exit
+  -- record itself is retracted). HR must resolve the settlement first
+  -- (its own return/correction workflow) before this exit can be
+  -- cancelled. Checked regardless of whether this exit was itself
+  -- finalized -- a still-'scheduled' exit can already be linked to a
+  -- submitted-and-approved terminal_dues row.
+  IF EXISTS (
+    SELECT 1 FROM terminal_dues WHERE employee_exit_id = p_exit_id AND status IN ('approved', 'paid')
+  ) THEN
+    RAISE EXCEPTION 'Cannot cancel this exit -- it is linked to a Terminal Due that has already been approved or paid. Resolve that settlement (via its own return/correction workflow) before cancelling the exit record.';
+  END IF;
+
   UPDATE employee_exits SET
     status = 'cancelled',
     cancelled_by = v_caller_id,
@@ -442,10 +482,19 @@ BEGIN
   -- false for a perfectly real, found row whenever any such column
   -- happened to be null -- exactly the trap that made this revert
   -- silently never fire during this migration's own pre-merge testing.
+  --
+  -- Restores v_row.pre_finalize_employee_status (captured by
+  -- finalize_employee_exit) rather than a hardcoded 'Active' -- an
+  -- employee who was 'On Leave' at the moment their exit was finalized
+  -- is restored to 'On Leave', not incorrectly marked plain Active.
+  -- Falls back to 'Active' only in the defensive case that value is
+  -- somehow missing (it is always set by finalize_employee_exit itself).
   IF v_row.status = 'finalized' THEN
     SELECT status INTO v_employee_status FROM employees WHERE id = v_row.employee_id FOR UPDATE;
     IF FOUND AND v_employee_status = 'Exited' THEN
-      UPDATE employees SET status = 'Active' WHERE id = v_row.employee_id;
+      v_restored_status := coalesce(v_row.pre_finalize_employee_status, 'Active');
+      PERFORM set_config('app.exit_status_change_allowed', 'on', true);
+      UPDATE employees SET status = v_restored_status WHERE id = v_row.employee_id;
     END IF;
   END IF;
 
@@ -453,7 +502,7 @@ BEGIN
   VALUES (
     v_tenant_id, v_caller_id, 'CANCEL', 'employee_exit', p_exit_id::text,
     jsonb_build_object('status', v_row.status),
-    jsonb_build_object('status', 'cancelled', 'reason', p_reason, 'reverted_employee_status', (v_row.status = 'finalized'))
+    jsonb_build_object('status', 'cancelled', 'reason', p_reason, 'reverted_employee_status', (v_row.status = 'finalized'), 'restored_employee_status', v_restored_status)
   );
 
   RETURN jsonb_build_object('success', true, 'id', p_exit_id, 'status', 'cancelled');
@@ -463,6 +512,65 @@ $$;
 REVOKE ALL ON FUNCTION cancel_employee_exit(UUID, TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION cancel_employee_exit(UUID, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION cancel_employee_exit(UUID, TEXT) TO authenticated;
+
+-- ============================================================
+-- PART 2.5: guard against employees.status being moved into/out of
+-- 'Exited' through any path OTHER than finalize_employee_exit/
+-- cancel_employee_exit.
+--
+-- CONFIRMED GAP (found during post-implementation safety review):
+-- Employees.tsx's ordinary Edit Employee form does a direct
+-- `supabase.from('employees').update({ ..., status: ... })`, gated only
+-- by the pre-existing, broadly-held `employees.edit` RLS permission --
+-- completely independent of `terminal_dues.approve`. Before this
+-- migration, employees.status was only ever 'Active'/'On Leave', so that
+-- path was harmless. Now that this migration gives 'Exited' real
+-- meaning, that same free-text status dropdown could silently flip an
+-- employee into or out of 'Exited' with NO employee_exits row, NO
+-- audit_logs 'employee_exit' entry, and NO approved/paid-settlement
+-- protection at all -- a direct bypass of every guarantee this migration
+-- otherwise provides, defeating Step 3's requirement that "employment-
+-- status changes occur ONLY through an explicit, authorized action."
+--
+-- THE FIX: a BEFORE UPDATE trigger on `employees` that rejects any
+-- change into/out of 'Exited' unless the transaction-local GUC
+-- `app.exit_status_change_allowed` is set to 'on' -- which only
+-- finalize_employee_exit and cancel_employee_exit ever do, immediately
+-- before their own UPDATE, using `set_config(..., true)` (is_local),
+-- which self-clears at the end of that transaction. Every OTHER status
+-- transition (Active <-> On Leave <-> Suspended, exactly as before this
+-- migration) is completely untouched by this trigger.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION guard_employee_exited_status_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  -- 'Deleted' is deliberately exempt on EITHER side: Employees.tsx's
+  -- existing, independent soft-delete workflow unconditionally sets
+  -- status = 'Deleted' (overwriting whatever it was, including 'Exited')
+  -- and its restore workflow unconditionally sets status = 'Active' from
+  -- 'Deleted' -- both pre-existing, hardened, and unrelated to the exit
+  -- audit trail. Without this exemption, soft-deleting an already-Exited
+  -- employee would start failing with this trigger's own exception, a
+  -- regression this migration must not introduce.
+  IF NEW.status IS DISTINCT FROM OLD.status
+     AND (OLD.status = 'Exited' OR NEW.status = 'Exited')
+     AND 'Deleted' NOT IN (OLD.status, NEW.status) THEN
+    IF coalesce(current_setting('app.exit_status_change_allowed', true), '') <> 'on' THEN
+      RAISE EXCEPTION 'employees.status cannot be changed into or out of ''Exited'' directly -- use the Terminal Dues Exits tab (finalize/cancel) so the change stays linked to an auditable exit record';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS guard_employee_exited_status_transition ON employees;
+CREATE TRIGGER guard_employee_exited_status_transition
+BEFORE UPDATE ON employees
+FOR EACH ROW
+EXECUTE FUNCTION guard_employee_exited_status_transition();
 
 -- ============================================================
 -- PART 3: additive linkage columns (no existing row touched)

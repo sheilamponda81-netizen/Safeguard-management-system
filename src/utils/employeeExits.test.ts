@@ -427,4 +427,131 @@ describe.skipIf(!dbAvailable && !dbRequired)('Terminal Dues Phase 1: employee ex
     const after = queryRow(`SELECT basic_salary, gross_pay, net_pay, uniform_deduction, approval_status FROM payroll WHERE employee_id = '${fixture.employeeId}'`);
     expect(after).toEqual(before);
   });
+
+  // ===== PR #73 safety review additions =====
+
+  it('an On Leave employee can be scheduled for exit, and cancelling a finalized exit restores "On Leave", never a blind "Active"', () => {
+    const fixture = createFixture('On Leave Employee', 'On Leave');
+    const [exitId] = queryRow(`SELECT (record_employee_exit('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'retirement', NULL))->>'id'`);
+    expect(employeeStatus(fixture.employeeId)).toBe('On Leave'); // scheduling never touches status
+
+    queryRow(`SELECT finalize_employee_exit('${exitId}'::uuid)`);
+    expect(employeeStatus(fixture.employeeId)).toBe('Exited');
+
+    queryRow(`SELECT cancel_employee_exit('${exitId}'::uuid, 'reinstated in error')`);
+    expect(employeeStatus(fixture.employeeId)).toBe('On Leave'); // restored to the REAL prior status, not hardcoded Active
+  });
+
+  it('cancelling an exit linked to an APPROVED Terminal Due is rejected -- the settlement cannot be orphaned', () => {
+    const fixture = createFixture('Linked Approved Settlement');
+    const [exitId] = queryRow(`SELECT (record_employee_exit('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'resignation', NULL))->>'id'`);
+    exec(
+      `INSERT INTO terminal_dues (tenant_id, employee_id, employee_name, employee_number, position, date_joined, date_left, period_months, basic_salary, gratuity, annual_leave, uniform_refund, other_benefits, subtotal, deductions, total_payable, status, employee_exit_id) ` +
+      `VALUES ('${fixture.tenantId}', '${fixture.employeeId}', 'Linked Approved Settlement', 'E-7', 'Guard', '2020-01-01', '2026-11-10', 82, 100000, 820000, 0, 0, 0, 820000, 0, 820000, 'pending', '${exitId}'::uuid)`
+    );
+    const [terminalDueId] = queryRow(`SELECT id FROM terminal_dues WHERE employee_exit_id = '${exitId}'`);
+    queryRow(`SELECT approve_terminal_due('${terminalDueId}'::uuid)`);
+
+    const stderr = execExpectError(`SELECT cancel_employee_exit('${exitId}'::uuid, 'trying to cancel anyway')`);
+    expect(stderr).toMatch(/already been approved or paid/i);
+
+    // Correcting the (still-scheduled) exit's own date/category is blocked the same way.
+    const correctStderr = execExpectError(
+      `SELECT correct_employee_exit('${exitId}'::uuid, '2026-12-01'::date, 'retirement', NULL, 'change category')`
+    );
+    expect(correctStderr).toMatch(/already been approved or paid/i);
+
+    // Still rejected even after finalizing -- not merely a scheduled-only restriction.
+    queryRow(`SELECT finalize_employee_exit('${exitId}'::uuid)`);
+    const stderrAfterFinalize = execExpectError(`SELECT cancel_employee_exit('${exitId}'::uuid, 'trying again')`);
+    expect(stderrAfterFinalize).toMatch(/already been approved or paid/i);
+  });
+
+  it('cancelling an exit linked to a PAID Terminal Due is rejected -- the settlement cannot be orphaned', () => {
+    const fixture = createFixture('Linked Paid Settlement');
+    const [exitId] = queryRow(`SELECT (record_employee_exit('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'resignation', NULL))->>'id'`);
+    queryRow(`SELECT finalize_employee_exit('${exitId}'::uuid)`);
+    exec(
+      `INSERT INTO terminal_dues (tenant_id, employee_id, employee_name, employee_number, position, date_joined, date_left, period_months, basic_salary, gratuity, annual_leave, uniform_refund, other_benefits, subtotal, deductions, total_payable, status, employee_exit_id) ` +
+      `VALUES ('${fixture.tenantId}', '${fixture.employeeId}', 'Linked Paid Settlement', 'E-8', 'Guard', '2020-01-01', '2026-11-10', 82, 100000, 820000, 0, 0, 0, 820000, 0, 820000, 'pending', '${exitId}'::uuid)`
+    );
+    const [terminalDueId] = queryRow(`SELECT id FROM terminal_dues WHERE employee_exit_id = '${exitId}'`);
+    queryRow(`SELECT approve_terminal_due('${terminalDueId}'::uuid)`);
+    queryRow(`SELECT record_terminal_due_payment('${terminalDueId}'::uuid, '2026-11-20'::date, 'bank_transfer', 'REF-900', NULL)`);
+
+    const stderr = execExpectError(`SELECT cancel_employee_exit('${exitId}'::uuid, 'trying to cancel anyway')`);
+    expect(stderr).toMatch(/already been approved or paid/i);
+    // The employee is still correctly Exited -- the (rejected) cancel attempt did not partially revert anything.
+    expect(employeeStatus(fixture.employeeId)).toBe('Exited');
+  });
+
+  it('existing roster assignments for the employee are untouched by finalize/cancel', () => {
+    const fixture = createFixture('Roster Untouched');
+    exec(
+      `INSERT INTO roster_date_assignments (tenant_id, employee_id, assignment_date, assignment_type, assigned_by) ` +
+      `VALUES ('${fixture.tenantId}', '${fixture.employeeId}', '2026-11-15', 'day', '${fixture.callerId}')`
+    );
+    const before = queryRow(`SELECT assignment_date, assignment_type, is_active FROM roster_date_assignments WHERE employee_id = '${fixture.employeeId}'`);
+
+    const [exitId] = queryRow(`SELECT (record_employee_exit('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'resignation', NULL))->>'id'`);
+    queryRow(`SELECT finalize_employee_exit('${exitId}'::uuid)`);
+    queryRow(`SELECT cancel_employee_exit('${exitId}'::uuid, 'reverted')`);
+
+    const after = queryRow(`SELECT assignment_date, assignment_type, is_active FROM roster_date_assignments WHERE employee_id = '${fixture.employeeId}'`);
+    expect(after).toEqual(before);
+  });
+
+  it('a soft-deleted employee is never read, classified or converted by this migration, and finalizing then soft-deleting an employee still works (the Deleted-status exemption does not block the normal delete workflow)', () => {
+    const fixture = createFixture('Soft Delete Interaction');
+
+    // Record + finalize an exit for a still-current (not yet deleted) employee.
+    const [exitId] = queryRow(`SELECT (record_employee_exit('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'resignation', NULL))->>'id'`);
+    queryRow(`SELECT finalize_employee_exit('${exitId}'::uuid)`);
+    expect(employeeStatus(fixture.employeeId)).toBe('Exited');
+
+    // Employees.tsx's own soft-delete workflow unconditionally sets
+    // status = 'Deleted' alongside is_deleted = true -- this must still
+    // succeed for an already-Exited employee (the guard trigger exempts
+    // 'Deleted' on either side specifically so this pre-existing,
+    // independent workflow is never broken by this migration).
+    exec(`UPDATE employees SET status = 'Deleted', is_deleted = true, deleted_reason = 'test cleanup' WHERE id = '${fixture.employeeId}'`);
+    const [status, isDeleted, reason] = queryRow(`SELECT status, is_deleted, deleted_reason FROM employees WHERE id = '${fixture.employeeId}'`);
+    expect(status).toBe('Deleted');
+    expect(isDeleted).toBe('t');
+    expect(reason).toBe('test cleanup');
+
+    // A genuinely pre-existing soft-deleted employee (unrelated to any
+    // exit) is left completely untouched -- no exit record exists for it
+    // and recording one for it is not silently special-cased either way.
+    const preexisting = createFixture('Pre-existing Soft Deleted');
+    exec(`UPDATE employees SET is_deleted = true, deleted_reason = 'October import correction: duty station outside Lilongwe' WHERE id = '${preexisting.employeeId}'`);
+    const [, , preexistingReason] = queryRow(`SELECT status, is_deleted, deleted_reason FROM employees WHERE id = '${preexisting.employeeId}'`);
+    expect(preexistingReason).toBe('October import correction: duty station outside Lilongwe');
+    const exitCount = queryRow(`SELECT COUNT(*) FROM employee_exits WHERE employee_id = '${preexisting.employeeId}'`);
+    expect(exitCount).toEqual(['0']);
+  });
+
+  it('employees.status cannot be moved into or out of "Exited" by a direct UPDATE (e.g. the ordinary Edit Employee form) -- only finalize/cancel_employee_exit may do it', () => {
+    const fixture = createFixture('Direct Status Bypass Attempt');
+    const [exitId] = queryRow(`SELECT (record_employee_exit('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'resignation', NULL))->>'id'`);
+    queryRow(`SELECT finalize_employee_exit('${exitId}'::uuid)`);
+    expect(employeeStatus(fixture.employeeId)).toBe('Exited');
+
+    // Simulates Employees.tsx's updateEmployee() doing a direct
+    // `.from('employees').update({ status: 'Active' })` -- gated only by
+    // the ordinary employees.edit permission, nothing to do with
+    // terminal_dues.approve or the exit audit trail at all.
+    const stderr = execExpectError(`UPDATE employees SET status = 'Active' WHERE id = '${fixture.employeeId}'`);
+    expect(stderr).toMatch(/cannot be changed into or out of 'Exited' directly/i);
+    expect(employeeStatus(fixture.employeeId)).toBe('Exited'); // unchanged -- the attempt was fully rejected
+
+    // The reverse direction (a direct attempt to mark someone Exited without going through finalize_employee_exit) is rejected too.
+    const other = createFixture('Direct Exit Bypass Attempt');
+    const stderr2 = execExpectError(`UPDATE employees SET status = 'Exited' WHERE id = '${other.employeeId}'`);
+    expect(stderr2).toMatch(/cannot be changed into or out of 'Exited' directly/i);
+
+    // Ordinary, unrelated status transitions (never touching 'Exited') are completely unaffected by the guard.
+    exec(`UPDATE employees SET status = 'On Leave' WHERE id = '${other.employeeId}'`);
+    expect(employeeStatus(other.employeeId)).toBe('On Leave');
+  });
 });

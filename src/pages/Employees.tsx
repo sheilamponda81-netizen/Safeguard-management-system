@@ -2661,9 +2661,17 @@ function EditEmployeeForm({ employee, onSubmit, onCancel, departments, canChoose
             { label: 'Part-time', value: 'Part-time' }
           ])}
           {field('status', 'Status', 'text', false, [
-            { label: 'Active', value: 'Active' }, 
-            { label: 'On Leave', value: 'On Leave' }, 
-            { label: 'Suspended', value: 'Suspended' }
+            { label: 'Active', value: 'Active' },
+            { label: 'On Leave', value: 'On Leave' },
+            { label: 'Suspended', value: 'Suspended' },
+            // Only shown when the employee is currently Exited, so the
+            // dropdown displays their real status instead of looking
+            // blank -- not offered as a free pick for anyone else.
+            // Terminal Dues' Exits tab (finalize/cancel) is the only way
+            // to actually move status into or out of 'Exited'; a direct
+            // save attempting that here is rejected by the database
+            // (guard_employee_exited_status_transition).
+            ...(employee.status === 'Exited' ? [{ label: 'Exited', value: 'Exited' }] : []),
           ])}
         </div>
       </div>
