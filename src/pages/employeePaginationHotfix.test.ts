@@ -124,7 +124,10 @@ describe('Attendance.tsx: fetchData employee-fetch call site', () => {
   it('still feeds the full, paginated employee list into the existing attendance batch-fetch step, unchanged', () => {
     expect(fetchDataBody).toMatch(/setEmployees\(employeesData\);/);
     expect(fetchDataBody).toMatch(/const employeeIds = employeesData\.map\(e => e\.id\);/);
-    expect(fetchDataBody).toMatch(/await fetchAttendanceInBatches\(\s*employeeIds,/);
+    // Roster/off-day display fix: now runs alongside the roster fetches
+    // inside one Promise.all, rather than its own standalone await --
+    // still fed the exact same employeeIds/date-range arguments.
+    expect(fetchDataBody).toMatch(/fetchAttendanceInBatches\(employeeIds, datesArr\[0\], datesArr\[datesArr\.length - 1\]\)/);
   });
 
   it('still surfaces a page/query error through the existing outer catch, never silently', () => {
