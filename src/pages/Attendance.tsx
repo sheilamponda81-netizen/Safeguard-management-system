@@ -1237,28 +1237,41 @@ function MonthlyRegisterTab() {
       // function call/transaction, so a single out-of-region employee
       // would abort every other employee's copy along with it; separate
       // RPC calls let the rest continue and succeed independently.
+      //
+      // PR #69 final safety review: a target date that already holds an
+      // existing AUTOMATIC decision is never silently overridden here.
+      // attendance_correct requires a genuine, meaningful reason for that
+      // case -- and an auto-generated "Copied from <month>" note is NOT
+      // one; it is boilerplate, not a human's actual justification for
+      // overriding a fingerprint-backed result, and would defeat the
+      // entire point of the reason requirement if accepted as one. This
+      // background loop has no per-row dialog to collect a real reason
+      // from a human, so it does the other option PR #69's review
+      // explicitly allows instead: SKIP that specific employee/date pair
+      // entirely (no RPC call, no write, no fabricated justification) and
+      // report it distinctly from an ordinary failure, so the operator
+      // knows exactly which records still need a manual, individually-
+      // justified correction via the grid.
       let succeeded = 0;
       const failures: { employee_id: string; date: string; message: string }[] = [];
+      const skippedProtected: { employee_id: string; date: string }[] = [];
       for (const record of newRecords) {
+        // attendanceByKey holds exactly the target month's already-fetched
+        // rows (this page's own `attendance` state for `selectedMonth`).
+        const existingTarget = attendanceByKey.get(`${record.employee_id}_${record.date}`);
+        if (existingTarget?.source === 'automatic') {
+          skippedProtected.push({ employee_id: record.employee_id, date: record.date });
+          continue;
+        }
         try {
-          // Restore fast manual entry: only pass a reason when the
-          // TARGET date already holds an existing AUTOMATIC decision --
-          // attendance_correct requires one in that case, and this
-          // auto-generated note ("Copied from <month>") is the
-          // appropriate batch-level explanation for why that override
-          // happened, since this background copy loop has no per-row
-          // dialog to ask a human for one. Every other target (blank, or
-          // already manual) gets p_reason: null -- never inventing a
-          // reason the backend no longer requires. attendanceByKey holds
-          // exactly the target month's already-fetched rows (this page's
-          // own `attendance` state for `selectedMonth`).
-          const existingTarget = attendanceByKey.get(`${record.employee_id}_${record.date}`);
-          const overridesAutomatic = existingTarget?.source === 'automatic';
+          // Every other target (blank, or already manual) needs no
+          // reason at all -- never inventing one the backend doesn't
+          // require.
           const { error } = await supabase.rpc('attendance_correct', {
             p_employee_id: record.employee_id,
             p_date: record.date,
             p_status: record.status,
-            p_reason: overridesAutomatic ? `Copied from ${getMonthLabel(sourceMonth)}` : null,
+            p_reason: null,
           });
           if (error) throw error;
           succeeded++;
@@ -1276,7 +1289,8 @@ function MonthlyRegisterTab() {
             sourceMonth: sourceMonth,
             targetMonth: selectedMonth,
             recordsCopied: succeeded,
-            recordsFailed: failures.length
+            recordsFailed: failures.length,
+            recordsSkippedProtected: skippedProtected.length
           },
           region_id: userProfile?.region_id
         });
@@ -1284,11 +1298,18 @@ function MonthlyRegisterTab() {
         await fetchData();
       }
 
-      if (failures.length === 0) {
+      const protectedSuffix = skippedProtected.length > 0
+        ? ` ${skippedProtected.length} record${skippedProtected.length === 1 ? '' : 's'} already has a fingerprint-based (automatic) result and was left unchanged -- correct ${skippedProtected.length === 1 ? 'it' : 'those'} individually in the grid with a real reason if an override is needed.`
+        : '';
+
+      if (failures.length === 0 && skippedProtected.length === 0) {
         showNotification(`Attendance data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}`, 'success');
         setShowCopyModal(false);
+      } else if (failures.length === 0) {
+        showNotification(`Copied ${succeeded} of ${newRecords.length} records.${protectedSuffix}`, 'info');
+        setShowCopyModal(false);
       } else if (succeeded > 0) {
-        showNotification(`Copied ${succeeded} of ${newRecords.length} records. ${failures.length} failed (${failures[0].message}) -- check permissions or region scope and retry for those employees.`, 'error');
+        showNotification(`Copied ${succeeded} of ${newRecords.length} records. ${failures.length} failed (${failures[0].message}) -- check permissions or region scope and retry for those employees.${protectedSuffix}`, 'error');
         setShowCopyModal(false);
       } else {
         showNotification(`Failed to copy data: ${failures[0].message}`, 'error');

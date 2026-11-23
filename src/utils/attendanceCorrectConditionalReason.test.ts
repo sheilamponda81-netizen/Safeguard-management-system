@@ -219,6 +219,79 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_correct: conditional re
     expect(outcome).toBe('written');
   });
 
+  // ---- PR #69 FINAL SAFETY REVIEW: BLANK vs MANUAL vs AUTOMATIC vs UNKNOWN SOURCE ----
+  // Four situations, tested together so the distinction between "no row
+  // at all" (A) and "a row whose source we cannot affirmatively call
+  // manual" (D) is explicit and never conflated -- absence of a record
+  // is NOT equivalent to a record with unknown provenance; both end up
+  // requiring no reason vs. requiring one for entirely different reasons
+  // (A has nothing to override at all; D is the safe default for an
+  // override we cannot vouch for).
+
+  it('A. No existing row at all (blank) -- Present and Absent both succeed without a reason', () => {
+    const fixture = createFixture();
+    const [presentOutcome] = queryRow(`SELECT outcome FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'P', NULL)`);
+    expect(presentOutcome).toBe('written');
+
+    const fixture2 = createFixture();
+    const [absentOutcome] = queryRow(`SELECT outcome FROM attendance_correct('${fixture2.employeeId}'::uuid, '2026-11-10'::date, 'A', NULL)`);
+    expect(absentOutcome).toBe('written');
+  });
+
+  it('B. An existing row with source=manual -- a manual-to-manual correction succeeds without a reason', () => {
+    const fixture = createFixture();
+    seedExistingAttendance(fixture, '2026-11-10', 'P', 'manual');
+    const [outcome] = queryRow(`SELECT outcome FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'A', NULL)`);
+    expect(outcome).toBe('written');
+  });
+
+  it('C. An existing row with source=automatic -- the same change requires a meaningful written reason', () => {
+    const fixture = createFixture();
+    seedExistingAttendance(fixture, '2026-11-10', 'P', 'automatic');
+    expectRpcError(
+      `SELECT * FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'A', NULL)`,
+      REASON_REQUIRED_MESSAGE
+    );
+    const [outcome] = queryRow(`SELECT outcome FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'A', 'Reviewed CCTV footage, employee was genuinely absent')`);
+    expect(outcome).toBe('written');
+  });
+
+  it('D. An existing row with MISSING/UNKNOWN source does NOT silently bypass the automatic-override protection -- it follows the same safe default as an automatic row, never the same fast path as a manual one. (attendance.source is NOT NULL in the real schema; this test relaxes that constraint for this one disposable-database session only, to prove the function\'s own logic -- not the schema\'s absence of the value -- is what keeps this safe, then restores it immediately.)', () => {
+    const fixture = createFixture();
+    exec('ALTER TABLE attendance ALTER COLUMN source DROP NOT NULL');
+    try {
+      exec(
+        `INSERT INTO attendance (tenant_id, employee_id, date, status, calculation_basis, source) VALUES ` +
+        `('${fixture.tenantId}', '${fixture.employeeId}', '2026-11-10', 'P', NULL, NULL)`
+      );
+      // A trailing sentinel column, never a tab-delimited row's own
+      // trailing field: queryRow's helper .trim()s its whole raw output
+      // before splitting, which silently drops a genuinely-NULL LAST (or
+      // FIRST) column's empty field along with the real trailing
+      // whitespace/newline -- source must never be read from either edge
+      // position here, or this test would wrongly see 'undefined' instead
+      // of confirming a real NULL.
+      const [status, source] = queryRow(`SELECT status, source, 'x' AS sentinel FROM attendance WHERE employee_id = '${fixture.employeeId}' AND date = '2026-11-10'`);
+      expect(status).toBe('P');
+      expect(source).toBe(''); // genuinely NULL, confirmed before testing the function against it
+
+      expectRpcError(
+        `SELECT * FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'A', NULL)`,
+        REASON_REQUIRED_MESSAGE
+      );
+      // And it is NOT a dead end -- the same safe correction path (supply
+      // a real reason) that works for a known-automatic row still works
+      // here, exactly as this migration's "preserve the established safe
+      // correction path" requirement demands.
+      const [outcome] = queryRow(`SELECT outcome FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-10'::date, 'A', 'Provenance of the existing record could not be confirmed as manual -- verified in person before correcting')`);
+      expect(outcome).toBe('written');
+    } finally {
+      // Never leave this disposable database's schema altered for any
+      // test file that runs after this one in the same shared instance.
+      exec("ALTER TABLE attendance ALTER COLUMN source SET NOT NULL");
+    }
+  });
+
   // ---- SAFETY: PAYROLL / TENANT / AUDIT ----
 
   it('12. Existing approved-payroll protection remains effective: a manual override of an automatic Absent is still allowed through (manual precedence, unchanged) but still flagged for reconciliation, exactly as before this migration', () => {
@@ -379,5 +452,36 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_bulk_correct: a shared 
       `SELECT * FROM attendance_bulk_correct(ARRAY['${fixture.employeeId}']::uuid[], '2026-11-05'::date, '2026-11-05'::date, 'NOT_A_STATUS', NULL)`,
       'Invalid status'
     );
+  });
+
+  it('PR #69 final safety review: a row protected by approved payroll is distinguishable through the SAME per-row outcome/payroll_flag columns as every other row -- applied-but-flagged is never confused with a plain "written" row that has nothing to reconcile, and is never silently reported as a blanket success', () => {
+    const fixture = createFixture();
+    const blankEmployeeId = randomUUID();
+    exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, workstation) VALUES ('${blankEmployeeId}', '${fixture.tenantId}', 'E-${blankEmployeeId.slice(0, 8)}', 'Blank Employee', 'Active', false, 'SITE')`);
+    exec(`INSERT INTO payroll (tenant_id, employee_id, month, approval_status) VALUES ('${fixture.tenantId}', '${fixture.employeeId}', '2026-11', 'approved')`);
+
+    // A trailing sentinel column -- queryRows .trim()s its whole raw
+    // output before splitting, which would otherwise silently drop a
+    // genuinely-NULL payroll_flag field whenever it lands on the very
+    // last line of this (randomly-UUID-ordered) result, turning a real
+    // '' into an undefined and making this test flaky depending on how
+    // the two employee UUIDs happened to sort.
+    const rows = queryRows(
+      `SELECT employee_id, outcome, payroll_flag, 'x' AS sentinel FROM attendance_bulk_correct(ARRAY['${fixture.employeeId}', '${blankEmployeeId}']::uuid[], '2026-11-10'::date, '2026-11-10'::date, 'P', NULL) ORDER BY employee_id`
+    );
+    expect(rows).toHaveLength(2);
+    const byEmployee = new Map(rows.map(([empId, outcome, payrollFlag]) => [empId, { outcome, payrollFlag }]));
+    // Manual corrections are intentionally ALLOWED through on an
+    // approved-payroll month (never silently blocked -- that protection
+    // only ever applies to the AUTOMATIC write path, unchanged by this
+    // PR) but are still distinctly flagged for reconciliation review,
+    // never indistinguishable from an ordinary unflagged write.
+    expect(byEmployee.get(fixture.employeeId)).toEqual({ outcome: 'written', payrollFlag: 'approved' });
+    expect(byEmployee.get(blankEmployeeId)).toEqual({ outcome: 'written', payrollFlag: '' });
+
+    const [flaggedReason] = queryRow(
+      `SELECT flagged_reason FROM attendance_reconciliation_flags WHERE employee_id = '${fixture.employeeId}' AND attendance_date = '2026-11-10'`
+    );
+    expect(flaggedReason).toBe('payroll_approved');
   });
 });

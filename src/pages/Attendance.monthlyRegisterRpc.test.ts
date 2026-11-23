@@ -229,9 +229,22 @@ describe('Monthly Register: "Copy from previous month" is routed through attenda
     expect(copyFromPreviousMonthBody).not.toMatch(/p_source\s*:/);
   });
 
-  it('Restore fast manual entry: only passes the auto-generated "Copied from <month>" reason when the TARGET date already holds an automatic decision -- every other copied record passes p_reason: null rather than inventing a reason the backend no longer requires', () => {
+  it('PR #69 final safety review: a TARGET date that already holds an existing AUTOMATIC decision is SKIPPED entirely (no RPC call, no write) rather than overridden with a fabricated "Copied from <month>" reason -- a generic auto-generated string is never accepted as the genuine human justification attendance_correct requires for an automatic override', () => {
     expect(copyFromPreviousMonthBody).toMatch(/const existingTarget = attendanceByKey\.get\(`\$\{record\.employee_id\}_\$\{record\.date\}`\);/);
-    expect(copyFromPreviousMonthBody).toMatch(/const overridesAutomatic = existingTarget\?\.source === 'automatic';/);
-    expect(copyFromPreviousMonthBody).toMatch(/p_reason: overridesAutomatic \? `Copied from \$\{getMonthLabel\(sourceMonth\)\}` : null,/);
+    expect(copyFromPreviousMonthBody).toMatch(/if \(existingTarget\?\.source === 'automatic'\) \{\s*skippedProtected\.push\(\{ employee_id: record\.employee_id, date: record\.date \}\);\s*continue;\s*\}/);
+    // The only p_reason ever sent from this loop is null -- there is no
+    // remaining code path that invents or forwards any other reason text.
+    expect(copyFromPreviousMonthBody).toMatch(/p_reason: null,/);
+    expect(copyFromPreviousMonthBody).not.toMatch(/p_reason: `Copied from/);
+  });
+
+  it('every copied record not skipped as protected needs no reason at all -- ordinary blank/manual targets stay fast', () => {
+    expect(copyFromPreviousMonthBody).toMatch(/\/\/ Every other target \(blank, or already manual\) needs no\s*\n\s*\/\/ reason at all/);
+  });
+
+  it('skipped-protected records are counted and reported distinctly from both success and failure -- never a blanket "success" when some records were left unchanged', () => {
+    expect(copyFromPreviousMonthBody).toMatch(/const skippedProtected: \{ employee_id: string; date: string \}\[\] = \[\];/);
+    expect(copyFromPreviousMonthBody).toMatch(/if \(failures\.length === 0 && skippedProtected\.length === 0\)/);
+    expect(copyFromPreviousMonthBody).toMatch(/already has a fingerprint-based \(automatic\) result and was left unchanged/);
   });
 });
