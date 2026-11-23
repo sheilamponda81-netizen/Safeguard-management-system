@@ -72,10 +72,11 @@ function callSqlEngine(input: AttendanceCalculationInput): { status: string; bas
   const eventsLiteral = sqlTimestampArrayLiteral(input.events.map((e) => e.timestampIso));
   const coverageStatusLiteral = sqlNullableTextLiteral(input.coverage.status);
   const coverageThroughLiteral = sqlNullableTimestampLiteral(input.coverage.verifiedThroughIso);
+  const asOfLiteral = sqlNullableTimestampLiteral(input.asOfIso);
   const sql =
     `SELECT status, COALESCE(calculation_basis, ''), ` +
     `COALESCE((EXTRACT(EPOCH FROM check_in_at) * 1000)::text, ''), COALESCE((EXTRACT(EPOCH FROM check_out_at) * 1000)::text, '') ` +
-    `FROM attendance_engine_calculate('${input.shiftDate}', '${input.resolvedShift}', ${eventsLiteral}, ${coverageStatusLiteral}, ${coverageThroughLiteral});`;
+    `FROM attendance_engine_calculate('${input.shiftDate}', '${input.resolvedShift}', ${eventsLiteral}, ${coverageStatusLiteral}, ${coverageThroughLiteral}, ${asOfLiteral});`;
   const output = execFileSync('psql', ['-t', '-A', '-F', ',', '-c', sql], { encoding: 'utf-8' }).trim();
   const [status, basis, checkInMillis, checkOutMillis] = output.split(',');
   return {
@@ -176,6 +177,43 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_engine_calculate() SQL/
     {
       name: 'Unknown coverage (no status, no verifiedThroughIso) behaves exactly like insufficient',
       input: { shiftDate: DAY_DATE, resolvedShift: 'day', events: [{ timestampIso: '2026-10-05T04:05:00.000Z' }], coverage: { status: 'insufficient' } },
+    },
+    {
+      name: 'Staleness gate: asOfIso before the Day checkout window closes -- still provisional Present',
+      input: { shiftDate: DAY_DATE, resolvedShift: 'day', events: [{ timestampIso: '2026-10-05T04:05:00.000Z' }], coverage: { status: 'insufficient' }, asOfIso: '2026-10-05T17:59:59.000Z' },
+    },
+    {
+      name: 'Staleness gate: asOfIso after the Day checkout window closes, coverage unconfirmed -- Pending, never Absent',
+      input: { shiftDate: DAY_DATE, resolvedShift: 'day', events: [{ timestampIso: '2026-10-05T04:05:00.000Z' }], coverage: { status: 'insufficient' }, asOfIso: '2026-11-23T00:00:00.000Z' },
+    },
+    {
+      name: 'Staleness gate: a stale LATE check-in also becomes Pending, not a stuck provisional Late',
+      input: { shiftDate: DAY_DATE, resolvedShift: 'day', events: [{ timestampIso: '2026-10-05T04:30:00.000Z' }], coverage: { status: 'insufficient' }, asOfIso: '2026-11-23T00:00:00.000Z' },
+    },
+    {
+      name: 'Staleness gate: Night shift crossing midnight, asOfIso before the next-day checkout window closes -- still provisional Present',
+      input: { shiftDate: NIGHT_DATE, resolvedShift: 'night', events: [{ timestampIso: '2026-10-05T16:05:00.000Z' }], coverage: { status: 'insufficient' }, asOfIso: '2026-10-06T05:59:59.000Z' },
+    },
+    {
+      name: 'Staleness gate: Night shift crossing midnight, asOfIso after the next-day checkout window closes -- Pending',
+      input: { shiftDate: NIGHT_DATE, resolvedShift: 'night', events: [{ timestampIso: '2026-10-05T16:05:00.000Z' }], coverage: { status: 'insufficient' }, asOfIso: '2026-10-06T06:00:00.000Z' },
+    },
+    {
+      name: 'Staleness gate: a missing check-in stays Pending exactly as before, regardless of asOfIso',
+      input: { shiftDate: DAY_DATE, resolvedShift: 'day', events: [], coverage: { status: 'insufficient' }, asOfIso: '2026-11-23T00:00:00.000Z' },
+    },
+    {
+      name: 'Staleness gate: omitting asOfIso preserves the exact prior provisional-credit behavior',
+      input: { shiftDate: DAY_DATE, resolvedShift: 'day', events: [{ timestampIso: '2026-10-05T04:05:00.000Z' }], coverage: { status: 'insufficient' } },
+    },
+    {
+      name: 'Staleness gate: a previously-stale Pending still resolves to a confirmed Present once an overlapping later import supplies the checkout',
+      input: {
+        shiftDate: DAY_DATE, resolvedShift: 'day',
+        events: [{ timestampIso: '2026-10-05T04:05:00.000Z' }, { timestampIso: '2026-10-05T14:30:00.000Z' }],
+        coverage: { status: 'confirmed_complete', verifiedThroughIso: '2026-10-05T18:00:00.000Z' },
+        asOfIso: '2026-11-23T00:00:00.000Z',
+      },
     },
   ];
 

@@ -213,6 +213,11 @@ export default function AttendanceServerCalculationPreview() {
         officialStatusByKey: previewData.officialStatusByKey,
         employeeIdsWithActiveMapping: previewData.employeeIdsWithActiveMapping,
         serverCoverageByKey,
+        // Compared directly against the server's own attendance_
+        // resolve_and_calculate, which supplies clock_timestamp() as its
+        // real-time reference (20261125000000) -- using "now" here too
+        // keeps this an apples-to-apples comparison.
+        asOfIso: new Date().toISOString(),
       });
 
       const serverByDate = new Map(serverRows.map((r) => [r.attendanceDate, r]));

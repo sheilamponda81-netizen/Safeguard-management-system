@@ -290,6 +290,7 @@ export default function AttendanceEvidenceCentrePage() {
       coveragePolicy,
       officialStatusByKey: data.officialStatusByKey,
       employeeIdsWithActiveMapping: data.employeeIdsWithActiveMapping,
+      asOfIso: new Date().toISOString(),
     });
   }, [data, candidateEmployees, shiftDates, coveragePolicy]);
 

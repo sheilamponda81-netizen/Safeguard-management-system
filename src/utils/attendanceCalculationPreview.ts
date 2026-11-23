@@ -247,8 +247,17 @@ export function buildAttendanceCalculationPreviewRows(params: {
    * only).
    */
   serverCoverageByKey?: Map<string, ServerCoverageEvidence>;
+  /**
+   * The real current UTC wall-clock instant, ISO 8601 -- forwarded as-is
+   * to calculateAttendanceStatus's own `asOfIso` (see that function for
+   * the one thing it's used for: the early-export staleness gate).
+   * Optional and defaults to undefined, which preserves
+   * calculateAttendanceStatus's own prior behavior unchanged; every real
+   * caller should supply `new Date().toISOString()`.
+   */
+  asOfIso?: string;
 }): AttendanceCalculationPreviewRow[] {
-  const { employees, shiftDates, datedAssignments, patterns, shiftPatterns = [], eventsByEmployeeId, coveragePolicy, officialStatusByKey, employeeIdsWithActiveMapping, serverCoverageByKey } = params;
+  const { employees, shiftDates, datedAssignments, patterns, shiftPatterns = [], eventsByEmployeeId, coveragePolicy, officialStatusByKey, employeeIdsWithActiveMapping, serverCoverageByKey, asOfIso } = params;
   const rows: AttendanceCalculationPreviewRow[] = [];
 
   for (const employee of employees) {
@@ -262,7 +271,7 @@ export function buildAttendanceCalculationPreviewRows(params: {
       const coverage = hasActiveMapping
         ? combineCoverageSources(operatorCoverage, serverCoverageByKey?.get(`${employee.id}|${shiftDate}`))
         : ({ status: 'insufficient' } as const);
-      const calculation = calculateAttendanceStatus({ shiftDate, resolvedShift, events, coverage });
+      const calculation = calculateAttendanceStatus({ shiftDate, resolvedShift, events, coverage, asOfIso });
       rows.push({
         employeeId: employee.id,
         employeeName: employee.fullName,

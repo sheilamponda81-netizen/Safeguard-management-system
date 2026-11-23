@@ -405,6 +405,7 @@ export default function AttendanceCalculationPreviewPage() {
       officialStatusByKey: data.officialStatusByKey,
       employeeIdsWithActiveMapping: data.employeeIdsWithActiveMapping,
       serverCoverageByKey,
+      asOfIso: new Date().toISOString(),
     });
   }, [data, candidateEmployees, shiftDates, coveragePolicy, serverCoverageByKey]);
 

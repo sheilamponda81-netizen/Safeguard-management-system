@@ -221,4 +221,61 @@ describe.skipIf(!dbAvailable && !dbRequired)('Attendance pipeline integration (r
     // Never even written -- no attendance row exists for this date at all.
     expect(attendanceRow(fixture, '2026-11-05').status).toBeNull();
   });
+
+  it('early-export staleness gate (Nov 2026 integrity review): a weeks-old check-in-only shift with coverage still unconfirmed resolves Pending, not a permanently-stuck provisional Present -- and is still never automatically written', () => {
+    const fixture = createFixture('STALE SITE');
+    exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-10-25', NULL)`);
+
+    // A genuine, on-time check-in -- real evidence -- but no checkout was
+    // ever recorded for this shift, on a date weeks before "now" (this
+    // environment's real clock sits in late November 2026 -- see this
+    // repo's other 2026-11-xx dated fixtures). No coverage confirmation
+    // is ever inserted at all, matching HILIA MAKHASU/SAMU ELIA
+    // MAKUNGWA's confirmed production situation: the only coverage
+    // confirmations on file for this access point are
+    // unsupported_historical and so never count as 'confirmed_complete'.
+    insertRawEvent(fixture, '2026-10-26T04:05:00Z');
+
+    const [status, calculationBasis, checkInAt, checkOutAt] = queryRow(
+      `SELECT status, COALESCE(calculation_basis, ''), check_in_at IS NOT NULL, check_out_at IS NOT NULL ` +
+      `FROM attendance_resolve_and_calculate('${fixture.employeeId}'::uuid, '2026-10-26'::date)`
+    );
+    expect(status).toBe('pending');
+    expect(status).not.toBe('absent');
+    expect(calculationBasis).toBe(''); // NULL -- never 'check_in_only_provisional' once genuinely stale
+    expect(checkInAt).toBe('t'); // the real check-in evidence is preserved
+    expect(checkOutAt).toBe('f');
+
+    // Never automatically written -- Pending was already a skip outcome
+    // before this fix (same as the old permanently-stuck provisional
+    // Present/Late was); this proves the fix changes WHICH non-writing
+    // outcome is reported, never whether a write happens.
+    const [outcome] = queryRow(`SELECT outcome FROM attendance_apply_automatic(ARRAY['${fixture.employeeId}']::uuid[], '2026-10-26'::date, '2026-10-26'::date)`);
+    expect(outcome).toBe('skipped_pending');
+    expect(attendanceRow(fixture, '2026-10-26').status).toBeNull();
+  });
+
+  it('early-export staleness gate: the same stale Pending still reconciles to a genuinely confirmed outcome once real, evidence-backed coverage later arrives (never stuck, in either direction)', () => {
+    const fixture = createFixture('STALE RECONCILE SITE');
+    exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-10-25', NULL)`);
+    insertRawEvent(fixture, '2026-10-26T04:05:00Z');
+
+    const [staleStatus] = queryRow(`SELECT status FROM attendance_resolve_and_calculate('${fixture.employeeId}'::uuid, '2026-10-26'::date)`);
+    expect(staleStatus).toBe('pending');
+
+    // A later, genuinely evidence-backed coverage confirmation arrives
+    // (e.g. a human review closes out the old access point's history) --
+    // spanning the whole shift with no checkout ever found in it.
+    exec(
+      `INSERT INTO fingerprint_coverage_confirmations (tenant_id, confirmed_by, workstations, access_points, covers_from, covers_through, latest_observed_event_at) ` +
+      `VALUES ('${fixture.tenantId}', '${fixture.callerId}', ARRAY[]::TEXT[], ARRAY['GATE1'], '2026-10-26T00:00:00Z', '2026-10-26T23:59:00Z', '2026-10-26T17:50:00Z')`
+    );
+
+    const [reconciledStatus] = queryRow(`SELECT status FROM attendance_resolve_and_calculate('${fixture.employeeId}'::uuid, '2026-10-26'::date)`);
+    expect(reconciledStatus).toBe('absent');
+
+    const [outcome, , newStatus] = queryRow(`SELECT outcome, old_status, new_status FROM attendance_apply_automatic(ARRAY['${fixture.employeeId}']::uuid[], '2026-10-26'::date, '2026-10-26'::date)`);
+    expect(outcome).toBe('written');
+    expect(newStatus).toBe('A');
+  });
 });
