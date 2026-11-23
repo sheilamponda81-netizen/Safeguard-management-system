@@ -209,10 +209,20 @@ BEGIN
 END;
 $$;
 
+-- Fires on INSERT (the normal add path) AND on UPDATE (so that a direct
+-- "un-remove" write -- setting removed_at back to NULL without going
+-- through add_employees_to_batch -- is caught too; a super admin's raw
+-- client write is the only thing RLS lets reach UPDATE directly, since
+-- remove_employee_from_batch is the only RPC that ever updates this
+-- table and always sets removed_at to a real timestamp, never back to
+-- NULL, so this adds no new check on the normal removal path). The WHEN
+-- clause limits the check to rows that end up active -- exactly the
+-- state the invariant is about.
 DROP TRIGGER IF EXISTS guard_batch_member_single_active_batch ON terminal_due_batch_members;
 CREATE TRIGGER guard_batch_member_single_active_batch
-BEFORE INSERT ON terminal_due_batch_members
+BEFORE INSERT OR UPDATE ON terminal_due_batch_members
 FOR EACH ROW
+WHEN (NEW.removed_at IS NULL)
 EXECUTE FUNCTION guard_batch_member_single_active_batch();
 
 -- ============================================================

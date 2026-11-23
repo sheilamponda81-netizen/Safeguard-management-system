@@ -442,4 +442,35 @@ describe.skipIf(!dbAvailable && !dbRequired)('Terminal Dues Phase 2: batch manag
       expect(row[1]).toBe(fixture.callerId);
     }
   });
+
+  it('16. the cross-batch guard also rejects a direct UPDATE that "un-removes" a membership, not just a fresh INSERT (defense-in-depth gap found in final safety review)', () => {
+    const fixture = createFixture('Direct Update Bypass Guard');
+    const employeeId = createEmployee(fixture, 'Direct Update Bypass Employee');
+    const [batchAId] = queryRow(`SELECT (create_terminal_due_batch('Batch A'))->>'id'`);
+    const [batchBId] = queryRow(`SELECT (create_terminal_due_batch('Batch B'))->>'id'`);
+
+    queryJson(`SELECT add_employees_to_batch('${batchAId}'::uuid, ARRAY['${employeeId}'::uuid])`);
+    queryRow(`SELECT remove_employee_from_batch('${batchAId}'::uuid, '${employeeId}'::uuid, 'moving to batch B')`);
+    queryJson(`SELECT add_employees_to_batch('${batchBId}'::uuid, ARRAY['${employeeId}'::uuid])`);
+
+    // A raw UPDATE (what RLS permits a super admin to issue directly,
+    // bypassing every RPC) trying to reinstate the batch A membership
+    // while the employee is still active in batch B must be rejected by
+    // the same trigger that protects the INSERT path.
+    const stderr = execExpectError(
+      `UPDATE terminal_due_batch_members SET removed_at = NULL, removal_reason = NULL WHERE batch_id = '${batchAId}' AND employee_id = '${employeeId}'`
+    );
+    expect(stderr).toMatch(/already an active member of another open batch/i);
+
+    expect(activeMemberCount(batchAId)).toBe(0);
+    expect(activeMemberCount(batchBId)).toBe(1);
+
+    // The legitimate removal UPDATE (removed_at NULL -> a real timestamp)
+    // must remain completely unaffected by the trigger now also covering UPDATE.
+    const employeeId2 = createEmployee(fixture, 'Unaffected Removal Employee');
+    queryJson(`SELECT add_employees_to_batch('${batchAId}'::uuid, ARRAY['${employeeId2}'::uuid])`);
+    queryRow(`SELECT remove_employee_from_batch('${batchAId}'::uuid, '${employeeId2}'::uuid, 'ordinary removal')`);
+    const [removedAt] = queryRow(`SELECT removed_at IS NOT NULL FROM terminal_due_batch_members WHERE employee_id = '${employeeId2}'`);
+    expect(removedAt).toBe('t');
+  });
 });
