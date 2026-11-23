@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList, Banknote, History, AlertTriangle, TrendingUp } from '../utils/icons';
+import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList, Banknote, History, AlertTriangle, TrendingUp, UserMinus } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, EmptyState } from '../components/ui';
 import { TerminalDuesCalculatorTab, TerminalDuesSubmittedTab } from './TerminalDuesCalculator';
 import { TerminalDuesAllocationsTab } from './TerminalDuesAllocations';
 import { TerminalDuesPaymentHistoryTab } from './TerminalDuesPaymentHistory';
+import { TerminalDuesExitsTab } from './TerminalDuesExits';
 import { EntitlementRevisionPanel } from './TerminalDuesRevision';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -205,7 +206,7 @@ export function TerminalDuesPage() {
   // calculations promoted into the existing approval workflow via their
   // linked terminal_dues row's own live status -- never a self-reported
   // "Settled" state.
-  const [activeTab, setActiveTab] = useState<'records' | 'calculator' | 'submitted' | 'allocations' | 'history' | 'leave'>('records');
+  const [activeTab, setActiveTab] = useState<'records' | 'calculator' | 'submitted' | 'allocations' | 'history' | 'leave' | 'exits'>('records');
   
   // ===== PAGINATION STATES =====
   const [duesPage, setDuesPage] = useState(1);
@@ -906,6 +907,7 @@ export function TerminalDuesPage() {
         tabs={[
           { id: 'records', label: 'Records', icon: Wallet },
           { id: 'calculator', label: 'Calculator', icon: Calculator },
+          { id: 'exits', label: 'Exits', icon: UserMinus },
           { id: 'submitted', label: 'Submitted', icon: CheckCircle },
           { id: 'allocations', label: 'Allocations', icon: Banknote },
           { id: 'history', label: 'Payment History', icon: History },
@@ -929,6 +931,20 @@ export function TerminalDuesPage() {
           }))}
           canCreate={canCreateTerminalDue}
           canEdit={canEditTerminalDue}
+        />
+      )}
+
+      {activeTab === 'exits' && (
+        <TerminalDuesExitsTab
+          employees={employees.map(e => ({
+            id: e.id,
+            employeeNumber: e.employeeNumber,
+            fullName: e.fullName,
+            position: e.position,
+          }))}
+          canCreate={canCreateTerminalDue}
+          canEdit={canEditTerminalDue}
+          canApprove={canApproveTerminalDue}
         />
       )}
 
