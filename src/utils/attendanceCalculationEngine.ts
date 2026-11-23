@@ -85,7 +85,12 @@ export type AttendanceCalculationStatus = 'present' | 'late' | 'absent' | 'off' 
  *    checkout at all yet. This is provisional: recalculating once a
  *    later, more complete export arrives applies the normal rules again
  *    and can still resolve to 'absent' if the checkout window closes
- *    with no checkout ever recorded.
+ *    with no checkout ever recorded. Only returned while `asOfIso` says
+ *    the checkout window has not genuinely passed yet in real time --
+ *    once it has (and coverage is still unconfirmed), the result is
+ *    'pending' instead (status 'pending', basis 'not_applicable'), since
+ *    an already-aged shift's missing checkout will never gain fresh
+ *    evidence and must not stay provisionally credited forever.
  *  - 'not_applicable': every other status (off/unassigned/pending/absent).
  */
 export type AttendanceCalculationBasis = 'confirmed' | 'check_in_only_provisional' | 'not_applicable';
@@ -97,6 +102,19 @@ export interface AttendanceCalculationInput {
   /** This employee's successful/authorized scans in a reasonably wide surrounding window; the engine does its own windowing and ignores anything outside the applicable check-in/checkout windows. */
   events: NormalizedFingerprintEvent[];
   coverage: ShiftCoverage;
+  /**
+   * The real UTC wall-clock instant this calculation is being run at, ISO
+   * 8601. OPTIONAL and used for exactly one purpose: deciding, in the
+   * early-export branch below, whether the checkout window has already
+   * genuinely passed in real time (see the early-export rule's own
+   * comment). This is never derived from `events` or `coverage` --
+   * keeping the function pure and testable -- so when omitted, the
+   * checkout window is simply treated as not yet passed, which preserves
+   * this function's exact prior behavior for any caller that has no
+   * meaningful "now" to supply (e.g. a historical/fixture calculation).
+   * Every live caller should supply the real current time.
+   */
+  asOfIso?: string;
 }
 
 export interface AttendanceCalculationResult {
@@ -158,7 +176,7 @@ function earliestEventInWindow(events: NormalizedFingerprintEvent[], startIso: s
  * concern, out of scope for Stage A).
  */
 export function calculateAttendanceStatus(input: AttendanceCalculationInput): AttendanceCalculationResult {
-  const { resolvedShift, shiftDate, events, coverage } = input;
+  const { resolvedShift, shiftDate, events, coverage, asOfIso } = input;
 
   if (resolvedShift === 'off') {
     return { status: 'off', checkInIso: null, checkOutIso: null, reason: 'Scheduled Off day.', basis: 'not_applicable' };
@@ -208,6 +226,28 @@ export function calculateAttendanceStatus(input: AttendanceCalculationInput): At
     // here: a missing check-in is NEVER assumed Absent before coverage
     // is confirmed, per the base completeness rule.
     if (checkInIso) {
+      // Staleness gate: the early-export credit above is only sound
+      // while there is still a real opportunity for a checkout to show
+      // up in a later, more complete export. Once the checkout window
+      // has ALREADY genuinely passed in real wall-clock time (asOfIso is
+      // on/after it) and coverage is still unconfirmed, that opportunity
+      // is gone -- an aged, already-exported shift's missing checkout
+      // will never retroactively gain fresh evidence, so "provisional
+      // Present/Late" would otherwise be permanently stuck, never
+      // resolving to either a confirmed outcome or Absent. Per the
+      // explicit policy, this must NOT become Absent (coverage is still
+      // unconfirmed) and must NOT stay a provisional Present/Late
+      // forever -- it falls to Pending, flagging it for reconciliation
+      // (e.g. a human review, or a genuinely new coverage confirmation).
+      if (asOfIso !== undefined && asOfIso >= windows.checkOutWindowEndIso) {
+        return {
+          status: 'pending',
+          checkInIso,
+          checkOutIso: null,
+          reason: 'Valid check-in recorded, but the checkout window has already passed with no checkout observed and data coverage is still not confirmed complete; held as Pending for reconciliation rather than assumed Present or Absent.',
+          basis: 'not_applicable',
+        };
+      }
       const status: AttendanceCalculationStatus = checkInIso <= windows.lateAfterIso ? 'present' : 'late';
       const reason =
         status === 'present'

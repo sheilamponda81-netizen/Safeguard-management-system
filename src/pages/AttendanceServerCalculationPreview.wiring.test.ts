@@ -16,7 +16,9 @@ const previewSource = fs.readFileSync(path.resolve(__dirname, './AttendanceServe
 describe('AttendanceServerCalculationPreview: the comparison now uses the same server-authoritative coverage evidence, classified with a reason -- not a bare match/mismatch', () => {
   it('fetches attendance_coverage_explain for the selected employee and passes it into the JS build', () => {
     expect(previewSource).toMatch(/fetchAttendanceCoverageExplain\(\[selectedEmployeeId\], fromDate, toDate\)/);
-    expect(previewSource).toMatch(/serverCoverageByKey,\s*\n\s*\}\);/);
+    // Early-export staleness gate (20261125): asOfIso now also flows
+    // into this same build call, alongside serverCoverageByKey.
+    expect(previewSource).toMatch(/serverCoverageByKey,\s*\n[\s\S]*?asOfIso: new Date\(\)\.toISOString\(\),\s*\n\s*\}\);/);
   });
 
   it('classifies every row with classifyStageCComparison rather than a bare status-equality check for "match"', () => {

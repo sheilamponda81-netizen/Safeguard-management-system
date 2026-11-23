@@ -104,6 +104,7 @@ export default function AttendanceWhatIfSimulation() {
         resolvedShift: hypotheticalShift,
         events,
         coverage: { status: 'insufficient' },
+        asOfIso: new Date().toISOString(),
       });
 
       setResult({

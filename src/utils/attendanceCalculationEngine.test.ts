@@ -261,6 +261,111 @@ describe('calculateAttendanceStatus -- early export rule: Present/Late credited 
   });
 });
 
+describe('calculateAttendanceStatus -- early-export staleness gate (HILIA MAKHASU / SAMU ELIA MAKUNGWA investigation)', () => {
+  // Day checkout window closes at 20:00 Blantyre = 18:00 UTC on the shift's own date.
+  const DAY_CHECKOUT_WINDOW_END = '2026-10-05T18:00:00.000Z';
+  // Night checkout window closes at 08:00 Blantyre = 06:00 UTC on the NEXT date.
+  const NIGHT_CHECKOUT_WINDOW_END = '2026-10-06T06:00:00.000Z';
+
+  it('Day: asOfIso before the checkout window closes -- still the ordinary provisional credit, unchanged', () => {
+    const result = calculateAttendanceStatus(
+      dayInput({ events: [ev('2026-10-05T04:05:00.000Z')], coverage: insufficientCoverage(), asOfIso: '2026-10-05T17:59:59.000Z' })
+    );
+    expect(result.status).toBe('present');
+    expect(result.basis).toBe('check_in_only_provisional');
+  });
+
+  it('Day: asOfIso exactly AT the checkout window close instant is already "passed" (inclusive boundary) -- Pending, not provisional Present', () => {
+    const result = calculateAttendanceStatus(
+      dayInput({ events: [ev('2026-10-05T04:05:00.000Z')], coverage: insufficientCoverage(), asOfIso: DAY_CHECKOUT_WINDOW_END })
+    );
+    expect(result.status).toBe('pending');
+    expect(result.basis).toBe('not_applicable');
+    expect(result.checkInIso).not.toBeNull();
+    expect(result.checkOutIso).toBeNull();
+  });
+
+  it('Day: asOfIso well after the checkout window closes, coverage still unconfirmed -- Pending (never stuck forever as provisional Present, never Absent)', () => {
+    const result = calculateAttendanceStatus(
+      dayInput({ events: [ev('2026-10-05T04:05:00.000Z')], coverage: insufficientCoverage(), asOfIso: '2026-11-23T00:00:00.000Z' })
+    );
+    expect(result.status).toBe('pending');
+    expect(result.status).not.toBe('absent');
+    expect(result.status).not.toBe('present');
+    expect(result.basis).toBe('not_applicable');
+  });
+
+  it('Day: a LATE check-in (after grace) that is now stale also becomes Pending, not a stuck provisional Late', () => {
+    const result = calculateAttendanceStatus(
+      dayInput({ events: [ev('2026-10-05T04:30:00.000Z')], coverage: insufficientCoverage(), asOfIso: '2026-11-23T00:00:00.000Z' })
+    );
+    expect(result.status).toBe('pending');
+    expect(result.status).not.toBe('late');
+  });
+
+  it('Night shift crossing midnight: asOfIso before the (next-day) checkout window closes -- still provisional, unchanged', () => {
+    const result = calculateAttendanceStatus(
+      nightInput({ events: [ev('2026-10-05T16:05:00.000Z')], coverage: insufficientCoverage(), asOfIso: '2026-10-06T05:59:59.000Z' })
+    );
+    expect(result.status).toBe('present');
+    expect(result.basis).toBe('check_in_only_provisional');
+  });
+
+  it('Night shift crossing midnight: asOfIso after the (next-day) checkout window closes -- Pending', () => {
+    const result = calculateAttendanceStatus(
+      nightInput({ events: [ev('2026-10-05T16:05:00.000Z')], coverage: insufficientCoverage(), asOfIso: NIGHT_CHECKOUT_WINDOW_END })
+    );
+    expect(result.status).toBe('pending');
+    expect(result.basis).toBe('not_applicable');
+    expect(result.checkInIso).not.toBeNull();
+  });
+
+  it('a missing check-in stays Pending under staleness exactly as before -- the staleness gate only changes the check-in-ONLY branch', () => {
+    const result = calculateAttendanceStatus(
+      dayInput({ events: [], coverage: insufficientCoverage(), asOfIso: '2026-11-23T00:00:00.000Z' })
+    );
+    expect(result.status).toBe('pending');
+    expect(result.checkInIso).toBeNull();
+  });
+
+  it('omitting asOfIso entirely preserves the exact prior (pre-fix) behavior -- provisional credit, never held back merely for lack of a time reference', () => {
+    const result = calculateAttendanceStatus(
+      dayInput({ events: [ev('2026-10-05T04:05:00.000Z')], coverage: insufficientCoverage() })
+    );
+    expect(result.status).toBe('present');
+    expect(result.basis).toBe('check_in_only_provisional');
+  });
+
+  it('reconciliation: a stale check-in-only Pending resolves to a genuine confirmed Present once an overlapping later import supplies the checkout', () => {
+    const stale = calculateAttendanceStatus(
+      dayInput({ events: [ev('2026-10-05T04:05:00.000Z')], coverage: insufficientCoverage(), asOfIso: '2026-11-23T00:00:00.000Z' })
+    );
+    expect(stale.status).toBe('pending');
+
+    const reconciled = calculateAttendanceStatus(
+      dayInput({
+        events: [ev('2026-10-05T04:05:00.000Z'), ev('2026-10-05T14:30:00.000Z')],
+        coverage: coverageThrough(DAY_CHECKOUT_WINDOW_END),
+        asOfIso: '2026-11-23T00:00:00.000Z',
+      })
+    );
+    expect(reconciled.status).toBe('present');
+    expect(reconciled.basis).toBe('confirmed');
+  });
+
+  it('reconciliation: a stale check-in-only Pending resolves to Absent once coverage genuinely becomes confirmed_complete with no checkout ever found -- the staleness gate never blocks a legitimately evidenced Absent', () => {
+    const reconciled = calculateAttendanceStatus(
+      dayInput({
+        events: [ev('2026-10-05T04:05:00.000Z')],
+        coverage: coverageThrough(DAY_CHECKOUT_WINDOW_END),
+        asOfIso: '2026-11-23T00:00:00.000Z',
+      })
+    );
+    expect(reconciled.status).toBe('absent');
+    expect(reconciled.basis).toBe('not_applicable');
+  });
+});
+
 describe('calculateAttendanceStatus -- incomplete/unknown coverage', () => {
   it('explicit insufficient coverage with no scans at all -> Pending, never Absent', () => {
     const input = dayInput({ events: [], coverage: insufficientCoverage() });
