@@ -278,4 +278,34 @@ describe.skipIf(!dbAvailable && !dbRequired)('Attendance pipeline integration (r
     expect(outcome).toBe('written');
     expect(newStatus).toBe('A');
   });
+
+  it('early-export staleness gate: HILIA MAKHASU\'s confirmed production scenario -- a genuine Night-shift check-in with no checkout, crossing midnight -- resolves Pending through the real RPC stack, never a stuck provisional Present', () => {
+    const fixture = createFixture('NIGHT STALE SITE');
+    exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'night', '2026-10-25', NULL)`);
+
+    // Night check-in window is 16:00-20:00 Blantyre (14:00-18:00 UTC) on
+    // the shift's own date; the checkout window is 04:00-08:00 Blantyre
+    // (02:00-06:00 UTC) the NEXT date -- long past "now" (this
+    // environment's real clock sits in late November 2026). No checkout
+    // event exists at all, matching HILIA's confirmed raw-event query
+    // (her Nov 3 Night-shift checkout window contained zero events, even
+    // though the same import batch spanned well past it). No coverage
+    // confirmation is inserted either, matching her access point's
+    // confirmed all-unsupported_historical state.
+    insertRawEvent(fixture, '2026-10-26T14:05:00Z');
+
+    const [status, calculationBasis, checkInAt, checkOutAt] = queryRow(
+      `SELECT status, COALESCE(calculation_basis, ''), check_in_at IS NOT NULL, check_out_at IS NOT NULL ` +
+      `FROM attendance_resolve_and_calculate('${fixture.employeeId}'::uuid, '2026-10-26'::date)`
+    );
+    expect(status).toBe('pending');
+    expect(status).not.toBe('absent');
+    expect(calculationBasis).toBe('');
+    expect(checkInAt).toBe('t');
+    expect(checkOutAt).toBe('f');
+
+    const [outcome] = queryRow(`SELECT outcome FROM attendance_apply_automatic(ARRAY['${fixture.employeeId}']::uuid[], '2026-10-26'::date, '2026-10-26'::date)`);
+    expect(outcome).toBe('skipped_pending');
+    expect(attendanceRow(fixture, '2026-10-26').status).toBeNull();
+  });
 });
