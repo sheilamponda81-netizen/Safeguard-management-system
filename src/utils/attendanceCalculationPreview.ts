@@ -79,6 +79,47 @@ export function coverageForWorkstationKey(policy: ResolvedCoveragePolicy, workst
   return { status: 'confirmed_complete', verifiedThroughIso: policy.exportTimeUtcIso! };
 }
 
+/**
+ * Attendance coverage-consistency improvement: the read-only, server-
+ * authoritative explanation of one (employee, date)'s coverage, from
+ * attendance_coverage_explain -- see that RPC's own migration header for
+ * the full coverage-trust reasoning. `sufficientEvidence` already
+ * reflects this app's own, stricter trust decision (an unsupported
+ * historical declaration is NEVER sufficient here, even though
+ * `officialEngineTrustsThis` may be true for the exact same row) -- a
+ * caller should use `sufficientEvidence`, never `officialEngineTrustsThis`,
+ * to decide what to calculate with.
+ */
+export interface ServerCoverageEvidence {
+  resolvedShift: string;
+  coverageProvenance: string;
+  sufficientEvidence: boolean;
+  officialEngineTrustsThis: boolean;
+  confirmedThroughIso: string | null;
+  reason: string;
+}
+
+/**
+ * Combines the two coverage sources this page now has, never silently
+ * preferring one: an operator's own SESSION-LOCAL, explicitly-ticked
+ * confirmation (coverageForWorkstationKey -- unchanged, still the only
+ * path for a workstation the server has no persisted evidence for at
+ * all) and the real, persisted, evidence-checked server coverage this
+ * PR adds. Either source reaching 'confirmed_complete' is enough -- an
+ * operator's own live confirmation is never weakened by this change,
+ * and a genuinely trustworthy persisted confirmation is no longer
+ * invisible to the client just because nobody retyped it this session.
+ * Still 'insufficient' whenever BOTH stay unconfirmed, exactly as
+ * before this PR -- never a third, looser path to 'confirmed_complete'.
+ */
+export function combineCoverageSources(operatorCoverage: ShiftCoverage, serverEvidence: ServerCoverageEvidence | undefined): ShiftCoverage {
+  if (operatorCoverage.status === 'confirmed_complete') return operatorCoverage;
+  if (serverEvidence?.sufficientEvidence && serverEvidence.confirmedThroughIso) {
+    return { status: 'confirmed_complete', verifiedThroughIso: serverEvidence.confirmedThroughIso };
+  }
+  return { status: 'insufficient' };
+}
+
 export interface AttendanceCalculationPreviewRow {
   employeeId: string;
   employeeName: string;
@@ -196,18 +237,31 @@ export function buildAttendanceCalculationPreviewRows(params: {
   officialStatusByKey: Map<string, string>;
   /** Employees with NO active HikCentral Person Mapping always get forced 'insufficient' coverage, regardless of any operator workstation confirmation -- their zero events reflect an unresolved mapping, never an observed absence. */
   employeeIdsWithActiveMapping: Set<string>;
+  /**
+   * Attendance coverage-consistency improvement: the real, persisted,
+   * evidence-checked server coverage for each (employeeId, shiftDate),
+   * keyed `${employeeId}|${shiftDate}` -- see combineCoverageSources for
+   * exactly how this combines with coveragePolicy above. Optional and
+   * defaults to empty so every existing caller/test that genuinely has
+   * none keeps its current, unchanged behavior (operator-typed coverage
+   * only).
+   */
+  serverCoverageByKey?: Map<string, ServerCoverageEvidence>;
 }): AttendanceCalculationPreviewRow[] {
-  const { employees, shiftDates, datedAssignments, patterns, shiftPatterns = [], eventsByEmployeeId, coveragePolicy, officialStatusByKey, employeeIdsWithActiveMapping } = params;
+  const { employees, shiftDates, datedAssignments, patterns, shiftPatterns = [], eventsByEmployeeId, coveragePolicy, officialStatusByKey, employeeIdsWithActiveMapping, serverCoverageByKey } = params;
   const rows: AttendanceCalculationPreviewRow[] = [];
 
   for (const employee of employees) {
     const events = eventsByEmployeeId.get(employee.id) ?? [];
     const hasActiveMapping = employeeIdsWithActiveMapping.has(employee.id);
-    const coverage = hasActiveMapping
+    const operatorCoverage = hasActiveMapping
       ? coverageForWorkstationKey(coveragePolicy, normalizeWorkstationKey(employee.workstation || ''))
       : ({ status: 'insufficient' } as const);
     for (const shiftDate of shiftDates) {
       const resolvedShift = resolveScheduleForDate(employee.id, shiftDate, datedAssignments, patterns, shiftPatterns);
+      const coverage = hasActiveMapping
+        ? combineCoverageSources(operatorCoverage, serverCoverageByKey?.get(`${employee.id}|${shiftDate}`))
+        : ({ status: 'insufficient' } as const);
       const calculation = calculateAttendanceStatus({ shiftDate, resolvedShift, events, coverage });
       rows.push({
         employeeId: employee.id,
@@ -269,6 +323,62 @@ export function classifyAttendanceReviewSignal(row: AttendanceCalculationPreview
   const evidenceStillUncertain = row.calculation.status === 'pending' || row.calculation.basis === 'check_in_only_provisional';
   if (evidenceStillUncertain) return 'uncertain';
   return row.calculation.status === expected ? 'none' : 'contradiction';
+}
+
+/**
+ * Attendance coverage-consistency improvement -- Stage C comparison
+ * classification. Replaces a plain match/mismatch count with a REASON,
+ * per the explicit requirement not to label every difference an
+ * attendance-engine defect:
+ *
+ *   'match'                       -- the two sides agree.
+ *   'unavailable_incomplete_comparison' -- one side has no result at
+ *                                   all for this date (e.g. the server
+ *                                   RPC returned nothing) -- there is
+ *                                   simply nothing to compare yet.
+ *   'untrusted_historical_coverage' -- they disagree, and the JS side's
+ *                                   own coverage evidence for this date
+ *                                   is 'unsupported_historical' -- i.e.
+ *                                   the official engine currently still
+ *                                   trusts a declaration this app does
+ *                                   not, which is the coverage-TRUST gap
+ *                                   this PR reports, never a calculation
+ *                                   bug.
+ *   'different_coverage_inputs'   -- they disagree, and the JS side's
+ *                                   coverage simply never reached
+ *                                   sufficient evidence at all (no
+ *                                   confirmation, no assigned terminal,
+ *                                   no active mapping) -- an input gap,
+ *                                   not a disagreement about what the
+ *                                   same evidence means.
+ *   'genuine_calculation_disagreement' -- they disagree despite the JS
+ *                                   side ALSO having sufficient,
+ *                                   evidence-backed (or independently-
+ *                                   verified) coverage -- the one
+ *                                   outcome that IS worth investigating
+ *                                   as a real discrepancy.
+ *
+ * Never used to auto-correct anything, and never changes Stage C's
+ * Apply eligibility, which is computed only from the server's own
+ * result (see classifyAutomaticEligibility) and untouched by this.
+ */
+export type StageCComparisonClassification =
+  | 'match' | 'unavailable_incomplete_comparison' | 'untrusted_historical_coverage'
+  | 'different_coverage_inputs' | 'genuine_calculation_disagreement';
+
+export function classifyStageCComparison(params: {
+  serverStatus: AttendanceCalculationStatus | null;
+  jsStatus: AttendanceCalculationStatus | null;
+  jsCoverageProvenance: string | null;
+}): StageCComparisonClassification {
+  const { serverStatus, jsStatus, jsCoverageProvenance } = params;
+  if (serverStatus === null || jsStatus === null) return 'unavailable_incomplete_comparison';
+  if (serverStatus === jsStatus) return 'match';
+  if (jsCoverageProvenance === 'unsupported_historical') return 'untrusted_historical_coverage';
+  if (jsCoverageProvenance === 'no_coverage' || jsCoverageProvenance === 'no_assigned_terminal' || jsCoverageProvenance === 'no_active_mapping' || jsCoverageProvenance === 'not_applicable' || jsCoverageProvenance === null) {
+    return 'different_coverage_inputs';
+  }
+  return 'genuine_calculation_disagreement';
 }
 
 export interface AttendancePreviewRowFilters {

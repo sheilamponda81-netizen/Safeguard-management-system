@@ -44,8 +44,10 @@ import {
   fetchExistingAttendanceAndPayroll, classifyAutomaticEligibility, applyEligibleAutomaticResults,
   AutomaticEligibility, ApplyOutcome,
 } from '../utils/attendanceAutomaticApplyService';
-import { fetchAttendanceCalculationPreviewData } from '../utils/attendanceCalculationPreviewService';
-import { resolveCoveragePolicy, buildAttendanceCalculationPreviewRows } from '../utils/attendanceCalculationPreview';
+import { fetchAttendanceCalculationPreviewData, fetchAttendanceCoverageExplain } from '../utils/attendanceCalculationPreviewService';
+import {
+  resolveCoveragePolicy, buildAttendanceCalculationPreviewRows, classifyStageCComparison, StageCComparisonClassification,
+} from '../utils/attendanceCalculationPreview';
 import { fetchActiveEmployeesForRoster } from '../utils/rosterService';
 import { EmployeeLite } from '../utils/hikcentralPersonMapping';
 import { getBlantyreToday } from '../utils/rosterCalendarNav';
@@ -88,8 +90,25 @@ interface ComparisonRow {
   jsStatus: AttendanceCalculationStatus | null;
   jsBasis: AttendanceCalculationBasis | null;
   match: boolean;
+  classification: StageCComparisonClassification;
+  jsCoverageReason: string | null;
   eligibility: AutomaticEligibility;
 }
+
+const CLASSIFICATION_LABELS: Record<StageCComparisonClassification, string> = {
+  match: 'Match',
+  unavailable_incomplete_comparison: 'Unavailable (incomplete comparison)',
+  untrusted_historical_coverage: 'Untrusted historical coverage (not an engine defect)',
+  different_coverage_inputs: 'Different coverage inputs',
+  genuine_calculation_disagreement: 'Genuine calculation disagreement',
+};
+const CLASSIFICATION_COLORS: Record<StageCComparisonClassification, 'green' | 'gray' | 'gold' | 'blue' | 'red'> = {
+  match: 'green',
+  unavailable_incomplete_comparison: 'gray',
+  untrusted_historical_coverage: 'gold',
+  different_coverage_inputs: 'blue',
+  genuine_calculation_disagreement: 'red',
+};
 
 export default function AttendanceServerCalculationPreview() {
   const [canView, setCanView] = useState(false);
@@ -157,21 +176,23 @@ export default function AttendanceServerCalculationPreview() {
       const employee = employees.find((e) => e.id === selectedEmployeeId);
       if (!employee) throw new Error('Select an employee first.');
 
-      const [serverRows, previewData, existing] = await Promise.all([
+      const [serverRows, previewData, existing, serverCoverageByKey] = await Promise.all([
         fetchServerCalculationPreview([selectedEmployeeId], fromDate, toDate),
         fetchAttendanceCalculationPreviewData(fromDate, toDate),
         fetchExistingAttendanceAndPayroll(selectedEmployeeId, fromDate, toDate),
+        // Attendance coverage-consistency improvement: the JS side now
+        // ALSO consults the same real, persisted, evidence-checked
+        // coverage the server reads (attendance_coverage_explain) --
+        // this used to stay hardcoded to no operator-typed confirmation
+        // at all, which is why this comparison previously diverged from
+        // the server purely on coverage INPUT, not on a calculation
+        // disagreement. No operator-typed export time/workstation
+        // confirmation is still applied here (this remains a read-only
+        // comparison view, not the confirmation workflow) -- only the
+        // genuinely trustworthy, already-persisted evidence.
+        fetchAttendanceCoverageExplain([selectedEmployeeId], fromDate, toDate),
       ]);
 
-      // No operator-typed export time/workstation confirmation is applied
-      // on the JS side here (this is a read-only comparison view, not the
-      // coverage-confirmation workflow) -- the JS engine's own coverage
-      // therefore stays 'insufficient' unless the official attendance
-      // record already shows one. The server engine reads REAL durable
-      // fingerprint_coverage_confirmations rows instead (none exist on
-      // STAGING yet, per the readiness panel above), so the two sides can
-      // only diverge once confirmations exist -- worth re-checking once
-      // they do, not an oversight today.
       const coveragePolicy = resolveCoveragePolicy({ exportTimeBlantyreLocal: '', confirmedWorkstationsRaw: '', operatorConfirmed: false });
       const jsRows = buildAttendanceCalculationPreviewRows({
         employees: [employee],
@@ -191,6 +212,7 @@ export default function AttendanceServerCalculationPreview() {
         coveragePolicy,
         officialStatusByKey: previewData.officialStatusByKey,
         employeeIdsWithActiveMapping: previewData.employeeIdsWithActiveMapping,
+        serverCoverageByKey,
       });
 
       const serverByDate = new Map(serverRows.map((r) => [r.attendanceDate, r]));
@@ -203,13 +225,21 @@ export default function AttendanceServerCalculationPreview() {
           { employeeId: selectedEmployeeId, date, status: server?.status ?? '', calculationBasis: server?.calculationBasis ?? null },
           existing
         );
+        const coverageEvidence = serverCoverageByKey.get(`${selectedEmployeeId}|${date}`);
+        const classification = classifyStageCComparison({
+          serverStatus: server?.status ?? null,
+          jsStatus: js?.calculation.status ?? null,
+          jsCoverageProvenance: coverageEvidence?.coverageProvenance ?? null,
+        });
         return {
           date,
           serverStatus: server?.status ?? null,
           serverBasis: server?.calculationBasis ?? null,
           jsStatus: js?.calculation.status ?? null,
           jsBasis: js && js.calculation.basis !== 'not_applicable' ? js.calculation.basis : null,
-          match: (server?.status ?? null) === (js?.calculation.status ?? null),
+          match: classification === 'match',
+          classification,
+          jsCoverageReason: coverageEvidence?.reason ?? null,
           eligibility,
         };
       });
@@ -243,6 +273,9 @@ export default function AttendanceServerCalculationPreview() {
   if (!canView) return null;
 
   const mismatchCount = rows ? rows.filter((r) => !r.match).length : 0;
+  const classificationCounts = rows
+    ? rows.reduce((acc, r) => { acc[r.classification] = (acc[r.classification] ?? 0) + 1; return acc; }, {} as Record<StageCComparisonClassification, number>)
+    : null;
   const eligibilityCounts = rows
     ? rows.reduce((acc, r) => { acc[r.eligibility] = (acc[r.eligibility] ?? 0) + 1; return acc; }, {} as Record<AutomaticEligibility, number>)
     : null;
@@ -317,8 +350,18 @@ export default function AttendanceServerCalculationPreview() {
         <Card className="p-4">
           <div className="flex items-center justify-between mb-3">
             <h5 className="text-sm font-semibold text-slate-800">Comparison results</h5>
-            <Badge color={mismatchCount === 0 ? 'green' : 'red'}>{mismatchCount === 0 ? 'All match' : `${mismatchCount} mismatch(es)`}</Badge>
+            <Badge color={mismatchCount === 0 ? 'green' : 'red'}>{mismatchCount === 0 ? 'All match' : `${mismatchCount} difference(s)`}</Badge>
           </div>
+          {classificationCounts && mismatchCount > 0 && (
+            <p className="text-xs text-slate-500 mb-3 flex flex-wrap gap-2">
+              Not every difference is a calculation defect -- see each row's own reason:
+              {(Object.keys(CLASSIFICATION_LABELS) as StageCComparisonClassification[])
+                .filter((k) => k !== 'match' && (classificationCounts[k] ?? 0) > 0)
+                .map((k) => (
+                  <Badge key={k} color={CLASSIFICATION_COLORS[k]}>{CLASSIFICATION_LABELS[k]}: {classificationCounts[k]}</Badge>
+                ))}
+            </p>
+          )}
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
@@ -326,7 +369,7 @@ export default function AttendanceServerCalculationPreview() {
                   <th className="py-2 pr-4">Date</th>
                   <th className="py-2 pr-4">Server result</th>
                   <th className="py-2 pr-4">JS preview result</th>
-                  <th className="py-2 pr-4">Match</th>
+                  <th className="py-2 pr-4">Comparison</th>
                   <th className="py-2 pr-4">Automatic-apply status</th>
                 </tr>
               </thead>
@@ -340,7 +383,11 @@ export default function AttendanceServerCalculationPreview() {
                     <td className="py-2 pr-4">
                       {r.jsStatus && <Badge color={STATUS_COLORS[r.jsStatus]}>{STATUS_LABELS[r.jsStatus]}{r.jsBasis === 'check_in_only_provisional' ? ' (provisional)' : ''}</Badge>}
                     </td>
-                    <td className="py-2 pr-4">{r.match ? '✓' : '✗'}</td>
+                    <td className="py-2 pr-4">
+                      <span title={r.jsCoverageReason ?? undefined}>
+                        <Badge color={CLASSIFICATION_COLORS[r.classification]}>{CLASSIFICATION_LABELS[r.classification]}</Badge>
+                      </span>
+                    </td>
                     <td className="py-2 pr-4">
                       <Badge color={ELIGIBILITY_COLORS[r.eligibility]}>{ELIGIBILITY_LABELS[r.eligibility]}</Badge>
                     </td>

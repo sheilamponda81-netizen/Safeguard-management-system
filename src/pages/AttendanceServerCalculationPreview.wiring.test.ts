@@ -13,6 +13,28 @@ import path from 'node:path';
 // round deliberately never applies automatically.
 const previewSource = fs.readFileSync(path.resolve(__dirname, './AttendanceServerCalculationPreview.tsx'), 'utf-8');
 
+describe('AttendanceServerCalculationPreview: the comparison now uses the same server-authoritative coverage evidence, classified with a reason -- not a bare match/mismatch', () => {
+  it('fetches attendance_coverage_explain for the selected employee and passes it into the JS build', () => {
+    expect(previewSource).toMatch(/fetchAttendanceCoverageExplain\(\[selectedEmployeeId\], fromDate, toDate\)/);
+    expect(previewSource).toMatch(/serverCoverageByKey,\s*\n\s*\}\);/);
+  });
+
+  it('classifies every row with classifyStageCComparison rather than a bare status-equality check for "match"', () => {
+    expect(previewSource).toMatch(/const classification = classifyStageCComparison\(/);
+    expect(previewSource).toMatch(/match: classification === 'match',/);
+  });
+
+  it('never changes Stage C\'s Apply eligibility or write behavior: eligibility is still computed only from the server result, unaffected by this classification', () => {
+    expect(previewSource).toMatch(
+      /classifyAutomaticEligibility\(\s*\{ employeeId: selectedEmployeeId, date, status: server\?\.status \?\? '', calculationBasis: server\?\.calculationBasis \?\? null \},\s*existing\s*\)/
+    );
+  });
+
+  it('this comparison still performs no write call of any kind', () => {
+    expect(previewSource).not.toMatch(/\.insert\(|\.update\(|\.upsert\(|\.delete\(/);
+  });
+});
+
 describe('AttendanceServerCalculationPreview: Apply is permission-protected and confirmation-gated, not unconditional', () => {
   it('the Apply button is disabled unless the operator has checked the confirmation box', () => {
     expect(previewSource).toMatch(/disabled=\{!operatorConfirmed \|\| applying\}/);

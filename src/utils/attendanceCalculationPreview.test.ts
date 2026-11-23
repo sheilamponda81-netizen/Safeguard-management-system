@@ -4,7 +4,7 @@ import {
   collectEmployeeIdsWithRosterEvidence, collectEmployeeIdsWithFingerprintEvidence,
   hasAnyEmployeeWithBothRosterAndFingerprintEvidence, describeDateExtent, expectedShiftTimesFor,
   buildAttendanceCalculationPreviewRows, filterAttendancePreviewRows, buildSiteAlertCasesFromRows,
-  classifyAttendanceReviewSignal,
+  classifyAttendanceReviewSignal, combineCoverageSources, classifyStageCComparison, ServerCoverageEvidence,
 } from './attendanceCalculationPreview';
 import { NormalizedFingerprintEvent } from './attendanceCalculationEngine';
 import { DateAssignmentRow, OffDayPatternRow, ShiftPatternRow } from './rosterSchedule';
@@ -702,5 +702,75 @@ describe('classifyAttendanceReviewSignal', () => {
     expect(row.calculation.status).toBe('present');
     expect(row.calculation.basis).toBe('check_in_only_provisional');
     expect(classifyAttendanceReviewSignal(row)).toBe('uncertain');
+  });
+});
+
+// Attendance coverage-consistency improvement.
+describe('combineCoverageSources', () => {
+  function evidence(overrides: Partial<ServerCoverageEvidence> = {}): ServerCoverageEvidence {
+    return {
+      resolvedShift: 'day', coverageProvenance: 'evidence_backed', sufficientEvidence: true,
+      officialEngineTrustsThis: true, confirmedThroughIso: '2026-10-05T18:00:00.000Z', reason: 'test', ...overrides,
+    };
+  }
+
+  it('prefers an ACTIVE operator-typed confirmation over server evidence, even when server evidence also exists', () => {
+    const operator = { status: 'confirmed_complete' as const, verifiedThroughIso: '2026-10-05T20:00:00.000Z' };
+    const result = combineCoverageSources(operator, evidence({ confirmedThroughIso: '2026-10-05T18:00:00.000Z' }));
+    expect(result).toEqual(operator);
+  });
+
+  it('falls back to sufficient server evidence when the operator has not confirmed anything this session', () => {
+    const result = combineCoverageSources({ status: 'insufficient' }, evidence());
+    expect(result).toEqual({ status: 'confirmed_complete', verifiedThroughIso: '2026-10-05T18:00:00.000Z' });
+  });
+
+  it('stays insufficient when server evidence says sufficientEvidence is false, even with a confirmedThroughIso present (e.g. unsupported_historical)', () => {
+    const result = combineCoverageSources({ status: 'insufficient' }, evidence({ sufficientEvidence: false, coverageProvenance: 'unsupported_historical' }));
+    expect(result).toEqual({ status: 'insufficient' });
+  });
+
+  it('stays insufficient when there is no server evidence at all for this employee-day', () => {
+    const result = combineCoverageSources({ status: 'insufficient' }, undefined);
+    expect(result).toEqual({ status: 'insufficient' });
+  });
+
+  it('stays insufficient when server evidence is sufficient but somehow has no confirmedThroughIso (defensive -- never a confirmed_complete with no verified-through time)', () => {
+    const result = combineCoverageSources({ status: 'insufficient' }, evidence({ confirmedThroughIso: null }));
+    expect(result).toEqual({ status: 'insufficient' });
+  });
+});
+
+describe('classifyStageCComparison', () => {
+  it('is "match" when both sides agree, regardless of coverage provenance', () => {
+    expect(classifyStageCComparison({ serverStatus: 'present', jsStatus: 'present', jsCoverageProvenance: 'evidence_backed' })).toBe('match');
+  });
+
+  it('is "unavailable_incomplete_comparison" when either side has no result at all', () => {
+    expect(classifyStageCComparison({ serverStatus: null, jsStatus: 'present', jsCoverageProvenance: null })).toBe('unavailable_incomplete_comparison');
+    expect(classifyStageCComparison({ serverStatus: 'present', jsStatus: null, jsCoverageProvenance: null })).toBe('unavailable_incomplete_comparison');
+  });
+
+  it('is "untrusted_historical_coverage" -- never a calculation-engine defect -- when the JS side\'s own coverage is an unsupported historical declaration', () => {
+    expect(classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'pending', jsCoverageProvenance: 'unsupported_historical' })).toBe('untrusted_historical_coverage');
+  });
+
+  it('is "different_coverage_inputs" when the JS side never reached sufficient coverage at all (no confirmation, no terminal, no mapping)', () => {
+    expect(classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'pending', jsCoverageProvenance: 'no_coverage' })).toBe('different_coverage_inputs');
+    expect(classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'pending', jsCoverageProvenance: 'no_assigned_terminal' })).toBe('different_coverage_inputs');
+    expect(classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'pending', jsCoverageProvenance: 'no_active_mapping' })).toBe('different_coverage_inputs');
+    expect(classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'pending', jsCoverageProvenance: null })).toBe('different_coverage_inputs');
+  });
+
+  it('is "genuine_calculation_disagreement" -- the one outcome worth investigating -- when they disagree despite the JS side ALSO having sufficient, trustworthy coverage', () => {
+    expect(classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'present', jsCoverageProvenance: 'evidence_backed' })).toBe('genuine_calculation_disagreement');
+    expect(classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'present', jsCoverageProvenance: 'independently_verified_override' })).toBe('genuine_calculation_disagreement');
+  });
+
+  it('never labels every difference a defect: an unsupported-historical mismatch and a genuine disagreement are classified differently even though both are plain status mismatches', () => {
+    const untrusted = classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'pending', jsCoverageProvenance: 'unsupported_historical' });
+    const genuine = classifyStageCComparison({ serverStatus: 'absent', jsStatus: 'present', jsCoverageProvenance: 'evidence_backed' });
+    expect(untrusted).not.toBe(genuine);
+    expect(untrusted).not.toBe('genuine_calculation_disagreement');
   });
 });

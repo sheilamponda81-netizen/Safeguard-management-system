@@ -80,8 +80,14 @@ describe('AttendanceCalculationPreview.tsx: compact register uses the shared Saf
 
 describe('AttendanceCalculationPreview.tsx: decision source is fetched via the separate, additive service export', () => {
   it('fetches decision source via fetchOfficialAttendanceSourceByKey, never widening the shared officialStatusByKey map', () => {
-    expect(source).toMatch(/import \{ fetchAttendanceCalculationPreviewData, fetchOfficialAttendanceSourceByKey \} from '\.\.\/utils\/attendanceCalculationPreviewService';/);
-    expect(source).toMatch(/const sourceByKey = await fetchOfficialAttendanceSourceByKey\(/);
+    expect(source).toMatch(/import \{ fetchAttendanceCalculationPreviewData, fetchOfficialAttendanceSourceByKey, fetchAttendanceCoverageExplain \} from '\.\.\/utils\/attendanceCalculationPreviewService';/);
+    expect(source).toMatch(/fetchOfficialAttendanceSourceByKey\(result\.employees\.map/);
+  });
+
+  it('fetches server-authoritative coverage evidence and combines it into the rows built, never replacing the existing operator-typed coveragePolicy', () => {
+    expect(source).toMatch(/fetchAttendanceCoverageExplain\(result\.employees\.map/);
+    expect(source).toMatch(/coveragePolicy,\s*\n\s*officialStatusByKey: data\.officialStatusByKey,\s*\n\s*employeeIdsWithActiveMapping: data\.employeeIdsWithActiveMapping,\s*\n\s*serverCoverageByKey,/);
+    expect(source).toMatch(/\[data, candidateEmployees, shiftDates, coveragePolicy, serverCoverageByKey\]/);
   });
 
   it('offers an Automatic/Manual decision-source filter applied against the fetched source map', () => {
