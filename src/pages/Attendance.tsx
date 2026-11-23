@@ -22,23 +22,35 @@ import { calculateAttendanceDeductions } from '../utils/attendanceDeductions';
 import { fetchAllPages, fetchInEmployeeIdBatches, dedupeById } from '../utils/employeeBatchFetch';
 import { resolveAttendanceWritePermissions, canEditAttendanceInRegion } from '../utils/attendancePermissions';
 import { filterAttendanceEmployees } from '../utils/attendanceFilters';
+import { fetchActiveOffDayPatterns, fetchActiveShiftPatterns, fetchActiveDateAssignments } from '../utils/rosterService';
+import { DateAssignmentRow, OffDayPatternRow, ShiftPatternRow } from '../utils/rosterSchedule';
+import { resolveAttendanceCellDisplayCode } from '../utils/attendanceCellDisplay';
 
 const statusColors: Record<string, string> = {
-  P: 'bg-emerald-500', 
-  A: 'bg-red-500', 
-  L: 'bg-yellow-400', 
-  LV: 'bg-blue-500', 
-  SL: 'bg-purple-500', 
-  '-': 'bg-slate-200'
+  P: 'bg-emerald-500',
+  A: 'bg-red-500',
+  L: 'bg-yellow-400',
+  LV: 'bg-blue-500',
+  SL: 'bg-purple-500',
+  '-': 'bg-slate-200',
+  // Roster/off-day display fix: these two codes are DISPLAY-ONLY, never
+  // written to `attendance.status` (that CHECK constraint still only
+  // allows P/A/L/LV/SL/-) and never read back from it -- see
+  // getCellDisplayCode's own header for why a cell with no persisted row
+  // can no longer be assumed Off just because it renders blank.
+  UNASSIGNED: 'bg-slate-100 border-2 border-dashed border-slate-300',
+  PENDING: 'bg-slate-300',
 };
 
-const statusLabels: Record<string, string> = { 
-  P: 'Present', 
-  A: 'Absent', 
-  L: 'Late', 
-  LV: 'Leave', 
-  SL: 'Sick', 
-  '-': 'Off' 
+const statusLabels: Record<string, string> = {
+  P: 'Present',
+  A: 'Absent',
+  L: 'Late',
+  LV: 'Leave',
+  SL: 'Sick',
+  '-': 'Off',
+  UNASSIGNED: 'Unassigned',
+  PENDING: 'Pending',
 };
 
 const statusCycle = ['P', 'A', 'L', 'LV', 'SL', '-'];
@@ -535,6 +547,16 @@ function MonthlyRegisterTab() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
+  // Roster/off-day display fix: fetched read-only, alongside attendance,
+  // so a blank cell (no persisted attendance row) can be told apart as
+  // genuinely scheduled Off, Unassigned (no roster info at all), or
+  // merely Pending (a real working day not yet processed) -- using the
+  // EXACT SAME resolver (resolveScheduleForDate) Roster Management and
+  // the attendance engine already use, never a second, divergent
+  // definition of "Off". Never written to; see getCellDisplayCode.
+  const [offDayPatterns, setOffDayPatterns] = useState<OffDayPatternRow[]>([]);
+  const [shiftPatterns, setShiftPatterns] = useState<ShiftPatternRow[]>([]);
+  const [dateAssignments, setDateAssignments] = useState<DateAssignmentRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   // Company/Resident and Site/Workstation free-text filters -- UI/read-only:
@@ -675,15 +697,22 @@ function MonthlyRegisterTab() {
       if (datesArr.length > 0 && employeesData && employeesData.length > 0) {
         const employeeIds = employeesData.map(e => e.id);
 
-        const attendanceData = await fetchAttendanceInBatches(
-          employeeIds,
-          datesArr[0],
-          datesArr[datesArr.length - 1]
-        );
+        const [attendanceData, offDayPatternsData, shiftPatternsData, dateAssignmentsData] = await Promise.all([
+          fetchAttendanceInBatches(employeeIds, datesArr[0], datesArr[datesArr.length - 1]),
+          fetchActiveOffDayPatterns(),
+          fetchActiveShiftPatterns(),
+          fetchActiveDateAssignments(datesArr[0], datesArr[datesArr.length - 1]),
+        ]);
         setAttendance(attendanceData);
+        setOffDayPatterns(offDayPatternsData);
+        setShiftPatterns(shiftPatternsData);
+        setDateAssignments(dateAssignmentsData);
         setHasData(attendanceData.length > 0);
       } else {
         setAttendance([]);
+        setOffDayPatterns([]);
+        setShiftPatterns([]);
+        setDateAssignments([]);
         setHasData(false);
       }
     } catch (err) {
@@ -1077,6 +1106,25 @@ function MonthlyRegisterTab() {
   const getAttendanceSource = useCallback((employeeId: string, date: string): string | null => {
     return attendanceByKey.get(`${employeeId}_${date}`)?.source ?? null;
   }, [attendanceByKey]);
+
+  // ===== GET CELL DISPLAY CODE (roster/off-day display fix) =====
+  // Final roster/fingerprint integrity review: before this fix, a cell
+  // with no persisted attendance row always rendered as plain '-' (Off)
+  // -- conflating a genuinely scheduled Off day with an employee who has
+  // no roster configured at all (Unassigned) and with an ordinary
+  // working day that simply hasn't been processed yet (Pending). This is
+  // DISPLAY ONLY: it never writes anything, and getAttendanceStatus
+  // (used by the click-to-cycle handler and by getEmployeeStats'
+  // P/A/L/LV/SL counts) is completely unchanged -- a cell showing
+  // 'PENDING' or 'UNASSIGNED' still cycles from '-' exactly as before,
+  // since no persisted row means no persisted status regardless of what
+  // the roster says. Uses the EXACT SAME resolveScheduleForDate the
+  // server's attendance engine and Roster Management's own Calendar
+  // already resolve from -- never a second, divergent definition of Off.
+  const getCellDisplayCode = useCallback((employeeId: string, date: string): string => {
+    const recorded = attendanceByKey.get(`${employeeId}_${date}`)?.status;
+    return resolveAttendanceCellDisplayCode(recorded, employeeId, date, dateAssignments, offDayPatterns, shiftPatterns);
+  }, [attendanceByKey, dateAssignments, offDayPatterns, shiftPatterns]);
 
   // ===== GET EMPLOYEE STATS =====
   const getEmployeeStats = useCallback((employeeId: string) => {
@@ -1529,6 +1577,14 @@ function MonthlyRegisterTab() {
                     {dates.map((date, i) => {
                       const status = getAttendanceStatus(emp.id, date);
                       const source = getAttendanceSource(emp.id, date);
+                      // Display-only: decides what the cell SHOWS (color,
+                      // glyph, tooltip) using the roster's own resolved
+                      // schedule when there is no attendance row yet --
+                      // the click handler below still uses `status`/
+                      // `source` exactly as before, so this never changes
+                      // what a click writes.
+                      const displayCode = getCellDisplayCode(emp.id, date);
+                      const displayGlyph = displayCode === 'UNASSIGNED' ? '?' : displayCode === 'PENDING' ? '⋯' : displayCode;
                       const updateKey = `${emp.id}-${date}`;
                       const isUpdating = updating[updateKey];
                       return (
@@ -1550,11 +1606,14 @@ function MonthlyRegisterTab() {
                             );
                           }
                         }}>
-                          <div className={`w-6 h-6 mx-auto rounded text-[10px] font-semibold text-white flex items-center justify-center ${!isEditable ? 'cursor-not-allowed opacity-70' : isUpdating ? 'opacity-50' : 'cursor-pointer hover:opacity-80'} transition-opacity ${statusColors[status]}`}>
+                          <div
+                            title={statusLabels[displayCode]}
+                            className={`w-6 h-6 mx-auto rounded text-[10px] font-semibold flex items-center justify-center ${displayCode === 'UNASSIGNED' ? 'text-slate-400' : 'text-white'} ${!isEditable ? 'cursor-not-allowed opacity-70' : isUpdating ? 'opacity-50' : 'cursor-pointer hover:opacity-80'} transition-opacity ${statusColors[displayCode]}`}
+                          >
                             {isUpdating ? (
                               <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
                             ) : (
-                              status
+                              displayGlyph
                             )}
                           </div>
                         </td>
