@@ -43,7 +43,7 @@ export function AttendanceReasonModal({ open, onClose, onConfirm, employeeName, 
     <Modal open={open} onClose={onClose} title="Reason required" size="sm">
       <form onSubmit={handleSubmit} className="space-y-4">
         <p className="text-sm text-slate-600">
-          Changing <strong>{employeeName}</strong>'s attendance on <strong>{date}</strong> from <strong>{fromStatus}</strong> to <strong>{toStatus}</strong> requires a reason.
+          <strong>{employeeName}</strong>'s attendance on <strong>{date}</strong> was automatically calculated as <strong>{fromStatus}</strong>. Overriding it to <strong>{toStatus}</strong> requires a reason.
         </p>
         <Input
           label="Reason"

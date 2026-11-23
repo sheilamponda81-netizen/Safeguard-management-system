@@ -60,6 +60,14 @@ interface AttendanceRecord {
   employee_id: string;
   date: string;
   status: string;
+  /** Restore fast manual entry: the persisted source of THIS record is
+   * what decides whether correcting it needs a reason -- 'automatic'
+   * means the attendance engine decided it and a human override must
+   * explain why; 'manual' (or no record at all, i.e. blank) never
+   * needs one. Already selected by this file's `select('*')` fetches;
+   * only now given a real type so updateAttendance/copyFromPreviousMonth
+   * can read it instead of assuming every edit is of a blank/manual day. */
+  source?: string | null;
 }
 
 interface EmployeeDeductionCalc {
@@ -590,7 +598,7 @@ function MonthlyRegisterTab() {
   // previousStatus is carried alongside the queued write so a failed RPC
   // call can revert the optimistic UI change it caused -- the grid applies
   // the new status immediately on click, before the write is confirmed.
-  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string; previousStatus: string; reason: string }>>(new Map());
+  const updateQueue = useRef<Map<string, { employeeId: string; date: string; status: string; previousStatus: string; previousSource: string | null; reason: string | null }>>(new Map());
   const isProcessingUpdate = useRef(false);
 
   // ===== HELPER FUNCTIONS =====
@@ -801,7 +809,7 @@ function MonthlyRegisterTab() {
   // month already has a payroll record. On failure, the optimistic UI
   // change made in updateAttendance is reverted back to previousStatus so
   // the grid never shows an edit that didn't actually save.
-  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string, previousStatus: string, reason: string) => {
+  const processSingleUpdate = useCallback(async (employeeId: string, date: string, nextStatus: string, previousStatus: string, previousSource: string | null, reason: string | null) => {
     try {
       const { data, error } = await supabase.rpc('attendance_correct', {
         p_employee_id: employeeId,
@@ -828,7 +836,13 @@ function MonthlyRegisterTab() {
         const existingIndex = prev.findIndex(a => a.employee_id === employeeId && a.date === date);
         if (existingIndex >= 0) {
           const reverted = [...prev];
-          reverted[existingIndex] = { ...reverted[existingIndex], status: previousStatus };
+          // Revert source along with status -- the optimistic update in
+          // commitAttendanceUpdate always guesses source: 'manual' (the
+          // only value a successful write can ever produce), so a FAILED
+          // write must restore the real previous source too, not just the
+          // status, or a reverted automatic-sourced cell would wrongly
+          // skip the reason dialog on the very next click.
+          reverted[existingIndex] = { ...reverted[existingIndex], status: previousStatus, source: previousSource };
           return reverted;
         }
         return prev;
@@ -847,7 +861,7 @@ function MonthlyRegisterTab() {
       updateQueue.current.clear();
 
       // Group updates by employee for efficiency
-      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string; previousStatus: string; reason: string }[]> = {};
+      const groupedUpdates: Record<string, { employeeId: string; date: string; status: string; previousStatus: string; previousSource: string | null; reason: string | null }[]> = {};
       for (const entry of entries) {
         if (!groupedUpdates[entry.employeeId]) {
           groupedUpdates[entry.employeeId] = [];
@@ -858,7 +872,7 @@ function MonthlyRegisterTab() {
       // Process each employee's updates
       for (const updates of Object.values(groupedUpdates)) {
         for (const update of updates) {
-          await processSingleUpdate(update.employeeId, update.date, update.status, update.previousStatus, update.reason);
+          await processSingleUpdate(update.employeeId, update.date, update.status, update.previousStatus, update.previousSource, update.reason);
         }
       }
     } catch (err) {
@@ -873,55 +887,16 @@ function MonthlyRegisterTab() {
     }
   }, [processSingleUpdate]);
 
-  // ===== OPTIMIZED: UPDATE ATTENDANCE WITH OPTIMISTIC UI =====
-  const updateAttendance = useCallback((employeeId: string, date: string, currentStatus: string) => {
-    // Defense-in-depth: the grid's own click handler already gates on
-    // canModifyAttendance before ever calling this function, but this
-    // guard means no INSERT/UPDATE request can be issued from here even
-    // if some future call site forgets that check -- backend RLS is the
-    // real authorization boundary regardless, but a read-only viewer
-    // should never even have a request attempted.
-    if (!canModifyAttendance) {
-      showNotification('You do not have permission to edit attendance.', 'error');
-      return;
-    }
-
-    const employee = employees.find(e => e.id === employeeId);
-    if (!canEditAttendanceInRegion(userProfile, employee?.region_id)) {
-      showNotification('You can only edit attendance for employees in your region', 'error');
-      return;
-    }
-
-    if (selectedMonth !== systemMonth) {
-      showNotification('Attendance can only be edited for the current month.', 'error');
-      return;
-    }
-    
-    const currentIndex = statusCycle.indexOf(currentStatus);
-    const nextIndex = (currentIndex + 1) % statusCycle.length;
-    const nextStatus = statusCycle[nextIndex];
-
-    // Final Phase 2 release review: a reason is required by the
-    // database for every manual correction (attendance_correct), not
-    // only enforced client-side. Collected via AttendanceReasonModal,
-    // an accessible dialog built from this app's own Modal/Input/
-    // Button primitives (see that component's own header for why it
-    // replaced the previous native-dialog approach). This function
-    // stops here; a cancelled or blank reason in the dialog aborts
-    // before anything (UI state or server) is touched, and
-    // confirmReasonAndUpdate below carries out everything the old
-    // post-prompt code did.
-    setReasonPrompt({
-      employeeId, date, currentStatus, nextStatus,
-      employeeName: employee?.full_name || 'this employee',
-    });
-  }, [canModifyAttendance, employees, userProfile, selectedMonth, systemMonth]);
-
-  const confirmReasonAndUpdate = useCallback(async (reason: string) => {
-    if (!reasonPrompt) return;
-    const { employeeId, date, currentStatus, nextStatus } = reasonPrompt;
-    setReasonPrompt(null);
-
+  // ===== COMMIT (shared by the fast no-reason path and the reason-modal
+  // confirm path) =====
+  // Restore fast manual entry: this is the exact body that used to live
+  // directly inside confirmReasonAndUpdate (optimistic UI update, queue
+  // the write, log the audit event) -- extracted unchanged so BOTH the
+  // ordinary one-click path (reason === null, no dialog ever opens) and
+  // the automatic-override path (reason comes from AttendanceReasonModal's
+  // onConfirm) commit through the exact same code, instead of risking
+  // the two paths drifting apart.
+  const commitAttendanceUpdate = useCallback(async (employeeId: string, date: string, currentStatus: string, currentSource: string | null, nextStatus: string, reason: string | null) => {
     const employee = employees.find(e => e.id === employeeId);
 
     // ===== PERFORMANCE: Optimistic update - change UI immediately =====
@@ -935,15 +910,15 @@ function MonthlyRegisterTab() {
       const existingIndex = prev.findIndex(a => a.employee_id === employeeId && a.date === date);
       if (existingIndex >= 0) {
         const updated = [...prev];
-        updated[existingIndex] = { ...updated[existingIndex], status: nextStatus };
+        updated[existingIndex] = { ...updated[existingIndex], status: nextStatus, source: 'manual' };
         return updated;
       } else {
-        return [...prev, { id: '', employee_id: employeeId, date, status: nextStatus }];
+        return [...prev, { id: '', employee_id: employeeId, date, status: nextStatus, source: 'manual' }];
       }
     });
 
     // Queue the update for background processing
-    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus, previousStatus: currentStatus, reason });
+    updateQueue.current.set(updateKey, { employeeId, date, status: nextStatus, previousStatus: currentStatus, previousSource: currentSource, reason });
 
     // Trigger queue processing
     if (!isProcessingUpdate.current) {
@@ -974,7 +949,65 @@ function MonthlyRegisterTab() {
         return newState;
       });
     }
-  }, [reasonPrompt, employees, userProfile, selectedMonth, updating, processUpdateQueue]);
+  }, [employees, userProfile, selectedMonth, updating, processUpdateQueue]);
+
+  // ===== OPTIMIZED: UPDATE ATTENDANCE WITH OPTIMISTIC UI =====
+  const updateAttendance = useCallback((employeeId: string, date: string, currentStatus: string, currentSource: string | null) => {
+    // Defense-in-depth: the grid's own click handler already gates on
+    // canModifyAttendance before ever calling this function, but this
+    // guard means no INSERT/UPDATE request can be issued from here even
+    // if some future call site forgets that check -- backend RLS is the
+    // real authorization boundary regardless, but a read-only viewer
+    // should never even have a request attempted.
+    if (!canModifyAttendance) {
+      showNotification('You do not have permission to edit attendance.', 'error');
+      return;
+    }
+
+    const employee = employees.find(e => e.id === employeeId);
+    if (!canEditAttendanceInRegion(userProfile, employee?.region_id)) {
+      showNotification('You can only edit attendance for employees in your region', 'error');
+      return;
+    }
+
+    if (selectedMonth !== systemMonth) {
+      showNotification('Attendance can only be edited for the current month.', 'error');
+      return;
+    }
+
+    const currentIndex = statusCycle.indexOf(currentStatus);
+    const nextIndex = (currentIndex + 1) % statusCycle.length;
+    const nextStatus = statusCycle[nextIndex];
+
+    // Restore fast manual entry (the whole point of this change): a
+    // reason is required by the database ONLY when this click would
+    // override an existing, officially persisted AUTOMATIC decision
+    // (attendance_correct enforces this authoritatively -- this check
+    // here only decides whether to show the dialog at all, never
+    // whether the write is actually allowed). Every other case --
+    // blank, or an existing MANUAL record -- commits immediately with
+    // no dialog, no reason, same one-click interaction as before PR
+    // #63's mandatory-reason change.
+    if (currentSource === 'automatic') {
+      setReasonPrompt({
+        employeeId, date, currentStatus, nextStatus,
+        employeeName: employee?.full_name || 'this employee',
+      });
+      return;
+    }
+
+    commitAttendanceUpdate(employeeId, date, currentStatus, currentSource, nextStatus, null);
+  }, [canModifyAttendance, employees, userProfile, selectedMonth, systemMonth, commitAttendanceUpdate]);
+
+  const confirmReasonAndUpdate = useCallback((reason: string) => {
+    if (!reasonPrompt) return;
+    const { employeeId, date, currentStatus, nextStatus } = reasonPrompt;
+    setReasonPrompt(null);
+    // reasonPrompt is only ever set when currentSource === 'automatic'
+    // (see updateAttendance above) -- the dialog that led here only
+    // opens for that one case, so it is safe to pass it through literally.
+    commitAttendanceUpdate(employeeId, date, currentStatus, 'automatic', nextStatus, reason);
+  }, [reasonPrompt, commitAttendanceUpdate]);
 
   // ===== DEBOUNCED UPDATE (per cell) =====
   // A single shared debounce instance (as this used to be, memoized on
@@ -992,13 +1025,13 @@ function MonthlyRegisterTab() {
     updateAttendanceRef.current = updateAttendance;
   }, [updateAttendance]);
 
-  const debouncedUpdatesByKey = useRef<Map<string, (employeeId: string, date: string, currentStatus: string) => void>>(new Map());
+  const debouncedUpdatesByKey = useRef<Map<string, (employeeId: string, date: string, currentStatus: string, currentSource: string | null) => void>>(new Map());
 
   const getDebouncedUpdate = useCallback((updateKey: string) => {
     let fn = debouncedUpdatesByKey.current.get(updateKey);
     if (!fn) {
-      fn = debounce((employeeId: string, date: string, currentStatus: string) => {
-        updateAttendanceRef.current(employeeId, date, currentStatus);
+      fn = debounce((employeeId: string, date: string, currentStatus: string, currentSource: string | null) => {
+        updateAttendanceRef.current(employeeId, date, currentStatus, currentSource);
       }, 150);
       debouncedUpdatesByKey.current.set(updateKey, fn);
     }
@@ -1011,9 +1044,9 @@ function MonthlyRegisterTab() {
   // (previously O(employees x days x records)) gets slow fast. Both indexes
   // are built once per attendance fetch instead of per lookup.
   const attendanceByKey = useMemo(() => {
-    const map = new Map<string, string>();
+    const map = new Map<string, { status: string; source: string | null }>();
     attendance.forEach(record => {
-      map.set(`${record.employee_id}_${record.date}`, record.status);
+      map.set(`${record.employee_id}_${record.date}`, { status: record.status, source: record.source ?? null });
     });
     return map;
   }, [attendance]);
@@ -1033,7 +1066,16 @@ function MonthlyRegisterTab() {
 
   // ===== GET ATTENDANCE STATUS =====
   const getAttendanceStatus = useCallback((employeeId: string, date: string): string => {
-    return attendanceByKey.get(`${employeeId}_${date}`) || '-';
+    return attendanceByKey.get(`${employeeId}_${date}`)?.status || '-';
+  }, [attendanceByKey]);
+
+  // ===== GET ATTENDANCE SOURCE =====
+  // Restore fast manual entry: null means no record exists yet (blank) --
+  // the quick-click grid must treat that identically to an existing
+  // 'manual' record (fast path, no reason), and ONLY an existing
+  // 'automatic' record requires the reason dialog below.
+  const getAttendanceSource = useCallback((employeeId: string, date: string): string | null => {
+    return attendanceByKey.get(`${employeeId}_${date}`)?.source ?? null;
   }, [attendanceByKey]);
 
   // ===== GET EMPLOYEE STATS =====
@@ -1195,15 +1237,41 @@ function MonthlyRegisterTab() {
       // function call/transaction, so a single out-of-region employee
       // would abort every other employee's copy along with it; separate
       // RPC calls let the rest continue and succeed independently.
+      //
+      // PR #69 final safety review: a target date that already holds an
+      // existing AUTOMATIC decision is never silently overridden here.
+      // attendance_correct requires a genuine, meaningful reason for that
+      // case -- and an auto-generated "Copied from <month>" note is NOT
+      // one; it is boilerplate, not a human's actual justification for
+      // overriding a fingerprint-backed result, and would defeat the
+      // entire point of the reason requirement if accepted as one. This
+      // background loop has no per-row dialog to collect a real reason
+      // from a human, so it does the other option PR #69's review
+      // explicitly allows instead: SKIP that specific employee/date pair
+      // entirely (no RPC call, no write, no fabricated justification) and
+      // report it distinctly from an ordinary failure, so the operator
+      // knows exactly which records still need a manual, individually-
+      // justified correction via the grid.
       let succeeded = 0;
       const failures: { employee_id: string; date: string; message: string }[] = [];
+      const skippedProtected: { employee_id: string; date: string }[] = [];
       for (const record of newRecords) {
+        // attendanceByKey holds exactly the target month's already-fetched
+        // rows (this page's own `attendance` state for `selectedMonth`).
+        const existingTarget = attendanceByKey.get(`${record.employee_id}_${record.date}`);
+        if (existingTarget?.source === 'automatic') {
+          skippedProtected.push({ employee_id: record.employee_id, date: record.date });
+          continue;
+        }
         try {
+          // Every other target (blank, or already manual) needs no
+          // reason at all -- never inventing one the backend doesn't
+          // require.
           const { error } = await supabase.rpc('attendance_correct', {
             p_employee_id: record.employee_id,
             p_date: record.date,
             p_status: record.status,
-            p_reason: `Copied from ${getMonthLabel(sourceMonth)}`,
+            p_reason: null,
           });
           if (error) throw error;
           succeeded++;
@@ -1221,7 +1289,8 @@ function MonthlyRegisterTab() {
             sourceMonth: sourceMonth,
             targetMonth: selectedMonth,
             recordsCopied: succeeded,
-            recordsFailed: failures.length
+            recordsFailed: failures.length,
+            recordsSkippedProtected: skippedProtected.length
           },
           region_id: userProfile?.region_id
         });
@@ -1229,11 +1298,18 @@ function MonthlyRegisterTab() {
         await fetchData();
       }
 
-      if (failures.length === 0) {
+      const protectedSuffix = skippedProtected.length > 0
+        ? ` ${skippedProtected.length} record${skippedProtected.length === 1 ? '' : 's'} already has a fingerprint-based (automatic) result and was left unchanged -- correct ${skippedProtected.length === 1 ? 'it' : 'those'} individually in the grid with a real reason if an override is needed.`
+        : '';
+
+      if (failures.length === 0 && skippedProtected.length === 0) {
         showNotification(`Attendance data copied from ${getMonthLabel(sourceMonth)} to ${getMonthLabel(selectedMonth)}`, 'success');
         setShowCopyModal(false);
+      } else if (failures.length === 0) {
+        showNotification(`Copied ${succeeded} of ${newRecords.length} records.${protectedSuffix}`, 'info');
+        setShowCopyModal(false);
       } else if (succeeded > 0) {
-        showNotification(`Copied ${succeeded} of ${newRecords.length} records. ${failures.length} failed (${failures[0].message}) -- check permissions or region scope and retry for those employees.`, 'error');
+        showNotification(`Copied ${succeeded} of ${newRecords.length} records. ${failures.length} failed (${failures[0].message}) -- check permissions or region scope and retry for those employees.${protectedSuffix}`, 'error');
         setShowCopyModal(false);
       } else {
         showNotification(`Failed to copy data: ${failures[0].message}`, 'error');
@@ -1241,7 +1317,7 @@ function MonthlyRegisterTab() {
     } else {
       showNotification('No attendance data found in the source month.', 'error');
     }
-  }, [selectedMonth, userProfile, getDatesForMonth, fetchData]);
+  }, [selectedMonth, userProfile, getDatesForMonth, fetchData, attendanceByKey]);
 
 
   // ===== RENDER =====
@@ -1452,13 +1528,14 @@ function MonthlyRegisterTab() {
                     <TD className="hidden md:table-cell text-xs">{emp.position}</TD>
                     {dates.map((date, i) => {
                       const status = getAttendanceStatus(emp.id, date);
+                      const source = getAttendanceSource(emp.id, date);
                       const updateKey = `${emp.id}-${date}`;
                       const isUpdating = updating[updateKey];
                       return (
-                        <td key={i} className="px-1 py-3 text-center" onClick={(e) => { 
-                          e.stopPropagation(); 
+                        <td key={i} className="px-1 py-3 text-center" onClick={(e) => {
+                          e.stopPropagation();
                           if (isEditable && !isUpdating) {
-                            getDebouncedUpdate(updateKey)(emp.id, date, status);
+                            getDebouncedUpdate(updateKey)(emp.id, date, status, source);
                           } else if (!isEditable) {
                             // Preserve the month-specific message only when
                             // the month is actually the reason -- otherwise
