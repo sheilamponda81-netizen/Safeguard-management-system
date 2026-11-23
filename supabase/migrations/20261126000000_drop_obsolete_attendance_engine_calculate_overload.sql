@@ -1,0 +1,65 @@
+-- ============================================================
+-- MIGRATION: Drop the obsolete 5-argument overload of
+-- attendance_engine_calculate left behind by the staleness-gate fix.
+-- Date: 2026-11-26
+-- ============================================================
+--
+-- CONFIRMED PRODUCTION INVESTIGATION (read-only, post-release safety
+-- check of 20261125000000_attendance_early_export_staleness_gate.sql):
+-- that migration used CREATE OR REPLACE FUNCTION to add a 6th
+-- parameter (p_as_of TIMESTAMPTZ DEFAULT NULL) to
+-- attendance_engine_calculate. PostgreSQL's CREATE OR REPLACE only
+-- replaces a function whose argument TYPE LIST matches exactly --
+-- adding a parameter changes the signature, so this created a NEW,
+-- separate 6-argument function alongside the ORIGINAL 5-argument one,
+-- which was never dropped and still contains the pre-fix early-export
+-- logic (unconditionally credits a check-in-only shift as provisional
+-- Present/Late, with no staleness check at all).
+--
+-- CONFIRMED FINDINGS:
+--   - Both overloads are EXECUTE-granted to `authenticated` (identical
+--     to each other -- the new migration never changed the 5-arg
+--     overload's own grants).
+--   - Zero dependents: pg_depend has no entry referencing the 5-arg
+--     function's oid; no view, materialized view, trigger, or RLS
+--     policy references attendance_engine_calculate at all (checked
+--     by text search across pg_views/pg_matviews/pg_policies/
+--     pg_trigger definitions); the pg_cron extension is not even
+--     installed. No Supabase Edge Function or application TypeScript
+--     code calls it via RPC (grepped for `.rpc('attendance_engine_
+--     calculate'` -- zero matches). The only SQL caller anywhere in
+--     the schema, attendance_resolve_and_calculate, calls it at BOTH
+--     its call sites with exactly 6 positional arguments (ending in
+--     clock_timestamp()) -- confirmed by reading its own source --
+--     so it has only ever invoked the new, fixed overload.
+--   - Genuine (if narrow) defect, confirmed empirically: calling
+--     attendance_engine_calculate with exactly 5 arguments -- the
+--     ONLY way to invoke the old overload at all, since it has no
+--     other signature -- raises
+--     "ERROR: function attendance_engine_calculate(...) is not
+--     unique ... Could not choose a best candidate function", because
+--     PostgreSQL cannot decide between the true 5-arg function and
+--     the 6-arg function's one default. This means the old overload
+--     is NOT actually reachable (any attempt errors out rather than
+--     silently running the pre-fix logic) -- so there is no live path
+--     by which the obsolete logic can affect an attendance decision or
+--     return an inconsistent calculation today. But it also means the
+--     6th migration's own stated guarantee ("omitting p_as_of
+--     reproduces the exact prior behavior") is NOT actually available
+--     to any caller supplying 5 arguments -- they get a hard error
+--     instead of graceful default-filling, which was the entire point
+--     of giving p_as_of a default in the first place.
+--
+-- THE FIX (smallest safe correction): drop the dead, obsolete 5-arg
+-- overload by its EXACT signature. This is safe because:
+--   - It has zero dependents (confirmed above) -- no CASCADE needed or
+--     used.
+--   - It removes the only thing causing the 5-argument-call ambiguity,
+--     making the 6-arg function's own DEFAULT NULL finally usable by
+--     any direct caller exactly as originally intended.
+--   - It does not touch, replace, or alter the working 6-argument
+--     attendance_engine_calculate, attendance_resolve_and_calculate,
+--     or any other function, table, or row in any way.
+-- ============================================================
+
+DROP FUNCTION attendance_engine_calculate(DATE, TEXT, TIMESTAMPTZ[], TEXT, TIMESTAMPTZ);
