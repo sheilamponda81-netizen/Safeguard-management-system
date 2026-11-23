@@ -111,30 +111,48 @@ describe('Monthly Register: individual manual edits are routed through attendanc
     expect(attendanceSource).not.toMatch(/p_new_basis\s*:/);
   });
 
-  it('Final Phase 2 release review: a reason is mandatory, database-enforced -- the grid opens an accessible AttendanceReasonModal (not window.prompt) before either the optimistic update or the RPC call, and updateAttendance itself never touches attendance/UI state directly', () => {
+  it('Restore fast manual entry: updateAttendance opens the AttendanceReasonModal ONLY when the cell\'s current persisted source is \'automatic\' -- every other case (blank or existing manual) commits immediately with no dialog at all', () => {
     const updateAttendanceBody = attendanceSource.slice(
       attendanceSource.indexOf('const updateAttendance = useCallback'),
       attendanceSource.indexOf('const confirmReasonAndUpdate = useCallback')
     );
     expect(updateAttendanceBody).not.toMatch(/window\.prompt/);
-    expect(updateAttendanceBody).toMatch(/setReasonPrompt\(\{/);
+    expect(updateAttendanceBody).toMatch(/if \(currentSource === 'automatic'\) \{\s*setReasonPrompt\(\{/);
+    // The fast path: falls through to a direct commit with no reason once
+    // the automatic-override branch above has already `return`ed.
+    expect(updateAttendanceBody).toMatch(/commitAttendanceUpdate\(employeeId, date, currentStatus, currentSource, nextStatus, null\);/);
+    // updateAttendance itself still never touches attendance/UI state
+    // directly -- both branches delegate to commitAttendanceUpdate.
     expect(updateAttendanceBody).not.toMatch(/setAttendance\(/);
     expect(updateAttendanceBody).not.toMatch(/updateQueue\.current\.set/);
   });
 
-  it('AttendanceReasonModal is rendered gated on reasonPrompt, and a cancelled dialog (onClose) never reaches confirmReasonAndUpdate', () => {
+  it('commitAttendanceUpdate is the single shared path for both the fast no-reason commit and the reason-modal confirm commit -- the optimistic update, queueing and audit logging exist in exactly one place, not duplicated per branch', () => {
+    const commitBody = attendanceSource.slice(
+      attendanceSource.indexOf('const commitAttendanceUpdate = useCallback'),
+      attendanceSource.indexOf('const updateAttendance = useCallback')
+    );
+    expect(commitBody).toMatch(/setAttendance\(/);
+    expect(commitBody).toMatch(/updateQueue\.current\.set\(updateKey, \{ employeeId, date, status: nextStatus, previousStatus: currentStatus, previousSource: currentSource, reason \}\)/);
+    // The optimistic guess is always source: 'manual' -- the only value a
+    // successful write (through either branch) can ever actually produce.
+    expect(commitBody).toMatch(/status: nextStatus, source: 'manual'/);
+  });
+
+  it('AttendanceReasonModal is rendered gated on reasonPrompt, and a cancelled dialog (onClose) never reaches confirmReasonAndUpdate/commitAttendanceUpdate -- Cancel leaves attendance unchanged', () => {
     expect(attendanceSource).toMatch(/import \{ AttendanceReasonModal \} from '\.\.\/components\/AttendanceReasonModal';/);
     expect(attendanceSource).toMatch(/<AttendanceReasonModal\s*\n\s*open=\{reasonPrompt !== null\}\s*\n\s*onClose=\{\(\) => setReasonPrompt\(null\)\}\s*\n\s*onConfirm=\{confirmReasonAndUpdate\}/);
   });
 
-  it('confirmReasonAndUpdate performs the optimistic update and queues the already-confirmed reason only after a reasonPrompt exists, and clears it immediately so a second confirm cannot double-fire', () => {
+  it('confirmReasonAndUpdate commits via commitAttendanceUpdate only after a reasonPrompt exists, and clears it immediately so a second confirm cannot double-fire', () => {
     const confirmBody = attendanceSource.slice(
       attendanceSource.indexOf('const confirmReasonAndUpdate = useCallback'),
-      attendanceSource.indexOf('}, [reasonPrompt, employees, userProfile, selectedMonth, updating, processUpdateQueue]);')
+      attendanceSource.indexOf('}, [reasonPrompt, commitAttendanceUpdate]);')
     );
     expect(confirmBody).toMatch(/if \(!reasonPrompt\) return;/);
     expect(confirmBody).toMatch(/setReasonPrompt\(null\);/);
-    expect(confirmBody.indexOf('setReasonPrompt(null);')).toBeLessThan(confirmBody.indexOf('setAttendance('));
+    expect(confirmBody).toMatch(/commitAttendanceUpdate\(employeeId, date, currentStatus, 'automatic', nextStatus, reason\);/);
+    expect(confirmBody.indexOf('setReasonPrompt(null);')).toBeLessThan(confirmBody.indexOf('commitAttendanceUpdate('));
   });
 
   it('no longer writes directly to the attendance table from the grid edit path', () => {
@@ -149,26 +167,32 @@ describe('Monthly Register: individual manual edits are routed through attendanc
     expect(attendanceSource).toMatch(/Failed to save attendance: \$\{getErrorMessage\(err\)\}/);
   });
 
-  it('reverts the optimistic UI status back to previousStatus when the RPC call fails', () => {
+  it('reverts the optimistic UI status AND source back to their previous values when the RPC call fails -- a reverted automatic-sourced cell must not wrongly skip the reason dialog on the very next click', () => {
     const processSingleUpdateBody = attendanceSource.slice(
       attendanceSource.indexOf('const processSingleUpdate ='),
       attendanceSource.indexOf('// ===== PROCESS UPDATE QUEUE =====')
     );
-    expect(processSingleUpdateBody).toMatch(/reverted\[existingIndex\] = \{ \.\.\.reverted\[existingIndex\], status: previousStatus \}/);
+    expect(processSingleUpdateBody).toMatch(/reverted\[existingIndex\] = \{ \.\.\.reverted\[existingIndex\], status: previousStatus, source: previousSource \}/);
   });
 
-  it('threads previousStatus AND the now-mandatory, already-confirmed reason from confirmReasonAndUpdate through the queue into processSingleUpdate', () => {
+  it('threads previousStatus, previousSource AND the (possibly null) reason from commitAttendanceUpdate through the queue into processSingleUpdate', () => {
     expect(attendanceSource).toMatch(
-      /updateQueue\.current\.set\(updateKey, \{ employeeId, date, status: nextStatus, previousStatus: currentStatus, reason \}\)/
+      /updateQueue\.current\.set\(updateKey, \{ employeeId, date, status: nextStatus, previousStatus: currentStatus, previousSource: currentSource, reason \}\)/
     );
     expect(attendanceSource).toMatch(
-      /await processSingleUpdate\(update\.employeeId, update\.date, update\.status, update\.previousStatus, update\.reason\)/
+      /await processSingleUpdate\(update\.employeeId, update\.date, update\.status, update\.previousStatus, update\.previousSource, update\.reason\)/
     );
   });
 
   it('surfaces a distinct reconciliation notice for an approved vs. already-processed payroll month', () => {
     expect(attendanceSource).toMatch(/already approved -- flagged for reconciliation review/);
     expect(attendanceSource).toMatch(/already been processed -- flagged for reconciliation review/);
+  });
+
+  it('getAttendanceSource reads the same per-cell lookup index as getAttendanceStatus, and the grid cell click passes it through to the debounced update', () => {
+    expect(attendanceSource).toMatch(/const getAttendanceSource = useCallback\(\(employeeId: string, date: string\): string \| null => \{\s*return attendanceByKey\.get\(`\$\{employeeId\}_\$\{date\}`\)\?\.source \?\? null;/);
+    expect(attendanceSource).toMatch(/const source = getAttendanceSource\(emp\.id, date\);/);
+    expect(attendanceSource).toMatch(/getDebouncedUpdate\(updateKey\)\(emp\.id, date, status, source\);/);
   });
 });
 
@@ -203,5 +227,11 @@ describe('Monthly Register: "Copy from previous month" is routed through attenda
 
   it('never claims automatic source for a copied record (manual precedence is preserved -- attendance_correct has no source parameter at all)', () => {
     expect(copyFromPreviousMonthBody).not.toMatch(/p_source\s*:/);
+  });
+
+  it('Restore fast manual entry: only passes the auto-generated "Copied from <month>" reason when the TARGET date already holds an automatic decision -- every other copied record passes p_reason: null rather than inventing a reason the backend no longer requires', () => {
+    expect(copyFromPreviousMonthBody).toMatch(/const existingTarget = attendanceByKey\.get\(`\$\{record\.employee_id\}_\$\{record\.date\}`\);/);
+    expect(copyFromPreviousMonthBody).toMatch(/const overridesAutomatic = existingTarget\?\.source === 'automatic';/);
+    expect(copyFromPreviousMonthBody).toMatch(/p_reason: overridesAutomatic \? `Copied from \$\{getMonthLabel\(sourceMonth\)\}` : null,/);
   });
 });

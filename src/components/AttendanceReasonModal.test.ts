@@ -38,4 +38,9 @@ describe('AttendanceReasonModal', () => {
   it('labels the reason field via Input\'s own label prop (not a bare placeholder), so it has a real accessible name', () => {
     expect(source).toMatch(/label="Reason"/);
   });
+
+  it('Restore fast manual entry: explains that the PREVIOUS status was automatically calculated, since this dialog now only ever opens to override an automatic decision (never for an ordinary manual-to-manual change)', () => {
+    expect(source).toMatch(/was automatically calculated as/);
+    expect(source).toMatch(/Overriding it to/);
+  });
 });
