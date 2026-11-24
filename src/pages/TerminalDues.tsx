@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList, Banknote, History, AlertTriangle, TrendingUp, UserMinus, Users } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, EmptyState } from '../components/ui';
-import { TerminalDuesCalculatorTab, TerminalDuesSubmittedTab } from './TerminalDuesCalculator';
+import { TerminalDuesCalculatorTab, TerminalDuesSubmittedTab, PrepareSettlementRequest } from './TerminalDuesCalculator';
 import { TerminalDuesAllocationsTab } from './TerminalDuesAllocations';
 import { TerminalDuesPaymentHistoryTab } from './TerminalDuesPaymentHistory';
 import { TerminalDuesExitsTab } from './TerminalDuesExits';
@@ -209,7 +209,30 @@ export function TerminalDuesPage() {
   // linked terminal_dues row's own live status -- never a self-reported
   // "Settled" state.
   const [activeTab, setActiveTab] = useState<'records' | 'calculator' | 'submitted' | 'allocations' | 'history' | 'leave' | 'exits' | 'batches'>('records');
-  
+
+  // Phase 3: batch-to-calculator integration. Both tabs below are mounted
+  // conditionally (unmounted/remounted on every tab switch), so this parent
+  // is the only place that can carry a selection across that boundary --
+  // each is a one-shot signal, consumed and cleared the moment the
+  // receiving tab acts on it, so it never re-fires or overrides a later
+  // manual selection in either tab.
+  const [prepareSettlementRequest, setPrepareSettlementRequest] = useState<PrepareSettlementRequest | null>(null);
+  const [focusBatchId, setFocusBatchId] = useState<string | null>(null);
+
+  const handlePrepareSettlement = useCallback((employeeId: string, batchId: string, batchName: string) => {
+    if (!canCreateTerminalDue && !canEditTerminalDue) {
+      showNotification('You do not have permission to prepare a Terminal Dues settlement', 'error');
+      return;
+    }
+    setPrepareSettlementRequest({ employeeId, batchId, batchName });
+    setActiveTab('calculator');
+  }, [canCreateTerminalDue, canEditTerminalDue]);
+
+  const handleReturnToBatch = useCallback((batchId: string) => {
+    setFocusBatchId(batchId);
+    setActiveTab('batches');
+  }, []);
+
   // ===== PAGINATION STATES =====
   const [duesPage, setDuesPage] = useState(1);
   const [duesItemsPerPage, setDuesItemsPerPage] = useState(20);
@@ -935,6 +958,9 @@ export function TerminalDuesPage() {
           }))}
           canCreate={canCreateTerminalDue}
           canEdit={canEditTerminalDue}
+          prepareSettlementRequest={prepareSettlementRequest}
+          onPrepareSettlementRequestConsumed={() => setPrepareSettlementRequest(null)}
+          onReturnToBatch={handleReturnToBatch}
         />
       )}
 
@@ -962,6 +988,9 @@ export function TerminalDuesPage() {
           }))}
           canCreate={canCreateTerminalDue}
           canEdit={canEditTerminalDue}
+          onPrepareSettlement={handlePrepareSettlement}
+          focusBatchId={focusBatchId}
+          onFocusBatchIdConsumed={() => setFocusBatchId(null)}
         />
       )}
 

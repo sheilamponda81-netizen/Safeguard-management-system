@@ -12,7 +12,7 @@
 // every one of those stays the separate, explicitly-authorized action
 // it already was.
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Users, Plus, X, Search, ArrowRightCircle, Lock, AlertTriangle } from '../utils/icons';
+import { Users, Plus, X, Search, ArrowRightCircle, Lock, AlertTriangle, Calculator } from '../utils/icons';
 import { Card, Button, Badge, EmptyState, Modal } from '../components/ui';
 import { formatKwacha } from '../data';
 import { supabase } from '../lib/supabase';
@@ -72,10 +72,25 @@ export function TerminalDuesBatchesTab({
   employees,
   canCreate,
   canEdit,
+  onPrepareSettlement,
+  focusBatchId,
+  onFocusBatchIdConsumed,
 }: {
   employees: BatchEmployeeOption[];
   canCreate: boolean;
   canEdit: boolean;
+  /** Phase 3: batch-to-calculator integration. Opens the existing Calculator
+   * tab preselected for this employee, carrying this batch's id/name along
+   * so a newly saved draft gets linked to it via the existing, reviewed
+   * link_calculation_to_batch RPC. Never finalizes anything itself -- purely
+   * a navigation handoff. Omitted entirely (no button rendered) if the
+   * caller doesn't wire it up. */
+  onPrepareSettlement?: (employeeId: string, batchId: string, batchName: string) => void;
+  /** One-shot signal from the Calculator tab's "Return to Batch" action:
+   * when set, re-selects and refreshes this batch, then is cleared via
+   * onFocusBatchIdConsumed so it doesn't override a later manual selection. */
+  focusBatchId?: string | null;
+  onFocusBatchIdConsumed?: () => void;
 }) {
   const [batches, setBatches] = useState<Batch[]>([]);
   const [loading, setLoading] = useState(true);
@@ -126,6 +141,17 @@ export function TerminalDuesBatchesTab({
   useEffect(() => {
     fetchBatches();
   }, [fetchBatches]);
+
+  // Returning from the Calculator tab via "Return to Batch" -- a one-shot
+  // signal (consumed immediately) that re-selects this batch. The existing
+  // selectedBatchId effect below already (re-)fetches its detail, so this
+  // never needs its own fetch and never overrides a later manual selection.
+  useEffect(() => {
+    if (focusBatchId) {
+      setSelectedBatchId(focusBatchId);
+      onFocusBatchIdConsumed?.();
+    }
+  }, [focusBatchId, onFocusBatchIdConsumed]);
 
   const selectedBatch = useMemo(() => batches.find(b => b.id === selectedBatchId) || null, [batches, selectedBatchId]);
 
@@ -425,11 +451,26 @@ export function TerminalDuesBatchesTab({
                               )}
                             </div>
                           </div>
-                          {selectedBatch.status === 'active' && canEdit && (
-                            <Button variant="outline" size="sm" onClick={() => setRemoveTarget(m.employee_id)}>
-                              <X size={14} />
-                            </Button>
-                          )}
+                          <div className="flex items-center gap-1">
+                            {/* Only offered while there's no confirmed entitlement yet (due is
+                                undefined) -- once submitted, that settlement's own status lives in
+                                the Submitted/Records tabs, not here. A draft is fine (safe
+                                re-entry below reopens it instead of creating a duplicate). */}
+                            {selectedBatch.status === 'active' && canEdit && !due && onPrepareSettlement && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => onPrepareSettlement(m.employee_id, selectedBatch.id, selectedBatch.name)}
+                              >
+                                <Calculator size={14} className="mr-1" /> {draft ? 'Review Draft' : 'Prepare Settlement'}
+                              </Button>
+                            )}
+                            {selectedBatch.status === 'active' && canEdit && (
+                              <Button variant="outline" size="sm" onClick={() => setRemoveTarget(m.employee_id)}>
+                                <X size={14} />
+                              </Button>
+                            )}
+                          </div>
                         </div>
                       );
                     })}
