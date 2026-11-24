@@ -107,7 +107,7 @@ describe.skipIf(!dbAvailable && !dbRequired)('resolve_staff_names + attendance_s
   });
 
   it('resolve_staff_names never returns a profile from a different tenant to a non-super-admin caller', () => {
-    const fixtureA = createFixture('Resolve Tenant A', { role: 'hr_manager', permissions: ['attendance.view'] });
+    const fixtureA = createFixture('Resolve Tenant A', { role: 'hr_manager', permissions: ['attendance.map_hikcentral_persons'] });
     const fixtureB = createFixture('Resolve Tenant B');
     const otherUserId = randomUUID();
     exec(`INSERT INTO auth.users (id) VALUES ('${otherUserId}')`);
@@ -118,7 +118,34 @@ describe.skipIf(!dbAvailable && !dbRequired)('resolve_staff_names + attendance_s
     expect(rows).toEqual([]);
   });
 
-  it('resolve_staff_names requires attendance.view (or super admin) -- a caller without it is rejected', () => {
+  // RELEASE SAFETY FIX (post-review): resolve_staff_names must be
+  // gated on attendance.map_hikcentral_persons -- the SAME permission
+  // the Evidence Centre page itself requires to open at all
+  // (AttendanceEvidenceCentre.tsx's canView check) -- not
+  // attendance.view, which this RPC's first draft copied from the
+  // separate, unrelated attendance_site_absence_alerts_list function.
+  // In production these two permissions are granted to two
+  // non-overlapping roles (hr_manager and operations_manager), so this
+  // is the exact difference between the feature working for its real
+  // intended user and silently failing for them.
+  it('resolve_staff_names succeeds for an hr_manager-role caller (attendance.map_hikcentral_persons, same permission that opens the Evidence Centre page)', () => {
+    const fixture = createFixture('Resolve HR Manager', { role: 'hr_manager', permissions: ['attendance.map_hikcentral_persons'] });
+    const otherUserId = randomUUID();
+    exec(`INSERT INTO auth.users (id) VALUES ('${otherUserId}')`);
+    exec(`INSERT INTO profiles (id, tenant_id, is_super_admin, is_active, full_name) VALUES ('${otherUserId}', '${fixture.tenantId}', false, true, 'Jane HR Manager Colleague')`);
+
+    exec(`SELECT set_caller('${fixture.callerId}')`);
+    const rows = queryRows(`SELECT user_id, full_name FROM resolve_staff_names(ARRAY['${otherUserId}']::uuid[])`);
+    expect(rows).toEqual([[otherUserId, 'Jane HR Manager Colleague']]);
+  });
+
+  it('resolve_staff_names rejects an operations_manager-role caller who holds ONLY attendance.view -- confirms the gate no longer matches the unrelated alerts-list permission', () => {
+    const fixture = createFixture('Resolve Operations Manager Only', { role: 'operations_manager', permissions: ['attendance.view'] });
+    const stderr = execExpectError(`SELECT * FROM resolve_staff_names(ARRAY['${fixture.callerId}']::uuid[])`);
+    expect(stderr).toMatch(/not authorized/i);
+  });
+
+  it('resolve_staff_names requires attendance.map_hikcentral_persons (or super admin) -- a caller with no permission at all is rejected', () => {
     const fixture = createFixture('Resolve No Permission', { role: 'guard', permissions: [] });
     const stderr = execExpectError(`SELECT * FROM resolve_staff_names(ARRAY['${fixture.callerId}']::uuid[])`);
     expect(stderr).toMatch(/not authorized/i);

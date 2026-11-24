@@ -250,9 +250,30 @@ GRANT EXECUTE ON FUNCTION attendance_engine_calculate(DATE, TEXT, TIMESTAMPTZ[],
 -- ------------------------------------------------------------
 -- PART 2A: raise the site-level cluster alert threshold from "5 or
 -- more" to "6 or more" (the user's own rule: "more than five").
+--
+-- RELEASE SAFETY FIX (post-review): production already holds 73
+-- historical attendance_site_absence_alerts rows with
+-- absent_count_at_creation = 5 (25 of them still 'open'), all valid
+-- under the OLD ">= 5" constraint this replaces. A plain ADD
+-- CONSTRAINT validates every existing row by default and would abort
+-- this migration part-way through on first production apply --
+-- reproduced and confirmed directly against a disposable Postgres
+-- seeded with the same precondition. NOT VALID makes Postgres skip
+-- that historical validation scan entirely: the constraint still
+-- applies in full to every INSERT and every UPDATE of this column
+-- from this point forward (confirmed: a new row with
+-- absent_count_at_creation = 5 is still rejected), it just never
+-- retroactively re-checks rows that already exist. No historical
+-- alert is read, closed, or rewritten by this statement -- NOT VALID
+-- is pure DDL metadata, not a data scan. Deliberately NOT followed by
+-- VALIDATE CONSTRAINT: that would perform the exact full-table
+-- historical scan being avoided here, and is explicitly out of scope
+-- for this release (see the business rationale above -- those 73 rows
+-- predate the "six or more" rule entirely and are not being
+-- reconciled as part of it).
 -- ------------------------------------------------------------
 ALTER TABLE attendance_site_absence_alerts DROP CONSTRAINT IF EXISTS attendance_site_absence_alerts_absent_count_at_creation_check;
-ALTER TABLE attendance_site_absence_alerts ADD CONSTRAINT attendance_site_absence_alerts_absent_count_at_creation_check CHECK (absent_count_at_creation >= 6);
+ALTER TABLE attendance_site_absence_alerts ADD CONSTRAINT attendance_site_absence_alerts_absent_count_at_creation_check CHECK (absent_count_at_creation >= 6) NOT VALID;
 
 -- ------------------------------------------------------------
 -- PART 2B: trigger function -- threshold 6, and scoped to
@@ -430,20 +451,37 @@ GRANT EXECUTE ON FUNCTION attendance_site_absence_alerts_list(TEXT) TO authentic
 -- for the pattern -- the Evidence Centre panel and AuditLogs.tsx both
 -- show the raw id or nothing). profiles' own RLS ("Users can view own
 -- profile or, as Admin, their tenant's") would make a plain client-side
--- select return NOTHING for most functional roles (e.g. an ordinary HR
--- manager) looking up a DIFFERENT user's name, even though that HR
--- manager already has attendance.view and is entitled to know who made
--- an attendance change they are already authorized to review in full.
--- This narrow, read-only, SECURITY DEFINER RPC closes exactly that gap:
--- it returns ONLY id + full_name (never any other profile column, e.g.
--- never role, email, region) for the requested ids, gated behind the
--- SAME permission (attendance.view) the Evidence Centre itself already
--- requires, and only within the caller's own tenant (a super admin may
--- cross tenants, same convention as every other RPC in this file). A
--- requested id with no matching profile in scope is simply absent from
--- the result -- the caller (not this function) decides the "identity
--- unavailable" wording, since that is a presentation choice, not a
--- data-access one.
+-- select return NOTHING for most functional roles looking up a
+-- DIFFERENT user's name. This narrow, read-only, SECURITY DEFINER RPC
+-- closes exactly that gap: it returns ONLY id + full_name (never any
+-- other profile column, e.g. never role, email, region) for the
+-- requested ids, and only within the caller's own tenant (a super
+-- admin may cross tenants, same convention as every other RPC in this
+-- file). A requested id with no matching profile in scope is simply
+-- absent from the result -- the caller (not this function) decides
+-- the "identity unavailable" wording, since that is a presentation
+-- choice, not a data-access one.
+--
+-- RELEASE SAFETY FIX (post-review): this RPC exists to serve ONE
+-- caller -- the Evidence Centre panel -- which gates its own page
+-- access on attendance.map_hikcentral_persons
+-- (AttendanceEvidenceCentre.tsx / Attendance.tsx's canReview check),
+-- NOT attendance.view. The first draft of this function gated on
+-- attendance.view instead, copying attendance_site_absence_alerts_
+-- list's own (separate, pre-existing, unrelated) permission rather
+-- than matching the page that actually calls it. In production,
+-- attendance.map_hikcentral_persons and attendance.view are granted to
+-- two non-overlapping roles (hr_manager and operations_manager
+-- respectively) -- so an HR Manager who can open the Evidence Centre
+-- page at all would have been unable to resolve any actor's name on
+-- it, defeating this feature's entire purpose for its real intended
+-- user. Gating on attendance.map_hikcentral_persons instead aligns
+-- this RPC with the page's own access model exactly -- no caller who
+-- could not already open the Evidence Centre gains anything new, and
+-- no caller who could open it loses anything. attendance_site_
+-- absence_alerts_list's own gate is untouched -- it is a separate,
+-- pre-existing function with its own separate caller (the Alerts tab)
+-- and is out of scope for this fix.
 -- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION resolve_staff_names(p_user_ids UUID[])
 RETURNS TABLE (user_id UUID, full_name TEXT)
@@ -460,7 +498,7 @@ BEGIN
   SELECT tenant_id, is_super_admin, is_active INTO v_tenant_id, v_is_super_admin, v_is_active FROM profiles WHERE profiles.id = v_caller_id;
   IF v_tenant_id IS NULL THEN RAISE EXCEPTION 'No profile found'; END IF;
   IF COALESCE(v_is_active, false) = false THEN RAISE EXCEPTION 'Your account is disabled'; END IF;
-  IF NOT (v_is_super_admin OR has_permission('attendance.view')) THEN
+  IF NOT (v_is_super_admin OR has_permission('attendance.map_hikcentral_persons')) THEN
     RAISE EXCEPTION 'Not authorized to view attendance' USING ERRCODE = '42501';
   END IF;
 
