@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Calculator, Search, CheckCircle, Wallet, RotateCcw, Eye, Edit2, Save, ChevronDown, ClipboardList, Banknote, History, AlertTriangle, TrendingUp, UserMinus, Users } from '../utils/icons';
 import { Card, Button, Badge, PageHeader, THead, TBody, TR, TH, TD, Modal, Tabs, EmptyState } from '../components/ui';
 import { TerminalDuesCalculatorTab, TerminalDuesSubmittedTab, PrepareSettlementRequest } from './TerminalDuesCalculator';
+import { UniformRefundBreakdownRowResult } from '../utils/terminalDuesEngine';
 import { TerminalDuesAllocationsTab } from './TerminalDuesAllocations';
 import { TerminalDuesPaymentHistoryTab } from './TerminalDuesPaymentHistory';
 import { TerminalDuesExitsTab } from './TerminalDuesExits';
@@ -150,6 +151,47 @@ const getInitialFormData = () => ({
   uniform_refund: 0,
   other_benefits: 0
 });
+
+// Shows the itemised uniform refund breakdown behind a terminal_dues row's
+// flat uniform_refund total, for an approver reviewing an entitlement that
+// came through the modern Calculator workflow (terminal_due_calculations is
+// linked by submitted_terminal_due_id). Renders nothing for a legacy
+// Records "New Calculation" entitlement (no linked calculation row) or one
+// with no breakdown rows -- the flat total above already covers those.
+function LinkedUniformRefundBreakdown({ terminalDueId }: { terminalDueId: string }) {
+  const [rows, setRows] = useState<UniformRefundBreakdownRowResult[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRows(null);
+    (async () => {
+      const { data, error } = await supabase
+        .from('terminal_due_calculations')
+        .select('breakdown')
+        .eq('submitted_terminal_due_id', terminalDueId)
+        .maybeSingle();
+      if (cancelled || error || !data?.breakdown) return;
+      const breakdownRows = (data.breakdown as { uniformRefundBreakdown?: UniformRefundBreakdownRowResult[] }).uniformRefundBreakdown;
+      if (Array.isArray(breakdownRows) && breakdownRows.length > 0) setRows(breakdownRows);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [terminalDueId]);
+
+  if (!rows || rows.length === 0) return null;
+
+  return (
+    <div className="ml-4 -mt-1 mb-1 space-y-0.5">
+      {rows.map((row, i) => (
+        <div key={i} className="flex justify-between text-xs text-slate-400">
+          <span>{row.months} month{row.months === 1 ? '' : 's'} x {formatKwacha(row.amountPerMonth)}</span>
+          <span>{formatKwacha(row.subtotal)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export function TerminalDuesPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
@@ -1622,6 +1664,7 @@ export function TerminalDuesPage() {
                   <span className="text-slate-600">Uniform Refund</span>
                   <span className="font-medium">{formatKwacha(showDetailModal.uniform_refund)}</span>
                 </div>
+                <LinkedUniformRefundBreakdown terminalDueId={showDetailModal.id} />
                 {showDetailModal.other_benefits > 0 && (
                   <div className="flex justify-between border-b pb-2">
                     <span className="text-slate-600">Other Benefits</span>

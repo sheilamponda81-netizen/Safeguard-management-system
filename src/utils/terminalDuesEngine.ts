@@ -117,40 +117,64 @@ export function calculateAnnualLeaveRefund(unusedLeaveDays: number, finalSalary:
 // Uniform refund
 // ---------------------------------------------------------------------------
 
-/** Fallback rate used only when no approved `terminal_dues_uniform_refund_rate`
- * system setting exists yet (see TerminalDuesCalculator.tsx) -- keeps every
- * existing caller/test that omits `ratePerMonth` behaving exactly as before. */
-export const DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH = 10000;
-
 /**
- * Uniform refund = eligible deduction months x the CURRENT approved monthly
- * rate -- confirmed business policy: the current rate applies to every
- * eligible month, including months whose historical deduction rate was
- * different. Historical payroll amounts are evidence of HOW MANY months a
- * deduction occurred, never of what rate to refund at; this function
- * deliberately has no parameter for a historical rate.
+ * One HR-entered row of the uniform refund breakdown: a count of qualifying
+ * months and the deduction/refund amount that applied per month for those
+ * months, taken from HR's own paper records. Historical uniform deductions
+ * varied month to month, so a single blended rate across every month is
+ * wrong (e.g. 4 months @ 5,000 + 2 months @ 8,000 + 4 months @ 10,000 =
+ * 76,000 -- a single rate x 10 months would misstate this); each row covers
+ * one historical rate, never a blend.
  */
-export function calculateUniformRefund(
-  deductionMonths: number,
-  ratePerMonth: number = DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH
-): number {
-  if (!(deductionMonths > 0)) return 0;
-  return roundUpToWholeKwacha(deductionMonths * ratePerMonth);
+export interface UniformRefundBreakdownRowInput {
+  months: number;
+  amountPerMonth: number;
+}
+
+export interface UniformRefundBreakdownRowResult extends UniformRefundBreakdownRowInput {
+  /** roundUpToWholeKwacha(months * amountPerMonth), or 0 for an invalid row. */
+  subtotal: number;
 }
 
 /**
- * Whether an HR-entered uniform deduction month count needs a documented
- * correction reason: true only when reliable payroll evidence exists AND
- * the entered count disagrees with it. A fully historical case (no payroll
- * evidence at all, payrollEvidenceMonths === null) never needs one -- HR's
- * entered count IS the record in that case, per business rule.
+ * A row is valid only when months is a positive whole number (a row covers
+ * one or more whole qualifying months) and amountPerMonth is a positive,
+ * finite monetary amount. Negative, zero, fractional-month, NaN and
+ * Infinity values are all rejected -- there is no safe default for any of
+ * them once they directly drive a monetary total.
  */
-export function uniformRefundNeedsCorrectionReason(
-  payrollEvidenceMonths: number | null,
-  enteredMonths: number
-): boolean {
-  if (payrollEvidenceMonths == null) return false;
-  return enteredMonths !== payrollEvidenceMonths;
+export function isValidUniformRefundBreakdownRow(row: UniformRefundBreakdownRowInput): boolean {
+  return (
+    Number.isFinite(row.months) &&
+    Number.isInteger(row.months) &&
+    row.months > 0 &&
+    Number.isFinite(row.amountPerMonth) &&
+    row.amountPerMonth > 0
+  );
+}
+
+/**
+ * Uniform refund = the sum of (months x amountPerMonth) across every
+ * HR-entered breakdown row, each row rounded up independently before being
+ * summed -- replaces the old single fixed-rate x total-months formula, so a
+ * refund spanning several different historical monthly deduction amounts is
+ * computed correctly. Mirrors calculateOutstandingSalaryEntries()'s shape
+ * exactly. `hasInvalidRows` is true if any row failed
+ * isValidUniformRefundBreakdownRow() -- the caller should treat that as a
+ * validation error rather than trust `total`, which excludes invalid rows'
+ * contribution entirely (never guesses a value for them).
+ */
+export function calculateUniformRefundBreakdown(
+  rows: UniformRefundBreakdownRowInput[]
+): { rows: UniformRefundBreakdownRowResult[]; total: number; hasInvalidRows: boolean } {
+  let hasInvalidRows = false;
+  const resolved = rows.map(row => {
+    const valid = isValidUniformRefundBreakdownRow(row);
+    if (!valid) hasInvalidRows = true;
+    return { ...row, subtotal: valid ? roundUpToWholeKwacha(row.months * row.amountPerMonth) : 0 };
+  });
+  const total = roundUpToWholeKwacha(resolved.reduce((sum, r) => sum + r.subtotal, 0));
+  return { rows: resolved, total, hasInvalidRows };
 }
 
 /**
@@ -273,11 +297,10 @@ export interface TerminalDuesCalculationInputs {
   /** Authorised, audited correction of the system-calculated completed months. */
   pensionMonthsOverride?: number | null;
   unusedLeaveDays?: number;
-  uniformDeductionMonths?: number;
-  /** The CURRENT approved monthly uniform refund rate, sourced from the
-   * `terminal_dues_uniform_refund_rate` system setting by the caller.
-   * Defaults to DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH when omitted. */
-  uniformRefundRatePerMonth?: number;
+  /** HR-entered rows, each a count of qualifying months and the
+   * deduction/refund amount that applied per month for those months,
+   * taken from HR's own paper records. See UniformRefundBreakdownRowInput. */
+  uniformRefundBreakdown?: UniformRefundBreakdownRowInput[];
   outstandingSalaryEntries?: OutstandingSalaryEntryInput[];
   noticeStatus: NoticeStatus;
   requiredNoticeDays?: number;
@@ -290,6 +313,8 @@ export interface TerminalDuesBreakdown {
   pensionArrears: number;
   annualLeaveRefund: number;
   uniformRefund: number;
+  /** Itemised rows behind `uniformRefund`, preserved for audit/approver display. */
+  uniformRefundBreakdown: UniformRefundBreakdownRowResult[];
   outstandingSalaryEntries: OutstandingSalaryEntryResult[];
   outstandingSalaryTotal: number;
   lessNoticeDeduction: number;
@@ -333,6 +358,11 @@ export function calculateTerminalDuesBreakdown(
     return { error: 'Final salary must be greater than zero.' };
   }
 
+  const uniformResult = calculateUniformRefundBreakdown(inputs.uniformRefundBreakdown ?? []);
+  if (uniformResult.hasInvalidRows) {
+    return { error: 'Every uniform refund breakdown row must have a whole number of months greater than zero and a positive amount per month.' };
+  }
+
   const pension = calculatePensionArrears(
     inputs.dateJoined,
     inputs.dateLeft,
@@ -340,10 +370,7 @@ export function calculateTerminalDuesBreakdown(
     inputs.pensionMonthsOverride
   );
   const annualLeaveRefund = calculateAnnualLeaveRefund(inputs.unusedLeaveDays ?? 0, inputs.finalSalary);
-  const uniformRefund = calculateUniformRefund(
-    inputs.uniformDeductionMonths ?? 0,
-    inputs.uniformRefundRatePerMonth ?? DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH
-  );
+  const uniformRefund = uniformResult.total;
   const { entries: outstandingSalaryEntries, total: outstandingSalaryTotal } = calculateOutstandingSalaryEntries(
     inputs.outstandingSalaryEntries ?? []
   );
@@ -368,6 +395,7 @@ export function calculateTerminalDuesBreakdown(
     pensionArrears: pension.amount,
     annualLeaveRefund,
     uniformRefund,
+    uniformRefundBreakdown: uniformResult.rows,
     outstandingSalaryEntries,
     outstandingSalaryTotal,
     lessNoticeDeduction,

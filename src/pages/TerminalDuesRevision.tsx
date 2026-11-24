@@ -26,9 +26,10 @@ import {
   calculateTerminalDuesBreakdown,
   isTerminalDuesValidationError,
   OutstandingSalaryEntryInput,
+  UniformRefundBreakdownRowInput,
   NoticeStatus,
 } from '../utils/terminalDuesEngine';
-import { BreakdownPreview, CalculationInputsSnapshot } from './TerminalDuesCalculator';
+import { BreakdownPreview, UniformRefundBreakdownEditor, CalculationInputsSnapshot } from './TerminalDuesCalculator';
 
 interface RevisionRow {
   id: string;
@@ -54,9 +55,8 @@ function emptyInputsFrom(entitlement: { date_joined: string; date_left: string; 
     pensionMonthsOverride: null,
     pensionMonthsOverrideReason: '',
     unusedLeaveDays: 0,
-    uniformDeductionMonths: 0,
-    uniformDeductionPayrollEvidenceMonths: null,
-    uniformDeductionCorrectionReason: '',
+    uniformRefundBreakdown: [],
+    uniformRefundNote: '',
     outstandingSalaryEntries: [],
     noticeStatus: 'on_time',
     requiredNoticeDays: 26,
@@ -142,7 +142,7 @@ export function EntitlementRevisionPanel({
       finalSalary: inputs.finalSalary,
       pensionMonthsOverride: inputs.pensionMonthsOverride,
       unusedLeaveDays: inputs.unusedLeaveDays,
-      uniformDeductionMonths: inputs.uniformDeductionMonths,
+      uniformRefundBreakdown: inputs.uniformRefundBreakdown,
       outstandingSalaryEntries: inputs.outstandingSalaryEntries,
       noticeStatus: inputs.noticeStatus,
       requiredNoticeDays: inputs.requiredNoticeDays,
@@ -155,6 +155,16 @@ export function EntitlementRevisionPanel({
     setInputs(seed);
     setReason('');
     setShowForm(true);
+  };
+
+  const addUniformRefundRow = () => {
+    setInputs(prev => prev && { ...prev, uniformRefundBreakdown: [...prev.uniformRefundBreakdown, { months: 1, amountPerMonth: 0 }] });
+  };
+  const updateUniformRefundRow = (index: number, patch: Partial<UniformRefundBreakdownRowInput>) => {
+    setInputs(prev => prev && { ...prev, uniformRefundBreakdown: prev.uniformRefundBreakdown.map((r, i) => (i === index ? { ...r, ...patch } : r)) });
+  };
+  const removeUniformRefundRow = (index: number) => {
+    setInputs(prev => prev && { ...prev, uniformRefundBreakdown: prev.uniformRefundBreakdown.filter((_, i) => i !== index) });
   };
 
   const addOutstandingEntry = () => {
@@ -316,11 +326,14 @@ export function EntitlementRevisionPanel({
                 <label className="block text-xs font-medium text-slate-500 mb-1">Unused Leave Days</label>
                 <input type="number" value={inputs.unusedLeaveDays} onChange={e => setInputs(prev => prev && { ...prev, unusedLeaveDays: Number(e.target.value) || 0 })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" />
               </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-500 mb-1">Uniform Deduction Months</label>
-                <input type="number" value={inputs.uniformDeductionMonths} onChange={e => setInputs(prev => prev && { ...prev, uniformDeductionMonths: Number(e.target.value) || 0 })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" />
-              </div>
             </div>
+
+            <UniformRefundBreakdownEditor
+              rows={inputs.uniformRefundBreakdown}
+              onAdd={addUniformRefundRow}
+              onUpdate={updateUniformRefundRow}
+              onRemove={removeUniformRefundRow}
+            />
 
             <div>
               <div className="flex items-center justify-between mb-2">
