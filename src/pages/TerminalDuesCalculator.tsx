@@ -190,14 +190,30 @@ function emptyInputs(): CalculationInputsSnapshot {
 // Calculator tab
 // ---------------------------------------------------------------------------
 
+export interface PrepareSettlementRequest {
+  employeeId: string;
+  batchId: string;
+  batchName: string;
+}
+
 export function TerminalDuesCalculatorTab({
   employees,
   canCreate,
   canEdit,
+  prepareSettlementRequest,
+  onPrepareSettlementRequestConsumed,
+  onReturnToBatch,
 }: {
   employees: ExistingEmployeeOption[];
   canCreate: boolean;
   canEdit: boolean;
+  /** Phase 3: batch-to-calculator integration -- set by the Batches tab's
+   * "Prepare Settlement" action. Consumed (and cleared via
+   * onPrepareSettlementRequestConsumed) the moment it's acted on, so it
+   * never re-fires on an unrelated re-render. */
+  prepareSettlementRequest?: PrepareSettlementRequest | null;
+  onPrepareSettlementRequestConsumed?: () => void;
+  onReturnToBatch?: (batchId: string) => void;
 }) {
   const [historicalEmployees, setHistoricalEmployees] = useState<HistoricalEmployee[]>([]);
   const [drafts, setDrafts] = useState<CalculationRow[]>([]);
@@ -215,6 +231,13 @@ export function TerminalDuesCalculatorTab({
   const [reasonForLeaving, setReasonForLeaving] = useState('');
   const [terminationType, setTerminationType] = useState('resignation');
   const [saving, setSaving] = useState(false);
+
+  // Phase 3: batch-to-calculator integration. Set while this draft is being
+  // prepared for a specific batch (arrived here via "Prepare Settlement");
+  // survives a successful save/update so "Return to Batch" stays offered,
+  // but is cleared on Cancel so an abandoned attempt leaves no trace of it.
+  const [activeBatchContext, setActiveBatchContext] = useState<{ batchId: string; batchName: string } | null>(null);
+  const [checkingExistingDraft, setCheckingExistingDraft] = useState(false);
 
   // The CURRENT approved uniform refund rate -- fetched once per visit to
   // this tab, never refetched mid-edit, so a rate change made by an Admin
@@ -403,6 +426,56 @@ export function TerminalDuesCalculatorTab({
     }
   };
 
+  // Phase 3: batch-to-calculator integration. Always looks for an existing
+  // DRAFT for this employee first (regardless of which batch, if any, it is
+  // currently linked to) and reopens it instead of starting a fresh one --
+  // this is what makes repeated "Prepare Settlement" clicks, or navigating
+  // here again after an interrupted attempt, idempotent: nothing is ever
+  // inserted here, only the form is preselected or an existing draft is
+  // loaded for editing. The actual INSERT still only happens if/when HR
+  // explicitly clicks Save Draft, exactly as before this feature existed.
+  useEffect(() => {
+    if (!prepareSettlementRequest) return;
+    const { employeeId, batchId, batchName } = prepareSettlementRequest;
+    let cancelled = false;
+    (async () => {
+      setCheckingExistingDraft(true);
+      try {
+        const { data, error } = await supabase
+          .from('terminal_due_calculations')
+          .select('*')
+          .eq('employee_id', employeeId)
+          .eq('status', 'draft')
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (cancelled) return;
+        if (error) {
+          showNotification('Error checking for an existing draft: ' + getErrorMessage(error), 'error');
+        } else if (data) {
+          loadDraftForEditing(data as CalculationRow);
+          showNotification('This employee already has a draft calculation -- opened it for review.', 'success');
+        } else {
+          const emp = employees.find(e => e.id === employeeId) || null;
+          if (emp) {
+            setSubjectMode('existing');
+            await selectExistingEmployee(emp);
+          } else {
+            showNotification('This employee could not be found in your accessible list', 'error');
+          }
+        }
+        if (!cancelled) setActiveBatchContext({ batchId, batchName });
+      } finally {
+        if (!cancelled) setCheckingExistingDraft(false);
+      }
+    })();
+    onPrepareSettlementRequestConsumed?.();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prepareSettlementRequest]);
+
   const saveDraft = async () => {
     if (isTerminalDuesValidationError(breakdownResult)) {
       showNotification(breakdownResult.error, 'error');
@@ -447,6 +520,7 @@ export function TerminalDuesCalculatorTab({
       // was applied to, so the saved record is self-auditing.
       const inputsToSave: CalculationInputsSnapshot = { ...inputs, uniformRefundRatePerMonth: uniformRefundRate };
 
+      let savedId: string | null = editingId;
       if (editingId) {
         const { error } = await supabase.rpc('update_terminal_due_calculation_draft', {
           p_id: editingId,
@@ -460,22 +534,48 @@ export function TerminalDuesCalculatorTab({
         if (error) throw error;
         showNotification('Draft calculation updated', 'success');
       } else {
-        const { error } = await supabase.from('terminal_due_calculations').insert([
-          {
-            employee_id: subjectMode === 'existing' ? selectedEmployee!.id : null,
-            historical_employee_id: subjectMode === 'historical' ? selectedHistorical!.id : null,
-            region_id: subjectMode === 'existing' ? selectedEmployee!.region_id : null,
-            subject_name: subjectName,
-            subject_number: subjectNumber,
-            position,
-            inputs: inputsToSave,
-            breakdown: breakdownResult,
-            total_payable: breakdownResult.totalPayable,
-          },
-        ]);
+        const { data: insertedRow, error } = await supabase
+          .from('terminal_due_calculations')
+          .insert([
+            {
+              employee_id: subjectMode === 'existing' ? selectedEmployee!.id : null,
+              historical_employee_id: subjectMode === 'historical' ? selectedHistorical!.id : null,
+              region_id: subjectMode === 'existing' ? selectedEmployee!.region_id : null,
+              subject_name: subjectName,
+              subject_number: subjectNumber,
+              position,
+              inputs: inputsToSave,
+              breakdown: breakdownResult,
+              total_payable: breakdownResult.totalPayable,
+            },
+          ])
+          .select('id')
+          .single();
         if (error) throw error;
+        savedId = insertedRow?.id ?? null;
         showNotification('Draft calculation saved', 'success');
       }
+
+      // Phase 3: batch-to-calculator integration -- link this draft to the
+      // batch it was prepared for, using the existing, already-reviewed RPC
+      // (which itself re-verifies active membership, tenant/region and
+      // batch-open status; this is purely a convenience call, not a new
+      // authorization path). Only ever reaches a DRAFT row (never a
+      // submitted/approved/paid one), since editingId/savedId here can only
+      // name a draft this form just created or is editing.
+      if (activeBatchContext && savedId) {
+        const { error: linkError } = await supabase.rpc('link_calculation_to_batch', {
+          p_calculation_id: savedId,
+          p_batch_id: activeBatchContext.batchId,
+        });
+        if (linkError) {
+          showNotification(
+            'Draft saved, but it could not be linked to the batch: ' + getCalculationRpcErrorMessage(linkError),
+            'error'
+          );
+        }
+      }
+
       resetForm();
       await fetchDrafts();
     } catch (err) {
@@ -512,6 +612,26 @@ export function TerminalDuesCalculatorTab({
 
   return (
     <div className="space-y-6">
+      {activeBatchContext && (
+        <Card className="p-3 bg-amber-50 border border-amber-200 flex items-center justify-between gap-3">
+          <p className="text-sm text-amber-800">
+            Preparing this settlement for batch <strong>{activeBatchContext.batchName}</strong> -- it will be linked to
+            that batch when you save the draft. Nothing is submitted, approved or paid yet.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              const batchId = activeBatchContext.batchId;
+              setActiveBatchContext(null);
+              onReturnToBatch?.(batchId);
+            }}
+          >
+            Return to Batch
+          </Button>
+        </Card>
+      )}
+      {checkingExistingDraft && <p className="text-sm text-slate-400">Checking for an existing draft for this employee...</p>}
       <Card className="p-4 space-y-4">
         <div className="flex items-center gap-2">
           <button
@@ -757,7 +877,7 @@ export function TerminalDuesCalculatorTab({
             )}
 
             <div className="flex justify-end gap-2 pt-2 border-t">
-              <Button variant="outline" onClick={resetForm}>Cancel</Button>
+              <Button variant="outline" onClick={() => { resetForm(); setActiveBatchContext(null); }}>Cancel</Button>
               <Button onClick={saveDraft} disabled={saving}>
                 <Save size={14} className="mr-1" /> {editingId ? 'Update Draft' : 'Save Draft'}
               </Button>
