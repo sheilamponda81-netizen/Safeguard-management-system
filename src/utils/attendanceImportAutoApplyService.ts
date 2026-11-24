@@ -408,6 +408,44 @@ export interface CoverageEvidenceWarning {
   accessPoints: string[];
 }
 
+/**
+ * Part 5 (SAFEGUARD attendance accuracy/accountability update): the
+ * server (attendance_process_import_batch, via attendance_apply_automatic)
+ * already computes one outcome code per employee/day -- see that
+ * migration's RETURNS TABLE and attendance_write_one -- but until now
+ * only the three coarse buckets below (applied/unchanged/skipped) were
+ * read from the response; the exact `rows` breakdown was parsed and then
+ * discarded. A real production import (4,988 events, 0 applied, 906
+ * unchanged, 898 skipped) left HR unable to tell apart "nothing to do
+ * because everything was already correct" from "manual records are
+ * protected" from "this month's payroll is already approved" from
+ * "these shifts simply haven't finished yet" -- all of which land in the
+ * same "skipped" number today. This surfaces the REAL per-outcome counts
+ * the server already calculated, never invented client-side.
+ */
+export type ImportApplyOutcomeCode =
+  | 'written'
+  | 'skipped_no_change'
+  | 'skipped_manual_protected'
+  | 'skipped_payroll_approved'
+  | 'skipped_provisional_present'
+  | 'skipped_provisional_late'
+  | 'skipped_off'
+  | 'skipped_unassigned'
+  | 'skipped_pending';
+
+export const IMPORT_APPLY_OUTCOME_LABELS: Record<ImportApplyOutcomeCode, string> = {
+  written: 'Attendance written (new or changed Present/Late/Absent)',
+  skipped_no_change: 'Already correct -- no change needed',
+  skipped_manual_protected: 'Protected -- an existing manual correction was not overwritten',
+  skipped_payroll_approved: "Protected -- that month's payroll is already approved (flagged for review instead)",
+  skipped_provisional_present: "Not yet final -- shift's checkout window hasn't closed",
+  skipped_provisional_late: "Not yet final -- shift's checkout window hasn't closed",
+  skipped_off: 'Scheduled Off day -- not an attendance case',
+  skipped_unassigned: 'No shift assigned for this date',
+  skipped_pending: 'Pending -- evidence/coverage is still genuinely incomplete',
+};
+
 export interface ProcessImportBatchResult {
   success: boolean;
   outcome: ProcessImportBatchOutcome;
@@ -418,6 +456,8 @@ export interface ProcessImportBatchResult {
   unchangedCount?: number;
   skippedCount?: number;
   failedCount?: number;
+  /** Exact per-outcome-code counts across every employee/day the server evaluated, straight from its own `rows` detail -- never re-derived or estimated client-side. */
+  outcomeBreakdown?: Partial<Record<ImportApplyOutcomeCode, number>>;
   /**
    * Stage C Step 11: mapped, in-scope, rostered employees with NO active
    * assigned HikCentral terminal -- they can never resolve Absent (see
@@ -447,6 +487,26 @@ function isProcessImportBatchRpcResponse(data: unknown): data is ProcessImportBa
     typeof (data as { employee_count?: unknown }).employee_count === 'number' &&
     typeof (data as { applied_count?: unknown }).applied_count === 'number'
   );
+}
+
+/**
+ * Tallies the server's own per-employee-day `outcome` codes (see
+ * attendance_apply_automatic / attendance_write_one) into exact counts --
+ * never re-derived from the coarse applied/unchanged/skipped totals, and
+ * never guessed. An outcome code this client doesn't recognise (e.g. a
+ * future server addition) is counted too, under its own exact string, so
+ * nothing is silently dropped even if IMPORT_APPLY_OUTCOME_LABELS hasn't
+ * been updated yet.
+ */
+function tallyOutcomeBreakdown(rows: unknown[]): Partial<Record<ImportApplyOutcomeCode, number>> {
+  const breakdown: Partial<Record<ImportApplyOutcomeCode, number>> = {};
+  for (const row of rows) {
+    const outcome = (row as { outcome?: unknown } | null)?.outcome;
+    if (typeof outcome !== 'string' || outcome.length === 0) continue;
+    const key = outcome as ImportApplyOutcomeCode;
+    breakdown[key] = (breakdown[key] ?? 0) + 1;
+  }
+  return breakdown;
 }
 
 interface NeedsOverrideReasonRpcResponse {
@@ -557,6 +617,7 @@ export async function processHikCentralImportBatch(params: {
       unchangedCount: data.unchanged_count,
       skippedCount: data.skipped_count,
       failedCount: data.failed_count,
+      outcomeBreakdown: tallyOutcomeBreakdown(Array.isArray(data.rows) ? data.rows : []),
       needsTerminalConfiguration: (data.needs_terminal_configuration || []).map((e) => ({ employeeId: e.employee_id, fullName: e.full_name })),
     };
   } catch {

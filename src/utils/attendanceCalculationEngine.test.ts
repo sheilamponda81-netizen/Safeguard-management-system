@@ -116,12 +116,43 @@ describe('calculateAttendanceStatus -- missing check-in / missing checkout', () 
     expect(result.checkOutIso).not.toBeNull();
   });
 
-  it('no check-in and no checkout, coverage confirmed -> Absent', () => {
+  it('no check-in and no checkout, coverage confirmed -> Absent, with the "no scans at all" explanation', () => {
     const input = dayInput({ events: [], coverage: coverageThrough('2026-10-05T18:00:00.000Z') });
     const result = calculateAttendanceStatus(input);
     expect(result.status).toBe('absent');
     expect(result.checkInIso).toBeNull();
     expect(result.checkOutIso).toBeNull();
+    expect(result.reason).toBe('No valid fingerprint scans recorded for this scheduled shift after data coverage was confirmed complete.');
+  });
+
+  it('business rule E: scans exist but none fall within the valid windows, coverage confirmed -> Absent, with a DISTINCT explanation from "no scans at all"', () => {
+    const input = dayInput({
+      // Both scans are real events for this employee, but neither lands
+      // in the Day shift's check-in (04:00-08:00 Blantyre) or checkout
+      // (16:00-20:00 Blantyre) window -- e.g. a stray scan at midday.
+      events: [ev('2026-10-05T10:00:00.000Z'), ev('2026-10-05T11:30:00.000Z')],
+      coverage: coverageThrough('2026-10-05T18:00:00.000Z'),
+    });
+    const result = calculateAttendanceStatus(input);
+    expect(result.status).toBe('absent');
+    expect(result.checkInIso).toBeNull();
+    expect(result.checkOutIso).toBeNull();
+    expect(result.reason).toBe("Fingerprint scans were detected for this employee, but none fell within the assigned shift's valid check-in or checkout windows, and data coverage was confirmed complete.");
+    expect(result.reason).not.toBe('No valid fingerprint scans recorded for this scheduled shift after data coverage was confirmed complete.');
+  });
+
+  it('business rule E on an overnight Night shift: an out-of-window scan is still correctly distinguished, never mistaken for a valid overnight checkout', () => {
+    // A scan that lands well outside BOTH the night check-in and the
+    // next-day checkout window -- confirms the overnight date-crossing
+    // windows (see the Night shift describe block below) are consulted
+    // correctly here too, not just a same-day check.
+    const input = nightInput({
+      events: [ev('2026-10-05T10:00:00.000Z')], // 12:00 Blantyre -- outside both night windows
+      coverage: coverageThrough('2026-10-06T06:00:00.000Z'),
+    });
+    const result = calculateAttendanceStatus(input);
+    expect(result.status).toBe('absent');
+    expect(result.reason).toContain('fell within the assigned shift');
   });
 });
 

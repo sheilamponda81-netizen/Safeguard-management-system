@@ -38,7 +38,7 @@ import {
 } from '../utils/attendanceCalculationPreview';
 import { fetchAttendanceCalculationPreviewData, fetchOfficialAttendanceSourceByKey } from '../utils/attendanceCalculationPreviewService';
 import {
-  fetchAttendanceEvidenceDetail, AttendanceEvidenceDetail,
+  fetchAttendanceEvidenceDetail, AttendanceEvidenceDetail, AttendanceAuditEntry,
 } from '../utils/attendanceEvidenceService';
 import { classifyRawEventsForEvidence, deriveEvidenceCompleteness, EvidenceCompleteness, EVIDENCE_COMPLETENESS_LABELS } from '../utils/attendanceEvidence';
 import { blantyreDateRangeToUtcBounds } from '../utils/hikcentralAttendancePreview';
@@ -83,7 +83,80 @@ function rowKeyOf(row: AttendanceCalculationPreviewRow): string {
 
 type DetailState = { status: 'loading' } | { status: 'error'; message: string } | { status: 'ready'; detail: AttendanceEvidenceDetail };
 
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+/**
+ * Part 3 (SAFEGUARD attendance accuracy/accountability update): the
+ * Evidence Centre's own accountability date/time format -- "16
+ * November 2026 at 11:22 AM" -- distinct from formatLocalTime's compact
+ * "YYYY-MM-DD HH:MM" used in the technical-details tables below, since
+ * this one is read by HR as a plain sentence, not scanned in a table.
+ * Same Africa/Blantyre fixed UTC+2 convention as formatLocalTime.
+ */
+function formatAccountabilityDateTime(iso: string): string {
+  const d = new Date(new Date(iso).getTime() + 2 * 60 * 60_000);
+  const day = d.getUTCDate();
+  const month = MONTH_NAMES[d.getUTCMonth()];
+  const year = d.getUTCFullYear();
+  let hours = d.getUTCHours();
+  const minutes = String(d.getUTCMinutes()).padStart(2, '0');
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  if (hours === 0) hours = 12;
+  return `${day} ${month} ${year} at ${hours}:${minutes} ${ampm}`;
+}
+
+/** Plain-English, non-technical explanation per calculated status -- the detailed engine reason (which this maps from) stays available verbatim under "Show technical details". */
+const PLAIN_STATUS_EXPLANATIONS: Record<AttendanceCalculationStatus, string> = {
+  present: 'Present -- a valid check-in and a valid checkout were both recorded within the shift\'s allowed times.',
+  late: 'Late -- a valid checkout was recorded, but the check-in happened after the allowed grace period.',
+  absent: 'Absent -- Safeguard confirmed the fingerprint evidence for this shift was complete, and no qualifying check-in and checkout were found.',
+  pending: 'Pending -- the evidence needed to decide this day is not yet complete, so Safeguard has not made an automatic decision yet.',
+  off: 'Off -- this was a scheduled day off according to the roster.',
+  unassigned: 'No shift was assigned to this employee for this date.',
+};
+
+/** Never guesses a name: an unresolved actor id is shown as "an authorized staff account (identity unavailable)", exactly per the spec -- never silently blank, never a fabricated name. */
+function describeActor(userId: string | null, namesByUserId: Map<string, string>): string {
+  if (!userId) return 'an authorized staff account (identity unavailable)';
+  return namesByUserId.get(userId) ?? 'an authorized staff account (identity unavailable)';
+}
+
+interface AccountabilitySummary {
+  /** e.g. "Marked Absent automatically by Safeguard on 16 November 2026 at 11:22 AM, after checking the confirmed HikCentral export." or "Attendance changed from Absent to Present by Jane HR Officer on 16 November 2026 at 11:22 AM." */
+  whoLine: string;
+  /** Empty for an automatic decision (no human reason applies); "No reason recorded." when manual and no reason was supplied. */
+  reasonLine: string;
+  changeSource: 'automatic' | 'manual' | null;
+}
+
+/** Builds the plain-English accountability sentence from the LATEST audit entry only -- full history stays available, unaltered, under "Show technical details". Never guesses who made a change; see describeActor. */
+function buildAccountabilitySummary(latest: AttendanceAuditEntry | null, namesByUserId: Map<string, string>): AccountabilitySummary {
+  if (!latest) {
+    return { whoLine: 'No change has been recorded for this attendance decision yet.', reasonLine: '', changeSource: null };
+  }
+  const newLabel = OFFICIAL_STATUS_LABELS[latest.newStatus] || latest.newStatus;
+  const oldLabel = latest.oldStatus ? (OFFICIAL_STATUS_LABELS[latest.oldStatus] || latest.oldStatus) : null;
+  const when = formatAccountabilityDateTime(latest.changedAtIso);
+
+  if (latest.changeSource === 'automatic') {
+    const whoLine = oldLabel
+      ? `Safeguard automatically changed attendance from ${oldLabel} to ${newLabel} on ${when}, after checking the confirmed HikCentral export.`
+      : `Marked ${newLabel} automatically by Safeguard on ${when}, after checking the confirmed HikCentral export.`;
+    return { whoLine, reasonLine: '', changeSource: 'automatic' };
+  }
+
+  const actor = describeActor(latest.changedBy, namesByUserId);
+  const whoLine = oldLabel
+    ? `Attendance changed from ${oldLabel} to ${newLabel} by ${actor} on ${when}.`
+    : `Changed to ${newLabel} by ${actor} on ${when}.`;
+  const reasonLine = latest.reason && latest.reason.trim() ? latest.reason.trim() : 'No reason recorded.';
+  return { whoLine, reasonLine, changeSource: 'manual' };
+}
+
 function EvidenceDetailPanel({ row, state }: { row: AttendanceCalculationPreviewRow; state: DetailState }) {
+  const [showTechnical, setShowTechnical] = useState(false);
+
   if (state.status === 'loading') {
     return <div className="p-4 text-sm text-slate-400">Loading evidence...</div>;
   }
@@ -99,8 +172,65 @@ function EvidenceDetailPanel({ row, state }: { row: AttendanceCalculationPreview
     : [];
   const server = detail.serverCalculation;
 
+  // Part 3: the plain-English default panel -- see this file's own
+  // header note on what moves behind "Show technical details" below.
+  const latestAudit = detail.auditTimeline.length > 0 ? detail.auditTimeline[detail.auditTimeline.length - 1] : null;
+  const accountability = buildAccountabilitySummary(latestAudit, detail.namesByUserId);
+  const officialCalcStatus = row.officialStatus ? OFFICIAL_TO_CALC_STATUS[row.officialStatus] : undefined;
+  const explanationStatus = officialCalcStatus ?? row.calculation.status;
+  const whySentence = accountability.changeSource === 'manual'
+    ? 'This was a manual correction by HR -- see the accountability details below for who made it, when, and why.'
+    : (PLAIN_STATUS_EXPLANATIONS[explanationStatus] ?? row.calculation.reason);
+  const checkInIso = server?.checkInAtIso ?? row.calculation.checkInIso;
+  const checkOutIso = server?.checkOutAtIso ?? row.calculation.checkOutIso;
+  const assignedShiftLabel = row.resolvedShift === 'off' ? 'Scheduled Off'
+    : row.resolvedShift === 'unassigned' ? 'No shift assigned'
+    : row.resolvedShift.charAt(0).toUpperCase() + row.resolvedShift.slice(1);
+
   return (
     <div className="p-4 space-y-4 bg-slate-50">
+      {/* Part 3: plain-English default view -- the 12 items the spec
+          asks every reviewer to see first, before any technical detail. */}
+      <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+          <div><span className="text-slate-400">Employee</span><div className="font-medium">{row.employeeName} ({row.employeeNumber})</div></div>
+          <div><span className="text-slate-400">Date</span><div className="font-medium">{row.shiftDate}</div></div>
+          <div><span className="text-slate-400">Site</span><div className="font-medium">{row.workstation || '—'}</div></div>
+          <div><span className="text-slate-400">Assigned shift</span><div className="font-medium">{assignedShiftLabel}</div></div>
+          <div><span className="text-slate-400">Check-in time</span><div className="font-medium">{formatLocalTime(checkInIso)}</div></div>
+          <div><span className="text-slate-400">Checkout time</span><div className="font-medium">{formatLocalTime(checkOutIso)}</div></div>
+          <div><span className="text-slate-400">Official recorded attendance</span><div className="font-medium">{row.officialStatus ? OFFICIAL_STATUS_LABELS[row.officialStatus] || row.officialStatus : 'Not recorded'}</div></div>
+          <div>
+            <span className="text-slate-400">Automatic or manually changed</span>
+            <div className="font-medium">
+              {accountability.changeSource === 'manual' ? <Badge color="gold">Manually changed</Badge>
+                : accountability.changeSource === 'automatic' ? <Badge color="blue">Automatic</Badge>
+                : <span className="text-slate-500">Not yet decided</span>}
+            </div>
+          </div>
+        </div>
+        <div>
+          <span className="text-xs text-slate-400">Why Safeguard assigned this status</span>
+          <p className="text-sm text-slate-700 mt-0.5">{whySentence}</p>
+        </div>
+        <div className="border-t border-slate-100 pt-3">
+          <span className="text-xs text-slate-400">Accountability</span>
+          <p className="text-sm text-slate-700 mt-0.5">{accountability.whoLine}</p>
+          {accountability.reasonLine && <p className="text-xs text-slate-500 mt-1">Reason: {accountability.reasonLine}</p>}
+        </div>
+      </div>
+
+      <button
+        type="button"
+        className="text-xs font-medium text-blue-700 hover:underline flex items-center gap-1"
+        onClick={() => setShowTechnical((v) => !v)}
+      >
+        {showTechnical ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+        {showTechnical ? 'Hide technical details' : 'Show technical details'}
+      </button>
+
+      {showTechnical && (
+      <>
       {/* A. Identity + schedule */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
         <div><span className="text-slate-400">Employee</span><div className="font-medium">{row.employeeName} ({row.employeeNumber})</div></div>
@@ -144,7 +274,7 @@ function EvidenceDetailPanel({ row, state }: { row: AttendanceCalculationPreview
           <div className="mt-2 text-xs text-slate-500 space-y-1">
             {detail.coverageConfirmations.map((c, i) => (
               <p key={i}>
-                Coverage confirmed {formatLocalTime(c.confirmedAt)} by {c.confirmedBy}, declared through {formatLocalTime(c.coversThroughIso)}
+                Coverage confirmed {formatLocalTime(c.confirmedAt)} by {describeActor(c.confirmedBy, detail.namesByUserId)}, declared through {formatLocalTime(c.coversThroughIso)}
                 {c.workstations.length > 0 ? ` for ${c.workstations.join(', ')}` : ''}
                 {c.revokedAt ? ` — REVOKED ${formatLocalTime(c.revokedAt)}${c.revokedReason ? `: ${c.revokedReason}` : ''}` : ''}.
                 {c.exceedsObservedEvidence && (
@@ -189,13 +319,15 @@ function EvidenceDetailPanel({ row, state }: { row: AttendanceCalculationPreview
           <ul className="text-xs space-y-1">
             {detail.auditTimeline.map((a, i) => (
               <li key={i} className="border-t border-slate-200 pt-1">
-                {formatLocalTime(a.changedAtIso)} — {a.oldStatus ?? '(none)'} → {a.newStatus} ({a.changeSource || 'unknown'})
+                {formatLocalTime(a.changedAtIso)} — {a.oldStatus ?? '(none)'} → {a.newStatus} ({a.changeSource || 'unknown'}, by {a.changeSource === 'automatic' ? 'Safeguard' : describeActor(a.changedBy, detail.namesByUserId)})
                 {a.reason ? <> — "{a.reason}"</> : <span className="text-amber-600"> — no reason recorded</span>}
               </li>
             ))}
           </ul>
         )}
       </div>
+      </>
+      )}
     </div>
   );
 }

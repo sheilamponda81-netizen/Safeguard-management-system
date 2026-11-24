@@ -270,5 +270,20 @@ export function calculateAttendanceStatus(input: AttendanceCalculationInput): At
   if (!checkInIso && checkOutIso) {
     return { status: 'absent', checkInIso: null, checkOutIso, reason: 'Valid checkout recorded, but no valid check-in was recorded.', basis: 'not_applicable' };
   }
+  // Business rule E (distinct explanation only, classification
+  // unchanged): distinguishes "fingerprints were detected but none
+  // fell within the assigned shift's valid windows" from "no
+  // fingerprints at all nearby" -- mirrors attendance_engine_calculate
+  // in 20261201000000_attendance_automation_accuracy_accountability.sql
+  // exactly.
+  if (events.length > 0) {
+    return {
+      status: 'absent',
+      checkInIso: null,
+      checkOutIso: null,
+      reason: "Fingerprint scans were detected for this employee, but none fell within the assigned shift's valid check-in or checkout windows, and data coverage was confirmed complete.",
+      basis: 'not_applicable',
+    };
+  }
   return { status: 'absent', checkInIso: null, checkOutIso: null, reason: 'No valid fingerprint scans recorded for this scheduled shift after data coverage was confirmed complete.', basis: 'not_applicable' };
 }
