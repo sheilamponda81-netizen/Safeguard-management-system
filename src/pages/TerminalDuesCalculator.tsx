@@ -128,6 +128,7 @@ interface CalculationRow {
   breakdown: TerminalDuesBreakdown;
   total_payable: number;
   revision_history: unknown[];
+  batch_id: string | null;
   submitted_terminal_due_id: string | null;
   submitted_by: string | null;
   submitted_at: string | null;
@@ -238,6 +239,15 @@ export function TerminalDuesCalculatorTab({
   // but is cleared on Cancel so an abandoned attempt leaves no trace of it.
   const [activeBatchContext, setActiveBatchContext] = useState<{ batchId: string; batchName: string } | null>(null);
   const [checkingExistingDraft, setCheckingExistingDraft] = useState(false);
+  // Set instead of activeBatchContext when the draft found for "Prepare
+  // Settlement" is already linked to a DIFFERENT batch -- link_calculation_
+  // to_batch has no "already linked elsewhere" guard of its own (it simply
+  // overwrites batch_id once membership/region/open-batch checks pass), so
+  // the client must not call it here: doing so would silently move this
+  // draft's eventual settlement out of the batch it was deliberately
+  // prepared for. The draft is still opened for review/editing; only the
+  // link-on-save step is skipped.
+  const [linkageConflict, setLinkageConflict] = useState<{ requestedBatchName: string; requestedBatchId: string } | null>(null);
 
   // The CURRENT approved uniform refund rate -- fetched once per visit to
   // this tab, never refetched mid-edit, so a rate change made by an Admin
@@ -453,7 +463,20 @@ export function TerminalDuesCalculatorTab({
         if (error) {
           showNotification('Error checking for an existing draft: ' + getErrorMessage(error), 'error');
         } else if (data) {
-          loadDraftForEditing(data as CalculationRow);
+          const existingDraft = data as CalculationRow;
+          loadDraftForEditing(existingDraft);
+          if (existingDraft.batch_id && existingDraft.batch_id !== batchId) {
+            // Preserve the draft's existing linkage -- never silently move it.
+            if (!cancelled) {
+              setLinkageConflict({ requestedBatchId: batchId, requestedBatchName: batchName });
+              setActiveBatchContext(null);
+            }
+            showNotification(
+              'This employee already has a draft calculation linked to a different batch. It stays linked there -- opened here for review only, not relinked.',
+              'error'
+            );
+            return;
+          }
           showNotification('This employee already has a draft calculation -- opened it for review.', 'success');
         } else {
           const emp = employees.find(e => e.id === employeeId) || null;
@@ -464,7 +487,10 @@ export function TerminalDuesCalculatorTab({
             showNotification('This employee could not be found in your accessible list', 'error');
           }
         }
-        if (!cancelled) setActiveBatchContext({ batchId, batchName });
+        if (!cancelled) {
+          setLinkageConflict(null);
+          setActiveBatchContext({ batchId, batchName });
+        }
       } finally {
         if (!cancelled) setCheckingExistingDraft(false);
       }
@@ -624,6 +650,26 @@ export function TerminalDuesCalculatorTab({
             onClick={() => {
               const batchId = activeBatchContext.batchId;
               setActiveBatchContext(null);
+              onReturnToBatch?.(batchId);
+            }}
+          >
+            Return to Batch
+          </Button>
+        </Card>
+      )}
+      {linkageConflict && (
+        <Card className="p-3 bg-red-50 border border-red-200 flex items-center justify-between gap-3">
+          <p className="text-sm text-red-800">
+            This employee's existing draft is already linked to a different batch -- it stays linked there and will
+            NOT be moved to <strong>{linkageConflict.requestedBatchName}</strong>. You can still review or edit it
+            below; saving will not change its batch linkage.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              const batchId = linkageConflict.requestedBatchId;
+              setLinkageConflict(null);
               onReturnToBatch?.(batchId);
             }}
           >
@@ -877,7 +923,7 @@ export function TerminalDuesCalculatorTab({
             )}
 
             <div className="flex justify-end gap-2 pt-2 border-t">
-              <Button variant="outline" onClick={() => { resetForm(); setActiveBatchContext(null); }}>Cancel</Button>
+              <Button variant="outline" onClick={() => { resetForm(); setActiveBatchContext(null); setLinkageConflict(null); }}>Cancel</Button>
               <Button onClick={saveDraft} disabled={saving}>
                 <Save size={14} className="mr-1" /> {editingId ? 'Update Draft' : 'Save Draft'}
               </Button>

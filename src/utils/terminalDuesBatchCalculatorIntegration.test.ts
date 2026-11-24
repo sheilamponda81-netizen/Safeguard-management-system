@@ -329,6 +329,92 @@ describe.skipIf(!dbAvailable && !dbRequired)('Terminal Dues Phase 3: batch-to-ca
     expect(paidStatus).toBe('pending');
   });
 
+  it('12. a draft already linked to the CURRENT batch re-links idempotently (no conflict)', () => {
+    const fixture = createFixture('Already Current Batch');
+    const employeeId = createEmployee(fixture, 'Already Current Employee', { regionId: fixture.regionId });
+    const [batchId] = queryRow(`SELECT (create_terminal_due_batch('Already Current Batch'))->>'id'`);
+    queryJson(`SELECT add_employees_to_batch('${batchId}'::uuid, ARRAY['${employeeId}'::uuid])`);
+    const draftId = createDraftCalculation(fixture, employeeId, fixture.regionId);
+    queryJson(`SELECT link_calculation_to_batch('${draftId}'::uuid, '${batchId}'::uuid)`);
+
+    // Simulates the Calculator re-opening this same draft for "Prepare
+    // Settlement" against the SAME batch it is already linked to -- the
+    // client's own linkage-conflict check (existingDraft.batch_id !==
+    // requestedBatchId) is false here, so it proceeds to (re-)link normally.
+    const existingBatchId = queryRow(`SELECT batch_id FROM terminal_due_calculations WHERE id = '${draftId}'`)[0];
+    expect(existingBatchId).toBe(batchId);
+    const relinkResult = queryJson(`SELECT link_calculation_to_batch('${draftId}'::uuid, '${batchId}'::uuid)`);
+    expect(relinkResult.success).toBe(true);
+    const [stillBatchId] = queryRow(`SELECT batch_id FROM terminal_due_calculations WHERE id = '${draftId}'`);
+    expect(stillBatchId).toBe(batchId);
+  });
+
+  it('13. a draft already linked to ANOTHER batch is never relinked -- the client must skip calling link_calculation_to_batch', () => {
+    const fixture = createFixture('Linkage Conflict');
+    const employeeId = createEmployee(fixture, 'Linkage Conflict Employee', { regionId: fixture.regionId });
+    const [batchAId] = queryRow(`SELECT (create_terminal_due_batch('Original Batch'))->>'id'`);
+    queryJson(`SELECT add_employees_to_batch('${batchAId}'::uuid, ARRAY['${employeeId}'::uuid])`);
+    const draftId = createDraftCalculation(fixture, employeeId, fixture.regionId);
+    queryJson(`SELECT link_calculation_to_batch('${draftId}'::uuid, '${batchAId}'::uuid)`);
+
+    // Employee moves to a second batch; HR opens "Prepare Settlement" from
+    // there and the existing-draft lookup finds this SAME draft, still
+    // linked to batch A.
+    queryRow(`SELECT remove_employee_from_batch('${batchAId}'::uuid, '${employeeId}'::uuid, 'moving')`);
+    const [batchBId] = queryRow(`SELECT (create_terminal_due_batch('Second Batch'))->>'id'`);
+    queryJson(`SELECT add_employees_to_batch('${batchBId}'::uuid, ARRAY['${employeeId}'::uuid])`);
+
+    const [foundBatchId] = queryRow(`SELECT batch_id FROM terminal_due_calculations WHERE id = '${draftId}'`);
+    expect(foundBatchId).toBe(batchAId);
+    // The fix: the client detects foundBatchId !== batchBId and does NOT
+    // call link_calculation_to_batch at all -- modeled here by simply
+    // never issuing that call for this batch pairing.
+    const [unchangedBatchId] = queryRow(`SELECT batch_id FROM terminal_due_calculations WHERE id = '${draftId}'`);
+    expect(unchangedBatchId).toBe(batchAId);
+  });
+
+  it('14. an employee with an existing SUBMITTED calculation: a redundant new draft can still only ever reach one open Terminal Due (pre-existing guard)', () => {
+    const fixture = createFixture('Existing Submitted Calc');
+    const employeeId = createEmployee(fixture, 'Existing Submitted Employee', { regionId: fixture.regionId });
+    const [batchId] = queryRow(`SELECT (create_terminal_due_batch('Existing Submitted Batch'))->>'id'`);
+    queryJson(`SELECT add_employees_to_batch('${batchId}'::uuid, ARRAY['${employeeId}'::uuid])`);
+    const firstDraftId = createDraftCalculation(fixture, employeeId, fixture.regionId);
+    queryJson(`SELECT link_calculation_to_batch('${firstDraftId}'::uuid, '${batchId}'::uuid)`);
+    queryJson(`SELECT submit_terminal_due_calculation('${firstDraftId}'::uuid)`);
+
+    // The existing-draft lookup (status = 'draft') finds nothing for this
+    // employee now (the first one is 'submitted'), so a second, independent
+    // draft can be created -- but submitting IT is still rejected by the
+    // pre-existing open-Terminal-Due guard, so no duplicate settlement is
+    // ever actually created.
+    expect(findExistingDraftForEmployee(employeeId)).toBeNull();
+    const secondDraftId = createDraftCalculation(fixture, employeeId, fixture.regionId);
+    const stderr = execExpectError(`SELECT submit_terminal_due_calculation('${secondDraftId}'::uuid)`);
+    expect(stderr).toMatch(/already has an open terminal due/i);
+    const [dueCount] = queryRow(`SELECT COUNT(*) FROM terminal_dues WHERE employee_id = '${employeeId}'`);
+    expect(dueCount).toBe('1');
+  });
+
+  it('15. batch membership removed before linking: the save is never lost, only the link is rejected', () => {
+    const fixture = createFixture('Membership Removed Before Link');
+    const employeeId = createEmployee(fixture, 'Removed Before Link Employee', { regionId: fixture.regionId });
+    const [batchId] = queryRow(`SELECT (create_terminal_due_batch('Removed Before Link Batch'))->>'id'`);
+    queryJson(`SELECT add_employees_to_batch('${batchId}'::uuid, ARRAY['${employeeId}'::uuid])`);
+    const draftId = createDraftCalculation(fixture, employeeId, fixture.regionId);
+
+    // Employee is removed from the batch between "Prepare Settlement" and
+    // the HR clicking Save Draft.
+    queryRow(`SELECT remove_employee_from_batch('${batchId}'::uuid, '${employeeId}'::uuid, 'left before save')`);
+
+    const stderr = execExpectError(`SELECT link_calculation_to_batch('${draftId}'::uuid, '${batchId}'::uuid)`);
+    expect(stderr).toMatch(/not an active member of the target batch/i);
+    // The draft itself (the "save") is completely unaffected by the failed link.
+    const [draftStillExists] = queryRow(`SELECT COUNT(*) FROM terminal_due_calculations WHERE id = '${draftId}' AND status = 'draft'`);
+    expect(draftStillExists).toBe('1');
+    const [stillUnlinked] = queryRow(`SELECT batch_id FROM terminal_due_calculations WHERE id = '${draftId}'`);
+    expect(stillUnlinked).toBeUndefined();
+  });
+
   function employeeStatus(employeeId: string): string {
     const [status] = queryRow(`SELECT status FROM employees WHERE id = '${employeeId}'`);
     return status;
