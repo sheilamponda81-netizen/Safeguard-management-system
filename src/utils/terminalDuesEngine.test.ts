@@ -3,10 +3,9 @@ import {
   calculateCompletedEmploymentMonths,
   calculatePensionArrears,
   calculateAnnualLeaveRefund,
-  calculateUniformRefund,
-  uniformRefundNeedsCorrectionReason,
+  calculateUniformRefundBreakdown,
+  isValidUniformRefundBreakdownRow,
   pensionMonthsOverrideNeedsCorrectionReason,
-  DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH,
   calculateOutstandingSalaryEntries,
   findOutstandingSalaryDoubleCountWarnings,
   calculateLessNoticeDeduction,
@@ -98,40 +97,65 @@ describe('calculateAnnualLeaveRefund', () => {
   });
 });
 
-describe('calculateUniformRefund', () => {
-  it('pays MWK 10,000 per month actually deducted when no rate is supplied (back-compat default)', () => {
-    expect(calculateUniformRefund(6)).toBe(60000);
+describe('isValidUniformRefundBreakdownRow', () => {
+  it('accepts a positive whole month count and a positive amount', () => {
+    expect(isValidUniformRefundBreakdownRow({ months: 4, amountPerMonth: 5000 })).toBe(true);
   });
 
-  it('returns 0 for zero or negative months', () => {
-    expect(calculateUniformRefund(0)).toBe(0);
-    expect(calculateUniformRefund(-1)).toBe(0);
+  it('rejects zero, negative, fractional, NaN or Infinity months', () => {
+    expect(isValidUniformRefundBreakdownRow({ months: 0, amountPerMonth: 5000 })).toBe(false);
+    expect(isValidUniformRefundBreakdownRow({ months: -1, amountPerMonth: 5000 })).toBe(false);
+    expect(isValidUniformRefundBreakdownRow({ months: 1.5, amountPerMonth: 5000 })).toBe(false);
+    expect(isValidUniformRefundBreakdownRow({ months: NaN, amountPerMonth: 5000 })).toBe(false);
+    expect(isValidUniformRefundBreakdownRow({ months: Infinity, amountPerMonth: 5000 })).toBe(false);
   });
 
-  it('uses the CURRENT approved rate for every eligible month, never a historical rate', () => {
-    // Confirmed business policy example: historical rate was MK 5,000,
-    // current approved rate is MK 10,000, 7 eligible months -> MK 70,000
-    // (months x CURRENT rate, not a sum of historical amounts).
-    expect(calculateUniformRefund(7, 10000)).toBe(70000);
-  });
-
-  it('applies a different current rate when one is supplied', () => {
-    expect(calculateUniformRefund(6, 5000)).toBe(30000);
-  });
-
-  it('defaults to DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH when no rate argument is given', () => {
-    expect(calculateUniformRefund(4)).toBe(4 * DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH);
+  it('rejects zero, negative, NaN or Infinity amounts', () => {
+    expect(isValidUniformRefundBreakdownRow({ months: 4, amountPerMonth: 0 })).toBe(false);
+    expect(isValidUniformRefundBreakdownRow({ months: 4, amountPerMonth: -5000 })).toBe(false);
+    expect(isValidUniformRefundBreakdownRow({ months: 4, amountPerMonth: NaN })).toBe(false);
+    expect(isValidUniformRefundBreakdownRow({ months: 4, amountPerMonth: Infinity })).toBe(false);
   });
 });
 
-describe('uniformRefundNeedsCorrectionReason', () => {
-  it('never requires a reason when there is no payroll evidence at all (fully historical)', () => {
-    expect(uniformRefundNeedsCorrectionReason(null, 5)).toBe(false);
+describe('calculateUniformRefundBreakdown', () => {
+  it('computes the worked example of varying historical monthly deductions correctly', () => {
+    // 4 months x 5,000 = 20,000 / 2 months x 8,000 = 16,000 /
+    // 4 months x 10,000 = 40,000 -> correct total 76,000 (never a single
+    // blended rate x 10 months, which would wrongly produce 100,000).
+    const result = calculateUniformRefundBreakdown([
+      { months: 4, amountPerMonth: 5000 },
+      { months: 2, amountPerMonth: 8000 },
+      { months: 4, amountPerMonth: 10000 },
+    ]);
+    expect(result.hasInvalidRows).toBe(false);
+    expect(result.rows.map(r => r.subtotal)).toEqual([20000, 16000, 40000]);
+    expect(result.total).toBe(76000);
   });
 
-  it('requires a reason only when the entered count disagrees with reliable evidence', () => {
-    expect(uniformRefundNeedsCorrectionReason(6, 6)).toBe(false);
-    expect(uniformRefundNeedsCorrectionReason(6, 4)).toBe(true);
+  it('returns a total of 0 for an empty breakdown', () => {
+    const result = calculateUniformRefundBreakdown([]);
+    expect(result.total).toBe(0);
+    expect(result.hasInvalidRows).toBe(false);
+  });
+
+  it('flags hasInvalidRows and contributes 0 for an invalid row, without discarding the rest', () => {
+    const result = calculateUniformRefundBreakdown([
+      { months: 4, amountPerMonth: 5000 },
+      { months: -2, amountPerMonth: 8000 },
+    ]);
+    expect(result.hasInvalidRows).toBe(true);
+    expect(result.rows[0].subtotal).toBe(20000);
+    expect(result.rows[1].subtotal).toBe(0);
+  });
+
+  it('rounds each row up to the whole Kwacha independently before summing', () => {
+    const result = calculateUniformRefundBreakdown([
+      { months: 1, amountPerMonth: 100000.01 },
+      { months: 1, amountPerMonth: 1 },
+    ]);
+    expect(result.rows[0].subtotal).toBe(100001);
+    expect(result.total).toBe(100002);
   });
 });
 
@@ -248,7 +272,7 @@ describe('calculateTerminalDuesBreakdown', () => {
     dateLeft: '2026-01-15',
     finalSalary: 150000,
     unusedLeaveDays: 10,
-    uniformDeductionMonths: 6,
+    uniformRefundBreakdown: [{ months: 6, amountPerMonth: 10000 }],
     outstandingSalaryEntries: [{ month: '2026-01', amountOwed: 150000, amountPaid: 0 }],
     noticeStatus: 'on_time' as const,
   };
@@ -290,7 +314,7 @@ describe('calculateTerminalDuesBreakdown', () => {
       dateJoined: '2026-01-01',
       dateLeft: '2026-01-20',
       unusedLeaveDays: 0,
-      uniformDeductionMonths: 0,
+      uniformRefundBreakdown: [],
       outstandingSalaryEntries: [],
       noticeStatus: 'none',
     });
@@ -303,22 +327,34 @@ describe('calculateTerminalDuesBreakdown', () => {
     expect(result.excessDeduction).toBe(150000);
   });
 
-  it('defaults the uniform refund to the current flat rate when no rate is supplied', () => {
-    const result = calculateTerminalDuesBreakdown(validInputs);
+  it('defaults the uniform refund to 0 when no breakdown rows are supplied', () => {
+    const result = calculateTerminalDuesBreakdown({ ...validInputs, uniformRefundBreakdown: undefined });
     if (isTerminalDuesValidationError(result)) throw new Error('expected a successful breakdown');
-    expect(result.uniformRefund).toBe(60000); // 6 months x DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH
+    expect(result.uniformRefund).toBe(0);
+    expect(result.uniformRefundBreakdown).toEqual([]);
   });
 
-  it('uses the supplied CURRENT approved rate for the whole uniform refund, regardless of any historical rate', () => {
+  it('sums varying historical monthly amounts across breakdown rows rather than one blended rate', () => {
     const result = calculateTerminalDuesBreakdown({
       ...validInputs,
-      uniformDeductionMonths: 7,
-      uniformRefundRatePerMonth: 10000, // the current approved rate
+      uniformRefundBreakdown: [
+        { months: 4, amountPerMonth: 5000 },
+        { months: 2, amountPerMonth: 8000 },
+        { months: 4, amountPerMonth: 10000 },
+      ],
     });
     if (isTerminalDuesValidationError(result)) throw new Error('expected a successful breakdown');
-    // Confirmed business policy example: 7 months x current rate (10,000) =
-    // 70,000, even though the historical rate for some of those months was
-    // MK 5,000 -- this breakdown never sees or sums a historical amount.
-    expect(result.uniformRefund).toBe(70000);
+    // Confirmed worked example: 20,000 + 16,000 + 40,000 = 76,000 -- a
+    // single rate x 10 months would wrongly produce 100,000.
+    expect(result.uniformRefund).toBe(76000);
+    expect(result.uniformRefundBreakdown.map(r => r.subtotal)).toEqual([20000, 16000, 40000]);
+  });
+
+  it('returns a validation error when a uniform refund breakdown row is invalid', () => {
+    const result = calculateTerminalDuesBreakdown({
+      ...validInputs,
+      uniformRefundBreakdown: [{ months: -1, amountPerMonth: 5000 }],
+    });
+    expect(isTerminalDuesValidationError(result)).toBe(true);
   });
 });

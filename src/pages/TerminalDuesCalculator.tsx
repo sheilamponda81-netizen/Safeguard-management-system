@@ -15,36 +15,16 @@ import { showNotification } from '../utils/clickHandlers';
 import { getErrorMessage } from '../utils/errorHandler';
 import {
   calculateTerminalDuesBreakdown,
+  calculateUniformRefundBreakdown,
+  isValidUniformRefundBreakdownRow,
   isTerminalDuesValidationError,
-  uniformRefundNeedsCorrectionReason,
   pensionMonthsOverrideNeedsCorrectionReason,
   findOutstandingSalaryDoubleCountWarnings,
-  DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH,
   TerminalDuesBreakdown,
+  UniformRefundBreakdownRowInput,
   OutstandingSalaryEntryInput,
   NoticeStatus,
 } from '../utils/terminalDuesEngine';
-
-// `terminal_dues_uniform_refund_rate` is an Admin-only system setting (same
-// RLS as `current_payroll_month`/`uniform_deduction_default` -- INSERT/
-// UPDATE restricted to Admins, SELECT open to the tenant). Read-only here;
-// this page never writes it. Falls back to the current flat rate when no
-// Admin has set it yet, so behaviour is unchanged until that setting exists.
-async function fetchUniformRefundRate(): Promise<number> {
-  try {
-    const { data, error } = await supabase
-      .from('system_settings')
-      .select('value')
-      .eq('key', 'terminal_dues_uniform_refund_rate')
-      .maybeSingle();
-    if (error || !data) return DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH;
-    const parsed = Number(data.value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH;
-  } catch {
-    // Read-only, best-effort -- never block the Calculator on this lookup.
-    return DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH;
-  }
-}
 
 // BUG 3 fix: submit_terminal_due_calculation() and
 // update_terminal_due_calculation_draft() report every validation failure
@@ -143,17 +123,16 @@ export interface CalculationInputsSnapshot {
   pensionMonthsOverride?: number | null;
   pensionMonthsOverrideReason?: string | null;
   unusedLeaveDays: number;
-  uniformDeductionMonths: number;
-  uniformDeductionPayrollEvidenceMonths: number | null;
-  uniformDeductionCorrectionReason?: string | null;
-  /** The CURRENT approved uniform refund rate actually used to compute this
-   * snapshot's saved breakdown (see Row label=Uniform Refund). Populated at
-   * save time from the live `terminal_dues_uniform_refund_rate` system
-   * setting -- never a stale or client-chosen value; the backend re-checks
-   * it against that same setting on every save/submit (see
-   * 20261105000000_terminal_dues_calculator_safety_enforcement.sql). This is
-   * what makes the applied rate auditable from the saved record alone. */
-  uniformRefundRatePerMonth?: number;
+  /** HR-entered rows, each a count of qualifying months and the
+   * deduction/refund amount that applied per month for those months, taken
+   * from HR's own paper records (historical deductions varied month to
+   * month, so a single blended rate is never used -- see
+   * calculateUniformRefundBreakdown() in terminalDuesEngine.ts). */
+  uniformRefundBreakdown: UniformRefundBreakdownRowInput[];
+  /** Optional free-text reference to HR's paper record (e.g. a file
+   * number) -- deliberately NOT a validated/required "correction reason"
+   * field; there is no automated evidence to disagree with any more. */
+  uniformRefundNote?: string | null;
   outstandingSalaryEntries: OutstandingSalaryEntryInput[];
   noticeStatus: NoticeStatus;
   requiredNoticeDays: number;
@@ -177,9 +156,8 @@ function emptyInputs(): CalculationInputsSnapshot {
     pensionMonthsOverride: null,
     pensionMonthsOverrideReason: '',
     unusedLeaveDays: 0,
-    uniformDeductionMonths: 0,
-    uniformDeductionPayrollEvidenceMonths: null,
-    uniformDeductionCorrectionReason: '',
+    uniformRefundBreakdown: [],
+    uniformRefundNote: '',
     outstandingSalaryEntries: [],
     noticeStatus: 'on_time',
     requiredNoticeDays: 26,
@@ -249,15 +227,6 @@ export function TerminalDuesCalculatorTab({
   // link-on-save step is skipped.
   const [linkageConflict, setLinkageConflict] = useState<{ requestedBatchName: string; requestedBatchId: string } | null>(null);
 
-  // The CURRENT approved uniform refund rate -- fetched once per visit to
-  // this tab, never refetched mid-edit, so a rate change made by an Admin
-  // while this page is open never silently alters the live preview under
-  // HR's hands. Only ever read here; see fetchUniformRefundRate() above.
-  const [uniformRefundRate, setUniformRefundRate] = useState(DEFAULT_UNIFORM_REFUND_RATE_PER_MONTH);
-  useEffect(() => {
-    fetchUniformRefundRate().then(setUniformRefundRate);
-  }, []);
-
   const canUse = canCreate || canEdit;
 
   const fetchHistoricalEmployees = useCallback(async () => {
@@ -309,32 +278,23 @@ export function TerminalDuesCalculatorTab({
     setTerminationType('resignation');
   }, []);
 
-  // ===== Pick an existing employee: pull in dates/salary, fetch uniform
-  // deduction evidence from payroll (read-only), and surface any months
-  // already recorded as paid in payment_status (double-count warning). =====
+  // ===== Pick an existing employee: pull in dates/salary. The uniform
+  // refund breakdown is always HR-entered from paper records -- it is
+  // deliberately never auto-prefilled from payroll.uniform_deduction
+  // (a bundled figure covering uniform + attendance + lecture/appearance
+  // deductions together, not uniform-only evidence -- see
+  // payrollDeductionBreakdown.ts's own header) and any months already
+  // recorded as paid in payment_status still surface as a double-count
+  // warning for outstanding salary entries. =====
   const selectExistingEmployee = useCallback(async (emp: ExistingEmployeeOption) => {
     setSelectedEmployee(emp);
     setSelectedHistorical(null);
     setEmployeeSearch(emp.fullName);
 
-    let evidenceMonths: number | null = null;
-    try {
-      const { data, error } = await supabase
-        .from('payroll')
-        .select('uniform_deduction')
-        .eq('employee_id', emp.id)
-        .gt('uniform_deduction', 0);
-      if (!error) evidenceMonths = (data || []).length;
-    } catch {
-      // Read-only, best-effort -- a failed lookup just means HR enters the count manually.
-    }
-
     setInputs({
       ...emptyInputs(),
       dateJoined: emp.hire_date,
       finalSalary: emp.basicSalary,
-      uniformDeductionMonths: evidenceMonths ?? 0,
-      uniformDeductionPayrollEvidenceMonths: evidenceMonths,
     });
   }, []);
 
@@ -346,8 +306,6 @@ export function TerminalDuesCalculatorTab({
       dateJoined: he.date_joined,
       dateLeft: he.date_left,
       finalSalary: he.final_salary,
-      uniformDeductionMonths: 0,
-      uniformDeductionPayrollEvidenceMonths: null, // no payroll trail for a historical subject
     });
     setReasonForLeaving(he.reason_for_leaving);
     setTerminationType(he.termination_type || 'resignation');
@@ -362,20 +320,15 @@ export function TerminalDuesCalculatorTab({
         finalSalary: inputs.finalSalary,
         pensionMonthsOverride: inputs.pensionMonthsOverride,
         unusedLeaveDays: inputs.unusedLeaveDays,
-        uniformDeductionMonths: inputs.uniformDeductionMonths,
-        uniformRefundRatePerMonth: uniformRefundRate,
+        uniformRefundBreakdown: inputs.uniformRefundBreakdown,
         outstandingSalaryEntries: inputs.outstandingSalaryEntries,
         noticeStatus: inputs.noticeStatus,
         requiredNoticeDays: inputs.requiredNoticeDays,
         lateNoticeDays: inputs.lateNoticeDays,
       }),
-    [inputs, uniformRefundRate]
+    [inputs]
   );
 
-  const uniformNeedsReason = uniformRefundNeedsCorrectionReason(
-    inputs.uniformDeductionPayrollEvidenceMonths,
-    inputs.uniformDeductionMonths
-  );
   const pensionNeedsReason =
     !isTerminalDuesValidationError(breakdownResult) &&
     pensionMonthsOverrideNeedsCorrectionReason(breakdownResult.completedMonths, inputs.pensionMonthsOverride);
@@ -402,6 +355,22 @@ export function TerminalDuesCalculatorTab({
       cancelled = true;
     };
   }, [selectedEmployee, inputs.outstandingSalaryEntries]);
+
+  const addUniformRefundRow = () => {
+    setInputs(prev => ({
+      ...prev,
+      uniformRefundBreakdown: [...prev.uniformRefundBreakdown, { months: 1, amountPerMonth: 0 }],
+    }));
+  };
+  const updateUniformRefundRow = (index: number, patch: Partial<UniformRefundBreakdownRowInput>) => {
+    setInputs(prev => ({
+      ...prev,
+      uniformRefundBreakdown: prev.uniformRefundBreakdown.map((r, i) => (i === index ? { ...r, ...patch } : r)),
+    }));
+  };
+  const removeUniformRefundRow = (index: number) => {
+    setInputs(prev => ({ ...prev, uniformRefundBreakdown: prev.uniformRefundBreakdown.filter((_, i) => i !== index) }));
+  };
 
   const addOutstandingEntry = () => {
     setInputs(prev => ({
@@ -515,24 +484,8 @@ export function TerminalDuesCalculatorTab({
       showNotification('Select or add a historical employee', 'error');
       return;
     }
-    if (uniformNeedsReason && !inputs.uniformDeductionCorrectionReason?.trim()) {
-      showNotification('A correction reason is required: the entered uniform-deduction months differ from payroll evidence', 'error');
-      return;
-    }
     if (pensionNeedsReason && !inputs.pensionMonthsOverrideReason?.trim()) {
       showNotification('A correction reason is required: the entered completed months differ from the system calculation', 'error');
-      return;
-    }
-
-    // Save-time consistency check: re-fetch the live rate right before
-    // saving so a change made by an Admin while this form was open (a
-    // stale tab) is never silently baked into a saved calculation. The
-    // backend enforces this same check independently, but failing here
-    // gives HR a clear, immediate message instead of an RPC error.
-    const latestRate = await fetchUniformRefundRate();
-    if (latestRate !== uniformRefundRate) {
-      setUniformRefundRate(latestRate);
-      showNotification('The uniform refund rate has changed since this form was opened. Review the updated calculation, then save again.', 'error');
       return;
     }
 
@@ -541,10 +494,6 @@ export function TerminalDuesCalculatorTab({
       const subjectName = subjectMode === 'existing' ? selectedEmployee!.fullName : selectedHistorical!.full_name;
       const subjectNumber = subjectMode === 'existing' ? selectedEmployee!.employeeNumber : selectedHistorical!.historical_reference;
       const position = subjectMode === 'existing' ? selectedEmployee!.position : null;
-      // The rate actually used to compute breakdownResult (see the
-      // breakdownResult useMemo above) is recorded alongside the inputs it
-      // was applied to, so the saved record is self-auditing.
-      const inputsToSave: CalculationInputsSnapshot = { ...inputs, uniformRefundRatePerMonth: uniformRefundRate };
 
       let savedId: string | null = editingId;
       if (editingId) {
@@ -553,7 +502,7 @@ export function TerminalDuesCalculatorTab({
           p_subject_name: subjectName,
           p_subject_number: subjectNumber,
           p_position: position,
-          p_inputs: inputsToSave,
+          p_inputs: inputs,
           p_breakdown: breakdownResult,
           p_total_payable: breakdownResult.totalPayable,
         });
@@ -570,7 +519,7 @@ export function TerminalDuesCalculatorTab({
               subject_name: subjectName,
               subject_number: subjectNumber,
               position,
-              inputs: inputsToSave,
+              inputs,
               breakdown: breakdownResult,
               total_payable: breakdownResult.totalPayable,
             },
@@ -803,44 +752,32 @@ export function TerminalDuesCalculatorTab({
               )}
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-500 mb-1">Unused Leave Days</label>
+              <input
+                type="number"
+                value={inputs.unusedLeaveDays}
+                onChange={e => setInputs(prev => ({ ...prev, unusedLeaveDays: Number(e.target.value) || 0 }))}
+                className="w-full max-w-xs px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+
+            <div className="pt-2 border-t">
+              <UniformRefundBreakdownEditor
+                rows={inputs.uniformRefundBreakdown}
+                onAdd={addUniformRefundRow}
+                onUpdate={updateUniformRefundRow}
+                onRemove={removeUniformRefundRow}
+              />
               <div>
-                <label className="block text-xs font-medium text-slate-500 mb-1">Unused Leave Days</label>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Reference / note (optional, e.g. paper file reference)</label>
                 <input
-                  type="number"
-                  value={inputs.unusedLeaveDays}
-                  onChange={e => setInputs(prev => ({ ...prev, unusedLeaveDays: Number(e.target.value) || 0 }))}
+                  type="text"
+                  value={inputs.uniformRefundNote || ''}
+                  onChange={e => setInputs(prev => ({ ...prev, uniformRefundNote: e.target.value }))}
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-500 mb-1">
-                  Uniform Deduction Months
-                  {inputs.uniformDeductionPayrollEvidenceMonths != null && (
-                    <span className="text-slate-400"> (payroll evidence: {inputs.uniformDeductionPayrollEvidenceMonths})</span>
-                  )}
-                </label>
-                <p className="text-xs font-medium text-slate-600 mb-1">
-                  Current uniform refund rate: {formatKwacha(uniformRefundRate)} / month
-                </p>
-                <input
-                  type="number"
-                  value={inputs.uniformDeductionMonths}
-                  onChange={e => setInputs(prev => ({ ...prev, uniformDeductionMonths: Number(e.target.value) || 0 }))}
-                  className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-                />
-              </div>
-              {uniformNeedsReason && (
-                <div className="md:col-span-2">
-                  <label className="block text-xs font-medium text-slate-500 mb-1">Correction reason (required -- disagrees with payroll evidence) *</label>
-                  <input
-                    type="text"
-                    value={inputs.uniformDeductionCorrectionReason || ''}
-                    onChange={e => setInputs(prev => ({ ...prev, uniformDeductionCorrectionReason: e.target.value }))}
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
-                  />
-                </div>
-              )}
             </div>
 
             <div>
@@ -1095,6 +1032,86 @@ export function TerminalDuesSubmittedTab({ canEdit }: { canEdit: boolean }) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared uniform refund breakdown rows editor -- the ONE place HR enters
+// uniform refund months/amounts, used by both the Calculator form above and
+// the entitlement revision panel (TerminalDuesRevision.tsx), so there is a
+// single authoritative UI feeding calculateUniformRefundBreakdown().
+// ---------------------------------------------------------------------------
+
+export function UniformRefundBreakdownEditor({
+  rows,
+  onAdd,
+  onUpdate,
+  onRemove,
+}: {
+  rows: UniformRefundBreakdownRowInput[];
+  onAdd: () => void;
+  onUpdate: (index: number, patch: Partial<UniformRefundBreakdownRowInput>) => void;
+  onRemove: (index: number) => void;
+}) {
+  const computed = calculateUniformRefundBreakdown(rows);
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <label className="block text-xs font-medium text-slate-500">
+          Uniform Refund Breakdown -- months x amount per month, from HR's paper records
+        </label>
+        <Button variant="outline" size="sm" onClick={onAdd}>
+          <Plus size={14} className="mr-1" /> Add Row
+        </Button>
+      </div>
+      {rows.length === 0 && (
+        <p className="text-xs text-slate-400 mb-2">No uniform refund rows added yet -- uniform refund will be MWK 0.</p>
+      )}
+      {rows.map((row, idx) => {
+        const subtotal = computed.rows[idx]?.subtotal ?? 0;
+        const rowValid = isValidUniformRefundBreakdownRow(row);
+        return (
+          <div key={idx} className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-2 items-end">
+            <div>
+              <label className="block text-xs text-slate-400 mb-0.5">Months</label>
+              <input
+                type="number"
+                value={row.months}
+                onChange={e => onUpdate(idx, { months: Number(e.target.value) })}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-slate-400 mb-0.5">Amount per Month (MWK)</label>
+              <input
+                type="number"
+                value={row.amountPerMonth}
+                onChange={e => onUpdate(idx, { amountPerMonth: Number(e.target.value) })}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-slate-400 mb-0.5">Subtotal</label>
+              <p className="px-3 py-2 text-sm">{formatKwacha(subtotal)}</p>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => onRemove(idx)}>
+              <Trash2 size={14} />
+            </Button>
+            {!rowValid && (
+              <p className="md:col-span-4 text-xs text-red-600">
+                Months must be a whole number greater than zero, and the amount per month must be greater than zero.
+              </p>
+            )}
+          </div>
+        );
+      })}
+      {rows.length > 0 && (
+        <div className="flex justify-between text-sm font-medium border-t pt-2 mb-3">
+          <span>Uniform Refund Total</span>
+          <span>{formatKwacha(computed.total)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Shared breakdown preview
 // ---------------------------------------------------------------------------
 
@@ -1104,6 +1121,16 @@ export function BreakdownPreview({ breakdown }: { breakdown: TerminalDuesBreakdo
       <Row label={`Pension Arrears (${breakdown.effectiveMonths} months x 10%)`} value={breakdown.pensionArrears} />
       <Row label="Annual Leave Refund" value={breakdown.annualLeaveRefund} />
       <Row label="Uniform Refund" value={breakdown.uniformRefund} />
+      {breakdown.uniformRefundBreakdown.length > 0 && (
+        <div className="ml-4 space-y-0.5">
+          {breakdown.uniformRefundBreakdown.map((row, i) => (
+            <div key={i} className="flex justify-between text-xs text-slate-400">
+              <span>{row.months} month{row.months === 1 ? '' : 's'} x {formatKwacha(row.amountPerMonth)}</span>
+              <span>{formatKwacha(row.subtotal)}</span>
+            </div>
+          ))}
+        </div>
+      )}
       <Row label="Outstanding Salary" value={breakdown.outstandingSalaryTotal} />
       <div className="flex justify-between font-medium border-t pt-2">
         <span>Total Entitlements</span>
