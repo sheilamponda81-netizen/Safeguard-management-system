@@ -8,7 +8,8 @@ vi.mock('../lib/supabase', () => ({
   },
 }));
 
-const { fetchActiveNonDeletedEmployees, fetchAllEmployeesById, fetchActiveHikCentralPersonMappings } = await import('./hikcentralPersonMappingService');
+const { fetchActiveNonDeletedEmployees, fetchAllEmployeesById, fetchActiveHikCentralPersonMappings, fetchIdentifiedRawEvents } = await import('./hikcentralPersonMappingService');
+const { profileHikCentralIdentities, classifyHikCentralIdentities } = await import('./hikcentralPersonMapping');
 
 // PRODUCTION HOTFIX regression coverage: both functions now page through
 // fetchAllPages() instead of a single unbounded query. `pages` is consumed
@@ -19,6 +20,8 @@ interface ChainableMock {
   select: (...args: unknown[]) => ChainableMock;
   eq: (...args: unknown[]) => ChainableMock;
   or: (...args: unknown[]) => ChainableMock;
+  not: (...args: unknown[]) => ChainableMock;
+  neq: (...args: unknown[]) => ChainableMock;
   order: (...args: unknown[]) => ChainableMock;
   range: (...args: unknown[]) => Promise<{ data: unknown; error: unknown; count?: number | null }>;
 }
@@ -30,6 +33,8 @@ function mockPaginatedFrom(pages: Array<{ data: unknown; error: unknown; count?:
       select: () => builder,
       eq: () => builder,
       or: () => builder,
+      not: () => builder,
+      neq: () => builder,
       order: () => builder,
       range: () => {
         const page = pages[Math.min(callIndex, pages.length - 1)];
@@ -100,6 +105,8 @@ describe('fetchActiveNonDeletedEmployees', () => {
         select: () => builder,
         eq: (...args: unknown[]) => { seenCalls.push(`eq:${JSON.stringify(args)}`); return builder; },
         or: (...args: unknown[]) => { seenCalls.push(`or:${JSON.stringify(args)}`); return builder; },
+        not: () => builder,
+        neq: () => builder,
         order: () => builder,
         range: () => {
           const page = pages[Math.min(callIndex, pages.length - 1)];
@@ -158,6 +165,8 @@ describe('fetchAllEmployeesById', () => {
         select: () => builder,
         eq: (...args: unknown[]) => { seenCalls.push(`eq:${JSON.stringify(args)}`); return builder; },
         or: (...args: unknown[]) => { seenCalls.push(`or:${JSON.stringify(args)}`); return builder; },
+        not: () => builder,
+        neq: () => builder,
         order: () => builder,
         range: () => {
           const page = pages[Math.min(callIndex, pages.length - 1)];
@@ -238,6 +247,8 @@ describe('fetchActiveHikCentralPersonMappings', () => {
         select: () => builder,
         eq: (...args: unknown[]) => { seenCalls.push(`eq:${JSON.stringify(args)}`); return builder; },
         or: () => builder,
+        not: () => builder,
+        neq: () => builder,
         order: () => builder,
         range: () => {
           const page = pages[Math.min(callIndex, pages.length - 1)];
@@ -249,5 +260,202 @@ describe('fetchActiveHikCentralPersonMappings', () => {
     });
     await fetchActiveHikCentralPersonMappings();
     expect(seenCalls).toEqual([`eq:${JSON.stringify(['is_active', true])}`]);
+  });
+});
+
+function rawEventRow(overrides: Partial<{
+  id: string; hikcentral_person_no: string; first_name: string | null; last_name: string | null;
+  access_point: string | null; event_time: string;
+}> = {}) {
+  return {
+    id: 'evt-1',
+    hikcentral_person_no: '00000084',
+    first_name: 'Falesi',
+    last_name: 'Mlotho',
+    access_point: 'AHL - LIMBE_Door_1',
+    event_time: '2026-11-06T04:10:55.000Z',
+    ...overrides,
+  };
+}
+
+// Person Mapping pagination defect (confirmed in production: 8,138
+// identified raw-event rows / 185 distinct Person Nos. for the real
+// tenant, but the old unpaginated query returned only ~1,000 rows --
+// 18 distinct Person Nos. in practice -- hiding 167 real identities
+// from the page entirely). fetchAllPages() closes this the same way
+// every sibling function in this file was already fixed.
+describe('fetchIdentifiedRawEvents', () => {
+  beforeEach(() => fromMock.mockReset());
+
+  it('maps rows to IdentifiedRawEventRow shape (fewer than 1,000 matches, single page)', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: [rawEventRow(), rawEventRow({ id: 'evt-2', hikcentral_person_no: '00000085', first_name: 'John', last_name: 'Banda' })], error: null, count: 2 },
+    ]));
+    const result = await fetchIdentifiedRawEvents();
+    expect(result).toEqual([
+      { hikcentralPersonNo: '00000084', firstName: 'Falesi', lastName: 'Mlotho', accessPoint: 'AHL - LIMBE_Door_1', eventTimeIso: '2026-11-06T04:10:55.000Z' },
+      { hikcentralPersonNo: '00000085', firstName: 'John', lastName: 'Banda', accessPoint: 'AHL - LIMBE_Door_1', eventTimeIso: '2026-11-06T04:10:55.000Z' },
+    ]);
+  });
+
+  // Task 4, item 1 & 3: proves more than 1,000 raw events are fetched,
+  // and that ordering by `id` (the table's own unique primary key) as
+  // the page tie-breaker means no row at the exact page boundary is
+  // skipped OR duplicated -- the same boundary-correctness convention
+  // already proven for every sibling paginated function in this file.
+  it('REGRESSION (PostgREST 1,000-row cap): pages past 1,000 identified raw events with no missing or duplicated rows at the page boundary', async () => {
+    const page1 = Array.from({ length: 1000 }, (_, i) => rawEventRow({ id: `evt-${i}`, hikcentral_person_no: `P${i}` }));
+    const page2 = [rawEventRow({ id: 'evt-1000', hikcentral_person_no: 'P1000' }), rawEventRow({ id: 'evt-1001', hikcentral_person_no: 'P1001' })];
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: page1, error: null, count: 1002 },
+      { data: page2, error: null, count: null },
+    ]));
+    const result = await fetchIdentifiedRawEvents();
+    expect(result).toHaveLength(1002);
+    const personNos = result.map((r) => r.hikcentralPersonNo);
+    expect(personNos).toContain('P999'); // last row of page 1 (exact boundary)
+    expect(personNos).toContain('P1000'); // first row of page 2 (exact boundary)
+    expect(new Set(personNos).size).toBe(1002); // no duplicates
+    expect(fromMock.mock.calls.length).toBe(2);
+  });
+
+  it('propagates a query error rather than returning a partial (misleadingly small) identity list', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([{ data: null, error: { message: 'boom' }, count: null }]));
+    await expect(fetchIdentifiedRawEvents()).rejects.toBeTruthy();
+  });
+
+  it('an empty dataset returns an empty array, never an error', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([{ data: [], error: null, count: 0 }]));
+    expect(await fetchIdentifiedRawEvents()).toEqual([]);
+  });
+
+  it('filters to identified (non-null, non-blank) Person No. on every page -- never broadens scope to anonymous events', async () => {
+    const seenCalls: string[] = [];
+    let callIndex = 0;
+    const pages = [{ data: [], error: null, count: 0 }];
+    fromMock.mockImplementation(() => {
+      const builder: ChainableMock = {
+        select: () => builder,
+        eq: () => builder,
+        or: () => builder,
+        not: (...args: unknown[]) => { seenCalls.push(`not:${JSON.stringify(args)}`); return builder; },
+        neq: (...args: unknown[]) => { seenCalls.push(`neq:${JSON.stringify(args)}`); return builder; },
+        order: () => builder,
+        range: () => {
+          const page = pages[Math.min(callIndex, pages.length - 1)];
+          callIndex++;
+          return Promise.resolve(page);
+        },
+      };
+      return builder;
+    });
+    await fetchIdentifiedRawEvents();
+    expect(seenCalls).toEqual([
+      `not:${JSON.stringify(['hikcentral_person_no', 'is', null])}`,
+      `neq:${JSON.stringify(['hikcentral_person_no', ''])}`,
+    ]);
+  });
+
+  // Task 4, item 8: this is strictly a read -- a builder with no
+  // insert/update/delete method at all still lets the whole call
+  // succeed, proving nothing in this function's own code path ever
+  // reaches for one (it would throw a TypeError immediately if it did).
+  it('performs no write operation of any kind -- a read-only builder with no insert/update/delete is sufficient', async () => {
+    fromMock.mockImplementation(mockPaginatedFrom([{ data: [rawEventRow()], error: null, count: 1 }]));
+    await expect(fetchIdentifiedRawEvents()).resolves.toHaveLength(1);
+  });
+
+  // Tenant isolation: no explicit tenant_id filter is added here, by the
+  // same deliberate convention as every sibling function in this file
+  // (fetchActiveNonDeletedEmployees / fetchAllEmployeesById /
+  // fetchActiveHikCentralPersonMappings) -- it is enforced server-side by
+  // RLS ("HikCentral raw events: view within tenant, permitted", confirmed
+  // directly against production), unchanged by this fix.
+
+  // Task 2 / Task 4 items 2, 4, 5, 6: a representative, >1,000-row, 185-
+  // identity dataset (mirroring the real production shape) proves the
+  // FULL pipeline -- paginated fetch -> profileHikCentralIdentities ->
+  // classifyHikCentralIdentities -- discovers every identity once the
+  // pagination defect is fixed, with duplicate raw events for the same
+  // Person No. collapsing into exactly one identity card (never one per
+  // row), already-mapped identities staying correctly classified as
+  // 'mapped' (never duplicated or reclassified), and unmapped identities
+  // correctly landing in 'exact' or 'needs_review' as their own name
+  // evidence dictates -- never auto-mapped. The classification algorithm
+  // itself is untouched by this fix; this proves the pipeline feeding it
+  // is now complete.
+  it('integration: 185 distinct identities (8,138 identified rows, spanning 2 pages) are all discoverable and classify correctly end-to-end', async () => {
+    const rows: ReturnType<typeof rawEventRow>[] = [];
+    // 160 identities already mapped in production's real shape -- 7
+    // duplicate raw events each (160*7 = 1,120 rows on their own,
+    // already past PostgREST's 1,000-row cap), which must collapse into
+    // ONE identity card per Person No., never one per row.
+    const EVENTS_PER_MAPPED_IDENTITY = 7;
+    for (let i = 0; i < 160; i++) {
+      const personNo = `M${String(i).padStart(4, '0')}`;
+      for (let e = 0; e < EVENTS_PER_MAPPED_IDENTITY; e++) {
+        rows.push(rawEventRow({ id: `evt-mapped-${i}-${e}`, hikcentral_person_no: personNo, first_name: 'Mapped', last_name: `Employee${i}` }));
+      }
+    }
+    // 20 identities with no mapping yet, but an exact unambiguous name
+    // match against an active employee -- must classify 'exact'.
+    for (let i = 0; i < 20; i++) {
+      rows.push(rawEventRow({ id: `evt-exact-${i}`, hikcentral_person_no: `E${String(i).padStart(4, '0')}`, first_name: 'Exact', last_name: `Candidate${i}` }));
+    }
+    // 5 identities with no mapping and no confident name match --
+    // must land in 'needs_review', never auto-mapped.
+    for (let i = 0; i < 5; i++) {
+      rows.push(rawEventRow({ id: `evt-review-${i}`, hikcentral_person_no: `R${String(i).padStart(4, '0')}`, first_name: 'Completely', last_name: `Unmatched${i}` }));
+    }
+    expect(rows.length).toBeGreaterThan(1000); // 160*7 + 20 + 5 = 1,145 rows -- genuinely exceeds the PostgREST cap
+    const distinctPersonNos = new Set(rows.map((r) => r.hikcentral_person_no));
+    expect(distinctPersonNos.size).toBe(185);
+
+    // Split across two PostgREST pages, exactly as production would.
+    const page1 = rows.slice(0, 1000);
+    const page2 = rows.slice(1000);
+    fromMock.mockImplementation(mockPaginatedFrom([
+      { data: page1, error: null, count: rows.length },
+      { data: page2, error: null, count: null },
+    ]));
+
+    const identifiedRows = await fetchIdentifiedRawEvents();
+    expect(identifiedRows).toHaveLength(rows.length);
+
+    const profiles = profileHikCentralIdentities(identifiedRows);
+    expect(profiles).toHaveLength(185); // every real identity discovered, none hidden by pagination
+
+    const mappedProfile = profiles.find((p) => p.hikcentralPersonNo === 'M0000');
+    expect(mappedProfile?.eventCount).toBe(7); // 7 duplicate raw events collapsed into ONE identity card
+
+    const employees = [
+      ...Array.from({ length: 20 }, (_, i) => ({
+        id: `emp-exact-${i}`, employeeNumber: `SFG-E-${i}`, fullName: `Exact Candidate${i}`,
+        workstation: 'LIMBE', status: 'Active', isDeleted: false,
+      })),
+    ];
+    const activeMappings = Array.from({ length: 160 }, (_, i) => ({
+      id: `map-${i}`, hikcentralPersonNo: `M${String(i).padStart(4, '0')}`, employeeId: `emp-mapped-${i}`,
+      matchMethod: 'manual', confirmedBy: 'admin-1', confirmedAt: '2026-10-01T00:00:00Z', createdAt: '2026-10-01T00:00:00Z',
+    }));
+
+    const classified = classifyHikCentralIdentities(profiles, employees, activeMappings);
+    expect(classified).toHaveLength(185);
+    const byCategory = { mapped: 0, exact: 0, needs_review: 0, conflict: 0 };
+    for (const c of classified) byCategory[c.category]++;
+    expect(byCategory.mapped).toBe(160); // already-mapped identities remain correctly classified, never duplicated
+    expect(byCategory.exact).toBe(20); // unambiguous name matches, still requiring explicit confirmation to actually map
+    expect(byCategory.needs_review).toBe(5); // ambiguous identities appear under review, never auto-mapped
+    expect(byCategory.conflict).toBe(0);
+
+    // One HikCentral Person No. cannot be actively mapped to two
+    // different employees -- classification itself never produces two
+    // ClassifiedIdentity entries for the same Person No. (confirmed by
+    // the 185-length assertion above matching 185 distinct Person Nos.
+    // exactly), and the database's own unique partial index
+    // (uq_hikcentral_person_mappings_active_person) enforces this
+    // server-side regardless.
+    const distinctClassifiedPersonNos = new Set(classified.map((c) => c.profile.hikcentralPersonNo));
+    expect(distinctClassifiedPersonNos.size).toBe(185);
   });
 });

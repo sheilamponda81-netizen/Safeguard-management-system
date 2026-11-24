@@ -18,16 +18,48 @@ import {
  * Every identified (non-blank Person No.) raw event for the caller's
  * tenant. Anonymous events are deliberately never fetched here -- this
  * function's result can never produce a mappable identity for one.
+ *
+ * PRODUCTION HOTFIX (Person Mapping pagination defect): this was a
+ * single unpaginated query -- the exact same PostgREST 1,000-row-cap
+ * silent-truncation risk already fixed for every sibling query in this
+ * file (fetchActiveNonDeletedEmployees / fetchAllEmployeesById /
+ * fetchActiveHikCentralPersonMappings) and across the rest of the app.
+ * Confirmed in production: this tenant has 8,138 identified raw-event
+ * rows spanning 185 distinct Person Nos., but the unpaginated query
+ * returned only whichever ~1,000 rows PostgREST's default cap allowed
+ * through -- 18 distinct Person Nos. in practice, hiding 167 real
+ * identities from the Person Mapping page entirely (they were never
+ * fetched, not merely mis-classified). fetchAllPages() (same pattern as
+ * every sibling fix in this file) pages through `.range()`, ordered by
+ * `id` (this table's own UUID primary key -- a stable, unique
+ * tie-breaker so no page boundary can skip or duplicate a row) until
+ * the server's own exact count is fully met. Purely additive to the
+ * existing filter (identified, non-blank Person No.) and RLS (tenant
+ * isolation unchanged, enforced server-side exactly as before) -- no
+ * raw event is altered, no mapping is created or changed, and nothing
+ * here touches attendance calculation.
  */
 export async function fetchIdentifiedRawEvents(): Promise<IdentifiedRawEventRow[]> {
-  const { data, error } = await supabase
-    .from('hikcentral_raw_events')
-    .select('hikcentral_person_no, first_name, last_name, access_point, event_time')
-    .not('hikcentral_person_no', 'is', null)
-    .neq('hikcentral_person_no', '');
-  if (error) throw error;
-  return (data || []).map((row) => ({
-    hikcentralPersonNo: row.hikcentral_person_no as string,
+  const rows = await fetchAllPages<{
+    id: string;
+    hikcentral_person_no: string;
+    first_name: string | null;
+    last_name: string | null;
+    access_point: string | null;
+    event_time: string;
+  }>((rangeFrom, rangeTo, withExactCount) => {
+    const columns = 'id, hikcentral_person_no, first_name, last_name, access_point, event_time';
+    const q = withExactCount
+      ? supabase.from('hikcentral_raw_events').select(columns, { count: 'exact' })
+      : supabase.from('hikcentral_raw_events').select(columns);
+    return q
+      .not('hikcentral_person_no', 'is', null)
+      .neq('hikcentral_person_no', '')
+      .order('id')
+      .range(rangeFrom, rangeTo);
+  });
+  return rows.map((row) => ({
+    hikcentralPersonNo: row.hikcentral_person_no,
     firstName: row.first_name,
     lastName: row.last_name,
     accessPoint: row.access_point,
