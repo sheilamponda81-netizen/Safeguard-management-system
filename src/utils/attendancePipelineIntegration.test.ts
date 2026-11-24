@@ -308,4 +308,89 @@ describe.skipIf(!dbAvailable && !dbRequired)('Attendance pipeline integration (r
     expect(outcome).toBe('skipped_pending');
     expect(attendanceRow(fixture, '2026-10-26').status).toBeNull();
   });
+
+  // Part 7, item 19 (SAFEGUARD attendance accuracy/accountability
+  // update): a HR administrator re-running the SAME export (or
+  // re-declaring the identical coverage window by mistake) must never
+  // duplicate the fingerprint_coverage_confirmations row it already
+  // created, and must never duplicate the site absence alert that a
+  // genuine 6-employee automatic-Absent cluster already opened for that
+  // exact (tenant, site, date) -- both are enforced by existing,
+  // unmodified mechanisms (the confirmation-reuse SELECT at the top of
+  // attendance_process_import_batch, and attendance_site_absence_alerts'
+  // own UNIQUE(tenant_id, site, alert_date) constraint via its trigger's
+  // ON CONFLICT DO NOTHING) -- this proves both hold end-to-end through
+  // the real RPC, not just by code inspection.
+  it('Part 7 item 19: repeating the exact same import/coverage declaration reuses the existing confirmation and never duplicates the site absence alert', () => {
+    const tenantId = randomUUID();
+    const callerId = randomUUID();
+    const site = 'DUPLICATE IMPORT SITE';
+    const batchId = randomUUID();
+    const alertDate = '2026-11-20';
+
+    exec(`INSERT INTO tenants (id, name, code) VALUES ('${tenantId}', 'Integration Test Tenant', 'ITT-${tenantId.slice(0, 8)}')`);
+    exec(`INSERT INTO auth.users (id) VALUES ('${callerId}')`);
+    exec(`INSERT INTO profiles (id, tenant_id, is_super_admin, is_active) VALUES ('${callerId}', '${tenantId}', true, true)`);
+    exec(`SELECT set_caller('${callerId}')`);
+    exec(`INSERT INTO hikcentral_import_batches (id, tenant_id, filename, status, imported_by) VALUES ('${batchId}', '${tenantId}', 'duplicate-test.xlsx', 'completed', '${callerId}')`);
+
+    // Six fingerprint-managed employees at the same site, all scheduled
+    // Day shift, zero fingerprint events -- a genuine, confirmed-complete
+    // automatic Absent cluster at exactly the alert threshold.
+    const employeeIds = Array.from({ length: 6 }, () => randomUUID());
+    for (const employeeId of employeeIds) {
+      const personNo = `P${employeeId.slice(0, 8)}`;
+      exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, workstation) VALUES ('${employeeId}', '${tenantId}', 'E-${employeeId.slice(0, 8)}', 'Integration Test Employee', 'Active', false, '${site}')`);
+      exec(`SELECT set_employee_hikcentral_terminals('${employeeId}', ARRAY['GATE1'])`);
+      exec(`INSERT INTO hikcentral_person_mappings (tenant_id, hikcentral_person_no, employee_id, match_method, is_active) VALUES ('${tenantId}', '${personNo}', '${employeeId}', 'manual', true)`);
+      exec(`SELECT roster_assign_recurring_pattern(ARRAY['${employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
+    }
+
+    const runImportBatch = (overrideReason: string | null, independentlyVerified: boolean) => {
+      const sql =
+        `SELECT r->>'confirmation_id', r->>'applied_count', r->>'unchanged_count', r->>'skipped_count' FROM (` +
+        `SELECT attendance_process_import_batch('${batchId}', ARRAY['GATE1'], ` +
+        `'${alertDate}T00:00:00Z'::timestamptz, '${alertDate}T23:59:00Z'::timestamptz, ` +
+        `'${alertDate}'::date, '${alertDate}'::date, NULL, NULL, ` +
+        `${overrideReason ? `'${overrideReason}'` : 'NULL'}, ${independentlyVerified}) AS r) t`;
+      const [confirmationId, applied, unchanged] = queryRow(sql);
+      return { confirmationId, applied, unchanged };
+    };
+
+    // First call: zero events observed for this access point/window at
+    // all, so the evidence-gap gate requires an explicit override --
+    // same real-world shape as a genuinely confirmed closed-down site.
+    const first = runImportBatch('Site supervisor confirms a genuine roster shortage; no device malfunction.', true);
+    expect(first.applied).toBe('6');
+    for (const employeeId of employeeIds) {
+      expect(queryRow(`SELECT status, source FROM attendance WHERE employee_id = '${employeeId}' AND date = '${alertDate}'`)).toEqual(['A', 'automatic']);
+    }
+
+    const [alertCountAfterFirst, alertStatusAfterFirst] = queryRow(
+      `SELECT count(*), (array_agg(status))[1] FROM attendance_site_absence_alerts WHERE tenant_id = '${tenantId}' AND site = '${site}' AND alert_date = '${alertDate}'`
+    );
+    expect(alertCountAfterFirst).toBe('1');
+    expect(alertStatusAfterFirst).toBe('open');
+
+    // Second call: the EXACT same declared window/access points -- an
+    // administrator accidentally re-running the same export, or
+    // re-confirming coverage already on file. No override reason is
+    // even supplied this time; it must not be needed, because the
+    // confirmation-reuse path never reaches the evidence-gap gate at all.
+    const second = runImportBatch(null, false);
+    expect(second.confirmationId).toBe(first.confirmationId);
+    expect(second.applied).toBe('0');
+    expect(second.unchanged).toBe('6'); // every employee: skipped_no_change, not re-written
+
+    const [confirmationCount] = queryRow(
+      `SELECT count(*) FROM fingerprint_coverage_confirmations WHERE tenant_id = '${tenantId}' AND access_points = ARRAY['GATE1'] AND covers_from = '${alertDate}T00:00:00Z'::timestamptz`
+    );
+    expect(confirmationCount).toBe('1'); // never duplicated
+
+    const [alertCountAfterSecond, alertStatusAfterSecond] = queryRow(
+      `SELECT count(*), (array_agg(status))[1] FROM attendance_site_absence_alerts WHERE tenant_id = '${tenantId}' AND site = '${site}' AND alert_date = '${alertDate}'`
+    );
+    expect(alertCountAfterSecond).toBe('1'); // never duplicated -- still the one alert from the first call
+    expect(alertStatusAfterSecond).toBe('open');
+  });
 });

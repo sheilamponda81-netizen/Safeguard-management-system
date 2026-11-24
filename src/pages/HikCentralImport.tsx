@@ -33,6 +33,7 @@ import {
   fetchSiteAbsenceAlerts, acknowledgeSiteAlert, bulkAcknowledgeSiteAlerts,
   SiteAbsenceAlert, CoverageEvidenceWarning, BulkAcknowledgeResultRow,
   fetchImportBatchHistory, ImportBatchHistoryEntry,
+  IMPORT_APPLY_OUTCOME_LABELS, ImportApplyOutcomeCode,
 } from '../utils/attendanceImportAutoApplyService';
 import { fetchActiveHikCentralPersonMappings } from '../utils/hikcentralPersonMappingService';
 import { groupConsecutiveDates, formatDateRange } from '../utils/dateRangeGrouping';
@@ -714,8 +715,9 @@ export default function HikCentralImportPage() {
                             <SummaryStat label="Skipped" value={autoApplyResult.skippedCount ?? 0} accent="amber" />
                           </div>
                           <p className="text-xs text-emerald-600 mt-2">
-                            Skipped covers Off/Unassigned/Pending days, manually-corrected or approved-payroll-protected records, and anything already up to date -- these are never overwritten automatically.
+                            Unchanged means attendance was already correct, so nothing was rewritten. Skipped covers Off/Unassigned/Pending days and manually-corrected or approved-payroll-protected records -- these are never overwritten automatically. See the exact breakdown below.
                           </p>
+                          <ImportOutcomeBreakdown breakdown={autoApplyResult.outcomeBreakdown} />
                           {autoApplyResult.needsTerminalConfiguration && autoApplyResult.needsTerminalConfiguration.length > 0 && (
                             <div className="mt-3 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-md p-3">
                               <AlertCircle size={14} className="text-amber-600 shrink-0 mt-0.5" />
@@ -1221,6 +1223,35 @@ function SummaryStat({ label, value, accent }: { label: string; value: number; a
     <div className="p-3 rounded-lg border border-slate-100">
       <p className="text-xs text-slate-500">{label}</p>
       <p className={`text-xl font-bold mt-1 ${colorClass}`}>{value.toLocaleString()}</p>
+    </div>
+  );
+}
+
+/**
+ * Part 5 (SAFEGUARD attendance accuracy/accountability update): the exact
+ * reason breakdown behind the coarse Applied/Unchanged/Skipped totals
+ * above, straight from the server's own per-employee-day outcome codes
+ * (never re-derived or guessed client-side -- see
+ * attendanceImportAutoApplyService.ts's tallyOutcomeBreakdown). Renders
+ * nothing when there is no breakdown to show (e.g. zero in-scope
+ * employees).
+ */
+function ImportOutcomeBreakdown({ breakdown }: { breakdown: Partial<Record<ImportApplyOutcomeCode, number>> | undefined }) {
+  if (!breakdown) return null;
+  const entries = Object.entries(breakdown).filter(([, count]) => (count ?? 0) > 0) as Array<[string, number]>;
+  if (entries.length === 0) return null;
+  entries.sort((a, b) => b[1] - a[1]);
+  return (
+    <div className="mt-3 bg-white border border-emerald-100 rounded-md p-3">
+      <p className="text-xs font-medium text-slate-700 mb-2">Exactly why each day was applied, left unchanged, or skipped</p>
+      <ul className="space-y-1">
+        {entries.map(([code, count]) => (
+          <li key={code} className="flex items-start justify-between gap-3 text-xs text-slate-600">
+            <span>{IMPORT_APPLY_OUTCOME_LABELS[code as ImportApplyOutcomeCode] ?? code}</span>
+            <span className="font-semibold text-slate-800 shrink-0">{count.toLocaleString()}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

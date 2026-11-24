@@ -13,6 +13,7 @@ vi.mock('../lib/supabase', () => ({
 const {
   fetchRawEventsForPersonInRange, fetchCoverageConfirmationsOverlapping, fetchImportBatchesByIds,
   fetchAuditTimelineForEmployeeDate, fetchActivePersonNoForEmployee, fetchAttendanceEvidenceDetail,
+  resolveStaffNames,
 } = await import('./attendanceEvidenceService');
 
 // Mirrors PR #55/#56's established ChainableMock/mockPaginatedFrom
@@ -233,6 +234,40 @@ describe('fetchActivePersonNoForEmployee', () => {
   });
 });
 
+describe('Part 3 (attendance accuracy/accountability update): resolveStaffNames', () => {
+  beforeEach(() => rpcMock.mockReset());
+
+  it('returns an empty map without calling the RPC when given no ids', async () => {
+    const result = await resolveStaffNames([]);
+    expect(result.size).toBe(0);
+    expect(rpcMock).not.toHaveBeenCalled();
+  });
+
+  it('de-duplicates and drops null/empty ids before calling the RPC', async () => {
+    rpcMock.mockResolvedValue({ data: [{ user_id: 'u1', full_name: 'Jane HR Officer' }], error: null });
+    await resolveStaffNames(['u1', 'u1', null, 'u1']);
+    expect(rpcMock).toHaveBeenCalledWith('resolve_staff_names', { p_user_ids: ['u1'] });
+  });
+
+  it('maps the RPC rows into a user_id -> full_name map', async () => {
+    rpcMock.mockResolvedValue({ data: [{ user_id: 'u1', full_name: 'Jane HR Officer' }, { user_id: 'u2', full_name: 'John Guard' }], error: null });
+    const result = await resolveStaffNames(['u1', 'u2']);
+    expect(result.get('u1')).toBe('Jane HR Officer');
+    expect(result.get('u2')).toBe('John Guard');
+  });
+
+  it('an id with no resolvable profile is simply absent from the map, never fabricated', async () => {
+    rpcMock.mockResolvedValue({ data: [], error: null });
+    const result = await resolveStaffNames(['unresolvable-id']);
+    expect(result.has('unresolvable-id')).toBe(false);
+  });
+
+  it('propagates an RPC error (e.g. not authorized) rather than swallowing it', async () => {
+    rpcMock.mockResolvedValue({ data: null, error: { message: 'Not authorized to view attendance' } });
+    await expect(resolveStaffNames(['u1'])).rejects.toBeTruthy();
+  });
+});
+
 describe('fetchAttendanceEvidenceDetail (composition)', () => {
   beforeEach(() => { fromMock.mockReset(); rpcMock.mockReset(); });
 
@@ -267,6 +302,37 @@ describe('fetchAttendanceEvidenceDetail (composition)', () => {
     });
     const detail = await fetchAttendanceEvidenceDetail('emp-1', '2026-10-22', '2026-10-21T22:00:00.000Z', '2026-10-23T02:00:00.000Z');
     expect(detail.serverCalculation?.status).toBe('absent');
+  });
+
+  it('Part 3: resolves auditTimeline.changedBy and coverageConfirmations.confirmedBy into namesByUserId', async () => {
+    fromMock.mockImplementation((table: string) => {
+      if (table === 'hikcentral_person_mappings') return { select: () => ({ eq: () => ({ eq: () => ({ maybeSingle: () => Promise.resolve({ data: null, error: null }) }) }) }) };
+      if (table === 'attendance_audit_log') {
+        const auditOrderResult = Promise.resolve({
+          data: [{ old_status: null, new_status: 'A', old_calculation_basis: null, new_calculation_basis: null, changed_by: 'uid-manual-1', change_source: 'manual', reason: 'Confirmed with site supervisor.', changed_at: '2026-11-16T09:22:00.000Z' }],
+          error: null,
+        });
+        return { select: () => ({ eq: () => ({ eq: () => ({ order: () => auditOrderResult }) }) }) };
+      }
+      if (table === 'fingerprint_coverage_confirmations') {
+        return mockPaginatedFrom([{
+          data: [{ confirmed_at: '2026-11-15T00:00:00.000Z', confirmed_by: 'uid-confirmer-1', covers_from: '2026-11-15T00:00:00.000Z', covers_through: '2026-11-17T00:00:00.000Z', export_time_declared: null, access_points: ['Gate 1'], workstations: [], revoked_at: null, revoked_reason: null }],
+          error: null, count: 1,
+        }])();
+      }
+      if (table === 'hikcentral_import_batches') return { select: () => ({ in: () => Promise.resolve({ data: [], error: null }) }) };
+      throw new Error(`unexpected table ${table}`);
+    });
+    rpcMock.mockImplementation((name: string) => {
+      if (name === 'resolve_staff_names') {
+        return Promise.resolve({ data: [{ user_id: 'uid-manual-1', full_name: 'Jane HR Officer' }, { user_id: 'uid-confirmer-1', full_name: 'John Admin' }], error: null });
+      }
+      return Promise.resolve({ data: [], error: null });
+    });
+    const detail = await fetchAttendanceEvidenceDetail('emp-1', '2026-11-16', '2026-11-15T22:00:00.000Z', '2026-11-17T02:00:00.000Z');
+    expect(rpcMock).toHaveBeenCalledWith('resolve_staff_names', { p_user_ids: expect.arrayContaining(['uid-manual-1', 'uid-confirmer-1']) });
+    expect(detail.namesByUserId.get('uid-manual-1')).toBe('Jane HR Officer');
+    expect(detail.namesByUserId.get('uid-confirmer-1')).toBe('John Admin');
   });
 
   it('never calls any write method (.insert/.update/.upsert/.delete) anywhere in its dependency chain', async () => {

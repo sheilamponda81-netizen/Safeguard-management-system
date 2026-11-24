@@ -68,22 +68,27 @@ function sqlNullableTimestampLiteral(value: string | undefined | null): string {
  * equality, immune to any textual timestamp-formatting difference
  * between Postgres and JavaScript.
  */
-function callSqlEngine(input: AttendanceCalculationInput): { status: string; basis: string | null; checkInMillis: number | null; checkOutMillis: number | null } {
+function callSqlEngine(input: AttendanceCalculationInput): { status: string; basis: string | null; checkInMillis: number | null; checkOutMillis: number | null; reason: string } {
   const eventsLiteral = sqlTimestampArrayLiteral(input.events.map((e) => e.timestampIso));
   const coverageStatusLiteral = sqlNullableTextLiteral(input.coverage.status);
   const coverageThroughLiteral = sqlNullableTimestampLiteral(input.coverage.verifiedThroughIso);
   const asOfLiteral = sqlNullableTimestampLiteral(input.asOfIso);
+  // reason is requested LAST and as the only column that can itself
+  // contain a comma, so it is fetched via a separate \t-delimited query
+  // rather than risk splitting a reason string that happens to contain
+  // a literal comma.
   const sql =
     `SELECT status, COALESCE(calculation_basis, ''), ` +
-    `COALESCE((EXTRACT(EPOCH FROM check_in_at) * 1000)::text, ''), COALESCE((EXTRACT(EPOCH FROM check_out_at) * 1000)::text, '') ` +
+    `COALESCE((EXTRACT(EPOCH FROM check_in_at) * 1000)::text, ''), COALESCE((EXTRACT(EPOCH FROM check_out_at) * 1000)::text, ''), reason ` +
     `FROM attendance_engine_calculate('${input.shiftDate}', '${input.resolvedShift}', ${eventsLiteral}, ${coverageStatusLiteral}, ${coverageThroughLiteral}, ${asOfLiteral});`;
-  const output = execFileSync('psql', ['-t', '-A', '-F', ',', '-c', sql], { encoding: 'utf-8' }).trim();
-  const [status, basis, checkInMillis, checkOutMillis] = output.split(',');
+  const output = execFileSync('psql', ['-t', '-A', '-F', '\t', '-c', sql], { encoding: 'utf-8' }).trim();
+  const [status, basis, checkInMillis, checkOutMillis, reason] = output.split('\t');
   return {
     status,
     basis: basis || null,
     checkInMillis: checkInMillis ? Number(checkInMillis) : null,
     checkOutMillis: checkOutMillis ? Number(checkOutMillis) : null,
+    reason,
   };
 }
 
@@ -147,6 +152,14 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_engine_calculate() SQL/
     {
       name: 'No scans at all, coverage confirmed closed -- Absent',
       input: { shiftDate: DAY_DATE, resolvedShift: 'day', events: [], coverage: { status: 'confirmed_complete', verifiedThroughIso: '2026-10-05T18:00:00.000Z' } },
+    },
+    {
+      name: 'Business rule E: scans detected but none in the valid windows, coverage confirmed closed -- Absent, with a reason distinct from "no scans at all"',
+      input: {
+        shiftDate: DAY_DATE, resolvedShift: 'day',
+        events: [{ timestampIso: '2026-10-05T10:00:00.000Z' }, { timestampIso: '2026-10-05T11:30:00.000Z' }],
+        coverage: { status: 'confirmed_complete', verifiedThroughIso: '2026-10-05T18:00:00.000Z' },
+      },
     },
     {
       name: 'Night shift crossing midnight -- Present',
@@ -224,5 +237,6 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_engine_calculate() SQL/
     expect(actual.basis).toBe(expected.basis === 'not_applicable' ? null : expected.basis);
     expect(actual.checkInMillis).toBe(expected.checkInIso ? new Date(expected.checkInIso).getTime() : null);
     expect(actual.checkOutMillis).toBe(expected.checkOutIso ? new Date(expected.checkOutIso).getTime() : null);
+    expect(actual.reason).toBe(expected.reason);
   });
 });

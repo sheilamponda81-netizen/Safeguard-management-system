@@ -10,14 +10,19 @@
 // (attendanceSiteAlerts.test.ts), which exercise the client-side
 // display aggregation on already-fetched data, never the real trigger
 // or RPCs. This file closes that gap: it proves, against the real
-// functions, that (1) an alert opens at exactly 5 confirmed absences
-// and never below, (2) the system auto-resolves its own alert when the
-// count genuinely falls back below 5, (3) reopening a system-closed
-// alert preserves its original incident identity (id, created_at,
-// absent_count_at_creation), (4) a human-acknowledged alert is never
-// reopened or re-closed by the trigger even while the count stays at
-// or above 5, and (5) acknowledging alerts (singly or in bulk) never
-// writes to attendance or payroll.
+// functions, that (1) an alert opens at exactly 6 confirmed AUTOMATIC
+// absences and never below, (2) the system auto-resolves its own alert
+// when the count genuinely falls back below 6, (3) reopening a
+// system-closed alert preserves its original incident identity (id,
+// created_at, absent_count_at_creation), (4) a human-acknowledged alert
+// is never reopened or re-closed by the trigger even while the count
+// stays at or above 6, and (5) acknowledging alerts (singly or in bulk)
+// never writes to attendance or payroll.
+//
+// Threshold raised from 5 to 6, and scoped to source='automatic' only,
+// by 20261201000000_attendance_automation_accuracy_accountability.sql
+// (see that migration's header for the business rationale) -- this file
+// was updated in lockstep to match the new live behaviour.
 //
 // No production migration, mutation, or schema change accompanies
 // this PR -- it is test-only, against functions already live in
@@ -96,28 +101,41 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_check_site_absence_aler
     }
   });
 
-  it('never alerts below 5 confirmed absences, and alerts at exactly 5', () => {
+  it('never alerts below 6 confirmed automatic absences, and alerts at exactly 6', () => {
     const fixture = createFixture();
     const date = '2026-11-10';
-    const employees = Array.from({ length: 5 }, () => makeEmployee(fixture));
+    const employees = Array.from({ length: 6 }, () => makeEmployee(fixture));
 
-    for (let i = 0; i < 4; i++) setAttendance(fixture, employees[i], date, 'A');
+    for (let i = 0; i < 5; i++) setAttendance(fixture, employees[i], date, 'A');
     expect(getAlert(fixture, date)).toEqual([]);
 
-    setAttendance(fixture, employees[4], date, 'A');
+    setAttendance(fixture, employees[5], date, 'A');
     const [, status, , , count] = getAlert(fixture, date);
     expect(status).toBe('open');
-    expect(count).toBe('5');
+    expect(count).toBe('6');
   });
 
-  it('auto-resolves its own alert when the count genuinely falls back below 5, and reopens the SAME row (preserving original identity) if it recovers back to 5', () => {
+  it('never alerts on a manual-sourced Absent, however many accumulate', () => {
+    const fixture = createFixture();
+    const date = '2026-11-09';
+    const employees = Array.from({ length: 6 }, () => makeEmployee(fixture));
+    employees.forEach((id) => {
+      exec(
+        `INSERT INTO attendance (tenant_id, employee_id, date, status, source) VALUES ('${fixture.tenantId}', '${id}', '${date}', 'A', 'manual') ` +
+        `ON CONFLICT (employee_id, date) DO UPDATE SET status = EXCLUDED.status, source = EXCLUDED.source`
+      );
+    });
+    expect(getAlert(fixture, date)).toEqual([]);
+  });
+
+  it('auto-resolves its own alert when the count genuinely falls back below 6, and reopens the SAME row (preserving original identity) if it recovers back to 6', () => {
     const fixture = createFixture();
     const date = '2026-11-11';
-    const employees = Array.from({ length: 5 }, () => makeEmployee(fixture));
+    const employees = Array.from({ length: 6 }, () => makeEmployee(fixture));
     employees.forEach((id) => setAttendance(fixture, id, date, 'A'));
 
     const [originalId, , , , originalCount, originalCreatedAt] = getAlert(fixture, date);
-    expect(originalCount).toBe('5');
+    expect(originalCount).toBe('6');
 
     // A late checkout / reconciliation resolves one employee to Present.
     setAttendance(fixture, employees[0], date, 'P');
@@ -127,7 +145,7 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_check_site_absence_aler
     expect(closedByAfterResolve).toBe('');
     expect(noteAfterResolve).toContain('Automatically resolved');
 
-    // The count genuinely recovers back to 5 -- reopen the SAME incident.
+    // The count genuinely recovers back to 6 -- reopen the SAME incident.
     setAttendance(fixture, employees[0], date, 'A');
     const [idAfterReopen, statusAfterReopen, closedByAfterReopen, noteAfterReopen, countAfterReopen, createdAtAfterReopen] = getAlert(fixture, date);
     expect(idAfterReopen).toBe(originalId);
@@ -138,10 +156,10 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_check_site_absence_aler
     expect(createdAtAfterReopen).toBe(originalCreatedAt);
   });
 
-  it('never reopens or re-closes a human-acknowledged alert, even while the count stays at or rises above 5', () => {
+  it('never reopens or re-closes a human-acknowledged alert, even while the count stays at or rises above 6', () => {
     const fixture = createFixture();
     const date = '2026-11-12';
-    const employees = Array.from({ length: 5 }, () => makeEmployee(fixture));
+    const employees = Array.from({ length: 6 }, () => makeEmployee(fixture));
     employees.forEach((id) => setAttendance(fixture, id, date, 'A'));
     const [alertId] = getAlert(fixture, date);
 
@@ -150,10 +168,10 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_check_site_absence_aler
     expect(statusAfterAck).toBe('closed');
     expect(closedByAfterAck).toBe(fixture.callerId);
 
-    // A 6th employee also goes absent the same day -- count rises to 6,
-    // still >=5, but this incident was a human decision and must stay closed.
-    const sixthEmployee = makeEmployee(fixture);
-    setAttendance(fixture, sixthEmployee, date, 'A');
+    // A 7th employee also goes absent the same day -- count rises to 7,
+    // still >=6, but this incident was a human decision and must stay closed.
+    const seventhEmployee = makeEmployee(fixture);
+    setAttendance(fixture, seventhEmployee, date, 'A');
     const [idStillSame, statusStillClosed, closedByStillSame] = getAlert(fixture, date);
     expect(idStillSame).toBe(alertId);
     expect(statusStillClosed).toBe('closed');
@@ -164,11 +182,11 @@ describe.skipIf(!dbAvailable && !dbRequired)('attendance_check_site_absence_aler
     const fixture = createFixture();
     const dateA = '2026-11-13';
     const dateB = '2026-11-14';
-    const siteAEmployees = Array.from({ length: 5 }, () => makeEmployee(fixture));
+    const siteAEmployees = Array.from({ length: 6 }, () => makeEmployee(fixture));
     siteAEmployees.forEach((id) => setAttendance(fixture, id, dateA, 'A'));
     const [alertIdA] = getAlert(fixture, dateA);
 
-    const siteBEmployees = Array.from({ length: 5 }, () => makeEmployee(fixture));
+    const siteBEmployees = Array.from({ length: 6 }, () => makeEmployee(fixture));
     siteBEmployees.forEach((id) => setAttendance(fixture, id, dateB, 'A'));
     const [alertIdB] = getAlert(fixture, dateB);
 

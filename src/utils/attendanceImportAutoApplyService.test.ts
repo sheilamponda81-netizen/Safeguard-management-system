@@ -238,8 +238,46 @@ describe('processHikCentralImportBatch', () => {
       unchangedCount: 1,
       skippedCount: 0,
       failedCount: 0,
+      outcomeBreakdown: {},
       needsTerminalConfiguration: [],
     });
+  });
+
+  it('Part 5 (attendance accuracy/accountability update): tallies the server\'s own per-employee-day outcome codes into an exact breakdown, straight from `rows`, never re-derived from the coarse totals', async () => {
+    rpcMock.mockResolvedValue({
+      data: {
+        confirmation_id: 'c1', employee_count: 5, applied_count: 1, unchanged_count: 2, skipped_count: 2, failed_count: 0,
+        rows: [
+          { employee_id: 'e1', attendance_date: '2026-11-20', outcome: 'written', old_status: 'Pending', new_status: 'A', payroll_flag: null },
+          { employee_id: 'e2', attendance_date: '2026-11-20', outcome: 'skipped_no_change', old_status: 'P', new_status: 'P', payroll_flag: null },
+          { employee_id: 'e3', attendance_date: '2026-11-20', outcome: 'skipped_no_change', old_status: 'A', new_status: 'A', payroll_flag: null },
+          { employee_id: 'e4', attendance_date: '2026-11-20', outcome: 'skipped_manual_protected', old_status: 'L', new_status: 'L', payroll_flag: null },
+          { employee_id: 'e5', attendance_date: '2026-11-20', outcome: 'skipped_pending', old_status: null, new_status: null, payroll_flag: null },
+        ],
+        needs_terminal_configuration: [],
+      },
+      error: null,
+    });
+    const result = await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-11-20', periodToDate: '2026-11-20', dateFrom: '2026-11-20', dateTo: '2026-11-20',
+    });
+    expect(result.outcomeBreakdown).toEqual({
+      written: 1,
+      skipped_no_change: 2,
+      skipped_manual_protected: 1,
+      skipped_pending: 1,
+    });
+  });
+
+  it('Part 5: a missing/non-array `rows` never throws -- outcomeBreakdown is simply empty', async () => {
+    rpcMock.mockResolvedValue({
+      data: { confirmation_id: 'c1', employee_count: 0, applied_count: 0, unchanged_count: 0, skipped_count: 0, failed_count: 0 },
+      error: null,
+    });
+    const result = await processHikCentralImportBatch({
+      importBatchId: 'b1', accessPoints: ['GATE1'], periodFromDate: '2026-11-20', periodToDate: '2026-11-20', dateFrom: '2026-11-20', dateTo: '2026-11-20',
+    });
+    expect(result.outcomeBreakdown).toEqual({});
   });
 
   it('Stage C Step 11: workstations remain optional, legacy, additive-only -- passed through verbatim when supplied', async () => {

@@ -67,7 +67,56 @@ describe('AttendanceEvidenceCentre.tsx: strictly read-only, no new permission, n
   });
 
   it('Phase 3 safety review: displays WHO confirmed coverage -- durable attribution in the database must also be visible to a reviewing administrator', () => {
-    expect(evidenceCentreSource).toMatch(/by \{c\.confirmedBy\}/);
+    // Part 3 (attendance accuracy/accountability update): the raw
+    // confirmedBy id is now resolved to a display name (via
+    // resolve_staff_names/describeActor) rather than shown as-is -- see
+    // the next describe block's own coverage of that resolution.
+    expect(evidenceCentreSource).toMatch(/by \{describeActor\(c\.confirmedBy, detail\.namesByUserId\)\}/);
+  });
+});
+
+describe('AttendanceEvidenceCentre.tsx: Part 3 (SAFEGUARD attendance accuracy/accountability update) -- plain-English default panel + accountability', () => {
+  it('resolves actor ids to display names via the service-layer resolve_staff_names wrapper, never a raw RPC call or a fabricated name', () => {
+    expect(evidenceCentreSource).toMatch(/namesByUserId/);
+    expect(evidenceCentreSource).toMatch(/an authorized staff account \(identity unavailable\)/);
+  });
+
+  it('never silently invents who made a change -- describeActor falls back to the exact spec wording for an unresolved actor', () => {
+    const describeActorBody = evidenceCentreSource.match(/function describeActor\([\s\S]*?\n\}/)?.[0] ?? '';
+    expect(describeActorBody).toMatch(/if \(!userId\) return 'an authorized staff account \(identity unavailable\)';/);
+    expect(describeActorBody).toMatch(/namesByUserId\.get\(userId\) \?\? 'an authorized staff account \(identity unavailable\)'/);
+  });
+
+  it('distinguishes an automatic decision from a manual change in the accountability sentence, and never fabricates a reason for an automatic one', () => {
+    const summaryBody = evidenceCentreSource.match(/function buildAccountabilitySummary\([\s\S]*?\n\}/)?.[0] ?? '';
+    expect(summaryBody).toMatch(/after checking the confirmed HikCentral export/);
+    expect(summaryBody).toMatch(/reasonLine: ''/);
+    expect(summaryBody).toMatch(/No reason recorded\./);
+  });
+
+  it('a "Show technical details" toggle hides the raw forensic sections by default, without removing them', () => {
+    expect(evidenceCentreSource).toMatch(/showTechnical \? 'Hide technical details' : 'Show technical details'/);
+    expect(evidenceCentreSource).toMatch(/\{showTechnical && \(/);
+    // Still present, just behind the toggle -- never deleted.
+    expect(evidenceCentreSource).toMatch(/Fingerprint evidence/);
+    expect(evidenceCentreSource).toMatch(/Decision & audit timeline/);
+  });
+
+  it('exposes all 12 plain-English panel items the spec requires, every time, before any technical detail', () => {
+    const panelBody = evidenceCentreSource.slice(
+      evidenceCentreSource.indexOf('Part 3: plain-English default view'),
+      evidenceCentreSource.indexOf('showTechnical ? <ChevronUp')
+    );
+    expect(panelBody).toMatch(/Employee/);
+    expect(panelBody).toMatch(/row\.shiftDate/);
+    expect(panelBody).toMatch(/Site/);
+    expect(panelBody).toMatch(/Assigned shift/);
+    expect(panelBody).toMatch(/Check-in time/);
+    expect(panelBody).toMatch(/Checkout time/);
+    expect(panelBody).toMatch(/Official recorded attendance/);
+    expect(panelBody).toMatch(/Why Safeguard assigned this status/);
+    expect(panelBody).toMatch(/Automatic or manually changed/);
+    expect(panelBody).toMatch(/Accountability/);
   });
 });
 

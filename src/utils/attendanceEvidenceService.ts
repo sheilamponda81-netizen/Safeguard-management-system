@@ -200,6 +200,32 @@ export async function fetchActivePersonNoForEmployee(employeeId: string): Promis
   return data?.hikcentral_person_no ?? null;
 }
 
+/**
+ * Part 3 (SAFEGUARD attendance accuracy/accountability update):
+ * resolves a batch of profile ids (attendance_audit_log.changed_by,
+ * fingerprint_coverage_confirmations.confirmed_by) to their full names,
+ * via the new resolve_staff_names RPC (supabase/migrations/
+ * 20261201000000_attendance_automation_accuracy_accountability.sql) --
+ * gated on the SAME attendance.view permission this page already
+ * requires, scoped to the caller's own tenant. An id with no resolvable
+ * profile (deleted account, cross-tenant for a non-super-admin, or
+ * simply not found) is absent from the returned map -- the CALLER
+ * decides the "identity unavailable" wording; this function never
+ * invents a name. Duplicate/empty ids are de-duplicated before the
+ * call; an empty input returns an empty map without calling the RPC.
+ */
+export async function resolveStaffNames(userIds: Array<string | null>): Promise<Map<string, string>> {
+  const distinctIds = Array.from(new Set(userIds.filter((id): id is string => !!id)));
+  if (distinctIds.length === 0) return new Map();
+  const { data, error } = await supabase.rpc('resolve_staff_names', { p_user_ids: distinctIds });
+  if (error) throw error;
+  const result = new Map<string, string>();
+  for (const row of (data || []) as Array<{ user_id: string; full_name: string }>) {
+    result.set(row.user_id, row.full_name);
+  }
+  return result;
+}
+
 export interface AttendanceEvidenceDetail {
   rawEvents: EvidenceRawEvent[];
   coverageConfirmations: EvidenceCoverageConfirmation[];
@@ -207,6 +233,16 @@ export interface AttendanceEvidenceDetail {
   auditTimeline: AttendanceAuditEntry[];
   /** The server's OWN recalculation (attendance_preview_calculate), for the one employee/date requested -- null only if the server returned no row at all (e.g. employee has no mapping), never a client-side approximation standing in for it. */
   serverCalculation: ServerCalculationPreviewRow | null;
+  /**
+   * Part 3: every distinct actor id appearing in auditTimeline
+   * (changedBy) or coverageConfirmations (confirmedBy) for this
+   * employee-day, resolved to a full name via resolve_staff_names --
+   * see that function's own header for scope/permission. An id with no
+   * entry here means it could not be resolved (e.g. a non-super-admin
+   * caller looking at a cross-tenant id, or a deleted account); the
+   * caller shows "identity unavailable" for those, never a guess.
+   */
+  namesByUserId: Map<string, string>;
 }
 
 /**
@@ -232,6 +268,10 @@ export async function fetchAttendanceEvidenceDetail(
 
   const rawEvents = personNo ? await fetchRawEventsForPersonInRange(personNo, fromUtcIso, toUtcIsoExclusive) : [];
   const importBatches = await fetchImportBatchesByIds(rawEvents.map((e) => e.importBatchId).filter((id): id is string => !!id));
+  const namesByUserId = await resolveStaffNames([
+    ...auditTimeline.map((a) => a.changedBy),
+    ...coverageConfirmations.map((c) => c.confirmedBy),
+  ]);
 
   return {
     rawEvents,
@@ -239,5 +279,6 @@ export async function fetchAttendanceEvidenceDetail(
     importBatches,
     auditTimeline,
     serverCalculation: serverRows.find((r) => r.attendanceDate === date) ?? null,
+    namesByUserId,
   };
 }
