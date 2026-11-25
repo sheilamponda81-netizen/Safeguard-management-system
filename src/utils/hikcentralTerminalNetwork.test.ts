@@ -117,6 +117,19 @@ function confirmCoverage(fixture: Fixture, accessPoints: string[], coversFromIso
   );
 }
 
+/**
+ * Fetches an employee's eligible access points and returns them sorted
+ * by plain JS string comparison -- never SQL's `ORDER BY`, whose text
+ * collation (and therefore space-vs-hyphen ordering) is locale-
+ * dependent and genuinely differs between environments (observed:
+ * local Postgres vs. the CI postgres:16 container disagree on where
+ * "LL - OCEAN_Door_1" sorts relative to "LL- MASM_Door_1").
+ */
+function eligibleAccessPointsSorted(tenantId: string, employeeId: string): string {
+  const [raw] = queryRow(`SELECT array_to_string(array_agg(access_point), '|') FROM attendance_employee_eligible_terminals('${tenantId}'::uuid, '${employeeId}'::uuid)`);
+  return (raw ? raw.split('|') : []).sort().join('|');
+}
+
 function resolveAndCalculate(employeeId: string, date: string): { status: string; basis: string; reason: string } {
   const [status, basis, , , reason] = queryRow(`SELECT status, COALESCE(calculation_basis,''), check_in_at, check_out_at, reason FROM attendance_resolve_and_calculate('${employeeId}'::uuid, '${date}'::date)`);
   return { status, basis, reason };
@@ -150,10 +163,10 @@ describe.skipIf(!dbAvailable && !dbRequired)('Shared fingerprint terminal networ
     setUpNetwork('LILONGWE NETWORK', ['AREA 12', 'KANENGO AHL'], [KANENGO, OCEAN, MASM_LL]);
     exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}', '${second.employeeId}']::uuid[], true)`);
 
-    const [eligibleFirst] = queryRow(`SELECT array_to_string(array_agg(access_point ORDER BY access_point), '|') FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
-    const [eligibleSecond] = queryRow(`SELECT array_to_string(array_agg(access_point ORDER BY access_point), '|') FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${second.employeeId}'::uuid)`);
+    const eligibleFirst = eligibleAccessPointsSorted(fixture.tenantId, fixture.employeeId);
+    const eligibleSecond = eligibleAccessPointsSorted(fixture.tenantId, second.employeeId);
     expect(eligibleFirst).toBe(eligibleSecond);
-    expect(eligibleFirst).toBe([KANENGO, OCEAN, MASM_LL].join('|'));
+    expect(eligibleFirst).toBe([KANENGO, OCEAN, MASM_LL].sort().join('|'));
     const [provenance] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
     expect(provenance).toBe('network_shared');
   });
@@ -313,15 +326,15 @@ describe.skipIf(!dbAvailable && !dbRequired)('Shared fingerprint terminal networ
     setUpNetwork('NETWORK ONE', ['SHARED NAME SITE'], [MASM_LL]); // tenant B deliberately configures a DIFFERENT terminal for the SAME network name
     exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureB.employeeId}']::uuid[], true)`);
 
-    const [eligibleA] = queryRow(`SELECT array_to_string(array_agg(access_point ORDER BY access_point), '|') FROM attendance_employee_eligible_terminals('${fixtureA.tenantId}'::uuid, '${fixtureA.employeeId}'::uuid)`);
-    const [eligibleB] = queryRow(`SELECT array_to_string(array_agg(access_point ORDER BY access_point), '|') FROM attendance_employee_eligible_terminals('${fixtureB.tenantId}'::uuid, '${fixtureB.employeeId}'::uuid)`);
+    const eligibleA = eligibleAccessPointsSorted(fixtureA.tenantId, fixtureA.employeeId);
+    const eligibleB = eligibleAccessPointsSorted(fixtureB.tenantId, fixtureB.employeeId);
     expect(eligibleA).toBe([KANENGO, OCEAN].sort().join('|'));
     expect(eligibleB).toBe(MASM_LL);
 
     // Within tenant A's own data: a second network ("NETWORK TWO") with different terminals, and a site that only joined NETWORK ONE, must never pick up NETWORK TWO's doors.
     exec(`SELECT set_caller('${fixtureA.callerId}')`);
     exec(`SELECT set_terminal_network_members('NETWORK TWO', ARRAY['${MASM_LL}'])`);
-    const [stillEligibleA] = queryRow(`SELECT array_to_string(array_agg(access_point ORDER BY access_point), '|') FROM attendance_employee_eligible_terminals('${fixtureA.tenantId}'::uuid, '${fixtureA.employeeId}'::uuid)`);
+    const stillEligibleA = eligibleAccessPointsSorted(fixtureA.tenantId, fixtureA.employeeId);
     expect(stillEligibleA).toBe([KANENGO, OCEAN].sort().join('|')); // unaffected by a network it never joined
   });
 
