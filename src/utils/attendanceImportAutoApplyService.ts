@@ -208,6 +208,68 @@ export async function fetchSiteHikCentralTerminalConfigs(): Promise<Map<string, 
   return bySite;
 }
 
+/**
+ * Shared fingerprint terminal networks (e.g. Lilongwe's KANENGO/MASM/
+ * OCEAN/Office World): a NAMED, reusable terminal list that many
+ * different sites can join at once, instead of every surrounding
+ * workstation declaring the same terminal list separately. Adding a
+ * terminal to the network later is one edit here, not one edit per
+ * site. Reconcile-by-full-desired-set shape, same as
+ * setSiteHikCentralTerminals.
+ */
+export async function setTerminalNetworkMembers(network: string, accessPoints: string[]): Promise<void> {
+  const { error } = await supabase.rpc('set_terminal_network_members', {
+    p_network: network,
+    p_access_points: accessPoints,
+  });
+  if (error) throw error;
+}
+
+/**
+ * Assigns one or more sites to a shared terminal network in a single
+ * administrator action (or clears their membership if network is
+ * null/empty). Returns how many of the given sites actually changed
+ * (never counts a site already in the target network).
+ */
+export async function setSiteNetworkMembership(sites: string[], network: string | null): Promise<number> {
+  const { data, error } = await supabase.rpc('set_site_network_membership', {
+    p_sites: sites,
+    p_network: network || '',
+  });
+  if (error) throw error;
+  return (data as { changed_count?: number } | null)?.changed_count || 0;
+}
+
+/** Every currently registered network's terminal list, keyed by the already-normalized network name. */
+export async function fetchTerminalNetworkConfigs(): Promise<Map<string, string[]>> {
+  const { data, error } = await supabase
+    .from('hikcentral_terminal_network_members')
+    .select('network, access_point')
+    .eq('is_active', true);
+  if (error) throw error;
+  const byNetwork = new Map<string, string[]>();
+  (data || []).forEach((row: { network: string; access_point: string }) => {
+    const existing = byNetwork.get(row.network);
+    if (existing) existing.push(row.access_point);
+    else byNetwork.set(row.network, [row.access_point]);
+  });
+  return byNetwork;
+}
+
+/** Every currently active site-to-network membership, keyed by the already-normalized site string. */
+export async function fetchSiteNetworkMemberships(): Promise<Map<string, string>> {
+  const { data, error } = await supabase
+    .from('hikcentral_site_network_membership')
+    .select('site, network')
+    .eq('is_active', true);
+  if (error) throw error;
+  const bySite = new Map<string, string>();
+  (data || []).forEach((row: { site: string; network: string }) => {
+    bySite.set(row.site, row.network);
+  });
+  return bySite;
+}
+
 /** Trims, collapses internal whitespace, and uppercases -- the exact site-key normalization set_site_hikcentral_terminals itself applies server-side, so a client-side lookup against fetchSiteHikCentralTerminalConfigs's keys always matches. */
 export function normalizeSiteKey(raw: string): string {
   return raw.trim().replace(/\s+/g, ' ').toUpperCase();

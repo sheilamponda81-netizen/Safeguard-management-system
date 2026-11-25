@@ -27,6 +27,7 @@ import {
   fetchEmployeeTerminalAssignments, setEmployeeHikCentralTerminals,
   fetchMappedEmployeeTerminalStatus, setSiteHikCentralTerminals,
   fetchSiteHikCentralTerminalConfigs, normalizeSiteKey, setFingerprintAttendanceEnabled,
+  setTerminalNetworkMembers, setSiteNetworkMembership, fetchTerminalNetworkConfigs, fetchSiteNetworkMemberships,
   MappedEmployeeTerminalStatus,
 } from '../utils/attendanceImportAutoApplyService';
 
@@ -103,6 +104,22 @@ export default function HikCentralPersonMappingPage() {
   const [savingSiteTerminals, setSavingSiteTerminals] = useState(false);
   const [siteConfigs, setSiteConfigs] = useState<Map<string, string[]>>(new Map());
 
+  // Shared fingerprint terminal networks (Part 4 simplification): a
+  // named, reusable terminal list many sites can join at once, kept in
+  // a collapsed "Advanced" section -- normal users never need to see
+  // this to use Person Mapping day to day.
+  const [networkConfigs, setNetworkConfigs] = useState<Map<string, string[]>>(new Map());
+  const [siteNetworkMemberships, setSiteNetworkMemberships] = useState<Map<string, string>>(new Map());
+  const [networkModalFor, setNetworkModalFor] = useState<string | null>(null);
+  const [networkModalIsNew, setNetworkModalIsNew] = useState(false);
+  const [networkNameInput, setNetworkNameInput] = useState('');
+  const [networkModalSelected, setNetworkModalSelected] = useState<Set<string>>(new Set());
+  const [networkModalCustom, setNetworkModalCustom] = useState('');
+  const [savingNetworkTerminals, setSavingNetworkTerminals] = useState(false);
+  const [assignSitesInput, setAssignSitesInput] = useState('');
+  const [assignNetworkInput, setAssignNetworkInput] = useState('');
+  const [assigningSites, setAssigningSites] = useState(false);
+
   const [activeTab, setActiveTab] = useState<TabId>('exact');
 
   // Step 11F: a single search box shared by all four tabs -- its text is
@@ -132,7 +149,7 @@ export default function HikCentralPersonMappingPage() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [rows, anonCount, active, allById, mappings, terminals, terminalStatus, siteConfigsResult] = await Promise.all([
+      const [rows, anonCount, active, allById, mappings, terminals, terminalStatus, siteConfigsResult, networkConfigsResult, siteNetworkMembershipsResult] = await Promise.all([
         fetchIdentifiedRawEvents(),
         fetchAnonymousEventCount(),
         fetchActiveNonDeletedEmployees(),
@@ -141,6 +158,8 @@ export default function HikCentralPersonMappingPage() {
         fetchEmployeeTerminalAssignments().catch(() => new Map<string, string[]>()),
         fetchMappedEmployeeTerminalStatus().catch(() => new Map<string, MappedEmployeeTerminalStatus>()),
         fetchSiteHikCentralTerminalConfigs().catch(() => new Map<string, string[]>()),
+        fetchTerminalNetworkConfigs().catch(() => new Map<string, string[]>()),
+        fetchSiteNetworkMemberships().catch(() => new Map<string, string>()),
       ]);
       const profiles = profileHikCentralIdentities(rows);
       const classified = classifyHikCentralIdentities(profiles, active, mappings);
@@ -151,6 +170,8 @@ export default function HikCentralPersonMappingPage() {
       setTerminalAssignments(terminals);
       setTerminalStatusByEmployee(terminalStatus);
       setSiteConfigs(siteConfigsResult);
+      setNetworkConfigs(networkConfigsResult);
+      setSiteNetworkMemberships(siteNetworkMembershipsResult);
 
       const confirmerIds = mappings.map((m) => m.confirmedBy).filter((id): id is string => !!id);
       setConfirmerNamesById(await fetchProfileFullNamesById(confirmerIds));
@@ -171,6 +192,26 @@ export default function HikCentralPersonMappingPage() {
   useEffect(() => {
     if (permissionsLoaded) loadData();
   }, [permissionsLoaded, loadData]);
+
+  // Part 4 simplification: one plain-language summary of fingerprint
+  // readiness across every mapped employee -- "Total mapped" and
+  // "Needs mapping" already exist as StatCards; this adds the
+  // fingerprint-specific breakdown without requiring a normal user to
+  // open the Advanced section or understand provenance at all.
+  const fingerprintStatusSummary = useMemo(() => {
+    let ready = 0;
+    let needsActivation = 0;
+    let needsSetup = 0;
+    for (const identity of identities) {
+      if (identity.category !== 'mapped') continue;
+      const employeeId = identity.activeMapping?.employeeId;
+      const provenance = employeeId ? terminalStatusByEmployee.get(employeeId)?.provenance : undefined;
+      if (provenance === 'employee_assigned' || provenance === 'site_shared') ready += 1;
+      else if (provenance === 'fingerprint_not_enabled') needsActivation += 1;
+      else needsSetup += 1;
+    }
+    return { ready, needsActivation, needsSetup };
+  }, [identities, terminalStatusByEmployee]);
 
   const exactMatches = useMemo(() => identities.filter((i) => i.category === 'exact'), [identities]);
   const needsReview = useMemo(() => identities.filter((i) => i.category === 'needs_review'), [identities]);
@@ -484,6 +525,119 @@ export default function HikCentralPersonMappingPage() {
     }
   }, [siteModalFor, siteModalSelected, loadData]);
 
+  // Shared fingerprint terminal networks: for each registered network,
+  // which sites joined it, how many currently-mapped employees that
+  // covers, and how many of them still need the one-time explicit
+  // enable action -- drives the collapsed "Advanced" section so a
+  // whole network (e.g. Lilongwe's KANENGO/MASM/OCEAN/Office World) can
+  // be reviewed and activated as a single unit, never per-workstation.
+  const networkSummaries = useMemo(() => {
+    const siteToNetwork = siteNetworkMemberships;
+    const byNetwork = new Map<string, { sites: Set<string>; mappedEmployeeCount: number; notEnabledEmployeeIds: string[] }>();
+    for (const identity of identities) {
+      if (identity.category !== 'mapped') continue;
+      const employeeId = identity.activeMapping?.employeeId;
+      const employee = employeeId ? employeesById.get(employeeId) : null;
+      const rawSite = employee?.workstation?.trim();
+      if (!rawSite || !employeeId) continue;
+      const key = normalizeSiteKey(rawSite);
+      const network = siteToNetwork.get(key);
+      if (!network) continue;
+      const notEnabled = terminalStatusByEmployee.get(employeeId)?.provenance === 'fingerprint_not_enabled';
+      const existing = byNetwork.get(network);
+      if (existing) {
+        existing.sites.add(key);
+        existing.mappedEmployeeCount += 1;
+        if (notEnabled) existing.notEnabledEmployeeIds.push(employeeId);
+      } else {
+        byNetwork.set(network, { sites: new Set([key]), mappedEmployeeCount: 1, notEnabledEmployeeIds: notEnabled ? [employeeId] : [] });
+      }
+    }
+    // Every registered network appears even with zero sites/employees yet, so a freshly-configured network is still visible for the next rollout step.
+    for (const network of networkConfigs.keys()) {
+      if (!byNetwork.has(network)) byNetwork.set(network, { sites: new Set(), mappedEmployeeCount: 0, notEnabledEmployeeIds: [] });
+    }
+    return Array.from(byNetwork.entries())
+      .map(([network, v]) => ({
+        network,
+        sites: Array.from(v.sites).sort(),
+        mappedEmployeeCount: v.mappedEmployeeCount,
+        notEnabledEmployeeIds: v.notEnabledEmployeeIds,
+        configuredAccessPoints: networkConfigs.get(network) || [],
+      }))
+      .sort((a, b) => a.network.localeCompare(b.network));
+  }, [identities, employeesById, siteNetworkMemberships, networkConfigs, terminalStatusByEmployee]);
+
+  const openNetworkModal = useCallback((network: string | null) => {
+    const key = network ? normalizeSiteKey(network) : null;
+    const current = key ? networkConfigs.get(key) || [] : [];
+    setNetworkModalFor(key ?? '__NEW_NETWORK__');
+    setNetworkModalIsNew(!network);
+    setNetworkNameInput('');
+    setNetworkModalSelected(new Set(current));
+    setNetworkModalCustom('');
+  }, [networkConfigs]);
+
+  const networkModalCandidates = useMemo(() => {
+    if (!networkModalFor || networkModalIsNew) return [];
+    const current = networkConfigs.get(networkModalFor) || [];
+    return Array.from(new Set(current)).sort();
+  }, [networkModalFor, networkModalIsNew, networkConfigs]);
+
+  const toggleNetworkCandidate = useCallback((ap: string) => {
+    setNetworkModalSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(ap)) next.delete(ap);
+      else next.add(ap);
+      return next;
+    });
+  }, []);
+
+  const handleAddCustomNetworkTerminal = useCallback(() => {
+    const ap = networkModalCustom.trim();
+    if (!ap) return;
+    setNetworkModalSelected((prev) => new Set(prev).add(ap));
+    setNetworkModalCustom('');
+  }, [networkModalCustom]);
+
+  const handleSaveNetworkTerminals = useCallback(async () => {
+    const name = networkModalIsNew ? networkNameInput.trim() : networkModalFor;
+    if (!name) return;
+    setSavingNetworkTerminals(true);
+    try {
+      await setTerminalNetworkMembers(name, Array.from(networkModalSelected));
+      showNotification('Shared terminal network updated.', 'success');
+      setNetworkModalFor(null);
+      await loadData();
+    } catch (err) {
+      showNotification(err instanceof Error ? err.message : 'Could not update the terminal network.', 'error');
+    } finally {
+      setSavingNetworkTerminals(false);
+    }
+  }, [networkModalFor, networkModalIsNew, networkNameInput, networkModalSelected, loadData]);
+
+  // Assigns one or more sites (comma-separated workstation names) to a
+  // network in a single administrator action -- the "future additional
+  // terminals/sites can join through a single configuration, never
+  // per-employee" requirement.
+  const handleAssignSitesToNetwork = useCallback(async () => {
+    const sites = assignSitesInput.split(',').map((s) => s.trim()).filter(Boolean);
+    const network = assignNetworkInput.trim();
+    if (sites.length === 0 || !network) return;
+    setAssigningSites(true);
+    try {
+      const changedCount = await setSiteNetworkMembership(sites, network);
+      showNotification(`${changedCount} site(s) assigned to ${normalizeSiteKey(network)}.`, 'success');
+      setAssignSitesInput('');
+      setAssignNetworkInput('');
+      await loadData();
+    } catch (err) {
+      showNotification(err instanceof Error ? err.message : 'Could not assign sites to this network.', 'error');
+    } finally {
+      setAssigningSites(false);
+    }
+  }, [assignSitesInput, assignNetworkInput, loadData]);
+
   // Explicit, reviewable activation of the fingerprint_attendance_enabled
   // flag -- individually (one id) or in bulk (a whole site's currently
   // not-enabled mapped employees at once). Never automatic, never
@@ -551,9 +705,15 @@ export default function HikCentralPersonMappingPage() {
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard title="HikCentral identities" value={identities.length.toLocaleString()} icon={Fingerprint} accent="navy" />
-        <StatCard title="Exact matches ready" value={exactMatches.length.toLocaleString()} icon={CheckCircle2} accent="green" />
-        <StatCard title="Need review" value={needsReview.length.toLocaleString()} icon={Search} accent="gold" />
-        <StatCard title="Mapped" value={mapped.length.toLocaleString()} icon={UserCheck} accent="blue" />
+        <StatCard title="Needs mapping" value={(exactMatches.length + needsReview.length).toLocaleString()} icon={Search} accent="gold" sub={`${exactMatches.length} ready, ${needsReview.length} need review`} />
+        <StatCard title="Total mapped" value={mapped.length.toLocaleString()} icon={UserCheck} accent="blue" />
+        <StatCard
+          title="Fingerprint status"
+          value={`${fingerprintStatusSummary.ready} ready`}
+          icon={CheckCircle2}
+          accent="green"
+          sub={`${fingerprintStatusSummary.needsActivation} need activation, ${fingerprintStatusSummary.needsSetup} need setup`}
+        />
       </div>
 
       <Card className="p-4 bg-slate-50 border-slate-200 border">
@@ -749,44 +909,113 @@ export default function HikCentralPersonMappingPage() {
 
       {activeTab === 'mapped' && (
         <>
-          {siteSummaries.length > 0 && canMap && (
-            <Card className="p-4 mb-4">
-              <h3 className="text-sm font-semibold text-slate-800 mb-1">Shared site terminal coverage</h3>
-              <p className="text-xs text-slate-500 mb-3">
-                Person Mapping is the only onboarding step most fingerprint employees need. Configure the eligible terminal(s) once per site here, and Safeguard automatically recognizes any mapped employee at that site -- no per-employee assignment required.
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {siteSummaries.map((s) => (
-                  <div key={s.key} className="rounded-lg border border-slate-200 overflow-hidden">
-                    <button
-                      type="button"
-                      onClick={() => openSiteModal(s.key)}
-                      className="text-left px-3 py-2 hover:bg-slate-50 transition-colors block w-full"
-                    >
-                      <span className="block text-sm font-medium text-slate-800">{s.rawSite}</span>
-                      <span className="block text-[11px] text-slate-500">{s.mappedEmployeeCount} mapped employee{s.mappedEmployeeCount === 1 ? '' : 's'}</span>
-                      {s.configuredAccessPoints.length > 0 ? (
-                        <span className="block text-[11px] text-emerald-600 mt-0.5">{s.configuredAccessPoints.join(', ')}</span>
-                      ) : s.observedAccessPoints.length > 1 ? (
-                        <span className="block text-[11px] text-amber-600 mt-0.5">Ambiguous -- {s.observedAccessPoints.length} terminals observed, needs review</span>
-                      ) : (
-                        <span className="block text-[11px] text-slate-400 mt-0.5">Not configured</span>
-                      )}
-                    </button>
-                    {s.configuredAccessPoints.length > 0 && s.notEnabledEmployeeIds.length > 0 && (
+          {canMap && (
+            <details className="mb-4 rounded-xl border border-slate-200 bg-white">
+              <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-50 rounded-xl">
+                Advanced: Terminal network configuration
+              </summary>
+              <div className="px-4 pb-4 space-y-4 border-t border-slate-100 pt-4">
+                <p className="text-xs text-slate-500">
+                  Most fingerprint employees need nothing here -- Person Mapping, plus a one-time site or network setup, is enough. Use this only to register a shared terminal network (e.g. several Lilongwe doors many workstations travel to), configure an individual site directly, or override one employee.
+                </p>
+
+                <div>
+                    <h3 className="text-sm font-semibold text-slate-800 mb-1">Shared terminal networks</h3>
+                    <p className="text-xs text-slate-500 mb-3">
+                      A network is a named, reusable terminal list -- many sites join it at once, and adding a terminal later is one edit here, never one edit per site.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {networkSummaries.map((n) => (
+                        <div key={n.network} className="rounded-lg border border-slate-200 overflow-hidden">
+                          <button
+                            type="button"
+                            onClick={() => openNetworkModal(n.network)}
+                            className="text-left px-3 py-2 hover:bg-slate-50 transition-colors block w-full"
+                          >
+                            <span className="block text-sm font-medium text-slate-800">{n.network}</span>
+                            <span className="block text-[11px] text-slate-500">{n.sites.length} site{n.sites.length === 1 ? '' : 's'} &middot; {n.mappedEmployeeCount} mapped employee{n.mappedEmployeeCount === 1 ? '' : 's'}</span>
+                            {n.configuredAccessPoints.length > 0 ? (
+                              <span className="block text-[11px] text-emerald-600 mt-0.5">{n.configuredAccessPoints.join(', ')}</span>
+                            ) : (
+                              <span className="block text-[11px] text-slate-400 mt-0.5">No terminals registered yet</span>
+                            )}
+                          </button>
+                          {n.configuredAccessPoints.length > 0 && n.notEnabledEmployeeIds.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleEnableFingerprintAttendance(n.notEnabledEmployeeIds)}
+                              disabled={n.notEnabledEmployeeIds.some((id) => enablingEmployeeIds.has(id))}
+                              className="w-full text-left px-3 py-1.5 text-[11px] font-medium text-[#081C3A] bg-slate-50 hover:bg-slate-100 border-t border-slate-200 disabled:opacity-50"
+                            >
+                              Enable fingerprint for {n.notEnabledEmployeeIds.length} not-yet-enabled employee{n.notEnabledEmployeeIds.length === 1 ? '' : 's'} here
+                            </button>
+                          )}
+                        </div>
+                      ))}
                       <button
                         type="button"
-                        onClick={() => handleEnableFingerprintAttendance(s.notEnabledEmployeeIds)}
-                        disabled={s.notEnabledEmployeeIds.some((id) => enablingEmployeeIds.has(id))}
-                        className="w-full text-left px-3 py-1.5 text-[11px] font-medium text-[#081C3A] bg-slate-50 hover:bg-slate-100 border-t border-slate-200 disabled:opacity-50"
+                        onClick={() => openNetworkModal(null)}
+                        className="text-left px-3 py-2 rounded-lg border border-dashed border-slate-300 hover:border-[#081C3A]/40 transition-colors text-sm text-slate-500"
                       >
-                        Enable fingerprint for {s.notEnabledEmployeeIds.length} not-yet-enabled employee{s.notEnabledEmployeeIds.length === 1 ? '' : 's'} here
+                        + Register a new network
                       </button>
-                    )}
+                    </div>
+                    <div className="mt-3 flex flex-col sm:flex-row gap-2 items-start sm:items-end">
+                      <div className="flex-1 w-full">
+                        <label className="block text-[11px] text-slate-500 mb-1">Site(s) to assign (comma-separated workstation names)</label>
+                        <Input placeholder="e.g. AREA 12, KANENGO AHL, OCEAN" value={assignSitesInput} onChange={(e) => setAssignSitesInput(e.target.value)} />
+                      </div>
+                      <div className="w-full sm:w-48">
+                        <label className="block text-[11px] text-slate-500 mb-1">Network</label>
+                        <Input placeholder="e.g. LILONGWE NETWORK" value={assignNetworkInput} onChange={(e) => setAssignNetworkInput(e.target.value)} />
+                      </div>
+                      <Button size="sm" onClick={handleAssignSitesToNetwork} disabled={assigningSites || !assignSitesInput.trim() || !assignNetworkInput.trim()}>
+                        {assigningSites ? 'Assigning...' : 'Assign'}
+                      </Button>
+                    </div>
                   </div>
-                ))}
+
+                {siteSummaries.length > 0 && (
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-800 mb-1">Individual site terminal coverage</h3>
+                    <p className="text-xs text-slate-500 mb-3">
+                      Configure one site's own terminal(s) directly -- only needed when a site is not part of a shared network.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {siteSummaries.map((s) => (
+                        <div key={s.key} className="rounded-lg border border-slate-200 overflow-hidden">
+                          <button
+                            type="button"
+                            onClick={() => openSiteModal(s.key)}
+                            className="text-left px-3 py-2 hover:bg-slate-50 transition-colors block w-full"
+                          >
+                            <span className="block text-sm font-medium text-slate-800">{s.rawSite}</span>
+                            <span className="block text-[11px] text-slate-500">{s.mappedEmployeeCount} mapped employee{s.mappedEmployeeCount === 1 ? '' : 's'}</span>
+                            {s.configuredAccessPoints.length > 0 ? (
+                              <span className="block text-[11px] text-emerald-600 mt-0.5">{s.configuredAccessPoints.join(', ')}</span>
+                            ) : s.observedAccessPoints.length > 1 ? (
+                              <span className="block text-[11px] text-amber-600 mt-0.5">Ambiguous -- {s.observedAccessPoints.length} terminals observed, needs review</span>
+                            ) : (
+                              <span className="block text-[11px] text-slate-400 mt-0.5">Not configured</span>
+                            )}
+                          </button>
+                          {s.configuredAccessPoints.length > 0 && s.notEnabledEmployeeIds.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleEnableFingerprintAttendance(s.notEnabledEmployeeIds)}
+                              disabled={s.notEnabledEmployeeIds.some((id) => enablingEmployeeIds.has(id))}
+                              className="w-full text-left px-3 py-1.5 text-[11px] font-medium text-[#081C3A] bg-slate-50 hover:bg-slate-100 border-t border-slate-200 disabled:opacity-50"
+                            >
+                              Enable fingerprint for {s.notEnabledEmployeeIds.length} not-yet-enabled employee{s.notEnabledEmployeeIds.length === 1 ? '' : 's'} here
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
-            </Card>
+            </details>
           )}
           {mapped.length === 0 ? (
           <EmptyState icon={UserCheck} title="No confirmed mappings yet" description="Mappings you confirm from the Exact Matches or Needs Review tabs will appear here." />
@@ -1043,6 +1272,64 @@ export default function HikCentralPersonMappingPage() {
             </Button>
             <Button onClick={handleSaveSiteTerminals} disabled={savingSiteTerminals}>
               {savingSiteTerminals ? 'Saving...' : 'Save'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        open={!!networkModalFor}
+        onClose={() => setNetworkModalFor(null)}
+        title={networkModalIsNew ? 'Register a new shared terminal network' : `Terminals for ${networkModalFor}`}
+        size="md"
+      >
+        <div className="space-y-4">
+          <p className="text-xs text-slate-500">
+            Every terminal registered here is automatically eligible for any mapped, enabled employee at any site joined to this network -- regardless of their workstation name. Adding a terminal later is one edit here, never one edit per site.
+          </p>
+          {networkModalIsNew && (
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-1">Network name</label>
+              <Input placeholder="e.g. LILONGWE NETWORK" value={networkNameInput} onChange={(e) => setNetworkNameInput(e.target.value)} />
+            </div>
+          )}
+          <div className="space-y-1.5">
+            {networkModalCandidates.length === 0 && (
+              <p className="text-xs text-slate-400">No terminals registered yet -- add one below.</p>
+            )}
+            {networkModalCandidates.map((ap) => (
+              <label key={ap} className="flex items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={networkModalSelected.has(ap)}
+                  onChange={() => toggleNetworkCandidate(ap)}
+                />
+                {ap}
+              </label>
+            ))}
+            {Array.from(networkModalSelected).filter((ap) => !networkModalCandidates.includes(ap)).map((ap) => (
+              <label key={ap} className="flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" checked onChange={() => toggleNetworkCandidate(ap)} />
+                {ap}
+              </label>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              placeholder="Add a terminal's exact HikCentral access point name..."
+              value={networkModalCustom}
+              onChange={(e) => setNetworkModalCustom(e.target.value)}
+            />
+            <Button variant="outline" size="sm" onClick={handleAddCustomNetworkTerminal} disabled={!networkModalCustom.trim()}>
+              Add
+            </Button>
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+            <Button variant="outline" onClick={() => setNetworkModalFor(null)} disabled={savingNetworkTerminals}>
+              Cancel
+            </Button>
+            <Button onClick={handleSaveNetworkTerminals} disabled={savingNetworkTerminals || (networkModalIsNew && !networkNameInput.trim())}>
+              {savingNetworkTerminals ? 'Saving...' : 'Save'}
             </Button>
           </div>
         </div>
