@@ -25,6 +25,9 @@ import {
 } from '../utils/hikcentralPersonMappingService';
 import {
   fetchEmployeeTerminalAssignments, setEmployeeHikCentralTerminals,
+  fetchMappedEmployeeTerminalStatus, setSiteHikCentralTerminals,
+  fetchSiteHikCentralTerminalConfigs, normalizeSiteKey,
+  MappedEmployeeTerminalStatus,
 } from '../utils/attendanceImportAutoApplyService';
 
 type TabId = 'exact' | 'needs_review' | 'mapped' | 'conflict';
@@ -82,6 +85,23 @@ export default function HikCentralPersonMappingPage() {
   const [terminalModalCustom, setTerminalModalCustom] = useState('');
   const [savingTerminals, setSavingTerminals] = useState(false);
 
+  // Automatic fingerprint terminal resolution: each mapped employee's
+  // resolved eligibility -- own assignment, the shared site-level
+  // fallback, deliberately excluded by manual history, or a genuine
+  // gap. Drives the honest status text in the Mapped tab (Part 5) --
+  // never shows "configured" when eligibility is actually unresolved.
+  const [terminalStatusByEmployee, setTerminalStatusByEmployee] = useState<Map<string, MappedEmployeeTerminalStatus>>(new Map());
+  // A separate, minimal site-level configuration modal -- same shape
+  // as the per-employee one, but keyed by site (employees.workstation)
+  // instead of one identity. Configuring a site once covers every
+  // employee at that site, including future hires, with no further
+  // per-employee action.
+  const [siteModalFor, setSiteModalFor] = useState<string | null>(null);
+  const [siteModalSelected, setSiteModalSelected] = useState<Set<string>>(new Set());
+  const [siteModalCustom, setSiteModalCustom] = useState('');
+  const [savingSiteTerminals, setSavingSiteTerminals] = useState(false);
+  const [siteConfigs, setSiteConfigs] = useState<Map<string, string[]>>(new Map());
+
   const [activeTab, setActiveTab] = useState<TabId>('exact');
 
   // Step 11F: a single search box shared by all four tabs -- its text is
@@ -111,13 +131,15 @@ export default function HikCentralPersonMappingPage() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [rows, anonCount, active, allById, mappings, terminals] = await Promise.all([
+      const [rows, anonCount, active, allById, mappings, terminals, terminalStatus, siteConfigsResult] = await Promise.all([
         fetchIdentifiedRawEvents(),
         fetchAnonymousEventCount(),
         fetchActiveNonDeletedEmployees(),
         fetchAllEmployeesById(),
         fetchActiveHikCentralPersonMappings(),
         fetchEmployeeTerminalAssignments().catch(() => new Map<string, string[]>()),
+        fetchMappedEmployeeTerminalStatus().catch(() => new Map<string, MappedEmployeeTerminalStatus>()),
+        fetchSiteHikCentralTerminalConfigs().catch(() => new Map<string, string[]>()),
       ]);
       const profiles = profileHikCentralIdentities(rows);
       const classified = classifyHikCentralIdentities(profiles, active, mappings);
@@ -126,6 +148,8 @@ export default function HikCentralPersonMappingPage() {
       setActiveEmployees(active);
       setEmployeesById(allById);
       setTerminalAssignments(terminals);
+      setTerminalStatusByEmployee(terminalStatus);
+      setSiteConfigs(siteConfigsResult);
 
       const confirmerIds = mappings.map((m) => m.confirmedBy).filter((id): id is string => !!id);
       setConfirmerNamesById(await fetchProfileFullNamesById(confirmerIds));
@@ -378,6 +402,84 @@ export default function HikCentralPersonMappingPage() {
     }
   }, [terminalModalFor, terminalModalSelected, loadData]);
 
+  // Automatic fingerprint terminal resolution: every distinct,
+  // normalized workstation among currently mapped employees -- the
+  // candidate list for "which site needs its shared terminal(s)
+  // configured", alongside whether each already has a configuration
+  // and how many currently-mapped employees it covers.
+  const siteSummaries = useMemo(() => {
+    const bySite = new Map<string, { rawSite: string; mappedEmployeeCount: number; observedAccessPoints: Set<string> }>();
+    for (const identity of identities) {
+      if (identity.category !== 'mapped') continue;
+      const employeeId = identity.activeMapping?.employeeId;
+      const employee = employeeId ? employeesById.get(employeeId) : null;
+      const rawSite = employee?.workstation?.trim();
+      if (!rawSite) continue;
+      const key = normalizeSiteKey(rawSite);
+      const existing = bySite.get(key);
+      if (existing) {
+        existing.mappedEmployeeCount += 1;
+        identity.profile.accessPoints.forEach((ap) => existing.observedAccessPoints.add(ap));
+      } else {
+        bySite.set(key, { rawSite, mappedEmployeeCount: 1, observedAccessPoints: new Set(identity.profile.accessPoints) });
+      }
+    }
+    return Array.from(bySite.entries())
+      .map(([key, v]) => ({
+        key,
+        rawSite: v.rawSite,
+        mappedEmployeeCount: v.mappedEmployeeCount,
+        observedAccessPoints: Array.from(v.observedAccessPoints).sort(),
+        configuredAccessPoints: siteConfigs.get(key) || [],
+      }))
+      .sort((a, b) => a.rawSite.localeCompare(b.rawSite));
+  }, [identities, employeesById, siteConfigs]);
+
+  const openSiteModal = useCallback((siteKey: string) => {
+    const current = siteConfigs.get(siteKey) || [];
+    setSiteModalFor(siteKey);
+    setSiteModalSelected(new Set(current));
+    setSiteModalCustom('');
+  }, [siteConfigs]);
+
+  const siteModalCandidates = useMemo(() => {
+    if (!siteModalFor) return [];
+    const summary = siteSummaries.find((s) => s.key === siteModalFor);
+    const current = siteConfigs.get(siteModalFor) || [];
+    return Array.from(new Set([...(summary?.observedAccessPoints || []), ...current])).sort();
+  }, [siteModalFor, siteSummaries, siteConfigs]);
+
+  const toggleSiteCandidate = useCallback((ap: string) => {
+    setSiteModalSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(ap)) next.delete(ap);
+      else next.add(ap);
+      return next;
+    });
+  }, []);
+
+  const handleAddCustomSiteTerminal = useCallback(() => {
+    const ap = siteModalCustom.trim();
+    if (!ap) return;
+    setSiteModalSelected((prev) => new Set(prev).add(ap));
+    setSiteModalCustom('');
+  }, [siteModalCustom]);
+
+  const handleSaveSiteTerminals = useCallback(async () => {
+    if (!siteModalFor) return;
+    setSavingSiteTerminals(true);
+    try {
+      await setSiteHikCentralTerminals(siteModalFor, Array.from(siteModalSelected));
+      showNotification('Shared site terminal configuration updated.', 'success');
+      setSiteModalFor(null);
+      await loadData();
+    } catch (err) {
+      showNotification(err instanceof Error ? err.message : 'Could not update the site terminal configuration.', 'error');
+    } finally {
+      setSavingSiteTerminals(false);
+    }
+  }, [siteModalFor, siteModalSelected, loadData]);
+
   const pickerResults = useMemo(() => {
     const q = pickerQuery.trim().toLowerCase();
     const pool = q === '' ? activeEmployees : activeEmployees.filter(
@@ -615,7 +717,36 @@ export default function HikCentralPersonMappingPage() {
       )}
 
       {activeTab === 'mapped' && (
-        mapped.length === 0 ? (
+        <>
+          {siteSummaries.length > 0 && canMap && (
+            <Card className="p-4 mb-4">
+              <h3 className="text-sm font-semibold text-slate-800 mb-1">Shared site terminal coverage</h3>
+              <p className="text-xs text-slate-500 mb-3">
+                Person Mapping is the only onboarding step most fingerprint employees need. Configure the eligible terminal(s) once per site here, and Safeguard automatically recognizes any mapped employee at that site -- no per-employee assignment required.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {siteSummaries.map((s) => (
+                  <button
+                    key={s.key}
+                    type="button"
+                    onClick={() => openSiteModal(s.key)}
+                    className="text-left px-3 py-2 rounded-lg border border-slate-200 hover:border-[#081C3A]/40 transition-colors"
+                  >
+                    <span className="block text-sm font-medium text-slate-800">{s.rawSite}</span>
+                    <span className="block text-[11px] text-slate-500">{s.mappedEmployeeCount} mapped employee{s.mappedEmployeeCount === 1 ? '' : 's'}</span>
+                    {s.configuredAccessPoints.length > 0 ? (
+                      <span className="block text-[11px] text-emerald-600 mt-0.5">{s.configuredAccessPoints.join(', ')}</span>
+                    ) : s.observedAccessPoints.length > 1 ? (
+                      <span className="block text-[11px] text-amber-600 mt-0.5">Ambiguous -- {s.observedAccessPoints.length} terminals observed, needs review</span>
+                    ) : (
+                      <span className="block text-[11px] text-slate-400 mt-0.5">Not configured</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </Card>
+          )}
+          {mapped.length === 0 ? (
           <EmptyState icon={UserCheck} title="No confirmed mappings yet" description="Mappings you confirm from the Exact Matches or Needs Review tabs will appear here." />
         ) : filteredMapped.length === 0 ? (
           <EmptyState icon={Search} title="No matching results" description={`No mapped employees match "${searchInput.trim()}". Try a different name, employee number, or Person No.`} />
@@ -637,7 +768,9 @@ export default function HikCentralPersonMappingPage() {
             <TBody>
               {filteredMapped.map((i) => {
                 const driftWarning = mappedIdentityHasNameDrift(i.profile);
-                const assignedTerminals = terminalAssignments.get(i.activeMapping!.employeeId) || [];
+                const employeeId = i.activeMapping!.employeeId;
+                const assignedTerminals = terminalAssignments.get(employeeId) || [];
+                const terminalStatus = terminalStatusByEmployee.get(employeeId);
                 return (
                   <TR key={i.profile.hikcentralPersonNo}>
                     <TD className="font-mono">{i.profile.hikcentralPersonNo}</TD>
@@ -655,18 +788,32 @@ export default function HikCentralPersonMappingPage() {
                     <TD>{i.activeMapping!.confirmedAt ? new Date(i.activeMapping!.confirmedAt as string).toLocaleDateString() : '—'}</TD>
                     <TD>{(i.activeMapping!.confirmedBy && confirmerNamesById.get(i.activeMapping!.confirmedBy)) || '—'}</TD>
                     <TD>
-                      {assignedTerminals.length > 0 ? (
-                        <div className="flex flex-wrap gap-1">
-                          {assignedTerminals.map((ap) => <Badge key={ap} color="blue">{ap}</Badge>)}
+                      {terminalStatus?.provenance === 'manual_protected' ? (
+                        <div className="space-y-1 max-w-xs">
+                          <Badge color="purple">Managed manually</Badge>
+                          <p className="text-xs text-slate-500">This employee has an existing manual attendance history and is deliberately kept outside automatic fingerprint attendance.</p>
+                        </div>
+                      ) : terminalStatus?.provenance === 'employee_assigned' || terminalStatus?.provenance === 'site_shared' ? (
+                        <div className="space-y-1 max-w-xs">
+                          <p className="text-xs text-emerald-700">Fingerprint identity confirmed. Safeguard automatically recognizes eligible HikCentral terminals.</p>
+                          <div className="flex flex-wrap gap-1">
+                            {(terminalStatus.accessPoints.length > 0 ? terminalStatus.accessPoints : assignedTerminals).map((ap) => (
+                              <Badge key={ap} color={terminalStatus.provenance === 'employee_assigned' ? 'blue' : 'teal'}>{ap}</Badge>
+                            ))}
+                          </div>
+                          <p className="text-[11px] text-slate-400">{terminalStatus.provenance === 'employee_assigned' ? 'Individually assigned' : 'Shared site configuration'}</p>
                         </div>
                       ) : (
-                        <Badge color="orange">Not configured</Badge>
+                        <div className="space-y-1 max-w-xs">
+                          <Badge color="orange">Waiting on terminal coverage</Badge>
+                          <p className="text-xs text-slate-500">Fingerprint identity mapped. Waiting for confirmed terminal coverage.</p>
+                        </div>
                       )}
                     </TD>
                     {canMap && (
                       <TD className="space-x-2 whitespace-nowrap">
-                        <Button variant="outline" size="sm" onClick={() => openTerminalModal(i)}>
-                          Terminals
+                        <Button variant="ghost" size="sm" onClick={() => openTerminalModal(i)} title="Override this employee's eligible terminal(s) individually -- only needed when the shared site configuration does not apply to them.">
+                          Individual override
                         </Button>
                         <Button variant="outline" size="sm" onClick={() => { setPickerFor(i.profile); setPickerIsRemap(true); setPickerQuery(''); }}>
                           Change
@@ -678,7 +825,8 @@ export default function HikCentralPersonMappingPage() {
               })}
             </TBody>
           </Table>
-        )
+          )}
+        </>
       )}
 
       {activeTab === 'conflict' && (
@@ -797,6 +945,52 @@ export default function HikCentralPersonMappingPage() {
             </Button>
             <Button onClick={handleSaveTerminals} disabled={savingTerminals}>
               {savingTerminals ? 'Saving...' : 'Save'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        open={!!siteModalFor}
+        onClose={() => setSiteModalFor(null)}
+        title={`Shared HikCentral terminal(s) for ${siteModalFor ? siteSummaries.find((s) => s.key === siteModalFor)?.rawSite || siteModalFor : ''}`}
+        size="md"
+      >
+        <div className="space-y-4">
+          <p className="text-xs text-slate-500">
+            Every mapped employee at this site, with no individual terminal override and no existing manual attendance history, automatically becomes eligible at the terminal(s) selected here. Employees with an individual override, or a manual attendance history, are never affected by this setting.
+          </p>
+          <div className="space-y-1.5">
+            {siteModalCandidates.length === 0 && (
+              <p className="text-xs text-slate-400">No access point observed for this site yet -- add one below.</p>
+            )}
+            {siteModalCandidates.map((ap) => (
+              <label key={ap} className="flex items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={siteModalSelected.has(ap)}
+                  onChange={() => toggleSiteCandidate(ap)}
+                />
+                {ap}
+              </label>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              placeholder="Add another access point by name..."
+              value={siteModalCustom}
+              onChange={(e) => setSiteModalCustom(e.target.value)}
+            />
+            <Button variant="outline" size="sm" onClick={handleAddCustomSiteTerminal} disabled={!siteModalCustom.trim()}>
+              Add
+            </Button>
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+            <Button variant="outline" onClick={() => setSiteModalFor(null)} disabled={savingSiteTerminals}>
+              Cancel
+            </Button>
+            <Button onClick={handleSaveSiteTerminals} disabled={savingSiteTerminals}>
+              {savingSiteTerminals ? 'Saving...' : 'Save'}
             </Button>
           </div>
         </div>
