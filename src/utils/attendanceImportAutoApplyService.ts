@@ -127,6 +127,92 @@ export async function setEmployeeHikCentralTerminals(employeeId: string, accessP
   if (error) throw error;
 }
 
+/**
+ * Automatic fingerprint terminal resolution: sets ONE site's complete
+ * desired set of shared, eligible terminals in one call -- every
+ * employee whose own `employees.workstation` matches this site (and
+ * who has no individual override, and no established manual-attendance
+ * history -- see attendance_employee_eligible_terminals) becomes
+ * eligible for automatic processing with zero per-employee action,
+ * including future hires. Same reconcile-by-full-desired-set shape as
+ * setEmployeeHikCentralTerminals.
+ */
+export async function setSiteHikCentralTerminals(site: string, accessPoints: string[]): Promise<void> {
+  const { error } = await supabase.rpc('set_site_hikcentral_terminals', {
+    p_site: site,
+    p_access_points: accessPoints,
+  });
+  if (error) throw error;
+}
+
+/**
+ * Explicitly enables (or disables) automatic site-shared fingerprint
+ * attendance for one or more mapped employees -- the one write path
+ * for the fingerprint_attendance_enabled flag (individually, with a
+ * single id, or in bulk per site). Never inferred from attendance
+ * history; always an explicit, reviewable human action.
+ */
+export async function setFingerprintAttendanceEnabled(employeeIds: string[], enabled: boolean): Promise<number> {
+  const { data, error } = await supabase.rpc('set_fingerprint_attendance_enabled', {
+    p_employee_ids: employeeIds,
+    p_enabled: enabled,
+  });
+  if (error) throw error;
+  return (data as { updated_count?: number } | null)?.updated_count || 0;
+}
+
+/** How a mapped employee is eligible for automatic processing, if at all -- see hikcentral_mapped_employees_terminal_status's own header for exactly what each value means. */
+export type HikCentralTerminalProvenance = 'employee_assigned' | 'site_shared' | 'fingerprint_not_enabled' | 'unconfigured';
+
+export interface MappedEmployeeTerminalStatus {
+  accessPoints: string[];
+  provenance: HikCentralTerminalProvenance;
+}
+
+interface MappedEmployeeTerminalStatusRpcRow {
+  employee_id: string;
+  access_points: string[] | null;
+  provenance: HikCentralTerminalProvenance;
+}
+
+/**
+ * Bulk, read-only status for every actively mapped employee in the
+ * caller's tenant/region -- the Person Mapping page's source of truth
+ * for the plain-English fingerprint configuration status (Part 5):
+ * never claims "fully configured" when eligibility is actually still
+ * unresolved.
+ */
+export async function fetchMappedEmployeeTerminalStatus(): Promise<Map<string, MappedEmployeeTerminalStatus>> {
+  const { data, error } = await supabase.rpc('hikcentral_mapped_employees_terminal_status');
+  if (error) throw error;
+  const byEmployee = new Map<string, MappedEmployeeTerminalStatus>();
+  for (const row of (data || []) as MappedEmployeeTerminalStatusRpcRow[]) {
+    byEmployee.set(row.employee_id, { accessPoints: row.access_points || [], provenance: row.provenance });
+  }
+  return byEmployee;
+}
+
+/** Every currently active site-level terminal configuration, keyed by the already-normalized site string -- the current state setSiteHikCentralTerminals edits. */
+export async function fetchSiteHikCentralTerminalConfigs(): Promise<Map<string, string[]>> {
+  const { data, error } = await supabase
+    .from('site_hikcentral_terminals')
+    .select('site, access_point')
+    .eq('is_active', true);
+  if (error) throw error;
+  const bySite = new Map<string, string[]>();
+  (data || []).forEach((row: { site: string; access_point: string }) => {
+    const existing = bySite.get(row.site);
+    if (existing) existing.push(row.access_point);
+    else bySite.set(row.site, [row.access_point]);
+  });
+  return bySite;
+}
+
+/** Trims, collapses internal whitespace, and uppercases -- the exact site-key normalization set_site_hikcentral_terminals itself applies server-side, so a client-side lookup against fetchSiteHikCentralTerminalConfigs's keys always matches. */
+export function normalizeSiteKey(raw: string): string {
+  return raw.trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
 // ---- Stage C Step 10: batch continuity (coverage timeline / gaps) ----
 
 export interface CoverageTimelineEntry {
