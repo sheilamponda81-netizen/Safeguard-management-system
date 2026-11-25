@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { calculateLivePayroll, LivePayrollInputs, getHistoricalSafeAbsentRate } from './payrollCalculations';
+import { calculateLivePayroll, LivePayrollInputs, getHistoricalSafeAbsentRate, getHistoricalSafeLateRate } from './payrollCalculations';
 import { DEFAULT_RATES } from './payrollSettings';
 
 // calculateLivePayroll is the single source of truth Payroll.tsx and
@@ -240,6 +240,65 @@ describe('getHistoricalSafeAbsentRate', () => {
         liveConfiguredRate: 5200,
       });
       expect(rate).toBe(5200);
+    });
+  });
+});
+
+// SALARY ADVANCES + PAYROLL & PAYSLIP FINANCIAL TRANSPARENCY audit: the
+// "Late" per-day rate label in both Payroll.tsx and Payslips.tsx
+// previously used today's live payrollRates.lateDeduction (Payroll.tsx) or
+// a hardcoded "MK4,200" literal (Payslips.tsx) for an ALREADY-PROCESSED
+// historical month, regardless of whether late_day_deduction has since
+// changed -- the exact class of bug getHistoricalSafeAbsentRate above was
+// already written to prevent, just never extended to the Late category.
+describe('getHistoricalSafeLateRate', () => {
+  describe('scenario A: current/unprocessed month (no frozen deduction row yet)', () => {
+    it('falls back to the live configured rate when nothing is stored', () => {
+      const rate = getHistoricalSafeLateRate({
+        frozenLateDeduction: undefined,
+        frozenLateDays: undefined,
+        liveConfiguredRate: 4200,
+      });
+      expect(rate).toBe(4200);
+    });
+
+    it('falls back to the live rate when a deduction row exists but has 0 late days', () => {
+      const rate = getHistoricalSafeLateRate({
+        frozenLateDeduction: 0,
+        frozenLateDays: 0,
+        liveConfiguredRate: 4200,
+      });
+      expect(rate).toBe(4200);
+    });
+  });
+
+  describe('scenario B: historical/processed month (frozen deduction row exists)', () => {
+    it('derives the rate actually charged from the frozen amount/days, ignoring a since-changed live rate', () => {
+      const rate = getHistoricalSafeLateRate({
+        frozenLateDeduction: 4200,
+        frozenLateDays: 1,
+        liveConfiguredRate: 6000,
+      });
+      expect(rate).toBe(4200);
+      expect(rate).not.toBe(6000);
+    });
+
+    it('divides the frozen amount by the frozen day count for a multi-day historical lateness record', () => {
+      const rate = getHistoricalSafeLateRate({
+        frozenLateDeduction: 12600,
+        frozenLateDays: 3,
+        liveConfiguredRate: 6000,
+      });
+      expect(rate).toBe(4200);
+    });
+
+    it('never uses the live rate once a frozen amount/days pair is present, even if it happens to equal the live rate', () => {
+      const rate = getHistoricalSafeLateRate({
+        frozenLateDeduction: 6000,
+        frozenLateDays: 1,
+        liveConfiguredRate: 6000,
+      });
+      expect(rate).toBe(6000);
     });
   });
 });

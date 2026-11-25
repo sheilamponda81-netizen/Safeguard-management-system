@@ -4,6 +4,8 @@ import {
   summarizeAdvanceStatuses,
   getDominantStatusForColor,
   getSlotsAvailableLabel,
+  filterAdvancesByTab,
+  getMissingEmployeeIds,
 } from './salaryAdvanceGrouping';
 
 // Regression coverage for the real staging UX request: the Salary
@@ -130,5 +132,77 @@ describe('getSlotsAvailableLabel', () => {
 
   it('never goes negative even if openCount somehow exceeds maxSlots', () => {
     expect(getSlotsAvailableLabel(3, 2)).toBe('No slots available');
+  });
+});
+
+// Part 3 (SALARY ADVANCES + PAYROLL & PAYSLIP FINANCIAL TRANSPARENCY):
+// ACTIVE/PAID/OTHER-HISTORY tabs. Regression coverage for the real
+// production case the audit found: DANIEL SIMPILICIOUS CHILINDE
+// (SFG-S-308) holds two advances for the same employee -- one 'active'
+// (outstanding MK15,000) and one 'cancelled' (never repaid, MK30,000,
+// which the task did not even mention but production data showed). The
+// two tabs must never show the same advance, and switching tabs must
+// never affect the other tab's own advances or counts.
+describe('filterAdvancesByTab', () => {
+  const chilindeActive = { employee_id: 'chilinde', status: 'active' };
+  const chilindeCancelled = { employee_id: 'chilinde', status: 'cancelled' };
+  const wongaActive = { employee_id: 'wonga', status: 'active' };
+  const somePending = { employee_id: 'other', status: 'pending' };
+  const somePaid = { employee_id: 'other', status: 'paid' };
+  const someRejected = { employee_id: 'other2', status: 'rejected' };
+  const all = [chilindeActive, chilindeCancelled, wongaActive, somePending, somePaid, someRejected];
+
+  it('ACTIVE tab includes active and pending, never paid/rejected/cancelled', () => {
+    expect(filterAdvancesByTab(all, 'active')).toEqual([chilindeActive, wongaActive, somePending]);
+  });
+
+  it('PAID tab includes only paid', () => {
+    expect(filterAdvancesByTab(all, 'paid')).toEqual([somePaid]);
+  });
+
+  it('OTHER/HISTORY tab includes rejected and cancelled, including CHILINDE\'s never-repaid cancelled advance -- never silently dropped', () => {
+    expect(filterAdvancesByTab(all, 'other')).toEqual([chilindeCancelled, someRejected]);
+  });
+
+  it('the same advance never appears in two tabs', () => {
+    const active = new Set(filterAdvancesByTab(all, 'active'));
+    const paid = new Set(filterAdvancesByTab(all, 'paid'));
+    const other = new Set(filterAdvancesByTab(all, 'other'));
+    all.forEach(row => {
+      const memberships = [active.has(row), paid.has(row), other.has(row)].filter(Boolean).length;
+      expect(memberships).toBe(1);
+    });
+  });
+
+  it('empty input yields an empty list for every tab', () => {
+    expect(filterAdvancesByTab([], 'active')).toEqual([]);
+    expect(filterAdvancesByTab([], 'paid')).toEqual([]);
+    expect(filterAdvancesByTab([], 'other')).toEqual([]);
+  });
+});
+
+// Part 2: resolving real names for soft-deleted employees who still own a
+// pre-existing advance (production case: CHARLES WONGA / SFG-S-303 and
+// DANIEL CHILINDE / SFG-S-308, both is_deleted = true with real
+// outstanding balances) -- without this, the page's active-only employee
+// fetch leaves their advances unable to resolve a name at all.
+describe('getMissingEmployeeIds', () => {
+  it('returns the employee_id of an advance whose employee is not in the active list', () => {
+    const advances = [{ employee_id: 'wonga' }, { employee_id: 'active-emp' }];
+    expect(getMissingEmployeeIds(advances, ['active-emp'])).toEqual(['wonga']);
+  });
+
+  it('dedupes when the same missing employee owns multiple advances (CHILINDE: active + cancelled)', () => {
+    const advances = [{ employee_id: 'chilinde' }, { employee_id: 'chilinde' }];
+    expect(getMissingEmployeeIds(advances, [])).toEqual(['chilinde']);
+  });
+
+  it('returns nothing when every advance already belongs to an active employee', () => {
+    const advances = [{ employee_id: 'active-emp' }];
+    expect(getMissingEmployeeIds(advances, ['active-emp'])).toEqual([]);
+  });
+
+  it('empty advances yields an empty list', () => {
+    expect(getMissingEmployeeIds([], ['active-emp'])).toEqual([]);
   });
 });

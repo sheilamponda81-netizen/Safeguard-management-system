@@ -80,3 +80,42 @@ export function getSlotsAvailableLabel(openCount: number, maxSlots: number): str
   if (available === 0) return 'No slots available';
   return `${available} slot${available === 1 ? '' : 's'} available`;
 }
+
+// ===== Part 3 transparency tabs (SalaryAdvances.tsx) =====
+// A pure view split of the SAME advances data the page already fetches --
+// no new query, and no change to status values themselves or to how an
+// advance transitions between them (that stays entirely server-side, in
+// approve_salary_advance()/the repayment RPCs). ACTIVE is the default so
+// an approver lands on what needs attention (open requests + live debt)
+// rather than on a wall of paid-off history. 'pending' is deliberately
+// grouped under ACTIVE, not its own tab: it is not yet a historical
+// record, and the existing Status badge in the table already distinguishes
+// Pending from Active within this tab (see summarizeAdvanceStatuses()
+// above).
+export type AdvanceTab = 'active' | 'paid' | 'other';
+
+export const TAB_STATUSES: Record<AdvanceTab, readonly string[]> = {
+  active: ['active', 'pending'],
+  paid: ['paid'],
+  other: ['rejected', 'cancelled'],
+};
+
+export function filterAdvancesByTab<T extends { status: string }>(rows: T[], tab: AdvanceTab): T[] {
+  const statuses = TAB_STATUSES[tab];
+  return rows.filter(row => statuses.includes(row.status));
+}
+
+// ===== Soft-deleted employee name resolution (SalaryAdvances.tsx) =====
+// Which employee ids a page's `advances` fetch references that are NOT
+// present in its active-only `employees` list -- e.g. a since-deleted
+// employee with a pre-existing advance. Deliberately returns every such
+// id (deduped), never excluding one just because it looks already
+// resolved elsewhere -- the caller (fetchFormerEmployees) is responsible
+// for not re-querying an id it already has.
+export function getMissingEmployeeIds<T extends { employee_id: string }>(
+  advances: T[],
+  activeEmployeeIds: Iterable<string>
+): string[] {
+  const active = new Set(activeEmployeeIds);
+  return Array.from(new Set(advances.map(a => a.employee_id).filter(id => !active.has(id))));
+}

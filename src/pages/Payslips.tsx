@@ -8,7 +8,7 @@ import { getCurrentProfile } from '../utils/currentProfile';
 import { showNotification } from '../utils/clickHandlers';
 import { logAudit } from '../utils/auditLogger';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
-import { getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
+import { getHistoricalSafeAbsentRate, getHistoricalSafeLateRate } from '../utils/payrollCalculations';
 import { buildItemizedAttendanceBreakdown, deriveUniformOnlyAmount } from '../utils/payslipBreakdown';
 import { getCompanySettings } from '../utils/companySettings';
 import {
@@ -626,7 +626,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
               ${attendanceBreakdownAvailable ? `
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
               ${absentDays > 0 ? `<div>Absent (${absentDays} × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}): -${formatKwacha(absentDeduction)}</div>` : ''}
-              ${lateDays > 0 ? `<div>Late (${lateDays} × MK4,200): -${formatKwacha(lateDeduction)}</div>` : ''}
+              ${lateDays > 0 ? `<div>Late (${lateDays} × ${formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: p.late_deduction, frozenLateDays: p.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}): -${formatKwacha(lateDeduction)}</div>` : ''}
               ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
               ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
               ` : (totalUniformAtt > 0 ? `<div>Itemized breakdown not available for this period -- total shown as processed.</div>` : '')}
@@ -728,7 +728,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
               ${attendanceBreakdownAvailable ? `
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
               ${absentDays > 0 ? `<div>Absent (${absentDays} × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}): -${formatKwacha(absentDeduction)}</div>` : ''}
-              ${lateDays > 0 ? `<div>Late (${lateDays} × MK4,200): -${formatKwacha(lateDeduction)}</div>` : ''}
+              ${lateDays > 0 ? `<div>Late (${lateDays} × ${formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: p.late_deduction, frozenLateDays: p.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}): -${formatKwacha(lateDeduction)}</div>` : ''}
               ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
               ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
               ` : (totalUniformAtt > 0 ? `<div>Itemized breakdown not available for this period -- total shown as processed.</div>` : '')}
@@ -1391,7 +1391,7 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
                       <span className="font-mono">-{formatKwacha(absentDeduction)}</span>
                     </div>
                   )}
-                  {lateDays > 0 && <div className="flex justify-between"><span>Late ({lateDays} × MK4,200)</span><span className="font-mono">-{formatKwacha(lateDeduction)}</span></div>}
+                  {lateDays > 0 && <div className="flex justify-between"><span>Late ({lateDays} × {formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: p.late_deduction, frozenLateDays: p.late_days, liveConfiguredRate: payrollRates.lateDeduction }))})</span><span className="font-mono">-{formatKwacha(lateDeduction)}</span></div>}
                   {lectureDeduction > 0 && <div className="flex justify-between"><span>Lecture Deduction</span><span className="font-mono">-{formatKwacha(lectureDeduction)}</span></div>}
                   {appearanceDeduction > 0 && <div className="flex justify-between"><span>Appearance Deduction</span><span className="font-mono">-{formatKwacha(appearanceDeduction)}</span></div>}
                 </div>

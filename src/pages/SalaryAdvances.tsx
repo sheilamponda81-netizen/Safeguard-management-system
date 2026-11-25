@@ -22,6 +22,9 @@ import {
   summarizeAdvanceStatuses,
   getDominantStatusForColor,
   getSlotsAvailableLabel,
+  getMissingEmployeeIds,
+  filterAdvancesByTab,
+  AdvanceTab,
 } from '../utils/salaryAdvanceGrouping';
 
 // Business rule: an employee may have at most this many simultaneously
@@ -32,6 +35,10 @@ import {
 // silently drifts from the number in the sentence "Maximum of two active
 // salary advances reached."
 const MAX_OPEN_ADVANCES_PER_EMPLOYEE = 2;
+
+// See salaryAdvanceGrouping.ts's own header for AdvanceTab/TAB_STATUSES/
+// filterAdvancesByTab -- moved there so the tab-to-status mapping is unit
+// testable the same way getQualifyingEmployeeIds() etc. already are.
 
 // Raw `employees` row shape this page's own query selects -- mirrors
 // TerminalDues.tsx's Employee/EmployeeRow split, since Salary Advances
@@ -62,6 +69,12 @@ interface Employee {
   hireDate: string;
   regionName: string;
   workstation: string;
+  // True only for employees fetched via fetchFormerEmployees() below (soft-
+  // deleted, resolved purely to show a real name + "Former employee" badge
+  // on a pre-existing advance -- never reactivates the employee record and
+  // never appears in the "New advance" employee picker, which still reads
+  // only from the active-only `employees` state).
+  isDeleted?: boolean;
 }
 
 interface SalaryAdvanceRow {
@@ -158,12 +171,19 @@ export function SalaryAdvancesPage() {
   // them out of this entire page.
   const [hasFunctionalManagePermission, setHasFunctionalManagePermission] = useState(false);
   const [employees, setEmployees] = useState<Employee[]>([]);
+  // Soft-deleted employees who own a pre-existing advance -- fetched
+  // separately (see fetchFormerEmployees below) so this page can resolve
+  // their real name/number instead of showing "Unknown", WITHOUT touching
+  // `employees` (which must stay active-only: it alone backs the "New
+  // advance" search picker at filteredEmployees).
+  const [formerEmployees, setFormerEmployees] = useState<Employee[]>([]);
+  const fetchedFormerEmployeeIdsRef = useRef<Set<string>>(new Set());
   const [advances, setAdvances] = useState<SalaryAdvanceRow[]>([]);
   const [deductionLedger, setDeductionLedger] = useState<DeductionLedgerRow[]>([]);
   const [combinedPlans, setCombinedPlans] = useState<CombinedPlanRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [filterStatus, setFilterStatus] = useState('all');
+  const [advanceTab, setAdvanceTab] = useState<AdvanceTab>('active');
   const [showApplyModal, setShowApplyModal] = useState(false);
   // Employee-scoped (not a single advance row) so the detail modal can
   // show ALL of an employee's advances together -- see the modal's own
@@ -218,9 +238,14 @@ export function SalaryAdvancesPage() {
 
   const employeesById = useMemo(() => {
     const map = new Map<string, Employee>();
+    // formerEmployees first, active `employees` second: if an id were ever
+    // somehow present in both (it shouldn't be -- see fetchFormerEmployees'
+    // own exclusion of ids already in `employees`), the real active record
+    // wins.
+    formerEmployees.forEach(e => map.set(e.id, e));
     employees.forEach(e => map.set(e.id, e));
     return map;
-  }, [employees]);
+  }, [employees, formerEmployees]);
 
   // Outstanding balance is ALWAYS derived (advance_amount - SUM of this
   // advance's own ledger rows), never read from a separately-stored
@@ -344,10 +369,7 @@ export function SalaryAdvancesPage() {
   }, [selectedEmployee, getEmployeeAdvanceSummary]);
 
   const displayedAdvances = useMemo(() => {
-    let result = advances;
-    if (filterStatus !== 'all') {
-      result = result.filter(a => a.status === filterStatus);
-    }
+    let result = filterAdvancesByTab(advances, advanceTab);
     if (search) {
       const searchLower = search.toLowerCase();
       result = result.filter(a => {
@@ -358,7 +380,7 @@ export function SalaryAdvancesPage() {
       });
     }
     return result;
-  }, [advances, filterStatus, search, employeesById]);
+  }, [advances, advanceTab, search, employeesById]);
 
   // ===== EMPLOYEE GROUPING FOR THE MAIN TABLE =====
   // The main list shows ONE row per employee, not one per advance --
@@ -376,6 +398,19 @@ export function SalaryAdvancesPage() {
     [displayedAdvances]
   );
 
+  // Employee counts per tab, for the tab labels below -- always computed
+  // from the FULL `advances` set (never the currently-selected tab's own
+  // filtered subset), so switching tabs never changes another tab's own
+  // count.
+  const tabEmployeeCounts = useMemo(() => {
+    const tabs: AdvanceTab[] = ['active', 'paid', 'other'];
+    const counts: Record<AdvanceTab, number> = { active: 0, paid: 0, other: 0 };
+    tabs.forEach(tab => {
+      counts[tab] = getQualifyingEmployeeIds(filterAdvancesByTab(advances, tab)).length;
+    });
+    return counts;
+  }, [advances]);
+
   // Pagination now operates on EMPLOYEE groups, not individual advance
   // rows -- "Show 20" means 20 employees. totalPages below (near the
   // render) is derived from this same length.
@@ -387,7 +422,7 @@ export function SalaryAdvancesPage() {
 
   useEffect(() => {
     setAdvancesPage(1);
-  }, [search, filterStatus]);
+  }, [search, advanceTab]);
 
   // ===== CALLBACKS =====
   const fetchUserProfile = useCallback(async () => {
@@ -442,6 +477,55 @@ export function SalaryAdvancesPage() {
     }
   }, [userProfile]);
 
+  // Resolves real names/numbers for soft-deleted employees who own a
+  // pre-existing advance -- e.g. a since-terminated employee with an
+  // active, still-being-repaid balance. fetchEmployees() above correctly
+  // excludes deleted employees from the "New advance" picker (you cannot
+  // apply for a new advance against someone no longer employed), but that
+  // same exclusion left any EXISTING advance of theirs unable to resolve a
+  // name at all, showing "Unknown" instead. This never reactivates the
+  // employee record (plain read, by id, of whatever already exists) and
+  // never feeds the picker -- only `employeesById` (via formerEmployees
+  // above), purely for display.
+  const fetchFormerEmployees = useCallback(async (employeeIds: string[]) => {
+    const toFetch = employeeIds.filter(id => !fetchedFormerEmployeeIdsRef.current.has(id));
+    if (toFetch.length === 0) return;
+    toFetch.forEach(id => fetchedFormerEmployeeIdsRef.current.add(id));
+    try {
+      const columns = 'id, employee_number, full_name, position, department, basic_salary, hire_date, region_id, workstation, status, is_deleted, regions(name)';
+      const rows: EmployeeRow[] = [];
+      // Chunked defensively (PostgREST URL length), though in practice the
+      // number of distinct deleted employees with a pre-existing advance is
+      // small relative to the employee population this guards fetchEmployees
+      // against above.
+      for (let i = 0; i < toFetch.length; i += 200) {
+        const batch = toFetch.slice(i, i + 200);
+        const { data, error } = await supabase.from('employees').select(columns).in('id', batch);
+        if (error) throw error;
+        if (data) rows.push(...(data as unknown as EmployeeRow[]));
+      }
+      const mapped = rows.map((emp): Employee => ({
+        id: emp.id,
+        employeeNumber: emp.employee_number || '',
+        fullName: emp.full_name || '',
+        position: emp.position || '',
+        department: emp.department || '',
+        basicSalary: emp.basic_salary || 0,
+        hireDate: emp.hire_date || '',
+        regionName: emp.regions?.name || '',
+        workstation: emp.workstation || '',
+        isDeleted: emp.is_deleted ?? true,
+      }));
+      if (mapped.length > 0) {
+        setFormerEmployees(prev => dedupeById([...prev, ...mapped]));
+      }
+    } catch (err) {
+      // Non-fatal: the affected rows simply keep showing "Unknown" if this
+      // fails, same as before this fix -- never block the rest of the page.
+      console.error('Error fetching former employees:', err);
+    }
+  }, []);
+
   const fetchAdvances = useCallback(async () => {
     setLoading(true);
     try {
@@ -449,11 +533,16 @@ export function SalaryAdvancesPage() {
       let plansData: CombinedPlanRow[];
 
       if (!userProfile?.is_super_admin && userProfile?.region_id) {
+        // Deliberately NOT filtered to is_deleted = false here: a region
+        // approver must still see (and be able to resolve the name of) a
+        // pre-existing advance belonging to someone who was in their region
+        // and has since been soft-deleted -- excluding them would make that
+        // advance vanish from this scoped view entirely, not just show
+        // "Unknown".
         const { data: regionEmployees } = await supabase
           .from('employees')
           .select('id')
-          .eq('region_id', userProfile.region_id)
-          .eq('is_deleted', false);
+          .eq('region_id', userProfile.region_id);
         const employeeIds = regionEmployees?.map(e => e.id) || [];
         if (employeeIds.length === 0) {
           setAdvances([]);
@@ -546,6 +635,17 @@ export function SalaryAdvancesPage() {
       fetchAdvances();
     }
   }, [userProfile, fetchEmployees, fetchAdvances]);
+
+  // Once both the active-employee list and the advances list have loaded,
+  // resolve any advance whose employee_id isn't an active employee -- see
+  // fetchFormerEmployees' own header.
+  useEffect(() => {
+    if (advances.length === 0) return;
+    const missing = getMissingEmployeeIds(advances, employees.map(e => e.id));
+    if (missing.length > 0) {
+      fetchFormerEmployees(missing);
+    }
+  }, [advances, employees, fetchFormerEmployees]);
 
   // ===== SEARCHABLE EMPLOYEE DROPDOWN =====
   useEffect(() => {
@@ -1006,9 +1106,37 @@ export function SalaryAdvancesPage() {
         </Card>
       </div>
 
+      {/* Part 3: ACTIVE (default) / PAID / OTHER-HISTORY -- a pure view
+          split of the same `advances` rows already fetched above. Changing
+          tabs never touches the two-slot rule, the combined repayment
+          plan, or any deduction logic; it only narrows which statuses the
+          table below shows. */}
+      <div className="flex gap-1 border-b border-slate-200" role="tablist" aria-label="Salary advance view">
+        {([
+          ['active', 'Active'],
+          ['paid', 'Paid'],
+          ['other', 'Other / History'],
+        ] as [AdvanceTab, string][]).map(([tab, label]) => (
+          <button
+            key={tab}
+            type="button"
+            role="tab"
+            aria-selected={advanceTab === tab}
+            onClick={() => setAdvanceTab(tab)}
+            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              advanceTab === tab
+                ? 'border-[#081C3A] text-[#081C3A]'
+                : 'border-transparent text-slate-500 hover:text-slate-700'
+            }`}
+          >
+            {label} <span className="ml-1 text-xs text-slate-400">({tabEmployeeCounts[tab]})</span>
+          </button>
+        ))}
+      </div>
+
       <Card className="p-4">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <div className="relative">
+          <div className="relative md:col-span-2">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input
               id="searchAdvances"
@@ -1020,21 +1148,7 @@ export function SalaryAdvancesPage() {
               className="w-full pl-10 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
             />
           </div>
-          <select
-            id="filterAdvanceStatus"
-            name="filterAdvanceStatus"
-            value={filterStatus}
-            onChange={e => setFilterStatus(e.target.value)}
-            className="px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-[#081C3A]"
-          >
-            <option value="all">All Status</option>
-            <option value="pending">Pending</option>
-            <option value="active">Active</option>
-            <option value="paid">Paid</option>
-            <option value="rejected">Rejected</option>
-            <option value="cancelled">Cancelled</option>
-          </select>
-          <Button variant="outline" onClick={() => { setSearch(''); setFilterStatus('all'); }} className="text-sm">
+          <Button variant="outline" onClick={() => { setSearch(''); setAdvanceTab('active'); }} className="text-sm">
             Clear Filters
           </Button>
         </div>
@@ -1085,6 +1199,11 @@ export function SalaryAdvancesPage() {
                     <TR key={employeeId} className="hover:bg-slate-50">
                       <TD>
                         <p className="font-medium text-slate-800">{emp?.fullName || 'Unknown'}</p>
+                        {emp?.isDeleted && (
+                          <span className="inline-block mt-0.5 text-[10px] font-medium text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">
+                            Former employee
+                          </span>
+                        )}
                       </TD>
                       <TD className="text-xs">{emp?.employeeNumber || 'N/A'}</TD>
                       <TD>
@@ -1401,7 +1520,15 @@ export function SalaryAdvancesPage() {
           return (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-3 text-sm">
-                <div><p className="text-slate-500">Employee</p><p className="font-semibold">{emp?.fullName || 'Unknown'}</p></div>
+                <div>
+                  <p className="text-slate-500">Employee</p>
+                  <p className="font-semibold">{emp?.fullName || 'Unknown'}</p>
+                  {emp?.isDeleted && (
+                    <span className="inline-block mt-0.5 text-[10px] font-medium text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">
+                      Former employee -- record soft-deleted
+                    </span>
+                  )}
+                </div>
                 <div><p className="text-slate-500">Employee #</p><p className="font-semibold">{emp?.employeeNumber || 'N/A'}</p></div>
                 <div><p className="text-slate-500">Open Advances / Slots</p><p className="font-semibold">{summary.openCount} / {MAX_OPEN_ADVANCES_PER_EMPLOYEE}</p></div>
                 <div><p className="text-slate-500">Active Outstanding</p><p className="font-semibold">{formatKwacha(summary.activeOutstanding)}</p></div>

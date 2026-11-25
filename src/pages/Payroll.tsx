@@ -9,7 +9,7 @@ import { logAudit } from '../utils/auditLogger';
 import { showNotification } from '../utils/clickHandlers';
 import { Pagination } from '../components/Pagination';
 import { getPayrollRatesStrict, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
-import { calculateLivePayroll, getHistoricalSafeAbsentRate } from '../utils/payrollCalculations';
+import { calculateLivePayroll, getHistoricalSafeAbsentRate, getHistoricalSafeLateRate } from '../utils/payrollCalculations';
 import { calculatePooledAllocation } from '../utils/salaryAdvanceCalculations';
 import { processPayrollWithTerminalDues, describeProcessPayrollBatchError } from '../utils/payrollProcessing';
 import { getDefaultPageSize } from '../utils/uiSettings';
@@ -59,7 +59,7 @@ import {
 } from '../utils/terminalDuesPayrollIntegration';
 import { buildTerminalDuePaymentsCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
 import { buildOrdinaryPayrollPaymentsCsv, buildAccountsReconciliationSummaryCsv, computeOrdinaryPayrollPaymentTotals, OrdinaryPayrollPaymentRecord } from '../utils/accountsReconciliationExport';
-import { buildPayrollDeductionBreakdown, deriveItemizedAttendanceDeduction, PayrollDeductionBreakdownEmployeeInput } from '../utils/payrollDeductionBreakdown';
+import { buildPayrollDeductionBreakdown, deriveItemizedAttendanceDeduction, PayrollDeductionBreakdownEmployeeInput, ItemizedAttendanceDeductionAmounts } from '../utils/payrollDeductionBreakdown';
 
 interface Employee {
   id: string;
@@ -161,6 +161,30 @@ interface EmployeeDeduction {
   total_deductions: number;
 }
 
+// Part 5/6: the Deductions Breakdown card's categories, and one row of its
+// drill-down modal -- see deductionDrilldownRows' own header.
+type DeductionCategory = 'paye' | 'pension' | 'absence' | 'late' | 'lecture' | 'appearance' | 'uniform' | 'salaryAdvance' | 'unitemized';
+
+interface DeductionDrilldownRow {
+  employeeId: string;
+  fullName: string;
+  employeeNumber: string;
+  amount: number;
+  detail: string;
+}
+
+const DEDUCTION_CATEGORY_LABELS: Record<DeductionCategory, string> = {
+  paye: 'PAYE',
+  pension: 'Pension',
+  absence: 'Absence',
+  late: 'Late Arrival',
+  lecture: 'Lecture',
+  appearance: 'Appearance',
+  uniform: 'Uniform',
+  salaryAdvance: 'Salary Advances',
+  unitemized: 'Not Itemized',
+};
+
 export function PayrollPage() {
   // ===== ALL HOOKS AT TOP LEVEL =====
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -173,6 +197,12 @@ export function PayrollPage() {
   const [availableMonths, setAvailableMonths] = useState<string[]>([]);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [showApprovalModal, setShowApprovalModal] = useState(false);
+  // Part 5/6: which Deductions Breakdown category card the Accountant/HR
+  // user clicked, if any -- drives the drill-down modal below. Purely a
+  // view of already-fetched data (employees/payrollByEmployee/
+  // itemizedByEmployeeId); selecting one never queries or mutates
+  // anything.
+  const [deductionDrilldownCategory, setDeductionDrilldownCategory] = useState<DeductionCategory | null>(null);
   const [processing, setProcessing] = useState(false);
   const [processed, setProcessed] = useState(false);
   const [editingValues, setEditingValues] = useState<Record<string, Partial<PayrollRecord>>>({});
@@ -1254,12 +1284,23 @@ export function PayrollPage() {
   // in "Not itemized" even though real per-category figures exist --
   // deriveItemizedAttendanceDeduction() picks the correct one of the two
   // sources per employee (see payrollDeductionBreakdown.ts's header).
-  const deductionBreakdown = useMemo(() => {
-    const inputs: PayrollDeductionBreakdownEmployeeInput[] = employees.map(emp => {
-      const p = getDisplayPayroll(emp);
+  // Per-employee itemization result, keyed by employee id -- the SAME
+  // resolution deductionBreakdown's aggregate below is built from, now
+  // also reused by (a) the per-row "Uniform/Att" cell's own sub-breakdown
+  // further down, which previously computed its "Uniform: MK..." line from
+  // TODAY's live positionsRequiringUniform/payrollRates.uniformDeduction
+  // regardless of whether the employee's month was already processed --
+  // silently showing a guessed, rate-may-have-changed-since figure for an
+  // employee with no employee_deductions row (e.g. Jameson Burnet, Oct
+  // 2026 -- see the audit this card's "Not itemized" line was added for),
+  // instead of the same honest "not available" fallback Payslips.tsx
+  // already uses -- and (b) the deduction-breakdown drill-down modal.
+  const itemizedByEmployeeId = useMemo(() => {
+    const map = new Map<string, ItemizedAttendanceDeductionAmounts | null>();
+    employees.forEach(emp => {
       const deduction = getEmployeeDeduction(emp.id);
       const isProcessed = payrollByEmployee.has(emp.id);
-      const itemized = deriveItemizedAttendanceDeduction({
+      map.set(emp.id, deriveItemizedAttendanceDeduction({
         isProcessed,
         liveAttendance: attendanceCounts.get(emp.id) || null,
         frozenRecord: deduction
@@ -1274,17 +1315,96 @@ export function PayrollPage() {
         appearanceDeduction: deduction?.appearance_deduction || 0,
         liveAbsentRate: payrollRates.absentDeduction,
         liveLateRate: payrollRates.lateDeduction,
-      });
+      }));
+    });
+    return map;
+  }, [employees, getEmployeeDeduction, payrollByEmployee, attendanceCounts, payrollRates]);
+
+  const deductionBreakdown = useMemo(() => {
+    const inputs: PayrollDeductionBreakdownEmployeeInput[] = employees.map(emp => {
+      const p = getDisplayPayroll(emp);
       return {
         paye: p.paye,
         pension: p.pension,
         uniformAndAttendanceTotal: p.uniform_deduction || 0,
         salaryAdvanceDeduction: p.salary_advance_deduction || 0,
-        itemized,
+        itemized: itemizedByEmployeeId.get(emp.id) ?? null,
       };
     });
     return buildPayrollDeductionBreakdown(inputs);
-  }, [employees, getDisplayPayroll, getEmployeeDeduction, payrollByEmployee, attendanceCounts, payrollRates]);
+  }, [employees, getDisplayPayroll, itemizedByEmployeeId]);
+
+  // Part 5/6 drill-down: per-employee rows for whichever Deductions
+  // Breakdown category card was clicked, built from the exact same
+  // itemizedByEmployeeId/getDisplayPayroll data the aggregate card above
+  // already sums -- this never re-derives a figure a different way, it
+  // only lists which employees make up a category total the page already
+  // shows, each with the quantity/rate evidence behind their own amount
+  // where one exists.
+  const deductionDrilldownRows = useMemo(() => {
+    if (!deductionDrilldownCategory) return [];
+    const rows: DeductionDrilldownRow[] = [];
+    employees.forEach(emp => {
+      const p = getDisplayPayroll(emp);
+      const itemized = itemizedByEmployeeId.get(emp.id) ?? null;
+      const attendance = attendanceCounts.get(emp.id);
+      const deduction = getEmployeeDeduction(emp.id);
+      let amount = 0;
+      let detail = '';
+      switch (deductionDrilldownCategory) {
+        case 'paye':
+          amount = p.paye || 0;
+          break;
+        case 'pension':
+          amount = p.pension || 0;
+          break;
+        case 'absence':
+          amount = itemized?.absenceDeduction || 0;
+          if (amount > 0) {
+            detail = `${attendance?.absentDays || 0} day(s) × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}`;
+          }
+          break;
+        case 'late':
+          amount = itemized?.lateDeduction || 0;
+          if (amount > 0) {
+            detail = `${attendance?.lateDays || 0} day(s) × ${formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: deduction?.late_deduction, frozenLateDays: deduction?.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}`;
+          }
+          break;
+        case 'lecture':
+          amount = itemized?.lectureDeduction || 0;
+          detail = deduction ? 'Recorded via Attendance -- Lecture Deduction' : '';
+          break;
+        case 'appearance':
+          amount = itemized?.appearanceDeduction || 0;
+          detail = deduction ? 'Recorded via Attendance -- Appearance Deduction' : '';
+          break;
+        case 'uniform':
+          if (itemized) {
+            amount = Math.max(0, (p.uniform_deduction || 0) - itemized.absenceDeduction - itemized.lateDeduction - itemized.lectureDeduction - itemized.appearanceDeduction);
+          }
+          break;
+        case 'salaryAdvance':
+          amount = p.salary_advance_deduction || 0;
+          break;
+        case 'unitemized':
+          if (!itemized && (p.uniform_deduction || 0) > 0) {
+            amount = p.uniform_deduction || 0;
+            detail = 'No employee_deductions row recorded for this employee/month -- composition cannot be itemized.';
+          }
+          break;
+      }
+      if (amount > 0) {
+        rows.push({
+          employeeId: emp.id,
+          fullName: emp.full_name || '',
+          employeeNumber: emp.employee_number || '',
+          amount,
+          detail,
+        });
+      }
+    });
+    return rows.sort((a, b) => b.amount - a.amount);
+  }, [deductionDrilldownCategory, employees, getDisplayPayroll, itemizedByEmployeeId, attendanceCounts, getEmployeeDeduction, payrollRates]);
 
   // True only when at least one CURRENTLY DISPLAYED figure is actually a
   // live calculation built on a failed/unavailable attendance-count fetch
@@ -2658,15 +2778,32 @@ export function PayrollPage() {
             <p className="text-sm text-red-600">Attendance totals unavailable -- deduction categories cannot be shown reliably.</p>
           ) : (
             <>
+              {/* Part 5: each category with a non-zero total is clickable --
+                  opens a drill-down modal listing exactly which employees
+                  make up that total, from the same data already summed
+                  here (see deductionDrilldownRows' own header). */}
               <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
-                <div className="flex justify-between"><span className="text-slate-500">PAYE</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.payeTotal)}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Pension</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.pensionTotal)}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Absence</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.absenceTotal)}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Late Arrival</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.lateTotal)}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Lecture</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.lectureTotal)}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Appearance</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.appearanceTotal)}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Uniform</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.uniformOnlyTotal)}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">Salary Advances</span><span className="font-medium text-slate-800">{formatKwacha(deductionBreakdown.salaryAdvanceTotal)}</span></div>
+                {([
+                  ['paye', 'PAYE', deductionBreakdown.payeTotal],
+                  ['pension', 'Pension', deductionBreakdown.pensionTotal],
+                  ['absence', 'Absence', deductionBreakdown.absenceTotal],
+                  ['late', 'Late Arrival', deductionBreakdown.lateTotal],
+                  ['lecture', 'Lecture', deductionBreakdown.lectureTotal],
+                  ['appearance', 'Appearance', deductionBreakdown.appearanceTotal],
+                  ['uniform', 'Uniform', deductionBreakdown.uniformOnlyTotal],
+                  ['salaryAdvance', 'Salary Advances', deductionBreakdown.salaryAdvanceTotal],
+                ] as [DeductionCategory, string, number][]).map(([category, label, total]) => (
+                  <button
+                    key={category}
+                    type="button"
+                    disabled={total <= 0}
+                    onClick={() => setDeductionDrilldownCategory(category)}
+                    className={`flex justify-between text-left ${total > 0 ? 'hover:bg-slate-50 cursor-pointer rounded px-1 -mx-1' : 'cursor-default'}`}
+                  >
+                    <span className="text-slate-500">{label}</span>
+                    <span className="font-medium text-slate-800">{formatKwacha(total)}</span>
+                  </button>
+                ))}
               </div>
               {/* Hygiene deductions do not exist anywhere in this schema (no
                   column, rate, or UI) -- no such category is invented here.
@@ -2675,10 +2812,14 @@ export function PayrollPage() {
                   amount shown here explicitly instead of being folded into
                   one of the named categories as a guess. */}
               {deductionBreakdown.unitemizedUniformAndAttendanceTotal > 0 && (
-                <div className="flex justify-between text-sm mt-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setDeductionDrilldownCategory('unitemized')}
+                  className="flex justify-between w-full text-left text-sm mt-2 pt-2 border-t border-slate-100 hover:bg-amber-50 rounded px-1 -mx-1"
+                >
                   <span className="text-amber-600">Not itemized ({deductionBreakdown.employeesWithoutItemizedBreakdown} employee{deductionBreakdown.employeesWithoutItemizedBreakdown === 1 ? '' : 's'})</span>
                   <span className="font-medium text-amber-700">{formatKwacha(deductionBreakdown.unitemizedUniformAndAttendanceTotal)}</span>
-                </div>
+                </button>
               )}
               <div className="flex justify-between text-sm mt-2 pt-2 border-t border-slate-200 font-semibold">
                 <span className="text-slate-700">Total Deductions</span>
@@ -2794,10 +2935,17 @@ export function PayrollPage() {
                 const p = getDisplayPayroll(emp);
                 const deduction = getEmployeeDeduction(emp.id);
                 const attendance = attendanceCounts.get(emp.id);
-                const positionRequiresUniform = positionsRequiringUniform.get(emp.position) ?? true;
-                const uniformAmount = positionRequiresUniform ? (emp.uniform_deduction ?? payrollRates.uniformDeduction) : 0;
-                const hasUniform = uniformAmount > 0;
                 const existingRecord = payrollByEmployee.get(emp.id);
+                // Null when no reliable itemization source exists for this
+                // employee/month (a processed employee with no frozen
+                // employee_deductions row) -- see itemizedByEmployeeId's own
+                // header above for why this, and never today's
+                // positionsRequiringUniform/payrollRates.uniformDeduction,
+                // decides what the sub-breakdown below shows.
+                const itemized = itemizedByEmployeeId.get(emp.id) ?? null;
+                const uniformOnlyAmount = itemized
+                  ? Math.max(0, (p.uniform_deduction || 0) - itemized.absenceDeduction - itemized.lateDeduction - itemized.lectureDeduction - itemized.appearanceDeduction)
+                  : 0;
                 // This employee's own uniform/attendance and net-pay figures
                 // are a live calculation built on attendanceCounts, and that
                 // fetch failed -- never render them as if valid (see
@@ -2993,11 +3141,17 @@ export function PayrollPage() {
                           {formatKwacha(p.uniform_deduction || 0)}
                           {hasAnyDeduction && (
                             <div className="text-[10px] text-red-400 space-y-0.5">
-                              {hasUniform && <div>Uniform: MK{uniformAmount}</div>}
-                              {(attendance?.absentDays || 0) > 0 && <div>Absent: {attendance!.absentDays} × {formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}</div>}
-                              {(attendance?.lateDays || 0) > 0 && <div>Late: {attendance!.lateDays} × {formatKwacha(payrollRates.lateDeduction)}</div>}
-                              {(deduction?.lecture_deduction || 0) > 0 && <div>Lecture: MK{deduction!.lecture_deduction}</div>}
-                              {(deduction?.appearance_deduction || 0) > 0 && <div>Appearance: MK{deduction!.appearance_deduction}</div>}
+                              {itemized ? (
+                                <>
+                                  {uniformOnlyAmount > 0 && <div>Uniform: {formatKwacha(uniformOnlyAmount)}</div>}
+                                  {itemized.absenceDeduction > 0 && <div>Absent: {attendance?.absentDays || 0} × {formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}</div>}
+                                  {itemized.lateDeduction > 0 && <div>Late: {attendance?.lateDays || 0} × {formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: deduction?.late_deduction, frozenLateDays: deduction?.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}</div>}
+                                  {itemized.lectureDeduction > 0 && <div>Lecture: {formatKwacha(itemized.lectureDeduction)}</div>}
+                                  {itemized.appearanceDeduction > 0 && <div>Appearance: {formatKwacha(itemized.appearanceDeduction)}</div>}
+                                </>
+                              ) : (
+                                <div className="text-slate-400">Itemized breakdown not available for this period -- total shown as processed.</div>
+                              )}
                             </div>
                           )}
                         </>
@@ -3363,6 +3517,51 @@ export function PayrollPage() {
             >
               <CheckCircle2 size={14} className="mr-1" /> Approve Payroll
             </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Part 5/6: Deductions Breakdown drill-down -- read-only, lists the
+          employees behind whichever category total was clicked above,
+          with the quantity/rate evidence behind their own amount where
+          one exists. Never edits anything -- opening or closing it cannot
+          change any figure on this page. */}
+      <Modal
+        open={!!deductionDrilldownCategory}
+        onClose={() => setDeductionDrilldownCategory(null)}
+        title={deductionDrilldownCategory ? `${DEDUCTION_CATEGORY_LABELS[deductionDrilldownCategory]} -- ${getMonthLabel(selectedMonth)}` : ''}
+        size="lg"
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-slate-500">
+            {deductionDrilldownRows.length} employee{deductionDrilldownRows.length === 1 ? '' : 's'} -- total {formatKwacha(deductionDrilldownRows.reduce((sum, r) => sum + r.amount, 0))}
+          </p>
+          <div className="max-h-96 overflow-y-auto border border-slate-200 rounded-lg">
+            <table className="w-full text-sm">
+              <THead>
+                <TR hover={false}>
+                  <TH>Employee</TH>
+                  <TH>Evidence</TH>
+                  <TH className="text-right">Amount</TH>
+                </TR>
+              </THead>
+              <TBody>
+                {deductionDrilldownRows.length === 0 ? (
+                  <TR><TD colSpan={3} className="text-center py-6 text-slate-500">No employees in this category.</TD></TR>
+                ) : (
+                  deductionDrilldownRows.map(row => (
+                    <TR key={row.employeeId}>
+                      <TD>
+                        <p className="font-medium text-slate-800">{row.fullName}</p>
+                        <p className="text-xs text-slate-500">{row.employeeNumber}</p>
+                      </TD>
+                      <TD className="text-xs text-slate-500">{row.detail || '--'}</TD>
+                      <TD className="text-right font-mono">{formatKwacha(row.amount)}</TD>
+                    </TR>
+                  ))
+                )}
+              </TBody>
+            </table>
           </div>
         </div>
       </Modal>
