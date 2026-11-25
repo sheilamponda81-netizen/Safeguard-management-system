@@ -252,11 +252,24 @@ describe.skipIf(!dbAvailable && !dbRequired)('Automatic fingerprint terminal res
   });
 
   // 11. Mapped employee deliberately managed manually (the CHITANI K KAPANDA production counterexample).
-  it('item 11: a mapped employee with an established manual attendance history is NEVER swept into the site-level fallback, even once their site is configured', () => {
+  //
+  // POST-REVIEW CORRECTION: this is no longer gated by attendance.source
+  // history at all (see the migration's header REVISION) -- a review
+  // correctly found that heuristic unreliable in both directions. The
+  // gate is now the EXPLICIT, reviewable fingerprint_attendance_enabled
+  // flag on the mapping itself. This test simulates exactly the
+  // situation the one-time migration backfill protects: a pre-existing
+  // mapping with no individual terminal assignment, conservatively left
+  // disabled, REGARDLESS of whether it has any attendance history at
+  // all (CHITANI/GIFT's actual production state) -- see the dedicated
+  // "counterexample A" test below for the zero-history case explicitly.
+  it('item 11: a mapped employee who has not been explicitly enabled for fingerprint attendance is NEVER swept into the site-level fallback, even once their site is configured', () => {
     const fixture = createFixture('DELIBERATE MANUAL SITE');
     exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
-    // An established manual history -- e.g. a prior date's manual correction.
-    exec(`SELECT * FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-01'::date, 'P', 'Deliberately managed manually -- confirmed by site supervisor.')`);
+    // Simulates the conservative migration backfill default for a
+    // pre-existing mapping with no individual assignment -- never
+    // inferred from attendance history.
+    exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
     exec(`SELECT set_site_hikcentral_terminals('${fixture.site}', ARRAY['DM-DOOR'])`);
     confirmCoverage(fixture, ['DM-DOOR'], '2026-11-16T00:00:00Z', '2026-11-16T23:59:00Z', '2026-11-16T19:00:00Z');
 
@@ -267,9 +280,6 @@ describe.skipIf(!dbAvailable && !dbRequired)('Automatic fingerprint terminal res
 
     const [eligibleCount] = queryRow(`SELECT count(*) FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
     expect(eligibleCount).toBe('0');
-
-    // The existing manual record itself is completely untouched.
-    expect(attendanceRow(fixture.employeeId, '2026-11-01')).toEqual({ status: 'P', source: 'manual' });
   });
 
   // 12. Overnight shifts.
@@ -460,18 +470,149 @@ describe.skipIf(!dbAvailable && !dbRequired)('Automatic fingerprint terminal res
     expect(afterCount).toBe(beforeCount);
   });
 
+  // POST-REVIEW CORRECTION: the two concrete counterexamples the review
+  // asked for, plus direct coverage of the migration's one-time backfill
+  // and the new explicit set_fingerprint_attendance_enabled RPC.
+  describe('explicit fingerprint_attendance_enabled flag (post-review correction)', () => {
+    it('migration backfill: a pre-existing mapping with no individual assignment is backfilled to disabled regardless of attendance history, while one with an individual assignment is backfilled to enabled', () => {
+      const fixtureGap = createFixture('BACKFILL GAP SITE');
+      // Simulate a mapping that predates this feature where some other
+      // process had left the column at its true default -- the backfill
+      // statement itself must still correct it down to false, since this
+      // employee has no individual employee_hikcentral_terminals row.
+      exec(`UPDATE hikcentral_person_mappings SET fingerprint_attendance_enabled = true WHERE employee_id = '${fixtureGap.employeeId}'::uuid`);
+
+      const fixtureAssigned = createFixture('BACKFILL ASSIGNED SITE');
+      exec(`SELECT set_employee_hikcentral_terminals('${fixtureAssigned.employeeId}', ARRAY['BF-DOOR'])`);
+      exec(`UPDATE hikcentral_person_mappings SET fingerprint_attendance_enabled = false WHERE employee_id = '${fixtureAssigned.employeeId}'::uuid`);
+
+      // The exact one-time backfill statement from the migration (PART 1B), re-run directly.
+      exec(
+        `UPDATE hikcentral_person_mappings m SET fingerprint_attendance_enabled = EXISTS (` +
+        `SELECT 1 FROM employee_hikcentral_terminals t WHERE t.tenant_id = m.tenant_id AND t.employee_id = m.employee_id AND t.is_active` +
+        `) WHERE m.is_active`
+      );
+
+      const [gapEnabled] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${fixtureGap.employeeId}'::uuid`);
+      expect(gapEnabled).toBe('f');
+      const [assignedEnabled] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${fixtureAssigned.employeeId}'::uuid`);
+      expect(assignedEnabled).toBe('t');
+    });
+
+    it('a freshly-confirmed mapping defaults to enabled with no extra admin step (confirm_hikcentral_person_mappings is unmodified -- the column default alone establishes intent)', () => {
+      const fixture = createFixture('FRESH CONFIRM DEFAULT SITE');
+      const [enabled] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${fixture.employeeId}'::uuid AND is_active`);
+      expect(enabled).toBe('t');
+
+      const otherEmployeeId = randomUUID();
+      const otherPersonNo = `P${randomUUID().slice(0, 8)}`;
+      exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, workstation) VALUES ('${otherEmployeeId}', '${fixture.tenantId}', 'E-${otherEmployeeId.slice(0, 8)}', 'Fresh Confirm Via RPC', 'Active', false, '${fixture.site}')`);
+      exec(`INSERT INTO hikcentral_raw_events (tenant_id, import_batch_id, hikcentral_person_no, event_time, access_point, authentication_result, event_type, event_fingerprint) VALUES ('${fixture.tenantId}', '${fixture.batchId}', '${otherPersonNo}', '2026-11-16T04:05:00Z', 'FRESH-DOOR', 'Authorization', 'Access Granted by Fingerprint', '${randomUUID()}')`);
+      exec(`SELECT confirm_hikcentral_person_mappings('[{"hikcentral_person_no":"${otherPersonNo}","employee_id":"${otherEmployeeId}","match_method":"manual"}]'::jsonb)`);
+
+      const [enabledViaRpc] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${otherEmployeeId}'::uuid AND is_active`);
+      expect(enabledViaRpc).toBe('t');
+    });
+
+    // COUNTEREXAMPLE A (required by review): a mapped, deliberately-manual
+    // employee with ZERO attendance history -- the exact case the
+    // superseded attendance.source heuristic could not protect, since
+    // there is no manual row to read. Left disabled by the conservative
+    // migration default, it must never become Absent-eligible just
+    // because their site happens to be configured.
+    it('counterexample A: a mapped employee with ZERO attendance history, left disabled by the conservative migration default, is never automatically Absent-eligible merely because their site is configured', () => {
+      const fixture = createFixture('COUNTEREXAMPLE A SITE');
+      exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
+
+      const [attendanceCountBefore] = queryRow(`SELECT count(*) FROM attendance WHERE employee_id = '${fixture.employeeId}'::uuid`);
+      expect(attendanceCountBefore).toBe('0');
+
+      exec(`SELECT set_site_hikcentral_terminals('${fixture.site}', ARRAY['CA-DOOR'])`);
+      confirmCoverage(fixture, ['CA-DOOR'], '2026-11-16T00:00:00Z', '2026-11-16T23:59:00Z', '2026-11-16T19:00:00Z');
+      // No scans at all -- if the site fallback silently applied, this would resolve Absent. It must not.
+      const result = resolveAndCalculate(fixture.employeeId, '2026-11-16');
+      expect(result.status).toBe('pending');
+      expect(result.status).not.toBe('absent');
+
+      // Once explicitly, reviewably enabled, the exact same configuration now correctly resolves Absent.
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], true)`);
+      const resultAfterEnable = resolveAndCalculate(fixture.employeeId, '2026-11-16');
+      expect(resultAfterEnable.status).toBe('absent');
+    });
+
+    // COUNTEREXAMPLE B (required by review): a genuine fingerprint
+    // employee with exactly one historical manual correction must not
+    // permanently lose site-shared automation. Removing the
+    // attendance.source heuristic entirely (rather than refining it)
+    // fixes this as a direct consequence: the one manual-corrected date
+    // stays protected by attendance_write_one's own, unrelated, per-date
+    // manual-source precedence, while every other date keeps resolving
+    // normally through the site-level fallback.
+    it('counterexample B: a genuine fingerprint employee with exactly one historical manual correction retains normal site-shared eligibility on every other, unprotected date', () => {
+      const fixture = createFixture('COUNTEREXAMPLE B SITE');
+      exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
+      // Default enabled=true for this freshly-confirmed mapping -- no extra step.
+      exec(`SELECT set_site_hikcentral_terminals('${fixture.site}', ARRAY['CB-DOOR'])`);
+      // One historical manual correction, on an unrelated earlier date (e.g. a device outage that day).
+      exec(`SELECT * FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-01'::date, 'P', 'One-off manual correction for a device outage that day.')`);
+      confirmCoverage(fixture, ['CB-DOOR'], '2026-11-16T00:00:00Z', '2026-11-16T23:59:00Z', '2026-11-16T19:00:00Z');
+
+      const [eligibleCount] = queryRow(`SELECT count(*) FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(eligibleCount).toBe('1');
+
+      // 11-16 is unrelated to the one manual correction -- it still resolves normally (no scans, genuinely complete coverage -> Absent).
+      const result = resolveAndCalculate(fixture.employeeId, '2026-11-16');
+      expect(result.status).toBe('absent');
+
+      // The one manual correction itself remains completely untouched.
+      expect(attendanceRow(fixture.employeeId, '2026-11-01')).toEqual({ status: 'P', source: 'manual' });
+    });
+
+    it('set_fingerprint_attendance_enabled requires authentication, only affects the caller\'s own tenant, and bulk-updates every employee_id supplied', () => {
+      const fixtureA = createFixture('ENABLE RPC TENANT A SITE');
+      const fixtureB = createFixture('ENABLE RPC TENANT B SITE'); // createFixture switches the active caller to tenant B -- switch back explicitly below.
+
+      // Bulk, as tenant A's own caller: both tenant A's own mapping, and
+      // a second employee in the same array, are affected in one call.
+      exec(`SELECT set_caller('${fixtureA.callerId}')`);
+      const secondEmployeeId = randomUUID();
+      exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, workstation) VALUES ('${secondEmployeeId}', '${fixtureA.tenantId}', 'E-${secondEmployeeId.slice(0, 8)}', 'Second Bulk Employee', 'Active', false, '${fixtureA.site}')`);
+      exec(`INSERT INTO hikcentral_person_mappings (tenant_id, hikcentral_person_no, employee_id, match_method, is_active) VALUES ('${fixtureA.tenantId}', 'P-SECOND-${secondEmployeeId.slice(0, 8)}', '${secondEmployeeId}', 'manual', true)`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureA.employeeId}']::uuid[], false)`); // flip tenant A's own employee off first
+      const [result] = queryRow(`SELECT (set_fingerprint_attendance_enabled(ARRAY['${fixtureA.employeeId}', '${secondEmployeeId}']::uuid[], true))->>'updated_count'`);
+      expect(result).toBe('2');
+
+      const [enabledA] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${fixtureA.employeeId}'::uuid AND is_active`);
+      expect(enabledA).toBe('t');
+
+      // Tenant isolation, still as tenant A's own caller: cannot flip
+      // tenant B's mapping, even naming its employee_id explicitly.
+      const [untouchedResult] = queryRow(`SELECT (set_fingerprint_attendance_enabled(ARRAY['${fixtureB.employeeId}']::uuid[], false))->>'updated_count'`);
+      expect(untouchedResult).toBe('0');
+
+      exec(`SELECT set_caller('${fixtureB.callerId}')`);
+      const [stillEnabledB] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${fixtureB.employeeId}'::uuid AND is_active`);
+      expect(stillEnabledB).toBe('t'); // untouched, still its own default
+
+      exec(`SELECT set_caller(NULL)`);
+      const stderr = execExpectError(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureA.employeeId}']::uuid[], true)`);
+      expect(stderr).toMatch(/not authenticated/i);
+    });
+  });
+
   // Additional direct coverage of attendance_coverage_explain's new provenance values (Part 5 diagnostic transparency).
   describe('attendance_coverage_explain: new site-level provenance values', () => {
-    it('reports "manual_protected" (not a plain gap) for a mapped, site-configured employee with an established manual history', () => {
+    it('reports "fingerprint_not_enabled" (not a plain gap) for a mapped, site-configured employee who has not been explicitly enabled', () => {
       const fixture = createFixture('EXPLAIN MANUAL SITE');
       exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
-      exec(`SELECT * FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-01'::date, 'P', 'Deliberately manual.')`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
       exec(`SELECT set_site_hikcentral_terminals('${fixture.site}', ARRAY['EM-DOOR'])`);
 
       const [provenance, sufficientEvidence] = queryRow(
         `SELECT coverage_provenance, sufficient_evidence FROM attendance_coverage_explain(ARRAY['${fixture.employeeId}']::uuid[], '2026-11-16'::date, '2026-11-16'::date)`
       );
-      expect(provenance).toBe('manual_protected');
+      expect(provenance).toBe('fingerprint_not_enabled');
       expect(sufficientEvidence).toBe('f');
     });
 
@@ -485,38 +626,38 @@ describe.skipIf(!dbAvailable && !dbRequired)('Automatic fingerprint terminal res
     });
   });
 
-  describe('attendance_process_import_batch: needs_terminal_configuration / manual_protected_mapped_employees transparency', () => {
-    it('lists a mapped, unconfigured employee under needs_terminal_configuration, and a mapped, manually-protected employee separately under manual_protected_mapped_employees', () => {
+  describe('attendance_process_import_batch: needs_terminal_configuration / fingerprint_not_enabled_mapped_employees transparency', () => {
+    it('lists a mapped, unconfigured employee under needs_terminal_configuration, and a mapped, not-yet-enabled employee separately under fingerprint_not_enabled_mapped_employees', () => {
       const fixture = createFixture('BATCH TRANSPARENCY SITE');
       exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
-      exec(`SELECT * FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-01'::date, 'P', 'Deliberately manual.')`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
       exec(`SELECT set_site_hikcentral_terminals('${fixture.site}', ARRAY['BT-DOOR'])`);
       insertRawEvent(fixture, '2026-11-16T04:05:00Z', 'BT-DOOR'); // in observed scope via a real event
 
-      const [needsConfig, manualProtected] = queryRow(
-        `SELECT r->>'needs_terminal_configuration', r->>'manual_protected_mapped_employees' FROM (` +
+      const [needsConfig, notEnabled] = queryRow(
+        `SELECT r->>'needs_terminal_configuration', r->>'fingerprint_not_enabled_mapped_employees' FROM (` +
         `SELECT attendance_process_import_batch('${fixture.batchId}', ARRAY['BT-DOOR'], ` +
         `'2026-11-16T00:00:00Z'::timestamptz, '2026-11-16T06:00:00Z'::timestamptz, '2026-11-16'::date, '2026-11-16'::date) AS r) t`
       );
       expect(needsConfig).toBe('[]');
-      expect(manualProtected).toContain(fixture.employeeId);
+      expect(notEnabled).toContain(fixture.employeeId);
     });
   });
 
   // Part 5: hikcentral_mapped_employees_terminal_status -- the bulk
   // status feed for the Person Mapping page's new, honest status text.
   describe('hikcentral_mapped_employees_terminal_status', () => {
-    it('reports "employee_assigned" for an employee with their own individual terminal, "site_shared" for one covered only by the shared site fallback, "manual_protected" for one deliberately excluded by manual history, and "unconfigured" for a genuine gap', () => {
+    it('reports "employee_assigned" for an employee with their own individual terminal, "site_shared" for one covered only by the shared site fallback, "fingerprint_not_enabled" for one whose site is configured but who has not been explicitly enabled, and "unconfigured" for a genuine gap', () => {
       const fixtureAssigned = createFixture('STATUS SITE ASSIGNED');
       exec(`SELECT set_employee_hikcentral_terminals('${fixtureAssigned.employeeId}', ARRAY['OWN-DOOR'])`);
 
       const fixtureShared = createFixture('STATUS SITE SHARED');
       exec(`SELECT set_site_hikcentral_terminals('${fixtureShared.site}', ARRAY['SHARED-DOOR'])`);
 
-      const fixtureProtected = createFixture('STATUS SITE PROTECTED');
-      exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixtureProtected.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
-      exec(`SELECT * FROM attendance_correct('${fixtureProtected.employeeId}'::uuid, '2026-11-01'::date, 'P', 'Deliberately manual.')`);
-      exec(`SELECT set_site_hikcentral_terminals('${fixtureProtected.site}', ARRAY['PROTECTED-DOOR'])`);
+      const fixtureNotEnabled = createFixture('STATUS SITE NOT ENABLED');
+      exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixtureNotEnabled.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureNotEnabled.employeeId}']::uuid[], false)`);
+      exec(`SELECT set_site_hikcentral_terminals('${fixtureNotEnabled.site}', ARRAY['PROTECTED-DOOR'])`);
 
       const fixtureGap = createFixture('STATUS SITE GAP');
       // No individual assignment, no site config at all for this site.
@@ -529,9 +670,9 @@ describe.skipIf(!dbAvailable && !dbRequired)('Automatic fingerprint terminal res
       const [[, provenanceShared]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixtureShared.employeeId}'::uuid`);
       expect(provenanceShared).toBe('site_shared');
 
-      exec(`SELECT set_caller('${fixtureProtected.callerId}')`);
-      const [[, provenanceProtected]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixtureProtected.employeeId}'::uuid`);
-      expect(provenanceProtected).toBe('manual_protected');
+      exec(`SELECT set_caller('${fixtureNotEnabled.callerId}')`);
+      const [[, provenanceNotEnabled]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixtureNotEnabled.employeeId}'::uuid`);
+      expect(provenanceNotEnabled).toBe('fingerprint_not_enabled');
 
       exec(`SELECT set_caller('${fixtureGap.callerId}')`);
       const [[, provenanceGap]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixtureGap.employeeId}'::uuid`);

@@ -145,8 +145,24 @@ export async function setSiteHikCentralTerminals(site: string, accessPoints: str
   if (error) throw error;
 }
 
+/**
+ * Explicitly enables (or disables) automatic site-shared fingerprint
+ * attendance for one or more mapped employees -- the one write path
+ * for the fingerprint_attendance_enabled flag (individually, with a
+ * single id, or in bulk per site). Never inferred from attendance
+ * history; always an explicit, reviewable human action.
+ */
+export async function setFingerprintAttendanceEnabled(employeeIds: string[], enabled: boolean): Promise<number> {
+  const { data, error } = await supabase.rpc('set_fingerprint_attendance_enabled', {
+    p_employee_ids: employeeIds,
+    p_enabled: enabled,
+  });
+  if (error) throw error;
+  return (data as { updated_count?: number } | null)?.updated_count || 0;
+}
+
 /** How a mapped employee is eligible for automatic processing, if at all -- see hikcentral_mapped_employees_terminal_status's own header for exactly what each value means. */
-export type HikCentralTerminalProvenance = 'employee_assigned' | 'site_shared' | 'manual_protected' | 'unconfigured';
+export type HikCentralTerminalProvenance = 'employee_assigned' | 'site_shared' | 'fingerprint_not_enabled' | 'unconfigured';
 
 export interface MappedEmployeeTerminalStatus {
   accessPoints: string[];

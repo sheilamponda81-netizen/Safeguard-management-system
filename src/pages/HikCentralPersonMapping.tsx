@@ -26,7 +26,7 @@ import {
 import {
   fetchEmployeeTerminalAssignments, setEmployeeHikCentralTerminals,
   fetchMappedEmployeeTerminalStatus, setSiteHikCentralTerminals,
-  fetchSiteHikCentralTerminalConfigs, normalizeSiteKey,
+  fetchSiteHikCentralTerminalConfigs, normalizeSiteKey, setFingerprintAttendanceEnabled,
   MappedEmployeeTerminalStatus,
 } from '../utils/attendanceImportAutoApplyService';
 
@@ -87,10 +87,11 @@ export default function HikCentralPersonMappingPage() {
 
   // Automatic fingerprint terminal resolution: each mapped employee's
   // resolved eligibility -- own assignment, the shared site-level
-  // fallback, deliberately excluded by manual history, or a genuine
-  // gap. Drives the honest status text in the Mapped tab (Part 5) --
-  // never shows "configured" when eligibility is actually unresolved.
+  // fallback, not yet explicitly enabled, or a genuine gap. Drives the
+  // honest status text in the Mapped tab (Part 5) -- never shows
+  // "configured" when eligibility is actually unresolved.
   const [terminalStatusByEmployee, setTerminalStatusByEmployee] = useState<Map<string, MappedEmployeeTerminalStatus>>(new Map());
+  const [enablingEmployeeIds, setEnablingEmployeeIds] = useState<Set<string>>(new Set());
   // A separate, minimal site-level configuration modal -- same shape
   // as the per-employee one, but keyed by site (employees.workstation)
   // instead of one identity. Configuring a site once covers every
@@ -408,20 +409,22 @@ export default function HikCentralPersonMappingPage() {
   // configured", alongside whether each already has a configuration
   // and how many currently-mapped employees it covers.
   const siteSummaries = useMemo(() => {
-    const bySite = new Map<string, { rawSite: string; mappedEmployeeCount: number; observedAccessPoints: Set<string> }>();
+    const bySite = new Map<string, { rawSite: string; mappedEmployeeCount: number; observedAccessPoints: Set<string>; notEnabledEmployeeIds: string[] }>();
     for (const identity of identities) {
       if (identity.category !== 'mapped') continue;
       const employeeId = identity.activeMapping?.employeeId;
       const employee = employeeId ? employeesById.get(employeeId) : null;
       const rawSite = employee?.workstation?.trim();
-      if (!rawSite) continue;
+      if (!rawSite || !employeeId) continue;
       const key = normalizeSiteKey(rawSite);
+      const notEnabled = terminalStatusByEmployee.get(employeeId)?.provenance === 'fingerprint_not_enabled';
       const existing = bySite.get(key);
       if (existing) {
         existing.mappedEmployeeCount += 1;
         identity.profile.accessPoints.forEach((ap) => existing.observedAccessPoints.add(ap));
+        if (notEnabled) existing.notEnabledEmployeeIds.push(employeeId);
       } else {
-        bySite.set(key, { rawSite, mappedEmployeeCount: 1, observedAccessPoints: new Set(identity.profile.accessPoints) });
+        bySite.set(key, { rawSite, mappedEmployeeCount: 1, observedAccessPoints: new Set(identity.profile.accessPoints), notEnabledEmployeeIds: notEnabled ? [employeeId] : [] });
       }
     }
     return Array.from(bySite.entries())
@@ -431,9 +434,10 @@ export default function HikCentralPersonMappingPage() {
         mappedEmployeeCount: v.mappedEmployeeCount,
         observedAccessPoints: Array.from(v.observedAccessPoints).sort(),
         configuredAccessPoints: siteConfigs.get(key) || [],
+        notEnabledEmployeeIds: v.notEnabledEmployeeIds,
       }))
       .sort((a, b) => a.rawSite.localeCompare(b.rawSite));
-  }, [identities, employeesById, siteConfigs]);
+  }, [identities, employeesById, siteConfigs, terminalStatusByEmployee]);
 
   const openSiteModal = useCallback((siteKey: string) => {
     const current = siteConfigs.get(siteKey) || [];
@@ -479,6 +483,33 @@ export default function HikCentralPersonMappingPage() {
       setSavingSiteTerminals(false);
     }
   }, [siteModalFor, siteModalSelected, loadData]);
+
+  // Explicit, reviewable activation of the fingerprint_attendance_enabled
+  // flag -- individually (one id) or in bulk (a whole site's currently
+  // not-enabled mapped employees at once). Never automatic, never
+  // inferred -- this is the one human action that turns the shared
+  // site-level fallback on for a given employee.
+  const handleEnableFingerprintAttendance = useCallback(async (employeeIds: string[]) => {
+    if (employeeIds.length === 0) return;
+    setEnablingEmployeeIds((prev) => {
+      const next = new Set(prev);
+      employeeIds.forEach((id) => next.add(id));
+      return next;
+    });
+    try {
+      const updatedCount = await setFingerprintAttendanceEnabled(employeeIds, true);
+      showNotification(`Fingerprint attendance enabled for ${updatedCount} employee${updatedCount === 1 ? '' : 's'}.`, 'success');
+      await loadData();
+    } catch (err) {
+      showNotification(err instanceof Error ? err.message : 'Could not enable fingerprint attendance.', 'error');
+    } finally {
+      setEnablingEmployeeIds((prev) => {
+        const next = new Set(prev);
+        employeeIds.forEach((id) => next.delete(id));
+        return next;
+      });
+    }
+  }, [loadData]);
 
   const pickerResults = useMemo(() => {
     const q = pickerQuery.trim().toLowerCase();
@@ -726,22 +757,33 @@ export default function HikCentralPersonMappingPage() {
               </p>
               <div className="flex flex-wrap gap-2">
                 {siteSummaries.map((s) => (
-                  <button
-                    key={s.key}
-                    type="button"
-                    onClick={() => openSiteModal(s.key)}
-                    className="text-left px-3 py-2 rounded-lg border border-slate-200 hover:border-[#081C3A]/40 transition-colors"
-                  >
-                    <span className="block text-sm font-medium text-slate-800">{s.rawSite}</span>
-                    <span className="block text-[11px] text-slate-500">{s.mappedEmployeeCount} mapped employee{s.mappedEmployeeCount === 1 ? '' : 's'}</span>
-                    {s.configuredAccessPoints.length > 0 ? (
-                      <span className="block text-[11px] text-emerald-600 mt-0.5">{s.configuredAccessPoints.join(', ')}</span>
-                    ) : s.observedAccessPoints.length > 1 ? (
-                      <span className="block text-[11px] text-amber-600 mt-0.5">Ambiguous -- {s.observedAccessPoints.length} terminals observed, needs review</span>
-                    ) : (
-                      <span className="block text-[11px] text-slate-400 mt-0.5">Not configured</span>
+                  <div key={s.key} className="rounded-lg border border-slate-200 overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => openSiteModal(s.key)}
+                      className="text-left px-3 py-2 hover:bg-slate-50 transition-colors block w-full"
+                    >
+                      <span className="block text-sm font-medium text-slate-800">{s.rawSite}</span>
+                      <span className="block text-[11px] text-slate-500">{s.mappedEmployeeCount} mapped employee{s.mappedEmployeeCount === 1 ? '' : 's'}</span>
+                      {s.configuredAccessPoints.length > 0 ? (
+                        <span className="block text-[11px] text-emerald-600 mt-0.5">{s.configuredAccessPoints.join(', ')}</span>
+                      ) : s.observedAccessPoints.length > 1 ? (
+                        <span className="block text-[11px] text-amber-600 mt-0.5">Ambiguous -- {s.observedAccessPoints.length} terminals observed, needs review</span>
+                      ) : (
+                        <span className="block text-[11px] text-slate-400 mt-0.5">Not configured</span>
+                      )}
+                    </button>
+                    {s.configuredAccessPoints.length > 0 && s.notEnabledEmployeeIds.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => handleEnableFingerprintAttendance(s.notEnabledEmployeeIds)}
+                        disabled={s.notEnabledEmployeeIds.some((id) => enablingEmployeeIds.has(id))}
+                        className="w-full text-left px-3 py-1.5 text-[11px] font-medium text-[#081C3A] bg-slate-50 hover:bg-slate-100 border-t border-slate-200 disabled:opacity-50"
+                      >
+                        Enable fingerprint for {s.notEnabledEmployeeIds.length} not-yet-enabled employee{s.notEnabledEmployeeIds.length === 1 ? '' : 's'} here
+                      </button>
                     )}
-                  </button>
+                  </div>
                 ))}
               </div>
             </Card>
@@ -788,10 +830,20 @@ export default function HikCentralPersonMappingPage() {
                     <TD>{i.activeMapping!.confirmedAt ? new Date(i.activeMapping!.confirmedAt as string).toLocaleDateString() : '—'}</TD>
                     <TD>{(i.activeMapping!.confirmedBy && confirmerNamesById.get(i.activeMapping!.confirmedBy)) || '—'}</TD>
                     <TD>
-                      {terminalStatus?.provenance === 'manual_protected' ? (
+                      {terminalStatus?.provenance === 'fingerprint_not_enabled' ? (
                         <div className="space-y-1 max-w-xs">
-                          <Badge color="purple">Managed manually</Badge>
-                          <p className="text-xs text-slate-500">This employee has an existing manual attendance history and is deliberately kept outside automatic fingerprint attendance.</p>
+                          <Badge color="purple">Fingerprint not enabled</Badge>
+                          <p className="text-xs text-slate-500">This employee's site has a shared terminal configuration, but automatic fingerprint attendance has not been explicitly enabled for them yet.</p>
+                          {canMap && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => handleEnableFingerprintAttendance([employeeId])}
+                              disabled={enablingEmployeeIds.has(employeeId)}
+                            >
+                              {enablingEmployeeIds.has(employeeId) ? 'Enabling...' : 'Enable fingerprint attendance'}
+                            </Button>
+                          )}
                         </div>
                       ) : terminalStatus?.provenance === 'employee_assigned' || terminalStatus?.provenance === 'site_shared' ? (
                         <div className="space-y-1 max-w-xs">

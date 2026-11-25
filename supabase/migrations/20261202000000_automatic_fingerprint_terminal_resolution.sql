@@ -63,16 +63,33 @@
 --     manual rows. Blindly extending automatic Absent-eligibility to
 --     every mapped-but-unassigned employee at a clean site would have
 --     put these two (and anyone else with an established manual
---     history) at risk of a FUTURE date silently flipping to automatic
---     processing, contradicting a deliberate, already-demonstrated
---     staffing decision -- attendance_write_one's manual-source
---     protection only protects a date that ALREADY has a manual row,
---     never a future one that doesn't exist yet. This is the exact,
---     concrete example the task asked for before justifying a safety
---     gate -- and it is handled below WITHOUT a new attendance_method
---     column: the gate reads an existing fact (has this employee EVER
---     had a manual attendance row?) rather than inventing new
---     configuration or an administration workflow.
+--     history, OR anyone with NO attendance history at all who is
+--     simply a brand-new, deliberately-manual onboarding) at risk of a
+--     FUTURE date silently flipping to automatic processing,
+--     contradicting a deliberate staffing decision that may never have
+--     produced a single attendance row yet to read back --
+--     attendance_write_one's manual-source protection only protects a
+--     date that ALREADY has a manual row, never a future one that
+--     doesn't exist yet, and never a brand-new employee with zero rows
+--     at all.
+--
+--   REVISION (post-review correction, same PR, before merge): the
+--   FIRST version of this migration gated the site-level fallback on
+--   "has this employee EVER had a manual attendance row?" -- a review
+--   correctly identified this as an unreliable proxy for attendance
+--   mode in BOTH directions: (a) a deliberately-manual employee with
+--   ZERO attendance history (a brand-new hire, never yet processed
+--   either way) produces no manual row to gate on, so the old check
+--   would have silently waved them through the instant their site was
+--   configured; (b) a genuine fingerprint employee who happens to have
+--   exactly one historical manual correction (a single day someone
+--   fixed by hand, e.g. for a device outage) would have been
+--   PERMANENTLY excluded from the shared site fallback forever after,
+--   even though every other day of their history is ordinary automatic
+--   processing. Both are now fixed by replacing the attendance-history
+--   read with an EXPLICIT, reviewable per-mapping flag -- see PART 1B
+--   and PART 3 below -- that is never inferred from attendance.source
+--   history at all, in either direction.
 --
 -- THE MODEL (Part 2 -- smallest reliable replacement):
 --   1. employee_hikcentral_terminals remains completely unchanged --
@@ -97,18 +114,40 @@
 --      directly (attendance_resolve_and_calculate, attendance_coverage_
 --      explain, attendance_process_import_batch). Resolution order:
 --        a. the employee's OWN active assignment, if any (unchanged,
---           always wins, never overridden by the shared fallback);
+--           always wins, never overridden by the shared fallback, and
+--           never gated by the new flag below either -- an explicit
+--           per-employee assignment IS the explicit intent);
 --        b. ELSE the site-level shared set for the employee's own
 --           (normalized) workstation, but ONLY when the employee has
---           no own assignment at all AND no pre-existing manual-
---           sourced attendance row has ever been recorded for them
---           (the CHITANI/GIFT safety gate above, read from existing
---           data, never a new column);
+--           no own assignment at all AND their active HikCentral
+--           Person Mapping has fingerprint_attendance_enabled = true
+--           (PART 1B/3 below) -- an EXPLICIT, reviewable per-mapping
+--           flag, never inferred from attendance.source history;
 --        c. ELSE empty -- identical to today's behavior: coverage can
 --           never reach confirmed_complete, Pending is preserved
 --           forever until configured, surfaced as a gap exactly as
 --           before (never silently fabricated, never a global "all
 --           terminals" default).
+--   3b. fingerprint_attendance_enabled defaults TRUE on the
+--       hikcentral_person_mappings column itself, so every NEW mapping
+--       confirmed from now on (confirm_hikcentral_person_mappings is
+--       NOT modified -- the column default alone covers it) explicitly
+--       establishes fingerprint intent at the moment of confirmation,
+--       matching the task's own "Person Mapping is the only routine
+--       onboarding step" goal for the common, going-forward case. For
+--       mappings that already existed before this migration, the
+--       one-time backfill below (PART 1B) sets it TRUE ONLY for
+--       employees who already carry their own employee_hikcentral_
+--       terminals row (an explicit administrator record, not an
+--       inference from attendance history) and FALSE for every other
+--       pre-existing mapping -- including all 64 of today's gap
+--       employees, regardless of their attendance history, so a
+--       migration-derived shared site row (PART 5) can never by itself
+--       activate a previously-unconfigured employee. A human reviews
+--       and explicitly turns a legacy employee's flag on, individually
+--       or in bulk per site (PART 2B, surfaced in the UI per Part 5),
+--       once that employee is confirmed to be a genuine fingerprint
+--       user.
 --   4. Coverage-completeness, confirmation matching, evidence-backing
 --      (latest_observed_event_at / exceeds_observed_evidence /
 --      independently_verified), the Absent/Pending engine
@@ -220,6 +259,87 @@ REVOKE ALL ON site_hikcentral_terminals FROM PUBLIC, anon;
 GRANT SELECT, INSERT, UPDATE ON site_hikcentral_terminals TO authenticated;
 
 -- ------------------------------------------------------------
+-- PART 1B: fingerprint_attendance_enabled -- the EXPLICIT, reviewable
+-- per-mapping flag that replaces the review-flagged attendance.source
+-- heuristic as the site-shared fallback's gate (see header REVISION).
+-- Lives on hikcentral_person_mappings itself: this is literally the
+-- record of a confirmed fingerprint identity, so "is this confirmed
+-- identity enabled for automatic site-shared processing" belongs on
+-- it directly, not on employees (no attendance_method column is
+-- introduced, exactly as the original task required).
+--
+-- DEFAULT TRUE at the column level -- so confirm_hikcentral_person_
+-- mappings() (20261007140000) needs NO code change at all: every
+-- NEW mapping confirmed from this point on gets the default, i.e.
+-- confirming a new fingerprint identity explicitly establishes
+-- fingerprint intent in the same stroke, with zero extra admin step
+-- for the common "brand-new fingerprint employee" case.
+--
+-- The one-time backfill below then OVERRIDES that default down to
+-- FALSE for every mapping that already existed before this migration
+-- AND has no own employee_hikcentral_terminals row -- i.e. exactly
+-- today's 64-employee gap, with NO exception for attendance history
+-- in either direction. This is deliberately MORE conservative than
+-- the superseded manual-history check: it protects a legacy employee
+-- with zero attendance rows (today's CONCRETE risk this correction
+-- closes) at the cost of requiring one explicit, reviewable human
+-- activation (individually via the existing Terminals action, or in
+-- bulk per site via PART 2B) before any of the 64 gains automatic
+-- site-shared eligibility -- never silently, never inferred.
+-- ------------------------------------------------------------
+ALTER TABLE hikcentral_person_mappings
+  ADD COLUMN IF NOT EXISTS fingerprint_attendance_enabled BOOLEAN NOT NULL DEFAULT true;
+
+UPDATE hikcentral_person_mappings m
+SET fingerprint_attendance_enabled = EXISTS (
+  SELECT 1 FROM employee_hikcentral_terminals t
+  WHERE t.tenant_id = m.tenant_id AND t.employee_id = m.employee_id AND t.is_active
+)
+WHERE m.is_active;
+
+-- ------------------------------------------------------------
+-- PART 2B: set_fingerprint_attendance_enabled -- the one human write
+-- path for the new flag, individually (one employee_id) or in bulk
+-- (the whole array at once, e.g. "enable fingerprint for every
+-- currently-unconfigured mapped employee at this site"). SECURITY
+-- INVOKER: the existing "update (supersede) within tenant+region,
+-- permitted" RLS policy on hikcentral_person_mappings (20260929000000)
+-- already expresses the complete tenant/region/permission rule for
+-- writing this table and is reused here verbatim, exactly like
+-- confirm_hikcentral_person_mappings reuses the INSERT policy -- no
+-- new authorization logic is written for this function at all.
+-- ------------------------------------------------------------
+CREATE OR REPLACE FUNCTION set_fingerprint_attendance_enabled(p_employee_ids UUID[], p_enabled BOOLEAN)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_caller_id UUID := auth.uid();
+  v_updated INTEGER := 0;
+BEGIN
+  IF v_caller_id IS NULL THEN RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501'; END IF;
+  IF p_employee_ids IS NULL OR array_length(p_employee_ids, 1) IS NULL THEN
+    RAISE EXCEPTION 'p_employee_ids must not be empty' USING ERRCODE = '22023';
+  END IF;
+  IF p_enabled IS NULL THEN RAISE EXCEPTION 'p_enabled is required' USING ERRCODE = '22023'; END IF;
+
+  UPDATE hikcentral_person_mappings
+  SET fingerprint_attendance_enabled = p_enabled
+  WHERE employee_id = ANY(p_employee_ids)
+    AND tenant_id = get_current_tenant_id()
+    AND is_active;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  RETURN jsonb_build_object('enabled', p_enabled, 'updated_count', v_updated);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION set_fingerprint_attendance_enabled(UUID[], BOOLEAN) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION set_fingerprint_attendance_enabled(UUID[], BOOLEAN) TO authenticated;
+
+-- ------------------------------------------------------------
 -- PART 2: set_site_hikcentral_terminals -- the one human write path,
 -- same reconcile-by-full-desired-set shape as
 -- set_employee_hikcentral_terminals. The site string is normalized
@@ -279,11 +399,11 @@ GRANT EXECUTE ON FUNCTION set_site_hikcentral_terminals(TEXT, TEXT[]) TO authent
 -- for every caller that used to read employee_hikcentral_terminals
 -- directly. SECURITY DEFINER so it is usable from any SECURITY
 -- DEFINER caller regardless of the caller's own RLS visibility into
--- site_hikcentral_terminals/attendance -- callers are always other
--- SECURITY DEFINER functions in this schema that have already
--- performed their own authorization check; this helper performs no
--- authorization of its own and is not intended to be called directly
--- by ordinary client code.
+-- site_hikcentral_terminals/hikcentral_person_mappings -- callers are
+-- always other SECURITY DEFINER functions in this schema that have
+-- already performed their own authorization check; this helper
+-- performs no authorization of its own and is not intended to be
+-- called directly by ordinary client code.
 -- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION attendance_employee_eligible_terminals(p_tenant_id UUID, p_employee_id UUID)
 RETURNS TABLE (access_point TEXT, provenance TEXT)
@@ -292,7 +412,9 @@ STABLE
 SET search_path = public, pg_temp
 AS $$
   -- (a) the employee's own explicit assignment, if any -- always wins,
-  -- never overridden or supplemented by the shared fallback below.
+  -- never overridden or supplemented by the shared fallback below, and
+  -- never gated by fingerprint_attendance_enabled either (an explicit
+  -- per-employee assignment already IS the explicit intent).
   SELECT t.access_point, 'employee_assigned'::TEXT
   FROM employee_hikcentral_terminals t
   WHERE t.tenant_id = p_tenant_id AND t.employee_id = p_employee_id AND t.is_active
@@ -300,13 +422,14 @@ AS $$
   UNION ALL
 
   -- (b) the shared site-level fallback -- ONLY reached when the
-  -- employee has NO own assignment at all AND no pre-existing
-  -- manual-sourced attendance row has ever been recorded for them
-  -- (see this migration's header: the CHITANI K KAPANDA / GIFT
-  -- BERNARD LICHE production counterexample -- a mapped employee with
-  -- an already-established, deliberate manual history is never swept
-  -- into automatic eligibility just because their workstation happens
-  -- to match a configured site).
+  -- employee has NO own assignment at all AND their own active
+  -- HikCentral Person Mapping explicitly has
+  -- fingerprint_attendance_enabled = true (PART 1B). This is an
+  -- EXPLICIT, reviewable per-mapping flag -- defaulting true for every
+  -- mapping confirmed from now on, and backfilled false for every
+  -- pre-existing mapping with no own terminal assignment (see this
+  -- migration's header REVISION) -- never inferred from
+  -- attendance.source history in either direction.
   SELECT s.access_point, 'site_shared'::TEXT
   FROM employees e
   JOIN site_hikcentral_terminals s
@@ -320,9 +443,10 @@ AS $$
       SELECT 1 FROM employee_hikcentral_terminals t2
       WHERE t2.tenant_id = p_tenant_id AND t2.employee_id = p_employee_id AND t2.is_active
     )
-    AND NOT EXISTS (
-      SELECT 1 FROM attendance a
-      WHERE a.employee_id = p_employee_id AND a.source = 'manual'
+    AND EXISTS (
+      SELECT 1 FROM hikcentral_person_mappings m
+      WHERE m.tenant_id = p_tenant_id AND m.employee_id = p_employee_id AND m.is_active
+        AND m.fingerprint_attendance_enabled
     );
 $$;
 
@@ -483,10 +607,12 @@ ON CONFLICT DO NOTHING;
 -- so the Evidence Centre / diagnostics can explain exactly why an
 -- employee has no eligible terminal: a genuine configuration gap
 -- ('no_assigned_terminal', unchanged meaning, now also covers "no
--- site-level config exists either") versus an employee who is
--- deliberately protected from the new site-level fallback by their
--- own existing manual attendance history ('manual_protected') --
--- never silently indistinguishable from a plain gap.
+-- site-level config exists either") versus an employee whose site IS
+-- configured but who has not yet been explicitly enabled for
+-- automatic fingerprint attendance ('fingerprint_not_enabled' --
+-- governed solely by the explicit hikcentral_person_mappings.
+-- fingerprint_attendance_enabled flag, PART 1B/3, never by attendance
+-- history) -- never silently indistinguishable from a plain gap.
 -- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION attendance_coverage_explain(
   p_employee_ids UUID[],
@@ -598,13 +724,16 @@ BEGIN
 
       IF assigned_terminal_count = 0 THEN
         checkout_window_covered := false;
-        -- Distinguish a genuine configuration gap from an employee who
-        -- is deliberately protected from the shared site fallback by
-        -- their own existing manual attendance history -- both still
-        -- correctly report sufficient_evidence = false (never a
-        -- fabricated Absent either way), but the REASON a reviewer
-        -- sees must never conflate "nobody has configured this yet"
-        -- with "this is a deliberate manual-attendance employee".
+        -- Distinguish a genuine configuration gap (nothing at all
+        -- exists for this employee yet) from an employee whose site
+        -- already has a shared terminal configuration but who has not
+        -- been explicitly enabled for automatic fingerprint attendance
+        -- -- governed solely by the explicit fingerprint_attendance_
+        -- enabled flag (PART 1B/3), never inferred from attendance
+        -- history. Both still correctly report sufficient_evidence =
+        -- false (never a fabricated Absent either way), but the REASON
+        -- a reviewer sees must never conflate "nobody has configured
+        -- this yet" with "this employee just hasn't been turned on".
         SELECT EXISTS (
           SELECT 1 FROM site_hikcentral_terminals s
           JOIN employees e ON e.id = v_employee_id
@@ -612,9 +741,13 @@ BEGIN
             AND s.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
         ) INTO v_site_config_exists;
 
-        IF v_site_config_exists AND EXISTS (SELECT 1 FROM attendance a WHERE a.employee_id = v_employee_id AND a.source = 'manual') THEN
-          coverage_provenance := 'manual_protected';
-          reason := 'This employee has an established manual attendance history, so Safeguard does not apply the shared site-level terminal configuration automatically -- assign a terminal directly if this employee should move to automatic processing.';
+        IF v_site_config_exists AND NOT EXISTS (
+          SELECT 1 FROM hikcentral_person_mappings m
+          WHERE m.tenant_id = v_tenant_id AND m.employee_id = v_employee_id AND m.is_active
+            AND m.fingerprint_attendance_enabled
+        ) THEN
+          coverage_provenance := 'fingerprint_not_enabled';
+          reason := 'A shared site-level terminal configuration exists for this employee''s workstation, but automatic fingerprint attendance has not been explicitly enabled for this employee yet -- enable it individually or in bulk for the site to begin automatic processing.';
         ELSE
           coverage_provenance := 'no_assigned_terminal';
           reason := 'No fingerprint terminal is assigned to this employee, and no shared site-level terminal configuration exists for their workstation yet -- coverage cannot be established.';
@@ -693,10 +826,12 @@ GRANT EXECUTE ON FUNCTION attendance_coverage_explain(UUID[], DATE, DATE) TO aut
 -- evidence-gap gating, OBSERVED scope, the legacy workstation scope,
 -- the PART A one-day-backward reconciliation window, attendance_apply_
 -- automatic's own call) is byte-for-byte unchanged. One new, additive
--- response field (manual_protected_mapped_employees) reports -- never
--- writes anything for -- employees this batch's scope reached who are
--- deliberately excluded from the shared site fallback by their own
--- existing manual attendance history (Part 4/5 transparency).
+-- response field (fingerprint_not_enabled_mapped_employees) reports --
+-- never writes anything for -- employees this batch's scope reached
+-- whose site DOES have a shared configuration but who have not yet
+-- been explicitly enabled for automatic fingerprint attendance (Part
+-- 4/5 transparency, governed solely by the explicit
+-- fingerprint_attendance_enabled flag, never by attendance history).
 -- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION attendance_process_import_batch(
   p_import_batch_id UUID,
@@ -730,7 +865,7 @@ DECLARE
   v_unchanged_count INTEGER := 0;
   v_skipped_count INTEGER := 0;
   v_needs_configuration JSONB;
-  v_manual_protected JSONB;
+  v_fingerprint_not_enabled JSONB;
   v_latest_observed_event_at TIMESTAMPTZ;
   v_exceeds_evidence BOOLEAN;
   v_evidence_gap_threshold INTERVAL := INTERVAL '2 hours';
@@ -870,7 +1005,7 @@ BEGIN
       'failed_count', 0,
       'rows', '[]'::jsonb,
       'needs_terminal_configuration', '[]'::jsonb,
-      'manual_protected_mapped_employees', '[]'::jsonb
+      'fingerprint_not_enabled_mapped_employees', '[]'::jsonb
     );
   END IF;
 
@@ -887,19 +1022,24 @@ BEGIN
   FROM attendance_apply_automatic(v_employee_ids, p_date_from - 1, p_date_to) r;
 
   -- Mapped, in-scope employees whose workstation DOES have a shared
-  -- site-level configuration, but who are deliberately excluded from
-  -- it because they already have an established manual attendance
-  -- history -- never a configuration gap, a reported safety exclusion
-  -- (Part 4/5: never silently reclassified, always explained). Computed
-  -- FIRST so the needs_terminal_configuration query right below can
-  -- exclude them -- a manually-protected employee is deliberately
-  -- working as intended, never also reported as a plain gap.
+  -- site-level configuration, but who have not yet been explicitly
+  -- enabled for automatic fingerprint attendance -- never a plain
+  -- configuration gap, a reported "ready to activate" exclusion (Part
+  -- 4/5: never silently reclassified, always explained, governed
+  -- solely by the explicit fingerprint_attendance_enabled flag, never
+  -- by attendance history). Computed FIRST so the needs_terminal_
+  -- configuration query right below can exclude them -- an employee
+  -- who is simply not yet enabled is never also reported as a plain
+  -- "nothing is configured" gap.
   SELECT COALESCE(jsonb_agg(jsonb_build_object('employee_id', e.id, 'full_name', e.full_name) ORDER BY e.full_name), '[]'::jsonb)
-    INTO v_manual_protected
+    INTO v_fingerprint_not_enabled
   FROM employees e
   WHERE e.id = ANY(v_employee_ids)
     AND NOT EXISTS (SELECT 1 FROM employee_hikcentral_terminals t WHERE t.employee_id = e.id AND t.tenant_id = v_tenant_id AND t.is_active)
-    AND EXISTS (SELECT 1 FROM attendance a WHERE a.employee_id = e.id AND a.source = 'manual')
+    AND NOT EXISTS (
+      SELECT 1 FROM hikcentral_person_mappings m
+      WHERE m.tenant_id = v_tenant_id AND m.employee_id = e.id AND m.is_active AND m.fingerprint_attendance_enabled
+    )
     AND EXISTS (
       SELECT 1 FROM site_hikcentral_terminals s
       WHERE s.tenant_id = v_tenant_id AND s.is_active
@@ -911,15 +1051,15 @@ BEGIN
   -- Absent, by design. Surfaced so an operator configures them
   -- (individually, or once for their whole site) instead of the gap
   -- going unnoticed. Deliberately EXCLUDES anyone already reported
-  -- under manual_protected_mapped_employees just above -- that is a
-  -- deliberate safety exclusion working exactly as intended, never a
-  -- plain configuration gap, and must never be reported as both.
+  -- under fingerprint_not_enabled_mapped_employees just above -- that
+  -- is a distinct, already-explained state, never a plain
+  -- configuration gap, and must never be reported as both.
   SELECT COALESCE(jsonb_agg(jsonb_build_object('employee_id', e.id, 'full_name', e.full_name) ORDER BY e.full_name), '[]'::jsonb)
     INTO v_needs_configuration
   FROM employees e
   WHERE e.id = ANY(v_employee_ids)
     AND NOT EXISTS (SELECT 1 FROM attendance_employee_eligible_terminals(v_tenant_id, e.id))
-    AND NOT (e.id::TEXT IN (SELECT jsonb_array_elements(v_manual_protected) ->> 'employee_id'));
+    AND NOT (e.id::TEXT IN (SELECT jsonb_array_elements(v_fingerprint_not_enabled) ->> 'employee_id'));
 
   RETURN jsonb_build_object(
     'status', 'applied',
@@ -931,7 +1071,7 @@ BEGIN
     'failed_count', 0,
     'rows', COALESCE(v_results, '[]'::jsonb),
     'needs_terminal_configuration', COALESCE(v_needs_configuration, '[]'::jsonb),
-    'manual_protected_mapped_employees', COALESCE(v_manual_protected, '[]'::jsonb)
+    'fingerprint_not_enabled_mapped_employees', COALESCE(v_fingerprint_not_enabled, '[]'::jsonb)
   );
 END;
 $$;
@@ -948,8 +1088,11 @@ GRANT EXECUTE ON FUNCTION attendance_process_import_batch(UUID, TEXT[], TIMESTAM
 --   'employee_assigned' / 'site_shared' -> "Fingerprint identity
 --     confirmed. Safeguard automatically recognizes eligible
 --     HikCentral terminals."
---   'manual_protected' -> an explicit, non-alarming explanation that
---     this employee is deliberately kept on manual attendance.
+--   'fingerprint_not_enabled' -> this employee's site already has a
+--     shared terminal configuration, but automatic fingerprint
+--     attendance has not been explicitly enabled for them yet --
+--     governed solely by fingerprint_attendance_enabled (PART 1B),
+--     never by attendance history.
 --   'unconfigured' -> "Fingerprint identity mapped. Waiting for
 --     confirmed terminal coverage."
 -- Never claims "fully configured" when eligibility is actually still
@@ -985,7 +1128,7 @@ BEGIN
         SELECT 1 FROM site_hikcentral_terminals s
         WHERE s.tenant_id = v_tenant_id AND s.is_active
           AND s.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
-      ) AND EXISTS (SELECT 1 FROM attendance a WHERE a.employee_id = m.employee_id AND a.source = 'manual') THEN 'manual_protected'
+      ) AND NOT m.fingerprint_attendance_enabled THEN 'fingerprint_not_enabled'
       ELSE 'unconfigured'
     END
   FROM hikcentral_person_mappings m
