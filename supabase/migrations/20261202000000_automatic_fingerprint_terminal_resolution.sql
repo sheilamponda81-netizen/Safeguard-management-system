@@ -308,6 +308,38 @@ WHERE m.is_active;
 -- writing this table and is reused here verbatim, exactly like
 -- confirm_hikcentral_person_mappings reuses the INSERT policy -- no
 -- new authorization logic is written for this function at all.
+--
+-- AUDIT TRAIL (post-review correction): this setting can change a
+-- FUTURE automatic Absent decision, and hikcentral_person_mappings has
+-- no audit trigger of its own, so this function writes one explicit
+-- audit_logs row per employee whose value ACTUALLY changes, reusing
+-- this schema's existing audit_logs table/RLS exactly as every other
+-- RPC in this project does (see e.g. approve_terminal_due). The
+-- `before` CTE snapshots each matched mapping's prior value BEFORE the
+-- UPDATE (a WITH clause's CTEs all share the same statement-start
+-- snapshot, so this is genuinely the pre-update value, never the
+-- post-update one read back); the final INSERT ... SELECT then keeps
+-- only rows where `old_enabled IS DISTINCT FROM p_enabled`, so setting
+-- an already-enabled (or already-disabled) employee to the same value
+-- again writes ZERO audit rows -- never a misleading "changed" entry
+-- for a genuine no-op. Each row in a bulk call gets its OWN audit_logs
+-- row (never one summary row for the whole batch), with
+-- batch_employee_count/is_bulk in new_data so a reviewer can always
+-- tell an individual action from a bulk one. The actor is v_caller_id
+-- (auth.uid()), never a client-supplied parameter -- there is no
+-- actor/user-id argument on this function at all. Because this INSERT
+-- runs SECURITY INVOKER, audit_logs' own "any active tenant member may
+-- insert their own audit event" RLS policy (20260817000001) applies
+-- here exactly as it would to any other direct authenticated insert --
+-- user_id is set to auth.uid() and user_email to auth.email(), both of
+-- which that policy requires to exactly match the real caller, so this
+-- function cannot forge a different actor's identity even if it tried.
+-- Reading audit_logs back remains Admin-only (that table's own,
+-- pre-existing SELECT policy, unchanged) and UPDATE/DELETE remain
+-- revoked from authenticated schema-wide (20260817000009), so these
+-- new rows are exactly as tamper-resistant as every other audit_logs
+-- row already written by this project -- no new protection needed,
+-- none weakened.
 -- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION set_fingerprint_attendance_enabled(p_employee_ids UUID[], p_enabled BOOLEAN)
 RETURNS JSONB
@@ -317,7 +349,9 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_caller_id UUID := auth.uid();
-  v_updated INTEGER := 0;
+  v_caller_email TEXT;
+  v_matched INTEGER := 0;
+  v_changed INTEGER := 0;
 BEGIN
   IF v_caller_id IS NULL THEN RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501'; END IF;
   IF p_employee_ids IS NULL OR array_length(p_employee_ids, 1) IS NULL THEN
@@ -325,14 +359,45 @@ BEGIN
   END IF;
   IF p_enabled IS NULL THEN RAISE EXCEPTION 'p_enabled is required' USING ERRCODE = '22023'; END IF;
 
-  UPDATE hikcentral_person_mappings
-  SET fingerprint_attendance_enabled = p_enabled
-  WHERE employee_id = ANY(p_employee_ids)
-    AND tenant_id = get_current_tenant_id()
-    AND is_active;
-  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  v_caller_email := auth.email();
 
-  RETURN jsonb_build_object('enabled', p_enabled, 'updated_count', v_updated);
+  WITH before AS (
+    SELECT id, employee_id, tenant_id, fingerprint_attendance_enabled AS old_enabled
+    FROM hikcentral_person_mappings
+    WHERE employee_id = ANY(p_employee_ids)
+      AND tenant_id = get_current_tenant_id()
+      AND is_active
+  ),
+  touched AS (
+    UPDATE hikcentral_person_mappings m
+    SET fingerprint_attendance_enabled = p_enabled
+    WHERE m.id IN (SELECT id FROM before)
+    RETURNING m.id
+  ),
+  audited AS (
+    INSERT INTO audit_logs (tenant_id, user_id, user_email, action, entity_type, entity_id, old_data, new_data)
+    SELECT
+      b.tenant_id,
+      v_caller_id,
+      v_caller_email,
+      CASE WHEN p_enabled THEN 'ENABLE_FINGERPRINT_ATTENDANCE' ELSE 'DISABLE_FINGERPRINT_ATTENDANCE' END,
+      'hikcentral_person_mapping',
+      b.employee_id::text,
+      jsonb_build_object('fingerprint_attendance_enabled', b.old_enabled),
+      jsonb_build_object(
+        'fingerprint_attendance_enabled', p_enabled,
+        'mapping_id', b.id,
+        'batch_employee_count', array_length(p_employee_ids, 1),
+        'is_bulk', array_length(p_employee_ids, 1) > 1
+      )
+    FROM before b
+    JOIN touched t ON t.id = b.id
+    WHERE b.old_enabled IS DISTINCT FROM p_enabled
+    RETURNING 1
+  )
+  SELECT (SELECT count(*) FROM touched), (SELECT count(*) FROM audited) INTO v_matched, v_changed;
+
+  RETURN jsonb_build_object('enabled', p_enabled, 'updated_count', v_matched, 'changed_count', v_changed);
 END;
 $$;
 
@@ -404,11 +469,42 @@ GRANT EXECUTE ON FUNCTION set_site_hikcentral_terminals(TEXT, TEXT[]) TO authent
 -- already performed their own authorization check; this helper
 -- performs no authorization of its own and is not intended to be
 -- called directly by ordinary client code.
+--
+-- SECURITY CORRECTION (post-review): the FIRST version of this
+-- function declared no SECURITY clause at all (silently defaulting to
+-- SECURITY INVOKER, contradicting the comment above, which already
+-- claimed SECURITY DEFINER) and was directly GRANTed to `authenticated`
+-- -- so any ordinary logged-in user could call it directly, as
+-- themselves, with an arbitrary p_tenant_id/p_employee_id of their
+-- choosing. In practice this happened to leak nothing, because every
+-- table it reads (employee_hikcentral_terminals, site_hikcentral_
+-- terminals, hikcentral_person_mappings, employees) already carries
+-- its own tenant+permission-scoped RLS, so a direct SECURITY-INVOKER
+-- call from an unauthorized or cross-tenant caller was silently
+-- filtered down to zero rows rather than ever returning another
+-- tenant's data -- but relying on that as the ONLY safeguard was
+-- fragile and never the intended model. Corrected by (a) adding the
+-- SECURITY DEFINER the comment always claimed, and (b) revoking the
+-- direct EXECUTE grant from `authenticated` entirely (kept revoked
+-- from PUBLIC/anon as before) -- this function is now genuinely
+-- internal-only: an ordinary client calling it directly now gets a
+-- clean "permission denied for function" instead of a silently-empty
+-- result. This changes NOTHING for its real callers (attendance_
+-- resolve_and_calculate, attendance_coverage_explain, attendance_
+-- process_import_batch, hikcentral_mapped_employees_terminal_status):
+-- all four are themselves SECURITY DEFINER, owned by the same role
+-- that owns this function, so Postgres evaluates their internal call
+-- to this helper as that OWNING role, which always implicitly holds
+-- EXECUTE on its own functions regardless of any REVOKE/GRANT to
+-- `authenticated` -- verified by re-running the full disposable-
+-- Postgres suite (every one of those four functions' own tests)
+-- unchanged after this correction; all still pass.
 -- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION attendance_employee_eligible_terminals(p_tenant_id UUID, p_employee_id UUID)
 RETURNS TABLE (access_point TEXT, provenance TEXT)
 LANGUAGE sql
 STABLE
+SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
   -- (a) the employee's own explicit assignment, if any -- always wins,
@@ -450,8 +546,11 @@ AS $$
     );
 $$;
 
-REVOKE ALL ON FUNCTION attendance_employee_eligible_terminals(UUID, UUID) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION attendance_employee_eligible_terminals(UUID, UUID) TO authenticated;
+-- Genuinely internal-only: no GRANT to `authenticated` at all (unlike
+-- every other function in this migration). Its SECURITY DEFINER
+-- callers keep working regardless -- see the SECURITY CORRECTION note
+-- above.
+REVOKE ALL ON FUNCTION attendance_employee_eligible_terminals(UUID, UUID) FROM PUBLIC, anon, authenticated;
 
 -- ------------------------------------------------------------
 -- PART 4: attendance_resolve_and_calculate -- same signature, CREATE

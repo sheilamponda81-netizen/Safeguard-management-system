@@ -853,7 +853,7 @@ export default function HikCentralPersonMappingPage() {
                               <Badge key={ap} color={terminalStatus.provenance === 'employee_assigned' ? 'blue' : 'teal'}>{ap}</Badge>
                             ))}
                           </div>
-                          <p className="text-[11px] text-slate-400">{terminalStatus.provenance === 'employee_assigned' ? 'Individually assigned' : 'Shared site configuration'}</p>
+                          <p className="text-[11px] text-slate-400">{terminalStatus.provenance === 'employee_assigned' ? 'Individually assigned -- always takes precedence over the shared site setting below' : 'Shared site configuration'}</p>
                         </div>
                       ) : (
                         <div className="space-y-1 max-w-xs">
@@ -964,7 +964,7 @@ export default function HikCentralPersonMappingPage() {
       >
         <div className="space-y-4">
           <p className="text-xs text-slate-500">
-            The expected HikCentral terminal(s) this employee actually uses -- independent of their HR workstation. An employee with no terminal assigned here can never be marked Absent; one who uses more than one central terminal can be assigned all of them.
+            The expected HikCentral terminal(s) this employee actually uses -- independent of their HR workstation. An employee with no terminal assigned here can never be marked Absent; one who uses more than one central terminal can be assigned all of them. An individual assignment here always takes priority over the shared site fingerprint-attendance setting: it keeps this employee eligible even while that setting is off for them.
           </p>
           <div className="space-y-1.5">
             {terminalModalCandidates.length === 0 && (
@@ -1010,7 +1010,7 @@ export default function HikCentralPersonMappingPage() {
       >
         <div className="space-y-4">
           <p className="text-xs text-slate-500">
-            Every mapped employee at this site, with no individual terminal override and no existing manual attendance history, automatically becomes eligible at the terminal(s) selected here. Employees with an individual override, or a manual attendance history, are never affected by this setting.
+            Every mapped employee at this site who has no individual terminal override AND has been explicitly enabled for automatic fingerprint attendance becomes eligible at the terminal(s) selected here. Employees with an individual override are never affected by this setting, in either direction -- their own assignment always takes priority. A newly-mapped employee is enabled by default; a pre-existing employee needs a one-time "Enable fingerprint attendance" action first (shown below, once this site has terminals configured).
           </p>
           <div className="space-y-1.5">
             {siteModalCandidates.length === 0 && (

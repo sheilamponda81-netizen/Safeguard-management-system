@@ -601,6 +601,304 @@ describe.skipIf(!dbAvailable && !dbRequired)('Automatic fingerprint terminal res
     });
   });
 
+  // PR #80 FINAL ACCOUNTABILITY AND ELIGIBILITY CHECK -- audit trail for
+  // set_fingerprint_attendance_enabled (hikcentral_person_mappings has no
+  // audit trigger of its own; the RPC writes audit_logs rows directly).
+  describe('set_fingerprint_attendance_enabled: audit trail', () => {
+    it('writes exactly one audit_logs row for a genuine individual change, with the real old/new value, actor, tenant and entity, and writes nothing at all for a repeated no-op', () => {
+      const fixture = createFixture('AUDIT INDIVIDUAL SITE');
+      // Freshly-confirmed mapping defaults to enabled=true.
+      const [before] = queryRow(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${fixture.tenantId}'::uuid`);
+      expect(before).toBe('0');
+
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
+      const [afterFirstCall] = queryRow(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${fixture.tenantId}'::uuid`);
+      expect(afterFirstCall).toBe('1');
+
+      const [action, entityType, entityId, userId, oldData, newData] = queryRow(
+        `SELECT action, entity_type, entity_id, user_id, old_data::text, new_data::text FROM audit_logs WHERE tenant_id = '${fixture.tenantId}'::uuid`
+      );
+      expect(action).toBe('DISABLE_FINGERPRINT_ATTENDANCE');
+      expect(entityType).toBe('hikcentral_person_mapping');
+      expect(entityId).toBe(fixture.employeeId);
+      expect(userId).toBe(fixture.callerId);
+      expect(JSON.parse(oldData)).toEqual({ fingerprint_attendance_enabled: true });
+      const parsedNew = JSON.parse(newData);
+      expect(parsedNew.fingerprint_attendance_enabled).toBe(false);
+      expect(parsedNew.is_bulk).toBe(false);
+      expect(parsedNew.batch_employee_count).toBe(1);
+
+      // Repeating the SAME value is a genuine no-op -- no misleading second audit row.
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
+      const [afterNoOp] = queryRow(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${fixture.tenantId}'::uuid`);
+      expect(afterNoOp).toBe('1');
+    });
+
+    it('bulk: writes one audit_logs row PER employee that actually changed, never a single summary row, and never a row for one that was already at the target value', () => {
+      const fixtureA = createFixture('AUDIT BULK SITE A');
+      const fixtureB = createFixture('AUDIT BULK SITE B');
+      exec(`SELECT set_caller('${fixtureA.callerId}')`);
+      const thirdEmployeeId = randomUUID();
+      exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, workstation) VALUES ('${thirdEmployeeId}', '${fixtureA.tenantId}', 'E-${thirdEmployeeId.slice(0, 8)}', 'Third Bulk Audit Employee', 'Active', false, '${fixtureA.site}')`);
+      exec(`INSERT INTO hikcentral_person_mappings (tenant_id, hikcentral_person_no, employee_id, match_method, is_active) VALUES ('${fixtureA.tenantId}', 'P-THIRD-${thirdEmployeeId.slice(0, 8)}', '${thirdEmployeeId}', 'manual', true)`);
+      // thirdEmployeeId is already at the default (true) -- pre-set fixtureA's own employee to false (its own, separately-audited change) so only ONE of the two in the bulk call below actually needs to change to true.
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureA.employeeId}']::uuid[], false)`);
+
+      const [result] = queryRow(
+        `SELECT (set_fingerprint_attendance_enabled(ARRAY['${fixtureA.employeeId}', '${thirdEmployeeId}']::uuid[], true))->>'changed_count'`
+      );
+      expect(result).toBe('1'); // only fixtureA.employeeId actually flipped; thirdEmployeeId was already true
+
+      // Isolate THIS bulk call's own rows by action -- the earlier pre-set step wrote its own, separate DISABLE row for the same employee.
+      const [auditCountForAEnable] = queryRow(`SELECT count(*) FROM audit_logs WHERE entity_id = '${fixtureA.employeeId}' AND tenant_id = '${fixtureA.tenantId}'::uuid AND action = 'ENABLE_FINGERPRINT_ATTENDANCE'`);
+      expect(auditCountForAEnable).toBe('1');
+      const [auditCountForThird] = queryRow(`SELECT count(*) FROM audit_logs WHERE entity_id = '${thirdEmployeeId}' AND tenant_id = '${fixtureA.tenantId}'::uuid`);
+      expect(auditCountForThird).toBe('0'); // no-op, never logged at all
+      const [totalAuditCountForA] = queryRow(`SELECT count(*) FROM audit_logs WHERE entity_id = '${fixtureA.employeeId}' AND tenant_id = '${fixtureA.tenantId}'::uuid`);
+      expect(totalAuditCountForA).toBe('2'); // the pre-set DISABLE, plus this bulk call's own ENABLE -- never a row for the no-op third employee
+
+      const [isBulk] = queryRow(`SELECT new_data->>'is_bulk' FROM audit_logs WHERE entity_id = '${fixtureA.employeeId}' AND tenant_id = '${fixtureA.tenantId}'::uuid AND action = 'ENABLE_FINGERPRINT_ATTENDANCE'`);
+      expect(isBulk).toBe('true');
+
+      // Never leaks into a different tenant's audit trail.
+      exec(`SELECT set_caller('${fixtureB.callerId}')`);
+      const [tenantBAuditCount] = queryRow(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${fixtureB.tenantId}'::uuid`);
+      expect(tenantBAuditCount).toBe('0');
+    });
+
+    it('an unauthenticated or unauthorized/cross-tenant attempt updates nothing and audits nothing', () => {
+      const fixtureA = createFixture('AUDIT UNAUTHORIZED TENANT A');
+      createFixture('AUDIT UNAUTHORIZED TENANT B'); // a second tenant, purely to switch the active caller away from tenant A
+
+      // Tenant B's caller cannot touch, or create an audit trail for, tenant A's employee.
+      const [crossTenantResult] = queryRow(`SELECT (set_fingerprint_attendance_enabled(ARRAY['${fixtureA.employeeId}']::uuid[], false))->>'changed_count'`);
+      expect(crossTenantResult).toBe('0');
+      const [crossTenantAudit] = queryRow(`SELECT count(*) FROM audit_logs WHERE entity_id = '${fixtureA.employeeId}'`);
+      expect(crossTenantAudit).toBe('0');
+
+      exec(`SELECT set_caller(NULL)`);
+      const stderr = execExpectError(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureA.employeeId}']::uuid[], true)`);
+      expect(stderr).toMatch(/not authenticated/i);
+      const [unauthenticatedAudit] = queryRow(`SELECT count(*) FROM audit_logs WHERE entity_id = '${fixtureA.employeeId}'`);
+      expect(unauthenticatedAudit).toBe('0');
+    });
+
+    it('audit_logs reads remain governed by the pre-existing, unchanged "Admin-only" RLS policy -- this PR adds no new SELECT policy and does not relax it', () => {
+      // NOTE: every query in this disposable-Postgres suite runs via psql
+      // as the `root` superuser (set_caller() only stubs the auth.uid()
+      // session variable `get_current_tenant_id()`/permission helpers
+      // read -- it never changes the actual connected Postgres ROLE), and
+      // a superuser bypasses RLS entirely regardless of policy content
+      // (audit_logs never sets FORCE ROW LEVEL SECURITY). A live
+      // behavioral "does an ordinary user actually get filtered rows"
+      // check is therefore not meaningfully exercisable in this harness --
+      // verified structurally instead: the pre-existing SELECT policy
+      // (20260817000001, untouched by this migration) still exists, is
+      // still the ONLY SELECT policy on this table, and its USING clause
+      // still requires is_super_admin()/is_business_admin() -- exactly
+      // the same check every other audit_logs row in this schema (terminal
+      // dues, payroll, user edits, ...) already relies on; this migration
+      // neither adds a second, more permissive SELECT policy nor edits
+      // this one.
+      const fixture = createFixture('AUDIT READ VISIBILITY SITE');
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
+      const [auditRowExists] = queryRow(`SELECT count(*) FROM audit_logs WHERE entity_id = '${fixture.employeeId}' AND tenant_id = '${fixture.tenantId}'::uuid`);
+      expect(auditRowExists).toBe('1'); // the row this action created genuinely exists
+
+      const selectPolicies = queryRows(`SELECT policyname, qual FROM pg_policies WHERE schemaname = 'public' AND tablename = 'audit_logs' AND cmd = 'SELECT'`);
+      expect(selectPolicies.length).toBe(1);
+      expect(selectPolicies[0][0]).toBe('Audit logs: view is Admin-only');
+      expect(selectPolicies[0][1]).toMatch(/is_super_admin|is_business_admin/);
+
+      const [updateDeleteRevoked] = queryRow(`SELECT (NOT (has_table_privilege('authenticated', 'audit_logs', 'UPDATE') OR has_table_privilege('authenticated', 'audit_logs', 'DELETE')))::text`);
+      expect(updateDeleteRevoked).toBe('true'); // 20260817000009: audit_logs rows, including this PR's new ones, cannot be tampered with by any authenticated client
+    });
+  });
+
+  // PR #80 FINAL ACCOUNTABILITY AND ELIGIBILITY CHECK -- individual
+  // terminal assignment must always keep taking precedence over
+  // fingerprint_attendance_enabled, in both directions, and the bulk/
+  // individual RPC must never itself touch employee_hikcentral_terminals.
+  describe('individual assignment always takes precedence over fingerprint_attendance_enabled', () => {
+    it('disabling the flag for an individually-assigned employee has ZERO effect on their eligibility -- own assignment still resolves Present/Absent exactly as before', () => {
+      const fixture = createFixture('PRECEDENCE SITE');
+      exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
+      exec(`SELECT set_employee_hikcentral_terminals('${fixture.employeeId}', ARRAY['PRECEDENCE-DOOR'])`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
+
+      const [provenance, accessPoints] = queryRow(
+        `SELECT array_agg(provenance), array_agg(access_point) FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`
+      );
+      expect(provenance).toBe('{employee_assigned}');
+      expect(accessPoints).toBe('{PRECEDENCE-DOOR}');
+
+      confirmCoverage(fixture, ['PRECEDENCE-DOOR'], '2026-11-16T00:00:00Z', '2026-11-16T23:59:00Z', '2026-11-16T19:00:00Z');
+      const result = resolveAndCalculate(fixture.employeeId, '2026-11-16');
+      expect(result.status).toBe('absent'); // genuinely complete coverage, no scans -- resolved exactly as if the flag were still true
+
+      // The Person Mapping page's own status feed must never claim this employee has been switched off fingerprint attendance.
+      const [[, provenanceStatus]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixture.employeeId}'::uuid`);
+      expect(provenanceStatus).toBe('employee_assigned');
+    });
+
+    it('a bulk disable spanning both an individually-assigned employee and a site-shared employee never writes to employee_hikcentral_terminals at all', () => {
+      const fixtureAssigned = createFixture('BULK PRECEDENCE ASSIGNED SITE');
+      exec(`SELECT set_employee_hikcentral_terminals('${fixtureAssigned.employeeId}', ARRAY['BULK-OWN-DOOR'])`);
+      exec(`SELECT set_caller('${fixtureAssigned.callerId}')`);
+      exec(`SELECT set_site_hikcentral_terminals('${fixtureAssigned.site}', ARRAY['BULK-SHARED-DOOR'])`);
+
+      const sharedEmployeeId = randomUUID();
+      exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, workstation) VALUES ('${sharedEmployeeId}', '${fixtureAssigned.tenantId}', 'E-${sharedEmployeeId.slice(0, 8)}', 'Bulk Precedence Shared Employee', 'Active', false, '${fixtureAssigned.site}')`);
+      exec(`INSERT INTO hikcentral_person_mappings (tenant_id, hikcentral_person_no, employee_id, match_method, is_active) VALUES ('${fixtureAssigned.tenantId}', 'P-SHARED-${sharedEmployeeId.slice(0, 8)}', '${sharedEmployeeId}', 'manual', true)`);
+
+      const [beforeCount, beforeChecksum] = queryRow(`SELECT count(*), COALESCE(md5(string_agg(id::text || access_point || is_active::text, ',' ORDER BY id)), '') FROM employee_hikcentral_terminals WHERE tenant_id = '${fixtureAssigned.tenantId}'::uuid`);
+
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureAssigned.employeeId}', '${sharedEmployeeId}']::uuid[], false)`);
+
+      const [afterCount, afterChecksum] = queryRow(`SELECT count(*), COALESCE(md5(string_agg(id::text || access_point || is_active::text, ',' ORDER BY id)), '') FROM employee_hikcentral_terminals WHERE tenant_id = '${fixtureAssigned.tenantId}'::uuid`);
+      expect(afterCount).toBe(beforeCount);
+      expect(afterChecksum).toBe(beforeChecksum);
+
+      // The individually-assigned employee is completely unaffected; the shared-only employee correctly loses eligibility.
+      const [assignedEligibleCount] = queryRow(`SELECT count(*) FROM attendance_employee_eligible_terminals('${fixtureAssigned.tenantId}'::uuid, '${fixtureAssigned.employeeId}'::uuid)`);
+      expect(assignedEligibleCount).toBe('1');
+      const [sharedEligibleCount] = queryRow(`SELECT count(*) FROM attendance_employee_eligible_terminals('${fixtureAssigned.tenantId}'::uuid, '${sharedEmployeeId}'::uuid)`);
+      expect(sharedEligibleCount).toBe('0');
+    });
+  });
+
+  // PR #80 FINAL ACCOUNTABILITY AND ELIGIBILITY CHECK -- the internal-only
+  // security model attendance_employee_eligible_terminals's own header
+  // always claimed, now actually enforced (SECURITY DEFINER + no direct
+  // `authenticated` grant), verified to not break its real callers.
+  describe('attendance_employee_eligible_terminals: internal-only security model', () => {
+    it('is SECURITY DEFINER with no EXECUTE grant to authenticated, anon, or PUBLIC -- genuinely internal-only', () => {
+      const [securityType] = queryRow(`SELECT prosecdef::text FROM pg_proc WHERE proname = 'attendance_employee_eligible_terminals'`);
+      expect(securityType).toBe('true'); // prosecdef = true means SECURITY DEFINER
+
+      const [authenticatedHasExecute] = queryRow(`SELECT has_function_privilege('authenticated', 'attendance_employee_eligible_terminals(uuid,uuid)', 'EXECUTE')::text`);
+      expect(authenticatedHasExecute).toBe('false');
+      const [publicHasExecute] = queryRow(`SELECT has_function_privilege('public', 'attendance_employee_eligible_terminals(uuid,uuid)', 'EXECUTE')::text`);
+      expect(publicHasExecute).toBe('false');
+    });
+
+    it('its real SECURITY DEFINER callers (attendance_resolve_and_calculate, attendance_coverage_explain, attendance_process_import_batch, hikcentral_mapped_employees_terminal_status) all still work correctly despite the revoked direct grant', () => {
+      const fixture = createFixture('INTERNAL SECURITY CALLERS SITE');
+      exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
+      exec(`SELECT set_site_hikcentral_terminals('${fixture.site}', ARRAY['SEC-DOOR'])`);
+      confirmCoverage(fixture, ['SEC-DOOR'], '2026-11-16T00:00:00Z', '2026-11-16T23:59:00Z', '2026-11-16T19:00:00Z');
+
+      const viaResolve = resolveAndCalculate(fixture.employeeId, '2026-11-16');
+      expect(viaResolve.status).toBe('absent');
+
+      const [coverageProvenance] = queryRow(`SELECT coverage_provenance FROM attendance_coverage_explain(ARRAY['${fixture.employeeId}']::uuid[], '2026-11-16'::date, '2026-11-16'::date)`);
+      expect(coverageProvenance).toBe('evidence_backed');
+
+      const [[, statusProvenance]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixture.employeeId}'::uuid`);
+      expect(statusProvenance).toBe('site_shared');
+    });
+  });
+
+  // PR #80 FINAL ACCOUNTABILITY AND ELIGIBILITY CHECK -- rehearses the
+  // migration's own seed rollup (PART 5) and backfill (PART 1B) against a
+  // dataset structurally representative of production's actual shape
+  // (scaled down from the real 115-individually-assigned / 64-gap split,
+  // a clean multi-employee site, a genuinely ambiguous site, and existing
+  // attendance/payroll/audit history) -- never literal production data.
+  describe('migration rehearsal against representative production preconditions', () => {
+    it('seeds only the clean sites, backfills the flag correctly by category, and never rewrites a single existing attendance or payroll row', () => {
+      const tenantId = randomUUID();
+      const callerId = randomUUID();
+      exec(`INSERT INTO tenants (id, name, code) VALUES ('${tenantId}', 'Rehearsal Tenant', 'REH-${tenantId.slice(0, 8)}')`);
+      exec(`INSERT INTO auth.users (id) VALUES ('${callerId}')`);
+      exec(`INSERT INTO profiles (id, tenant_id, is_super_admin, is_active) VALUES ('${callerId}', '${tenantId}', true, true)`);
+      exec(`SELECT set_caller('${callerId}')`);
+
+      const makeMappedEmployee = (site: string, withPayroll: boolean): string => {
+        const employeeId = randomUUID();
+        const personNo = `P${randomUUID().slice(0, 8)}`;
+        exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, workstation) VALUES ('${employeeId}', '${tenantId}', 'E-${employeeId.slice(0, 8)}', 'Rehearsal Employee', 'Active', false, '${site}')`);
+        exec(`INSERT INTO hikcentral_person_mappings (tenant_id, hikcentral_person_no, employee_id, match_method, is_active) VALUES ('${tenantId}', '${personNo}', '${employeeId}', 'manual', true)`);
+        if (withPayroll) {
+          exec(`INSERT INTO payroll (tenant_id, employee_id, month, approval_status) VALUES ('${tenantId}', '${employeeId}', '2026-11', 'approved')`);
+        }
+        return employeeId;
+      };
+
+      // Representative "115-individually-assigned" population: a clean, multi-employee site (CLEAN SITE A), a second clean site (CLEAN SITE B).
+      const cleanAEmployees = [makeMappedEmployee('CLEAN SITE A', true), makeMappedEmployee('CLEAN SITE A', false), makeMappedEmployee('CLEAN SITE A', false)];
+      cleanAEmployees.forEach((id) => exec(`SELECT set_employee_hikcentral_terminals('${id}', ARRAY['A-DOOR'])`));
+      const cleanBEmployees = [makeMappedEmployee('CLEAN SITE B', false), makeMappedEmployee('CLEAN SITE B', false)];
+      cleanBEmployees.forEach((id) => exec(`SELECT set_employee_hikcentral_terminals('${id}', ARRAY['B-DOOR'])`));
+
+      // Representative genuinely-ambiguous site: two individually-assigned employees disagree on the door.
+      const ambiguousEmployees = [makeMappedEmployee('AMBIGUOUS SITE', false), makeMappedEmployee('AMBIGUOUS SITE', false)];
+      exec(`SELECT set_employee_hikcentral_terminals('${ambiguousEmployees[0]}', ARRAY['AMBIG-DOOR-1'])`);
+      exec(`SELECT set_employee_hikcentral_terminals('${ambiguousEmployees[1]}', ARRAY['AMBIG-DOOR-2'])`);
+
+      // Representative "64-gap" population at the SAME clean site: no individual assignment at all.
+      const gapEmployeeNoHistory = makeMappedEmployee('CLEAN SITE A', false);
+      const gapEmployeeWithHistory = makeMappedEmployee('CLEAN SITE A', true);
+      exec(`SELECT * FROM attendance_correct('${gapEmployeeWithHistory}'::uuid, '2026-11-01'::date, 'A', 'Pre-existing historical record, predates this release -- representative of the CHITANI/GIFT production counterexample.')`);
+
+      // Full attendance/payroll snapshot BEFORE rehearsing the migration's own seed/backfill steps.
+      const [attendanceCountBefore, attendanceChecksumBefore] = queryRow(`SELECT count(*), COALESCE(md5(string_agg(employee_id::text || date::text || status || source, ',' ORDER BY employee_id, date)), '') FROM attendance WHERE tenant_id = '${tenantId}'::uuid`);
+      const [payrollCountBefore, payrollChecksumBefore] = queryRow(`SELECT count(*), COALESCE(md5(string_agg(employee_id::text || month || approval_status, ',' ORDER BY employee_id, month)), '') FROM payroll WHERE tenant_id = '${tenantId}'::uuid`);
+      const [auditCountBefore] = queryRow(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${tenantId}'::uuid`);
+
+      // PART 5 (the exact seed rollup statement from the migration), rehearsed directly against this dataset.
+      exec(
+        `INSERT INTO site_hikcentral_terminals (tenant_id, site, access_point, source, assigned_by) ` +
+        `SELECT rollup.tenant_id, rollup.site, rollup.only_access_point, 'derived_from_employee_assignments', NULL FROM (` +
+        `SELECT t.tenant_id, upper(btrim(regexp_replace(e.workstation, '\\s+', ' ', 'g'))) AS site, (array_agg(DISTINCT t.access_point))[1] AS only_access_point, count(DISTINCT t.access_point) AS distinct_access_points ` +
+        `FROM employee_hikcentral_terminals t JOIN employees e ON e.id = t.employee_id AND e.tenant_id = t.tenant_id ` +
+        `WHERE t.is_active AND t.tenant_id = '${tenantId}'::uuid AND COALESCE(btrim(e.workstation), '') <> '' ` +
+        `GROUP BY t.tenant_id, upper(btrim(regexp_replace(e.workstation, '\\s+', ' ', 'g')))` +
+        `) rollup WHERE rollup.distinct_access_points = 1 ON CONFLICT DO NOTHING`
+      );
+
+      // PART 1B (the exact backfill statement from the migration), rehearsed directly against this dataset.
+      exec(
+        `UPDATE hikcentral_person_mappings m SET fingerprint_attendance_enabled = EXISTS (` +
+        `SELECT 1 FROM employee_hikcentral_terminals t WHERE t.tenant_id = m.tenant_id AND t.employee_id = m.employee_id AND t.is_active` +
+        `) WHERE m.is_active AND m.tenant_id = '${tenantId}'::uuid`
+      );
+
+      // Clean sites seeded correctly; the ambiguous site left unconfigured.
+      const [[, cleanADoor]] = queryRows(`SELECT site, access_point FROM site_hikcentral_terminals WHERE tenant_id = '${tenantId}'::uuid AND site = 'CLEAN SITE A'`);
+      expect(cleanADoor).toBe('A-DOOR');
+      const [[, cleanBDoor]] = queryRows(`SELECT site, access_point FROM site_hikcentral_terminals WHERE tenant_id = '${tenantId}'::uuid AND site = 'CLEAN SITE B'`);
+      expect(cleanBDoor).toBe('B-DOOR');
+      const [ambiguousSiteRowCount] = queryRow(`SELECT count(*) FROM site_hikcentral_terminals WHERE tenant_id = '${tenantId}'::uuid AND site = 'AMBIGUOUS SITE'`);
+      expect(ambiguousSiteRowCount).toBe('0');
+
+      // The "115-pattern" (individually-assigned) employees are all backfilled to enabled=true.
+      for (const id of [...cleanAEmployees, ...cleanBEmployees, ...ambiguousEmployees]) {
+        const [enabled] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${id}'::uuid AND is_active`);
+        expect(enabled).toBe('t');
+      }
+      // The "64-gap pattern" employees are backfilled to disabled, REGARDLESS of attendance history.
+      const [gapNoHistoryEnabled] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${gapEmployeeNoHistory}'::uuid AND is_active`);
+      expect(gapNoHistoryEnabled).toBe('f');
+      const [gapWithHistoryEnabled] = queryRow(`SELECT fingerprint_attendance_enabled FROM hikcentral_person_mappings WHERE employee_id = '${gapEmployeeWithHistory}'::uuid AND is_active`);
+      expect(gapWithHistoryEnabled).toBe('f');
+
+      // No existing attendance/payroll/audit row was rewritten, and no historical Pending (missing) record was recalculated into existence.
+      const [attendanceCountAfter, attendanceChecksumAfter] = queryRow(`SELECT count(*), COALESCE(md5(string_agg(employee_id::text || date::text || status || source, ',' ORDER BY employee_id, date)), '') FROM attendance WHERE tenant_id = '${tenantId}'::uuid`);
+      const [payrollCountAfter, payrollChecksumAfter] = queryRow(`SELECT count(*), COALESCE(md5(string_agg(employee_id::text || month || approval_status, ',' ORDER BY employee_id, month)), '') FROM payroll WHERE tenant_id = '${tenantId}'::uuid`);
+      const [auditCountAfter] = queryRow(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${tenantId}'::uuid`);
+      expect(attendanceCountAfter).toBe(attendanceCountBefore);
+      expect(attendanceChecksumAfter).toBe(attendanceChecksumBefore);
+      expect(payrollCountAfter).toBe(payrollCountBefore);
+      expect(payrollChecksumAfter).toBe(payrollChecksumBefore);
+      expect(auditCountAfter).toBe(auditCountBefore); // the seed/backfill steps themselves never write audit_logs either
+      expect(attendanceCountBefore).toBe('1'); // sanity: only gapEmployeeWithHistory's one manual row exists
+      // The zero-history gap employee still has no attendance row at all -- no Pending record was ever materialized.
+      const [gapNoHistoryAttendanceCount] = queryRow(`SELECT count(*) FROM attendance WHERE employee_id = '${gapEmployeeNoHistory}'::uuid`);
+      expect(gapNoHistoryAttendanceCount).toBe('0');
+    });
+  });
+
   // Additional direct coverage of attendance_coverage_explain's new provenance values (Part 5 diagnostic transparency).
   describe('attendance_coverage_explain: new site-level provenance values', () => {
     it('reports "fingerprint_not_enabled" (not a plain gap) for a mapped, site-configured employee who has not been explicitly enabled', () => {
