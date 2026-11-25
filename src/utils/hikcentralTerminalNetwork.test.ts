@@ -479,4 +479,171 @@ describe.skipIf(!dbAvailable && !dbRequired)('Shared fingerprint terminal networ
     const [eligibleCount] = queryRow(`SELECT count(*) FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
     expect(eligibleCount).toBe('0');
   });
+
+  // PR #81 FINAL NETWORK RESOLUTION CORRECTION -- precedence must be
+  // individual assignment > explicit active network membership (when
+  // enabled and the network has terminals) > legacy direct site
+  // fallback > nothing. A site that already had a seeded direct
+  // configuration (the AHL KANENGO scenario) must actually switch to
+  // the network once explicitly joined to one.
+  describe('corrected precedence: network membership wins over a legacy direct site configuration', () => {
+    it('AHL KANENGO: an old direct site configuration is superseded the moment the site explicitly joins a network with real terminals', () => {
+      const fixture = createFixture('AHL KANENGO');
+      // The legacy, PR #80-era direct configuration -- e.g. seeded from historical employee_hikcentral_terminals data.
+      exec(`SELECT set_site_hikcentral_terminals('AHL KANENGO', ARRAY['LEGACY-DIRECT-DOOR'])`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], true)`);
+
+      const beforeNetwork = eligibleAccessPointsSorted(fixture.tenantId, fixture.employeeId);
+      expect(beforeNetwork).toBe('LEGACY-DIRECT-DOOR');
+      const [beforeProvenance] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(beforeProvenance).toBe('site_shared');
+
+      // Administrator explicitly joins AHL KANENGO to the Lilongwe network.
+      setUpNetwork('LILONGWE NETWORK', ['AHL KANENGO'], [KANENGO, OCEAN, MASM_LL]);
+
+      const afterNetwork = eligibleAccessPointsSorted(fixture.tenantId, fixture.employeeId);
+      expect(afterNetwork).toBe([KANENGO, OCEAN, MASM_LL].sort().join('|'));
+      const [afterProvenance] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(afterProvenance).toBe('network_shared');
+    });
+
+    it('an existing individual terminal assignment is unaffected by ANY network, even AHL KANENGO joining one', () => {
+      const fixture = createFixture('AHL KANENGO');
+      exec(`SELECT set_employee_hikcentral_terminals('${fixture.employeeId}', ARRAY['LEGACY-OWN-DOOR'])`);
+      setUpNetwork('LILONGWE NETWORK', ['AHL KANENGO'], [KANENGO, OCEAN, MASM_LL]);
+      // Deliberately not enabled -- own assignment must never need it.
+
+      const [provenance] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(provenance).toBe('employee_assigned');
+      const eligible = eligibleAccessPointsSorted(fixture.tenantId, fixture.employeeId);
+      expect(eligible).toBe('LEGACY-OWN-DOOR');
+    });
+
+    it('a Southern-region (Blantyre-style) employee whose site has no network membership at all keeps resolving via its own direct site configuration, completely unaffected by the Lilongwe network existing elsewhere', () => {
+      const fixture = createFixture('MTL CHICHIRI');
+      exec(`SELECT set_site_hikcentral_terminals('MTL CHICHIRI', ARRAY['MTL - CHICHIRI_Door_1'])`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], true)`);
+      // A Lilongwe network exists in the SAME tenant, but this site never joined it.
+      exec(`SELECT set_terminal_network_members('LILONGWE NETWORK', ARRAY['${KANENGO}'])`);
+
+      const [provenance] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(provenance).toBe('site_shared');
+      const eligible = eligibleAccessPointsSorted(fixture.tenantId, fixture.employeeId);
+      expect(eligible).toBe('MTL - CHICHIRI_Door_1');
+    });
+
+    it('fingerprint_attendance_enabled=false blocks BOTH the network and the legacy direct site fallback -- the disabled employee resolves nothing at all', () => {
+      const fixture = createFixture('AHL KANENGO');
+      exec(`SELECT set_site_hikcentral_terminals('AHL KANENGO', ARRAY['LEGACY-DIRECT-DOOR'])`);
+      setUpNetwork('LILONGWE NETWORK', ['AHL KANENGO'], [KANENGO, OCEAN, MASM_LL]);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
+
+      const [eligibleCount] = queryRow(`SELECT count(*) FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(eligibleCount).toBe('0');
+    });
+
+    it('a network with an empty terminal list is treated as not yet real -- the site falls through to its legacy direct configuration instead of resolving nothing', () => {
+      const fixture = createFixture('AHL KANENGO');
+      exec(`SELECT set_site_hikcentral_terminals('AHL KANENGO', ARRAY['LEGACY-DIRECT-DOOR'])`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], true)`);
+      // The site joins a network, but nobody has registered any terminal for it yet.
+      exec(`SELECT set_site_network_membership(ARRAY['AHL KANENGO'], 'LILONGWE NETWORK')`);
+
+      const [provenance] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(provenance).toBe('site_shared');
+      const eligible = eligibleAccessPointsSorted(fixture.tenantId, fixture.employeeId);
+      expect(eligible).toBe('LEGACY-DIRECT-DOOR');
+
+      // Once the network actually gets a terminal, it immediately takes over.
+      exec(`SELECT set_terminal_network_members('LILONGWE NETWORK', ARRAY['${KANENGO}'])`);
+      const [provenanceAfter] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(provenanceAfter).toBe('network_shared');
+    });
+
+    it('removing a site from its network reverts it to the legacy direct configuration, with no admin action on the employee itself', () => {
+      const fixture = createFixture('AHL KANENGO');
+      exec(`SELECT set_site_hikcentral_terminals('AHL KANENGO', ARRAY['LEGACY-DIRECT-DOOR'])`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], true)`);
+      setUpNetwork('LILONGWE NETWORK', ['AHL KANENGO'], [KANENGO]);
+
+      const [provenanceJoined] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(provenanceJoined).toBe('network_shared');
+
+      exec(`SELECT set_site_network_membership(ARRAY['AHL KANENGO'], NULL)`);
+      const [provenanceAfterRemoval] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixture.tenantId}'::uuid, '${fixture.employeeId}'::uuid)`);
+      expect(provenanceAfterRemoval).toBe('site_shared');
+      const eligible = eligibleAccessPointsSorted(fixture.tenantId, fixture.employeeId);
+      expect(eligible).toBe('LEGACY-DIRECT-DOOR');
+    });
+
+    it('tenant isolation: tenant B\'s AHL KANENGO network membership never affects tenant A\'s own AHL KANENGO direct configuration', () => {
+      const fixtureA = createFixture('AHL KANENGO');
+      exec(`SELECT set_site_hikcentral_terminals('AHL KANENGO', ARRAY['TENANT-A-LEGACY-DOOR'])`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureA.employeeId}']::uuid[], true)`);
+
+      const fixtureB = createFixture('AHL KANENGO'); // switches active caller to tenant B
+      setUpNetwork('LILONGWE NETWORK', ['AHL KANENGO'], [KANENGO, OCEAN, MASM_LL]);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureB.employeeId}']::uuid[], true)`);
+
+      const eligibleB = eligibleAccessPointsSorted(fixtureB.tenantId, fixtureB.employeeId);
+      expect(eligibleB).toBe([KANENGO, OCEAN, MASM_LL].sort().join('|'));
+
+      // Tenant A's own site never joined any network -- still resolves its own legacy direct configuration, unaffected by tenant B's network.
+      const eligibleA = eligibleAccessPointsSorted(fixtureA.tenantId, fixtureA.employeeId);
+      expect(eligibleA).toBe('TENANT-A-LEGACY-DOOR');
+      const [provenanceA] = queryRow(`SELECT DISTINCT provenance FROM attendance_employee_eligible_terminals('${fixtureA.tenantId}'::uuid, '${fixtureA.employeeId}'::uuid)`);
+      expect(provenanceA).toBe('site_shared');
+    });
+
+    it('none of this precedence correction\'s own write paths (set_site_hikcentral_terminals, set_terminal_network_members, set_site_network_membership) ever write, change, or recalculate any existing attendance row', () => {
+      const fixture = createFixture('AHL KANENGO');
+      exec(`SELECT roster_assign_recurring_pattern(ARRAY['${fixture.employeeId}']::uuid[], NULL, 'day', '2026-11-01', NULL)`);
+      exec(`SELECT * FROM attendance_correct('${fixture.employeeId}'::uuid, '2026-11-01'::date, 'A', 'Pre-existing historical record, predates this correction.')`);
+      const [beforeCount] = queryRow(`SELECT count(*) FROM attendance WHERE tenant_id = '${fixture.tenantId}'::uuid`);
+      const beforeRow = attendanceRow(fixture.employeeId, '2026-11-01');
+
+      exec(`SELECT set_site_hikcentral_terminals('AHL KANENGO', ARRAY['LEGACY-DIRECT-DOOR'])`);
+      setUpNetwork('LILONGWE NETWORK', ['AHL KANENGO'], [KANENGO, OCEAN, MASM_LL]);
+      exec(`SELECT set_site_network_membership(ARRAY['AHL KANENGO'], NULL)`);
+
+      const [afterCount] = queryRow(`SELECT count(*) FROM attendance WHERE tenant_id = '${fixture.tenantId}'::uuid`);
+      const afterRow = attendanceRow(fixture.employeeId, '2026-11-01');
+      expect(afterCount).toBe(beforeCount);
+      expect(afterRow).toEqual(beforeRow);
+      expect(afterRow).toEqual({ status: 'A', source: 'manual' });
+    });
+  });
+
+  // PR #81 FINAL NETWORK RESOLUTION CORRECTION -- status accuracy:
+  // hikcentral_mapped_employees_terminal_status must distinguish
+  // network_shared from a plain direct site_shared configuration.
+  describe('hikcentral_mapped_employees_terminal_status distinguishes network_shared from site_shared', () => {
+    it('reports "network_shared" for an employee resolved via a network, and "site_shared" for one resolved via a plain direct site configuration', () => {
+      const fixtureNetwork = createFixture('AHL KANENGO');
+      setUpNetwork('LILONGWE NETWORK', ['AHL KANENGO'], [KANENGO, OCEAN]);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureNetwork.employeeId}']::uuid[], true)`);
+
+      const fixtureSite = createFixture('MTL CHICHIRI');
+      exec(`SELECT set_site_hikcentral_terminals('MTL CHICHIRI', ARRAY['MTL - CHICHIRI_Door_1'])`);
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixtureSite.employeeId}']::uuid[], true)`);
+
+      exec(`SELECT set_caller('${fixtureNetwork.callerId}')`);
+      const [[, provenanceNetwork]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixtureNetwork.employeeId}'::uuid`);
+      expect(provenanceNetwork).toBe('network_shared');
+
+      exec(`SELECT set_caller('${fixtureSite.callerId}')`);
+      const [[, provenanceSite]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixtureSite.employeeId}'::uuid`);
+      expect(provenanceSite).toBe('site_shared');
+    });
+
+    it('reports "fingerprint_not_enabled" (not a plain "unconfigured" gap) for a mapped employee whose site joined a real network but who has not been explicitly enabled yet', () => {
+      const fixture = createFixture('AHL KANENGO');
+      setUpNetwork('LILONGWE NETWORK', ['AHL KANENGO'], [KANENGO, OCEAN]);
+      // Simulates a pre-existing, PR #80-backfilled mapping (conservatively disabled).
+      exec(`SELECT set_fingerprint_attendance_enabled(ARRAY['${fixture.employeeId}']::uuid[], false)`);
+
+      const [[, provenance]] = queryRows(`SELECT employee_id, provenance FROM hikcentral_mapped_employees_terminal_status() WHERE employee_id = '${fixture.employeeId}'::uuid`);
+      expect(provenance).toBe('fingerprint_not_enabled');
+    });
+  });
 });

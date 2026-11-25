@@ -206,7 +206,7 @@ export default function HikCentralPersonMappingPage() {
       if (identity.category !== 'mapped') continue;
       const employeeId = identity.activeMapping?.employeeId;
       const provenance = employeeId ? terminalStatusByEmployee.get(employeeId)?.provenance : undefined;
-      if (provenance === 'employee_assigned' || provenance === 'site_shared') ready += 1;
+      if (provenance === 'employee_assigned' || provenance === 'network_shared' || provenance === 'site_shared') ready += 1;
       else if (provenance === 'fingerprint_not_enabled') needsActivation += 1;
       else needsSetup += 1;
     }
@@ -1042,6 +1042,8 @@ export default function HikCentralPersonMappingPage() {
                 const employeeId = i.activeMapping!.employeeId;
                 const assignedTerminals = terminalAssignments.get(employeeId) || [];
                 const terminalStatus = terminalStatusByEmployee.get(employeeId);
+                const rowWorkstation = employeesById.get(employeeId)?.workstation?.trim();
+                const rowNetwork = rowWorkstation ? siteNetworkMemberships.get(normalizeSiteKey(rowWorkstation)) : undefined;
                 return (
                   <TR key={i.profile.hikcentralPersonNo}>
                     <TD className="font-mono">{i.profile.hikcentralPersonNo}</TD>
@@ -1074,15 +1076,25 @@ export default function HikCentralPersonMappingPage() {
                             </Button>
                           )}
                         </div>
-                      ) : terminalStatus?.provenance === 'employee_assigned' || terminalStatus?.provenance === 'site_shared' ? (
+                      ) : terminalStatus?.provenance === 'employee_assigned' || terminalStatus?.provenance === 'network_shared' || terminalStatus?.provenance === 'site_shared' ? (
                         <div className="space-y-1 max-w-xs">
-                          <p className="text-xs text-emerald-700">Fingerprint identity confirmed. Safeguard automatically recognizes eligible HikCentral terminals.</p>
+                          <p className="text-xs text-emerald-700">
+                            {terminalStatus.provenance === 'network_shared'
+                              ? `Fingerprint active · ${rowNetwork || 'shared network'}`
+                              : 'Fingerprint identity confirmed. Safeguard automatically recognizes eligible HikCentral terminals.'}
+                          </p>
                           <div className="flex flex-wrap gap-1">
                             {(terminalStatus.accessPoints.length > 0 ? terminalStatus.accessPoints : assignedTerminals).map((ap) => (
-                              <Badge key={ap} color={terminalStatus.provenance === 'employee_assigned' ? 'blue' : 'teal'}>{ap}</Badge>
+                              <Badge key={ap} color={terminalStatus.provenance === 'employee_assigned' ? 'blue' : terminalStatus.provenance === 'network_shared' ? 'purple' : 'teal'}>{ap}</Badge>
                             ))}
                           </div>
-                          <p className="text-[11px] text-slate-400">{terminalStatus.provenance === 'employee_assigned' ? 'Individually assigned -- always takes precedence over the shared site setting below' : 'Shared site configuration'}</p>
+                          <p className="text-[11px] text-slate-400">
+                            {terminalStatus.provenance === 'employee_assigned'
+                              ? 'Individually assigned -- always takes precedence over any shared network or site setting'
+                              : terminalStatus.provenance === 'network_shared'
+                                ? `Shared network configuration (${rowNetwork || 'network'}) -- see Advanced for terminal details`
+                                : 'Shared site configuration'}
+                          </p>
                         </div>
                       ) : (
                         <div className="space-y-1 max-w-xs">

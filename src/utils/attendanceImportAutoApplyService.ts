@@ -162,7 +162,7 @@ export async function setFingerprintAttendanceEnabled(employeeIds: string[], ena
 }
 
 /** How a mapped employee is eligible for automatic processing, if at all -- see hikcentral_mapped_employees_terminal_status's own header for exactly what each value means. */
-export type HikCentralTerminalProvenance = 'employee_assigned' | 'site_shared' | 'fingerprint_not_enabled' | 'unconfigured';
+export type HikCentralTerminalProvenance = 'employee_assigned' | 'network_shared' | 'site_shared' | 'fingerprint_not_enabled' | 'unconfigured';
 
 export interface MappedEmployeeTerminalStatus {
   accessPoints: string[];

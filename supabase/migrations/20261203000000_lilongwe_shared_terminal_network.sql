@@ -455,15 +455,34 @@ GRANT EXECUTE ON FUNCTION set_site_network_membership(TEXT[], TEXT) TO authentic
 -- PART 5: attendance_employee_eligible_terminals -- same signature,
 -- SAME SECURITY DEFINER / no-authenticated-grant model as PR #80
 -- (unchanged, re-declared here only because CREATE OR REPLACE
--- requires the full body). Adds exactly ONE new branch: network-
--- shared resolution, reached only when the employee has no own
--- assignment AND their site has no DIRECT site_hikcentral_terminals
--- row of its own AND their site belongs to an active network AND
--- that network has registered terminals AND their mapping has
--- fingerprint_attendance_enabled = true. A direct per-site
--- configuration (PR #80) always wins over network membership for that
--- same site -- zero behavior change for the 13 already-configured
--- Blantyre-area sites.
+-- requires the full body).
+--
+-- PRECEDENCE CORRECTION (post-review, same PR, before merge): the
+-- FIRST version of this function resolved direct-site (PR #80) before
+-- network membership, so a site that already had a seeded direct
+-- configuration (e.g. AHL KANENGO, one of the clean sites PR #80's
+-- own seed step derived from existing employee_hikcentral_terminals
+-- rows) would silently keep using that direct configuration even
+-- after an administrator explicitly assigned it to a network --
+-- making the network assignment appear to do nothing. Corrected
+-- precedence, in order:
+--   1. the employee's own individual employee_hikcentral_terminals
+--      assignment -- always wins, never gated by the enabled flag
+--      (legacy overrides are completely unaffected either way).
+--   2. an explicit, active network membership -- ONLY when the
+--      employee is fingerprint_attendance_enabled AND the network it
+--      resolves to has at least one registered terminal. A network
+--      assignment with zero registered terminals is treated as not
+--      yet real, and falls through to (3), rather than silently
+--      producing zero eligibility for a site that still has a
+--      perfectly good legacy direct configuration.
+--   3. the legacy direct per-site configuration (PR #80) -- reached
+--      only when (2) did not apply (no network membership at all, or
+--      a network membership whose network has no terminals yet).
+--      Still gated by fingerprint_attendance_enabled, exactly as
+--      before -- a disabled employee is never activated by this
+--      fallback either.
+--   4. empty -- identical to today.
 -- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION attendance_employee_eligible_terminals(p_tenant_id UUID, p_employee_id UUID)
 RETURNS TABLE (access_point TEXT, provenance TEXT)
@@ -472,7 +491,7 @@ STABLE
 SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
-  -- (a) the employee's own explicit assignment, if any -- always wins,
+  -- (1) the employee's own explicit assignment, if any -- always wins,
   -- never overridden or supplemented by anything below, and never
   -- gated by fingerprint_attendance_enabled either.
   SELECT t.access_point, 'employee_assigned'::TEXT
@@ -481,16 +500,24 @@ AS $$
 
   UNION ALL
 
-  -- (b) a DIRECT per-site configuration (PR #80) -- reached only when
-  -- the employee has no own assignment, and wins over network
-  -- membership for the same site (so an already-configured Blantyre
-  -- site is completely unaffected by this migration).
-  SELECT s.access_point, 'site_shared'::TEXT
+  -- (2) an explicit, active NETWORK's terminal list -- reached only
+  -- when the employee has no own assignment, their site belongs to an
+  -- active network that itself has at least one registered terminal,
+  -- and their mapping is explicitly enabled. Wins over the legacy
+  -- direct-site fallback (3) for the SAME site -- an administrator
+  -- who explicitly joins a site to a network expects that to actually
+  -- take effect, even if that site also has an old direct
+  -- configuration from before the network existed.
+  SELECT nm.access_point, 'network_shared'::TEXT
   FROM employees e
-  JOIN site_hikcentral_terminals s
-    ON s.tenant_id = p_tenant_id
-    AND s.is_active
-    AND s.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
+  JOIN hikcentral_site_network_membership snm
+    ON snm.tenant_id = p_tenant_id
+    AND snm.is_active
+    AND snm.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
+  JOIN hikcentral_terminal_network_members nm
+    ON nm.tenant_id = p_tenant_id
+    AND nm.is_active
+    AND nm.network = snm.network
   WHERE e.id = p_employee_id
     AND e.tenant_id = p_tenant_id
     AND COALESCE(btrim(e.workstation), '') <> ''
@@ -506,24 +533,19 @@ AS $$
 
   UNION ALL
 
-  -- (c) NEW: a shared NETWORK's terminal list -- reached only when the
-  -- employee has no own assignment, their site has NO direct
-  -- site_hikcentral_terminals row at all (branch (b) is empty), their
-  -- site belongs to an active network, that network has at least one
-  -- registered terminal, and their mapping is explicitly enabled.
-  -- "Workstation names do not restrict valid fingerprint events" is
-  -- satisfied here: many different site strings can share the exact
-  -- same network row set, with zero per-employee action.
-  SELECT nm.access_point, 'network_shared'::TEXT
+  -- (3) the legacy DIRECT per-site configuration (PR #80) -- reached
+  -- only when the employee has no own assignment AND (2) did not
+  -- apply: either their site has no active network membership at
+  -- all, or it does but that network currently has zero registered
+  -- terminals (not yet real). Still gated by fingerprint_attendance_
+  -- enabled, exactly as before -- this fallback never activates a
+  -- disabled employee either.
+  SELECT s.access_point, 'site_shared'::TEXT
   FROM employees e
-  JOIN hikcentral_site_network_membership snm
-    ON snm.tenant_id = p_tenant_id
-    AND snm.is_active
-    AND snm.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
-  JOIN hikcentral_terminal_network_members nm
-    ON nm.tenant_id = p_tenant_id
-    AND nm.is_active
-    AND nm.network = snm.network
+  JOIN site_hikcentral_terminals s
+    ON s.tenant_id = p_tenant_id
+    AND s.is_active
+    AND s.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
   WHERE e.id = p_employee_id
     AND e.tenant_id = p_tenant_id
     AND COALESCE(btrim(e.workstation), '') <> ''
@@ -532,9 +554,11 @@ AS $$
       WHERE t3.tenant_id = p_tenant_id AND t3.employee_id = p_employee_id AND t3.is_active
     )
     AND NOT EXISTS (
-      SELECT 1 FROM site_hikcentral_terminals s2
-      WHERE s2.tenant_id = p_tenant_id AND s2.is_active
-        AND s2.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
+      SELECT 1 FROM hikcentral_site_network_membership snm2
+      JOIN hikcentral_terminal_network_members nm2
+        ON nm2.tenant_id = p_tenant_id AND nm2.is_active AND nm2.network = snm2.network
+      WHERE snm2.tenant_id = p_tenant_id AND snm2.is_active
+        AND snm2.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
     )
     AND EXISTS (
       SELECT 1 FROM hikcentral_person_mappings m2
@@ -565,3 +589,74 @@ REVOKE ALL ON FUNCTION attendance_employee_eligible_terminals(UUID, UUID) FROM P
 -- them performed here. See this release's own report for the exact
 -- recommended rollout commands for the Lilongwe network specifically.
 -- ------------------------------------------------------------
+
+-- ------------------------------------------------------------
+-- PART 7: hikcentral_mapped_employees_terminal_status -- STATUS
+-- ACCURACY CORRECTION (post-review, same PR, before merge). Same
+-- signature, same auth/permission pattern as PR #80. The FIRST
+-- version of this function collapsed BOTH the legacy direct-site
+-- fallback and the new network-based fallback into one generic
+-- 'site_shared' label, so the Person Mapping page could not tell an
+-- HR user whether an employee's automatic recognition came from a
+-- shared network (e.g. Lilongwe) or a plain per-site configuration.
+-- Now distinguishes 'network_shared' from 'site_shared' explicitly,
+-- by reading the SAME helper's own per-row provenance column instead
+-- of only checking whether it returned anything at all. The
+-- 'fingerprint_not_enabled' detection is likewise extended to also
+-- recognize an active network membership whose network has
+-- registered terminals (not just a direct site_hikcentral_terminals
+-- row) -- otherwise a not-yet-enabled employee at a network-joined
+-- site would have been misreported as a plain 'unconfigured' gap
+-- instead of "already has coverage waiting, just needs activating".
+-- ------------------------------------------------------------
+CREATE OR REPLACE FUNCTION hikcentral_mapped_employees_terminal_status()
+RETURNS TABLE (employee_id UUID, access_points TEXT[], provenance TEXT)
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_caller_id UUID := auth.uid();
+  v_tenant_id UUID; v_is_super_admin BOOLEAN; v_is_active BOOLEAN;
+BEGIN
+  IF v_caller_id IS NULL THEN RAISE EXCEPTION 'Not authenticated'; END IF;
+  SELECT tenant_id, is_super_admin, is_active INTO v_tenant_id, v_is_super_admin, v_is_active FROM profiles WHERE id = v_caller_id;
+  IF v_tenant_id IS NULL THEN RAISE EXCEPTION 'No profile found'; END IF;
+  IF COALESCE(v_is_active, false) = false THEN RAISE EXCEPTION 'Your account is disabled'; END IF;
+  IF NOT (v_is_super_admin OR has_permission('attendance.map_hikcentral_persons')) THEN
+    RAISE EXCEPTION 'Not authorized to view attendance' USING ERRCODE = '42501';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    m.employee_id,
+    COALESCE((SELECT array_agg(DISTINCT elig.access_point) FROM attendance_employee_eligible_terminals(v_tenant_id, m.employee_id) elig), ARRAY[]::TEXT[]),
+    CASE
+      WHEN EXISTS (SELECT 1 FROM employee_hikcentral_terminals t WHERE t.employee_id = m.employee_id AND t.tenant_id = v_tenant_id AND t.is_active) THEN 'employee_assigned'
+      WHEN EXISTS (SELECT 1 FROM attendance_employee_eligible_terminals(v_tenant_id, m.employee_id) elig2 WHERE elig2.provenance = 'network_shared') THEN 'network_shared'
+      WHEN EXISTS (SELECT 1 FROM attendance_employee_eligible_terminals(v_tenant_id, m.employee_id) elig3 WHERE elig3.provenance = 'site_shared') THEN 'site_shared'
+      WHEN (
+        EXISTS (
+          SELECT 1 FROM site_hikcentral_terminals s
+          WHERE s.tenant_id = v_tenant_id AND s.is_active
+            AND s.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
+        )
+        OR EXISTS (
+          SELECT 1 FROM hikcentral_site_network_membership snm
+          JOIN hikcentral_terminal_network_members nm ON nm.tenant_id = v_tenant_id AND nm.is_active AND nm.network = snm.network
+          WHERE snm.tenant_id = v_tenant_id AND snm.is_active
+            AND snm.site = upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\s+', ' ', 'g')))
+        )
+      ) AND NOT m.fingerprint_attendance_enabled THEN 'fingerprint_not_enabled'
+      ELSE 'unconfigured'
+    END
+  FROM hikcentral_person_mappings m
+  JOIN employees e ON e.id = m.employee_id AND e.tenant_id = v_tenant_id
+  WHERE m.is_active AND m.tenant_id = v_tenant_id
+    AND (v_is_super_admin OR employee_region_allowed(m.employee_id));
+END;
+$$;
+
+REVOKE ALL ON FUNCTION hikcentral_mapped_employees_terminal_status() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION hikcentral_mapped_employees_terminal_status() TO authenticated;
