@@ -118,6 +118,17 @@ export interface PayrollDeductionBreakdownEmployeeInput {
   /** Pre-resolved via deriveItemizedAttendanceDeduction() -- null means no
    *  reliable itemization source exists for this employee/month. */
   itemized: ItemizedAttendanceDeductionAmounts | null;
+  /** Set only when `itemized` came from a VERIFIED payroll_deduction_snapshots
+   *  row (see payrollDeductionSnapshotResolution.ts) that already resolved
+   *  its own uniform-only amount (or determined it couldn't be verified).
+   *  When present, this is used in place of the usual
+   *  "uniform = bundled total minus the four evidenced categories"
+   *  remainder below -- a bare remainder is not by itself proof of a
+   *  genuine uniform charge; see that module's own header. null/omitted
+   *  means `itemized` came from the pre-existing employee_deductions-based
+   *  path instead, which keeps the original remainder-as-uniform
+   *  behavior unchanged. */
+  verifiedUniform?: { uniformDeduction: number; unallocatedAmount: number } | null;
 }
 
 export interface PayrollDeductionBreakdownTotals {
@@ -136,7 +147,18 @@ export interface PayrollDeductionBreakdownTotals {
   /** Count of employees with a non-zero bundled uniform/attendance
    *  total but no reliable source to itemize it. */
   employeesWithoutItemizedBreakdown: number;
-  /** Sum of every category above, including the unitemized bucket. */
+  /** Sum of a VERIFIED snapshot's own 'unallocated' amounts -- genuinely
+   *  unresolved evidence (NOT a deduction type, never folded into
+   *  uniformOnlyTotal). Distinct from unitemizedUniformAndAttendanceTotal:
+   *  that bucket is for an employee with NO itemization source at all;
+   *  this one is for an employee WITH a verified snapshot whose own
+   *  uniform-only portion still couldn't be independently confirmed. */
+  unallocatedTotal: number;
+  /** Count of employees with a verified snapshot that still has a
+   *  non-zero unallocated amount. */
+  employeesWithUnresolvedUniform: number;
+  /** Sum of every category above, including the unitemized and
+   *  unallocated buckets. */
   categorizedTotal: number;
   /** paye + pension + uniformAndAttendanceTotal + salaryAdvanceDeduction
    *  summed across every employee -- the same formula the page's
@@ -164,6 +186,8 @@ export function buildPayrollDeductionBreakdown(
   let salaryAdvanceTotal = 0;
   let unitemizedUniformAndAttendanceTotal = 0;
   let employeesWithoutItemizedBreakdown = 0;
+  let unallocatedTotal = 0;
+  let employeesWithUnresolvedUniform = 0;
   let grandTotal = 0;
 
   for (const e of inputs) {
@@ -177,9 +201,15 @@ export function buildPayrollDeductionBreakdown(
       lateTotal += e.itemized.lateDeduction;
       lectureTotal += e.itemized.lectureDeduction;
       appearanceTotal += e.itemized.appearanceDeduction;
-      const remainder =
-        e.uniformAndAttendanceTotal - e.itemized.absenceDeduction - e.itemized.lateDeduction - e.itemized.lectureDeduction - e.itemized.appearanceDeduction;
-      uniformOnlyTotal += Math.max(0, remainder);
+      if (e.verifiedUniform) {
+        uniformOnlyTotal += e.verifiedUniform.uniformDeduction;
+        unallocatedTotal += e.verifiedUniform.unallocatedAmount;
+        if (e.verifiedUniform.unallocatedAmount > 0) employeesWithUnresolvedUniform += 1;
+      } else {
+        const remainder =
+          e.uniformAndAttendanceTotal - e.itemized.absenceDeduction - e.itemized.lateDeduction - e.itemized.lectureDeduction - e.itemized.appearanceDeduction;
+        uniformOnlyTotal += Math.max(0, remainder);
+      }
     } else {
       unitemizedUniformAndAttendanceTotal += e.uniformAndAttendanceTotal;
       if (e.uniformAndAttendanceTotal > 0) employeesWithoutItemizedBreakdown += 1;
@@ -187,7 +217,7 @@ export function buildPayrollDeductionBreakdown(
   }
 
   const categorizedTotal =
-    payeTotal + pensionTotal + uniformOnlyTotal + absenceTotal + lectureTotal + appearanceTotal + lateTotal + salaryAdvanceTotal + unitemizedUniformAndAttendanceTotal;
+    payeTotal + pensionTotal + uniformOnlyTotal + absenceTotal + lectureTotal + appearanceTotal + lateTotal + salaryAdvanceTotal + unitemizedUniformAndAttendanceTotal + unallocatedTotal;
 
   return {
     payeTotal,
@@ -200,6 +230,8 @@ export function buildPayrollDeductionBreakdown(
     salaryAdvanceTotal,
     unitemizedUniformAndAttendanceTotal,
     employeesWithoutItemizedBreakdown,
+    unallocatedTotal,
+    employeesWithUnresolvedUniform,
     categorizedTotal,
     grandTotal,
     reconciles: Math.abs(categorizedTotal - grandTotal) <= TOLERANCE,

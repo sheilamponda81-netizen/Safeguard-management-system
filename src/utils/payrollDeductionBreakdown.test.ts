@@ -214,4 +214,67 @@ describe('buildPayrollDeductionBreakdown', () => {
     const result = buildPayrollDeductionBreakdown([employee({ uniformAndAttendanceTotal: 5000 })]);
     expect(Object.keys(result).some(k => k.toLowerCase().includes('hygiene'))).toBe(false);
   });
+
+  // ===== verifiedUniform (completion-pass review item 2): a snapshot's
+  // own verified uniform-only figure takes priority over the usual bare
+  // remainder, and an unresolved remainder is counted separately, never
+  // folded into uniformOnlyTotal. =====
+  describe('verifiedUniform', () => {
+    it('uses the verified uniform amount instead of the bare remainder when present', () => {
+      const result = buildPayrollDeductionBreakdown([
+        employee({
+          uniformAndAttendanceTotal: 4200,
+          itemized: itemized({ absenceDeduction: 0 }),
+          verifiedUniform: { uniformDeduction: 4200, unallocatedAmount: 0 },
+        }),
+      ]);
+      expect(result.uniformOnlyTotal).toBe(4200);
+      expect(result.unallocatedTotal).toBe(0);
+      expect(result.employeesWithUnresolvedUniform).toBe(0);
+      expect(result.reconciles).toBe(true);
+    });
+
+    it('counts an unresolved remainder under unallocatedTotal, never under uniformOnlyTotal', () => {
+      const result = buildPayrollDeductionBreakdown([
+        employee({
+          uniformAndAttendanceTotal: 4200,
+          itemized: itemized(),
+          verifiedUniform: { uniformDeduction: 0, unallocatedAmount: 4200 },
+        }),
+      ]);
+      expect(result.uniformOnlyTotal).toBe(0);
+      expect(result.unallocatedTotal).toBe(4200);
+      expect(result.employeesWithUnresolvedUniform).toBe(1);
+      // categorizedTotal still reconciles with grandTotal -- the money
+      // isn't lost, just honestly labeled as unresolved rather than Uniform.
+      expect(result.categorizedTotal).toBe(result.grandTotal);
+      expect(result.reconciles).toBe(true);
+    });
+
+    it('omitting verifiedUniform (legacy/employee_deductions-sourced employee) falls back to the original bare-remainder behavior unchanged', () => {
+      const result = buildPayrollDeductionBreakdown([
+        employee({
+          uniformAndAttendanceTotal: 9200,
+          itemized: itemized({ absenceDeduction: 5000 }),
+          // verifiedUniform omitted entirely
+        }),
+      ]);
+      expect(result.uniformOnlyTotal).toBe(4200);
+      expect(result.unallocatedTotal).toBe(0);
+    });
+
+    it('a mix of verified, unresolved, and legacy employees all reconcile together', () => {
+      const result = buildPayrollDeductionBreakdown([
+        employee({ uniformAndAttendanceTotal: 4200, itemized: itemized(), verifiedUniform: { uniformDeduction: 4200, unallocatedAmount: 0 } }),
+        employee({ uniformAndAttendanceTotal: 3000, itemized: itemized(), verifiedUniform: { uniformDeduction: 0, unallocatedAmount: 3000 } }),
+        employee({ uniformAndAttendanceTotal: 9200, itemized: itemized({ absenceDeduction: 5000 }) }),
+      ]);
+      expect(result.uniformOnlyTotal).toBe(4200 + 0 + 4200);
+      expect(result.unallocatedTotal).toBe(3000);
+      expect(result.employeesWithUnresolvedUniform).toBe(1);
+      expect(result.grandTotal).toBe(4200 + 3000 + 9200);
+      expect(result.categorizedTotal).toBe(result.grandTotal);
+      expect(result.reconciles).toBe(true);
+    });
+  });
 });

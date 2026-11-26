@@ -10,6 +10,7 @@ import { logAudit } from '../utils/auditLogger';
 import { getPayrollRates, PayrollRates, DEFAULT_RATES } from '../utils/payrollSettings';
 import { getHistoricalSafeAbsentRate, getHistoricalSafeLateRate } from '../utils/payrollCalculations';
 import { buildItemizedAttendanceBreakdown, deriveUniformOnlyAmount } from '../utils/payslipBreakdown';
+import { resolveDeductionSnapshot, PayrollDeductionSnapshotRow } from '../utils/payrollDeductionSnapshotResolution';
 import { getCompanySettings } from '../utils/companySettings';
 import {
   getSystemCurrentMonth,
@@ -96,6 +97,12 @@ interface ExtendedPayrollRecord extends PayrollRecord {
   // could not be reliably reconstructed, so the UI says so rather than
   // showing a silent zero that looks like "no absences."
   attendance_breakdown_available?: boolean;
+  // >0 only when sourced from a verified payroll_deduction_snapshots row
+  // whose own uniform-only portion could not be independently confirmed
+  // (see payrollDeductionSnapshotResolution.ts) -- NOT a deduction type,
+  // never folded into uniform_amount. Always 0 for the legacy
+  // employee_deductions-based path.
+  unallocated_amount?: number;
 }
 
 // Raw Supabase row shapes -- match the exact columns each query below
@@ -146,6 +153,19 @@ interface DeductionRow {
   late_deduction: number | null;
   lecture_deduction: number | null;
   appearance_deduction: number | null;
+}
+
+// Raw payroll_deduction_snapshots row shape (see
+// src/utils/payrollDeductionSnapshotResolution.ts and the migration
+// that writes it, supabase/migrations/
+// 20261204000000_payroll_deduction_snapshot_capture.sql).
+interface SnapshotRow {
+  payroll_id: string;
+  category: 'uniform' | 'absence' | 'late' | 'lecture' | 'appearance' | 'unallocated';
+  amount: number;
+  quantity: number | null;
+  rate: number | null;
+  source: string;
 }
 
 interface PayslipTemplate {
@@ -383,6 +403,42 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
 
       if (dedError) throw dedError;
 
+      // ===== payroll_deduction_snapshots (NOT YET applied to every
+      // environment -- supabase/migrations/
+      // 20261204000000_payroll_deduction_snapshot_capture.sql is still a
+      // draft proposal, not applied to production) -- isolated in its
+      // own try/catch, same defensive pattern as elsewhere in this file:
+      // a missing table must never break the rest of this page. Scoped
+      // directly by payroll_id (already known at this point, unlike
+      // Payroll.tsx's own fetch earlier in its load sequence) -- this is
+      // exactly what guarantees a payslip never shows a figure mixed in
+      // from a different, since-superseded payroll run for the same
+      // employee/month. See payrollDeductionSnapshotResolution.ts's own
+      // header for the full source-order rule this page now follows.
+      const authorizedPayrollIds = authorizedPayrollData.map((r: PayrollRow) => r.id);
+      let snapshotRowsByPayrollId = new Map<string, PayrollDeductionSnapshotRow[]>();
+      try {
+        const snapshotData = authorizedPayrollIds.length > 0
+          ? await fetchInEmployeeIdBatches<SnapshotRow>(
+              authorizedPayrollIds,
+              (batch, from, to, withCount) =>
+                supabase
+                  .from('payroll_deduction_snapshots')
+                  .select('payroll_id, category, amount, quantity, rate, source', withCount ? { count: 'exact' } : undefined)
+                  .in('payroll_id', batch)
+                  .range(from, to)
+            )
+          : [];
+        snapshotData.forEach(r => {
+          const row: PayrollDeductionSnapshotRow = { category: r.category, amount: r.amount, quantity: r.quantity, rate: r.rate, source: r.source };
+          const list = snapshotRowsByPayrollId.get(r.payroll_id);
+          if (list) list.push(row); else snapshotRowsByPayrollId.set(r.payroll_id, [row]);
+        });
+      } catch (snapshotErr) {
+        console.error('Error fetching payroll deduction snapshots (falling back to employee_deductions-based itemization):', snapshotErr);
+        snapshotRowsByPayrollId = new Map();
+      }
+
       const payslipData: PayslipData[] = [];
 
       if (authorizedPayrollData.length > 0) {
@@ -391,26 +447,41 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
           const deduction = deductionsData?.find((d: DeductionRow) => d.employee_id === payroll.employee_id);
 
           if (employee) {
-            // Calculate deduction breakdown -- absent_deduction/late_deduction
-            // come straight from the FROZEN employee_deductions row (what was
-            // actually charged that month), never from days x today's
-            // configured rate: payrollRates reflects system_settings AS OF
-            // NOW, which may have changed since this payroll was processed.
-            // Recomputing from it would silently relabel a past month's
-            // deduction with a rate that never applied to it. See
-            // buildItemizedAttendanceBreakdown()'s own header.
+            // Source order (highest priority first):
+            //   1. A verified payroll_deduction_snapshots row set for
+            //      this EXACT payroll.id -- see
+            //      payrollDeductionSnapshotResolution.ts's own header.
+            //   2. No snapshot for this payroll_id -- fall back to the
+            //      pre-existing employee_deductions-row-based logic
+            //      below, completely unchanged.
+            // Absent_deduction/late_deduction (either source) always
+            // come from a FROZEN figure (never recomputed from today's
+            // configured rate: payrollRates reflects system_settings AS
+            // OF NOW, which may have changed since this payroll was
+            // processed -- recomputing from it would silently relabel a
+            // past month's deduction with a rate that never applied to
+            // it). See buildItemizedAttendanceBreakdown()'s own header
+            // for the legacy path's exact rule.
+            const snapshot = resolveDeductionSnapshot(snapshotRowsByPayrollId.get(payroll.id) ?? null);
             const attendanceBreakdown = buildItemizedAttendanceBreakdown(deduction);
-            const absentDays = attendanceBreakdown.absentDays;
-            const lateDays = attendanceBreakdown.lateDays;
-            const absentDeduction = attendanceBreakdown.absentDeduction;
-            const lateDeduction = attendanceBreakdown.lateDeduction;
-            const lectureDeduction = deduction?.lecture_deduction || 0;
-            const appearanceDeduction = deduction?.appearance_deduction || 0;
+            const absentDays = snapshot ? (snapshot.absenceDays ?? 0) : attendanceBreakdown.absentDays;
+            const lateDays = snapshot ? (snapshot.lateDays ?? 0) : attendanceBreakdown.lateDays;
+            const absentDeduction = snapshot ? snapshot.absenceDeduction : attendanceBreakdown.absentDeduction;
+            const lateDeduction = snapshot ? snapshot.lateDeduction : attendanceBreakdown.lateDeduction;
+            const lectureDeduction = snapshot ? snapshot.lectureDeduction : (deduction?.lecture_deduction || 0);
+            const appearanceDeduction = snapshot ? snapshot.appearanceDeduction : (deduction?.appearance_deduction || 0);
             // Uniform-only portion of the frozen `payroll.uniform_deduction`
-            // bucket: see deriveUniformOnlyAmount()'s own header -- never
-            // from today's employee.uniform_deduction or position-eligibility
+            // bucket. A verified snapshot already resolved this (never a
+            // bare remainder -- see that module's own header); the legacy
+            // path below still derives it as a remainder via
+            // deriveUniformOnlyAmount(), exactly as before, never from
+            // today's employee.uniform_deduction or position-eligibility
             // config, both of which can change after the month was processed.
-            const uniformAmount = deriveUniformOnlyAmount(payroll.uniform_deduction || 0, attendanceBreakdown, lectureDeduction, appearanceDeduction);
+            const uniformAmount = snapshot
+              ? snapshot.uniformDeduction
+              : deriveUniformOnlyAmount(payroll.uniform_deduction || 0, attendanceBreakdown, lectureDeduction, appearanceDeduction);
+            const unallocatedAmount = snapshot?.unallocatedAmount || 0;
+            const breakdownAvailable = snapshot ? true : attendanceBreakdown.available;
 
             payslipData.push({
               employee,
@@ -438,7 +509,8 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
                 lecture_deduction: lectureDeduction,
                 appearance_deduction: appearanceDeduction,
                 uniform_amount: uniformAmount,
-                attendance_breakdown_available: attendanceBreakdown.available
+                attendance_breakdown_available: breakdownAvailable,
+                unallocated_amount: unallocatedAmount
               } as ExtendedPayrollRecord,
               month: selectedMonth,
               year: selectedYear
@@ -545,6 +617,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
     const totalUniformAtt = p.uniform_deduction || 0;
     const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
     const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
+    const unallocatedAmount = p.unallocated_amount || 0;
     const payePct = Math.round(payrollRates.payeRate * 100);
     const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
 
@@ -629,6 +702,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
               ${lateDays > 0 ? `<div>Late (${lateDays} × ${formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: p.late_deduction, frozenLateDays: p.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}): -${formatKwacha(lateDeduction)}</div>` : ''}
               ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
               ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
+              ${unallocatedAmount > 0 ? `<div>Unresolved (not independently verifiable as Uniform): -${formatKwacha(unallocatedAmount)}</div>` : ''}
               ` : (totalUniformAtt > 0 ? `<div>Itemized breakdown not available for this period -- total shown as processed.</div>` : '')}
             </div>
             ${salaryAdvanceDeduction > 0 ? `<div class="row deduction-item"><span class="label">Salary Advance</span><span class="amount">-${formatKwacha(salaryAdvanceDeduction)}</span></div>` : ''}
@@ -673,6 +747,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
       const totalUniformAtt = p.uniform_deduction || 0;
       const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
       const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
+      const unallocatedAmount = p.unallocated_amount || 0;
       const payePct = Math.round(payrollRates.payeRate * 100);
       const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
 
@@ -731,6 +806,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
               ${lateDays > 0 ? `<div>Late (${lateDays} × ${formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: p.late_deduction, frozenLateDays: p.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}): -${formatKwacha(lateDeduction)}</div>` : ''}
               ${lectureDeduction > 0 ? `<div>Lecture Deduction: -${formatKwacha(lectureDeduction)}</div>` : ''}
               ${appearanceDeduction > 0 ? `<div>Appearance Deduction: -${formatKwacha(appearanceDeduction)}</div>` : ''}
+              ${unallocatedAmount > 0 ? `<div>Unresolved (not independently verifiable as Uniform): -${formatKwacha(unallocatedAmount)}</div>` : ''}
               ` : (totalUniformAtt > 0 ? `<div>Itemized breakdown not available for this period -- total shown as processed.</div>` : '')}
             </div>
             ${salaryAdvanceDeduction > 0 ? `<div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Salary Advance</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(salaryAdvanceDeduction)}</span></div>` : ''}
@@ -1300,6 +1376,7 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
   const lateDays = p.late_days || 0;
   const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
   const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
+  const unallocatedAmount = p.unallocated_amount || 0;
   const totalDeductions = p.paye + p.pension + p.uniform_deduction + salaryAdvanceDeduction;
 
   return (
@@ -1394,6 +1471,12 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
                   {lateDays > 0 && <div className="flex justify-between"><span>Late ({lateDays} × {formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: p.late_deduction, frozenLateDays: p.late_days, liveConfiguredRate: payrollRates.lateDeduction }))})</span><span className="font-mono">-{formatKwacha(lateDeduction)}</span></div>}
                   {lectureDeduction > 0 && <div className="flex justify-between"><span>Lecture Deduction</span><span className="font-mono">-{formatKwacha(lectureDeduction)}</span></div>}
                   {appearanceDeduction > 0 && <div className="flex justify-between"><span>Appearance Deduction</span><span className="font-mono">-{formatKwacha(appearanceDeduction)}</span></div>}
+                  {unallocatedAmount > 0 && (
+                    <div className="flex justify-between text-amber-600">
+                      <span>Unresolved (not independently verifiable as Uniform)</span>
+                      <span className="font-mono">-{formatKwacha(unallocatedAmount)}</span>
+                    </div>
+                  )}
                 </div>
               ) : p.uniform_deduction > 0 ? (
                 <p className="pl-3 text-[11px] text-slate-400">Itemized breakdown not available for this period -- total shown as processed.</p>

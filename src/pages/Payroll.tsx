@@ -60,6 +60,7 @@ import {
 import { buildTerminalDuePaymentsCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
 import { buildOrdinaryPayrollPaymentsCsv, buildAccountsReconciliationSummaryCsv, computeOrdinaryPayrollPaymentTotals, OrdinaryPayrollPaymentRecord } from '../utils/accountsReconciliationExport';
 import { buildPayrollDeductionBreakdown, deriveItemizedAttendanceDeduction, PayrollDeductionBreakdownEmployeeInput, ItemizedAttendanceDeductionAmounts } from '../utils/payrollDeductionBreakdown';
+import { resolveDeductionSnapshot, PayrollDeductionSnapshotRow, ResolvedDeductionSnapshot } from '../utils/payrollDeductionSnapshotResolution';
 
 interface Employee {
   id: string;
@@ -161,9 +162,26 @@ interface EmployeeDeduction {
   total_deductions: number;
 }
 
+// Raw payroll_deduction_snapshots row shape (see
+// src/utils/payrollDeductionSnapshotResolution.ts and the migration
+// that writes it, supabase/migrations/
+// 20261204000000_payroll_deduction_snapshot_capture.sql).
+interface SnapshotRow {
+  payroll_id: string;
+  employee_id: string;
+  category: 'uniform' | 'absence' | 'late' | 'lecture' | 'appearance' | 'unallocated';
+  amount: number;
+  quantity: number | null;
+  rate: number | null;
+  source: string;
+}
+
 // Part 5/6: the Deductions Breakdown card's categories, and one row of its
-// drill-down modal -- see deductionDrilldownRows' own header.
-type DeductionCategory = 'paye' | 'pension' | 'absence' | 'late' | 'lecture' | 'appearance' | 'uniform' | 'salaryAdvance' | 'unitemized';
+// drill-down modal -- see deductionDrilldownRows' own header. 'unallocated'
+// (see payrollDeductionSnapshotResolution.ts) is NOT a deduction type --
+// it is a verified snapshot's own honest admission that part of its
+// bundled total could not be independently attributed to any category.
+type DeductionCategory = 'paye' | 'pension' | 'absence' | 'late' | 'lecture' | 'appearance' | 'uniform' | 'salaryAdvance' | 'unitemized' | 'unallocated';
 
 interface DeductionDrilldownRow {
   employeeId: string;
@@ -183,6 +201,7 @@ const DEDUCTION_CATEGORY_LABELS: Record<DeductionCategory, string> = {
   uniform: 'Uniform',
   salaryAdvance: 'Salary Advances',
   unitemized: 'Not Itemized',
+  unallocated: 'Unresolved',
 };
 
 export function PayrollPage() {
@@ -190,6 +209,7 @@ export function PayrollPage() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [payrollRecords, setPayrollRecords] = useState<PayrollRecord[]>([]);
   const [employeeDeductions, setEmployeeDeductions] = useState<EmployeeDeduction[]>([]);
+  const [snapshotRows, setSnapshotRows] = useState<SnapshotRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [selectedMonth, setSelectedMonth] = useState('');
@@ -745,7 +765,7 @@ export function PayrollPage() {
       // shows a blocking banner -- see the guard clause in processPayroll()
       // and the render section below. A historical month never calls this
       // RPC at all (employeeIds there come from what's already stored).
-      const [payrollDataRaw, deductionsDataRaw, attendanceRpcResult, positionsRequiringUniformMap] = await Promise.all([
+      const [payrollDataRaw, deductionsDataRaw, attendanceRpcResult, positionsRequiringUniformMap, snapshotRowsRaw] = await Promise.all([
         historicalPayrollPromise ?? fetchInEmployeeIdBatches<PayrollRecord>(
           employeeIds,
           (batch, from, to, withCount) =>
@@ -811,6 +831,40 @@ export function PayrollPage() {
             return new Map<string, boolean>();
           }
         })(),
+        // ===== payroll_deduction_snapshots (NOT YET applied to every
+        // environment -- supabase/migrations/
+        // 20261204000000_payroll_deduction_snapshot_capture.sql is still
+        // a draft proposal, not applied to production) -- isolated in its
+        // own try/catch for the exact same reason as the positions leg
+        // above: a missing table must never take down the rest of this
+        // page. On failure (or simply no rows yet), every employee falls
+        // through to the pre-existing employee_deductions-based logic
+        // completely unchanged -- see payrollDeductionSnapshotResolution.ts's
+        // own header for the full source-order rule. Scoped by
+        // employee_id/month, not by payroll_id (payroll ids aren't known
+        // until payrollDataRaw above resolves) -- each employee's row set
+        // is filtered down to their OWN exact payroll_id once both have
+        // resolved, below, which is what actually guarantees a figure is
+        // never mixed in from a different, since-superseded run.
+        (isHistoricalMonth && employeeIds.length === 0)
+          ? Promise.resolve([] as SnapshotRow[])
+          : (async () => {
+              try {
+                return await fetchInEmployeeIdBatches<SnapshotRow>(
+                  employeeIds,
+                  (batch, from, to, withCount) =>
+                    supabase
+                      .from('payroll_deduction_snapshots')
+                      .select('payroll_id, employee_id, category, amount, quantity, rate, source', withCount ? { count: 'exact' } : undefined)
+                      .eq('month', selectedMonth)
+                      .in('employee_id', batch)
+                      .range(from, to)
+                );
+              } catch (snapshotErr) {
+                console.error('Error fetching payroll deduction snapshots (falling back to employee_deductions-based itemization):', snapshotErr);
+                return [];
+              }
+            })(),
       ]);
 
       const payrollData = dedupeById(payrollDataRaw);
@@ -825,6 +879,10 @@ export function PayrollPage() {
 
       const deductionsData = dedupeById(deductionsDataRaw);
       setEmployeeDeductions(deductionsData);
+      // No dedupeById -- this row shape has no `id` column selected, and
+      // batches partition by employee_id (no overlap possible across
+      // batches), so there is nothing to dedupe.
+      setSnapshotRows(snapshotRowsRaw);
 
       // See deriveAttendanceCountsState's own header comment
       // (src/utils/payrollAttendanceCounts.ts) for the exact fail-closed
@@ -1295,9 +1353,60 @@ export function PayrollPage() {
   // 2026 -- see the audit this card's "Not itemized" line was added for),
   // instead of the same honest "not available" fallback Payslips.tsx
   // already uses -- and (b) the deduction-breakdown drill-down modal.
+  //
+  // END-TO-END COMPLETION PASS: groups the fetched snapshotRows by their
+  // OWN payroll_id (never by employee+month alone) -- see
+  // payrollDeductionSnapshotResolution.ts's header for why only matching
+  // on the exact payroll_id of the row currently in view guarantees a
+  // figure is never mixed in from a different, since-superseded run.
+  const snapshotRowsByPayrollId = useMemo(() => {
+    const map = new Map<string, PayrollDeductionSnapshotRow[]>();
+    snapshotRows.forEach(r => {
+      const row: PayrollDeductionSnapshotRow = { category: r.category, amount: r.amount, quantity: r.quantity, rate: r.rate, source: r.source };
+      const list = map.get(r.payroll_id);
+      if (list) list.push(row); else map.set(r.payroll_id, [row]);
+    });
+    return map;
+  }, [snapshotRows]);
+
+  // Null for an employee whose committed payroll row has no snapshot at
+  // all (any month processed before this migration existed, or where
+  // the snapshot step was itself skipped) -- itemizedByEmployeeId below
+  // then falls through to the pre-existing employee_deductions-based
+  // logic, completely unchanged, exactly as this task's own "preserve
+  // the current honest fallback" instruction requires.
+  const snapshotByEmployeeId = useMemo(() => {
+    const map = new Map<string, ResolvedDeductionSnapshot | null>();
+    employees.forEach(emp => {
+      const existingRecord = payrollByEmployee.get(emp.id);
+      const rows = existingRecord ? snapshotRowsByPayrollId.get(existingRecord.id) : undefined;
+      map.set(emp.id, resolveDeductionSnapshot(rows ?? null));
+    });
+    return map;
+  }, [employees, payrollByEmployee, snapshotRowsByPayrollId]);
+
   const itemizedByEmployeeId = useMemo(() => {
     const map = new Map<string, ItemizedAttendanceDeductionAmounts | null>();
     employees.forEach(emp => {
+      // A verified snapshot (tied to this employee's EXACT payroll_id)
+      // is the highest-priority source -- its own absence/late/lecture/
+      // appearance figures supersede the legacy derivation below
+      // entirely, since it is the authoritative record of what was
+      // actually used to compute this specific committed payroll row,
+      // frozen at that moment (an employee_deductions row consulted by
+      // the legacy path below could since have been edited by HR,
+      // which must never retroactively change an already-processed
+      // month's own explanation).
+      const snapshot = snapshotByEmployeeId.get(emp.id);
+      if (snapshot) {
+        map.set(emp.id, {
+          absenceDeduction: snapshot.absenceDeduction,
+          lateDeduction: snapshot.lateDeduction,
+          lectureDeduction: snapshot.lectureDeduction,
+          appearanceDeduction: snapshot.appearanceDeduction,
+        });
+        return;
+      }
       const deduction = getEmployeeDeduction(emp.id);
       const isProcessed = payrollByEmployee.has(emp.id);
       map.set(emp.id, deriveItemizedAttendanceDeduction({
@@ -1318,21 +1427,23 @@ export function PayrollPage() {
       }));
     });
     return map;
-  }, [employees, getEmployeeDeduction, payrollByEmployee, attendanceCounts, payrollRates]);
+  }, [employees, snapshotByEmployeeId, getEmployeeDeduction, payrollByEmployee, attendanceCounts, payrollRates]);
 
   const deductionBreakdown = useMemo(() => {
     const inputs: PayrollDeductionBreakdownEmployeeInput[] = employees.map(emp => {
       const p = getDisplayPayroll(emp);
+      const snapshot = snapshotByEmployeeId.get(emp.id);
       return {
         paye: p.paye,
         pension: p.pension,
         uniformAndAttendanceTotal: p.uniform_deduction || 0,
         salaryAdvanceDeduction: p.salary_advance_deduction || 0,
         itemized: itemizedByEmployeeId.get(emp.id) ?? null,
+        verifiedUniform: snapshot ? { uniformDeduction: snapshot.uniformDeduction, unallocatedAmount: snapshot.unallocatedAmount } : null,
       };
     });
     return buildPayrollDeductionBreakdown(inputs);
-  }, [employees, getDisplayPayroll, itemizedByEmployeeId]);
+  }, [employees, getDisplayPayroll, itemizedByEmployeeId, snapshotByEmployeeId]);
 
   // Part 5/6 drill-down: per-employee rows for whichever Deductions
   // Breakdown category card was clicked, built from the exact same
@@ -1347,6 +1458,7 @@ export function PayrollPage() {
     employees.forEach(emp => {
       const p = getDisplayPayroll(emp);
       const itemized = itemizedByEmployeeId.get(emp.id) ?? null;
+      const snapshot = snapshotByEmployeeId.get(emp.id);
       const attendance = attendanceCounts.get(emp.id);
       const deduction = getEmployeeDeduction(emp.id);
       let amount = 0;
@@ -1361,25 +1473,38 @@ export function PayrollPage() {
         case 'absence':
           amount = itemized?.absenceDeduction || 0;
           if (amount > 0) {
-            detail = `${attendance?.absentDays || 0} day(s) × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}`;
+            // A verified snapshot's own quantity/rate (frozen at
+            // processing time) takes priority -- only fall back to the
+            // live/legacy derivation when no snapshot exists.
+            const days = snapshot?.absenceDays ?? attendance?.absentDays ?? 0;
+            const rate = snapshot?.absenceRate ?? getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction });
+            detail = `${days} day(s) × ${formatKwacha(rate)}`;
           }
           break;
         case 'late':
           amount = itemized?.lateDeduction || 0;
           if (amount > 0) {
-            detail = `${attendance?.lateDays || 0} day(s) × ${formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: deduction?.late_deduction, frozenLateDays: deduction?.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}`;
+            const days = snapshot?.lateDays ?? attendance?.lateDays ?? 0;
+            const rate = snapshot?.lateRate ?? getHistoricalSafeLateRate({ frozenLateDeduction: deduction?.late_deduction, frozenLateDays: deduction?.late_days, liveConfiguredRate: payrollRates.lateDeduction });
+            detail = `${days} day(s) × ${formatKwacha(rate)}`;
           }
           break;
         case 'lecture':
           amount = itemized?.lectureDeduction || 0;
-          detail = deduction ? 'Recorded via Attendance -- Lecture Deduction' : '';
+          detail = deduction || snapshot ? 'Recorded via Attendance -- Lecture Deduction' : '';
           break;
         case 'appearance':
           amount = itemized?.appearanceDeduction || 0;
-          detail = deduction ? 'Recorded via Attendance -- Appearance Deduction' : '';
+          detail = deduction || snapshot ? 'Recorded via Attendance -- Appearance Deduction' : '';
           break;
         case 'uniform':
-          if (itemized) {
+          if (snapshot) {
+            // Verified at processing time against the employee's own
+            // profile/position -- never a bare remainder once a
+            // snapshot exists (see payrollDeductionSnapshotResolution.ts).
+            amount = snapshot.uniformDeduction;
+            detail = 'Verified at processing time (employee profile + position eligibility)';
+          } else if (itemized) {
             amount = Math.max(0, (p.uniform_deduction || 0) - itemized.absenceDeduction - itemized.lateDeduction - itemized.lectureDeduction - itemized.appearanceDeduction);
           }
           break;
@@ -1390,6 +1515,12 @@ export function PayrollPage() {
           if (!itemized && (p.uniform_deduction || 0) > 0) {
             amount = p.uniform_deduction || 0;
             detail = 'No employee_deductions row recorded for this employee/month -- composition cannot be itemized.';
+          }
+          break;
+        case 'unallocated':
+          amount = snapshot?.unallocatedAmount || 0;
+          if (amount > 0) {
+            detail = 'Verified snapshot could not independently confirm this remainder as a genuine Uniform charge -- recorded as unresolved, not a deduction type.';
           }
           break;
       }
@@ -1404,7 +1535,7 @@ export function PayrollPage() {
       }
     });
     return rows.sort((a, b) => b.amount - a.amount);
-  }, [deductionDrilldownCategory, employees, getDisplayPayroll, itemizedByEmployeeId, attendanceCounts, getEmployeeDeduction, payrollRates]);
+  }, [deductionDrilldownCategory, employees, getDisplayPayroll, itemizedByEmployeeId, snapshotByEmployeeId, attendanceCounts, getEmployeeDeduction, payrollRates]);
 
   // True only when at least one CURRENTLY DISPLAYED figure is actually a
   // live calculation built on a failed/unavailable attendance-count fetch
@@ -2821,6 +2952,25 @@ export function PayrollPage() {
                   <span className="font-medium text-amber-700">{formatKwacha(deductionBreakdown.unitemizedUniformAndAttendanceTotal)}</span>
                 </button>
               )}
+              {/* 'unallocated' is NOT a deduction type -- a verified
+                  snapshot's own honest admission that part of its
+                  bundled total couldn't be independently confirmed as a
+                  genuine Uniform charge (see
+                  payrollDeductionSnapshotResolution.ts). Distinct from
+                  "Not itemized" above: that's for an employee with NO
+                  itemization source at all; this is for one WITH a
+                  verified snapshot whose uniform-only portion still
+                  couldn't be confirmed. */}
+              {deductionBreakdown.unallocatedTotal > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setDeductionDrilldownCategory('unallocated')}
+                  className="flex justify-between w-full text-left text-sm mt-2 pt-2 border-t border-slate-100 hover:bg-amber-50 rounded px-1 -mx-1"
+                >
+                  <span className="text-amber-600">Unresolved ({deductionBreakdown.employeesWithUnresolvedUniform} employee{deductionBreakdown.employeesWithUnresolvedUniform === 1 ? '' : 's'})</span>
+                  <span className="font-medium text-amber-700">{formatKwacha(deductionBreakdown.unallocatedTotal)}</span>
+                </button>
+              )}
               <div className="flex justify-between text-sm mt-2 pt-2 border-t border-slate-200 font-semibold">
                 <span className="text-slate-700">Total Deductions</span>
                 <span className="text-slate-900">{formatKwacha(deductionBreakdown.grandTotal)}</span>
@@ -2943,9 +3093,17 @@ export function PayrollPage() {
                 // positionsRequiringUniform/payrollRates.uniformDeduction,
                 // decides what the sub-breakdown below shows.
                 const itemized = itemizedByEmployeeId.get(emp.id) ?? null;
-                const uniformOnlyAmount = itemized
-                  ? Math.max(0, (p.uniform_deduction || 0) - itemized.absenceDeduction - itemized.lateDeduction - itemized.lectureDeduction - itemized.appearanceDeduction)
-                  : 0;
+                const snapshot = snapshotByEmployeeId.get(emp.id);
+                // A verified snapshot already resolved its own uniform-
+                // only amount (never a bare remainder -- see
+                // payrollDeductionSnapshotResolution.ts); only fall back
+                // to the legacy remainder when no snapshot exists.
+                const uniformOnlyAmount = snapshot
+                  ? snapshot.uniformDeduction
+                  : itemized
+                    ? Math.max(0, (p.uniform_deduction || 0) - itemized.absenceDeduction - itemized.lateDeduction - itemized.lectureDeduction - itemized.appearanceDeduction)
+                    : 0;
+                const unallocatedAmount = snapshot?.unallocatedAmount || 0;
                 // This employee's own uniform/attendance and net-pay figures
                 // are a live calculation built on attendanceCounts, and that
                 // fetch failed -- never render them as if valid (see
@@ -3144,10 +3302,11 @@ export function PayrollPage() {
                               {itemized ? (
                                 <>
                                   {uniformOnlyAmount > 0 && <div>Uniform: {formatKwacha(uniformOnlyAmount)}</div>}
-                                  {itemized.absenceDeduction > 0 && <div>Absent: {attendance?.absentDays || 0} × {formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}</div>}
-                                  {itemized.lateDeduction > 0 && <div>Late: {attendance?.lateDays || 0} × {formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: deduction?.late_deduction, frozenLateDays: deduction?.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}</div>}
+                                  {itemized.absenceDeduction > 0 && <div>Absent: {snapshot?.absenceDays ?? attendance?.absentDays ?? 0} × {formatKwacha(snapshot?.absenceRate ?? getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}</div>}
+                                  {itemized.lateDeduction > 0 && <div>Late: {snapshot?.lateDays ?? attendance?.lateDays ?? 0} × {formatKwacha(snapshot?.lateRate ?? getHistoricalSafeLateRate({ frozenLateDeduction: deduction?.late_deduction, frozenLateDays: deduction?.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}</div>}
                                   {itemized.lectureDeduction > 0 && <div>Lecture: {formatKwacha(itemized.lectureDeduction)}</div>}
                                   {itemized.appearanceDeduction > 0 && <div>Appearance: {formatKwacha(itemized.appearanceDeduction)}</div>}
+                                  {unallocatedAmount > 0 && <div className="text-amber-500">Unresolved: {formatKwacha(unallocatedAmount)}</div>}
                                 </>
                               ) : (
                                 <div className="text-slate-400">Itemized breakdown not available for this period -- total shown as processed.</div>

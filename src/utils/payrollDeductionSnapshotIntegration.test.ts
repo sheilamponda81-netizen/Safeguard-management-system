@@ -74,18 +74,31 @@ function createFixture(): Fixture {
   // Rates this suite's expectations are all computed against. absent_day_deduction
   // and late_day_deduction are deliberately different amounts so a test
   // mixing both categories can never pass by both reading the same number.
+  // uniform_deduction_default (4200) is the tenant-wide uniform rate --
+  // every employee below has no employees.uniform_deduction override and
+  // no `positions` row (so requires_uniform defaults to true), so this is
+  // the figure the new uniform-verification logic should independently
+  // derive and match against the submitted bundle's remainder.
   exec(`INSERT INTO system_settings (tenant_id, key, value) VALUES
     ('${tenantId}', 'paye_rate', '0'),
     ('${tenantId}', 'paye_threshold', '0'),
     ('${tenantId}', 'pension_employee_rate', '0'),
     ('${tenantId}', 'absent_day_deduction', '5000'),
-    ('${tenantId}', 'late_day_deduction', '2000')`);
+    ('${tenantId}', 'late_day_deduction', '2000'),
+    ('${tenantId}', 'uniform_deduction_default', '4200')`);
   return { tenantId, callerId };
 }
 
-function createEmployee(fixture: Fixture, fullName: string): string {
+// uniformDeduction defaults to 4200 -- matching this suite's assumed
+// uniform component throughout -- mirroring how this app actually
+// populates employees.uniform_deduction explicitly at creation time
+// (Employees.tsx), not left at the schema's bare `0` default. Pass NULL
+// explicitly to simulate a legacy employee whose own override was never
+// set (the "fall back to the tenant's live default rate" case).
+function createEmployee(fixture: Fixture, fullName: string, uniformDeduction: number | null = 4200): string {
   const employeeId = randomUUID();
-  exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, basic_salary, hire_date) VALUES ('${employeeId}', '${fixture.tenantId}', 'E-${employeeId.slice(0, 8)}', '${fullName}', 'Active', false, 100000, '2020-01-01')`);
+  const uniformLiteral = uniformDeduction === null ? 'NULL' : String(uniformDeduction);
+  exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, status, is_deleted, basic_salary, hire_date, uniform_deduction) VALUES ('${employeeId}', '${fixture.tenantId}', 'E-${employeeId.slice(0, 8)}', '${fullName}', 'Active', false, 100000, '2020-01-01', ${uniformLiteral})`);
   return employeeId;
 }
 
@@ -261,6 +274,83 @@ describe.skipIf(!dbAvailable && !dbRequired)('process_payroll_batch: deduction s
     expect(snapshotByCategory(rows, 'lecture')).toMatchObject({ amount: 1500, source: 'employee_deductions_row' });
     expect(snapshotByCategory(rows, 'appearance')).toMatchObject({ amount: 800, source: 'employee_deductions_row' });
     expect(snapshotByCategory(rows, 'uniform').amount).toBe(4200);
+  });
+
+  // ===== Uniform-remainder verification (completion-pass review item 2) =====
+  // A bare remainder (submitted total minus the four evidenced
+  // categories) is not by itself proof it is a genuine uniform charge --
+  // these prove the independent cross-check against the employee's own
+  // profile/position actually gates whether it is ever labeled 'uniform'.
+
+  it('uniform-verified: an employee\'s own uniform_deduction override (not the tenant default) is matched and labeled Uniform', () => {
+    const fixture = createFixture();
+    const employeeId = createEmployee(fixture, 'Uniform Override Employee', 3000); // tenant default is 4200
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 3000 }]);
+
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const rows = getSnapshotRows(payroll.id);
+    expect(snapshotByCategory(rows, 'uniform')).toMatchObject({ amount: 3000, source: 'uniform_rate_config' });
+    expect(rows.find(r => r.category === 'unallocated')).toBeUndefined();
+  });
+
+  it('uniform-verified: a position ineligible for a uniform (requires_uniform = false) verifies a genuine zero, not unallocated', () => {
+    const fixture = createFixture();
+    exec(`INSERT INTO positions (tenant_id, name, requires_uniform) VALUES ('${fixture.tenantId}', 'Office Clerk', false)`);
+    const employeeId = randomUUID();
+    exec(`INSERT INTO employees (id, tenant_id, employee_number, full_name, position, status, is_deleted, basic_salary, hire_date, uniform_deduction) VALUES ('${employeeId}', '${fixture.tenantId}', 'E-${employeeId.slice(0, 8)}', 'Clerk Employee', 'Office Clerk', 'Active', false, 100000, '2020-01-01', 4200)`);
+    insertAttendance(fixture, employeeId, '2026-11-03', 'A');
+    // Position doesn't require a uniform -- the bundled total should be
+    // ONLY the absence charge, nothing uniform-shaped left over.
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 5000 }]);
+
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const rows = getSnapshotRows(payroll.id);
+    expect(snapshotByCategory(rows, 'uniform')).toMatchObject({ amount: 0, source: 'uniform_rate_config' });
+    expect(rows.find(r => r.category === 'unallocated')).toBeUndefined();
+  });
+
+  it('F: an unexplained remainder with no determinable uniform figure is recorded as unallocated, never relabeled Uniform', () => {
+    const fixture = createFixture();
+    // No employees.uniform_deduction override, AND no tenant-configured
+    // uniform_deduction_default -- nothing to verify the remainder against.
+    exec(`DELETE FROM system_settings WHERE tenant_id = '${fixture.tenantId}' AND key = 'uniform_deduction_default'`);
+    const employeeId = createEmployee(fixture, 'Unverifiable Remainder Employee', null);
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
+
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const rows = getSnapshotRows(payroll.id);
+    expect(snapshotByCategory(rows, 'uniform')).toMatchObject({ amount: 0 });
+    expect(snapshotByCategory(rows, 'unallocated')).toMatchObject({ amount: 4200, source: 'unresolved_remainder' });
+
+    const unresolved = queryScalar(`SELECT new_data->>'employeeDeductionSnapshotUnresolvedUniform' FROM audit_logs WHERE entity_type = 'payroll' ORDER BY created_at DESC LIMIT 1`);
+    expect(unresolved).toContain(employeeId);
+  });
+
+  it('F (continued): an employee\'s override that disagrees with the actual remainder is never trusted either -- still unallocated, never a fabricated Uniform figure', () => {
+    const fixture = createFixture();
+    // Override claims 3000, but the submitted bundle only leaves 1000
+    // unaccounted for (after a genuine 4200-worth-is-impossible scenario
+    // -- here the bundle itself is smaller than the stated override).
+    const employeeId = createEmployee(fixture, 'Mismatched Override Employee', 3000);
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 1000 }]);
+
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const rows = getSnapshotRows(payroll.id);
+    expect(snapshotByCategory(rows, 'uniform')).toMatchObject({ amount: 0 });
+    expect(snapshotByCategory(rows, 'unallocated')).toMatchObject({ amount: 1000, source: 'unresolved_remainder' });
+  });
+
+  it('uniform-verified + rate change: a verified uniform snapshot keeps its frozen amount even after the employee\'s own override later changes', () => {
+    const fixture = createFixture();
+    const employeeId = createEmployee(fixture, 'Uniform Rate Change Employee', 3000);
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 3000 }]);
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    approvePayroll(payroll.id);
+
+    exec(`UPDATE employees SET uniform_deduction = 9999 WHERE id = '${employeeId}'`);
+
+    const rows = getSnapshotRows(payroll.id);
+    expect(snapshotByCategory(rows, 'uniform').amount).toBe(3000);
   });
 
   // E. Employee with a valid existing HR deduction record (consistent with live attendance).
@@ -439,5 +529,49 @@ describe.skipIf(!dbAvailable && !dbRequired)('process_payroll_batch: deduction s
 
     const payroll = getPayrollRow(employeeId, '2026-11');
     expect(payroll.netPay).toBe(100000 - 4200 - 10000);
+
+    // C: the salary advance repayment (10000) is never folded into the
+    // uniform/attendance snapshot -- the snapshot only ever decomposes
+    // payroll.uniform_deduction (4200 here), a wholly separate column
+    // from payroll.salary_advance_deduction.
+    const rows = getSnapshotRows(payroll.id);
+    const snapshotTotal = rows.reduce((sum, r) => sum + r.amount, 0);
+    expect(snapshotTotal).toBe(4200);
+    expect(rows.some(r => r.category.toLowerCase().includes('advance'))).toBe(false);
+  });
+
+  // ===== Snapshot immutability (completion-pass review item 3) =====
+  it('K2: payroll_deduction_snapshots has NO delete policy of any kind -- RLS denies DELETE to every ordinary role by default', () => {
+    // This repo's disposable-Postgres integration tests always connect as
+    // the bootstrap's own Postgres superuser (see this file's header and
+    // bootstrap_stub.sql's own "every RPC call runs as the bootstrap's
+    // own superuser" note) -- RLS is never enforced for a superuser or
+    // table owner regardless of policy, so a real restricted-role DELETE
+    // attempt cannot be exercised through this harness (true of every
+    // other integration test in this repo, not unique to this file).
+    // What CAN be verified directly, and is the actual fix: the policy
+    // catalog itself has zero DELETE policies on this table, so under
+    // Supabase's real `authenticated` role (subject to RLS), a bare
+    // DELETE is denied by RLS's default-deny with no matching policy --
+    // there is no "is_super_admin() = true" grant left to exploit.
+    const [deletePolicyCount] = queryRows(`SELECT count(*) FROM pg_policy WHERE polrelid = 'payroll_deduction_snapshots'::regclass AND polcmd = 'd'`)[0];
+    expect(Number(deletePolicyCount)).toBe(0);
+
+    const [rlsEnabled] = queryRows(`SELECT relrowsecurity FROM pg_class WHERE oid = 'payroll_deduction_snapshots'::regclass`)[0];
+    expect(rlsEnabled).toBe('t');
+  });
+
+  it('L2: the only path that removes a snapshot row -- cascading from a not-yet-approved payroll row\'s own delete -- still works with zero delete policies on this table', () => {
+    const fixture = createFixture();
+    const employeeId = createEmployee(fixture, 'Cascade Without Policy Employee');
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    expect(getSnapshotRows(payroll.id).length).toBeGreaterThan(0);
+
+    // Reprocessing (not yet approved) deletes+reinserts the payroll row --
+    // this must still cascade-delete the old snapshot despite there
+    // being no DELETE policy granting that directly.
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
+    expect(queryRows(`SELECT id FROM payroll_deduction_snapshots WHERE payroll_id = '${payroll.id}'`)).toHaveLength(0);
   });
 });

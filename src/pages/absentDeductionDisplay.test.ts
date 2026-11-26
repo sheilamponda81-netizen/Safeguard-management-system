@@ -82,9 +82,9 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('Payroll.tsx: the per-employee row breakdown derives its absent-day rate via getHistoricalSafeAbsentRate, not the live rate directly, since this row can be an already-processed historical month', () => {
+  it('Payroll.tsx: the per-employee row breakdown derives its absent-day rate via a verified snapshot\'s own frozen rate when one exists, else getHistoricalSafeAbsentRate, never the live rate directly, since this row can be an already-processed historical month', () => {
     expect(payrollSource).toMatch(
-      /Absent:\s*\{attendance\?\.absentDays \|\| 0\}\s*×\s*\{formatKwacha\(getHistoricalSafeAbsentRate\(\{\s*frozenAbsentDeduction:\s*deduction\?\.absent_deduction,\s*frozenAbsentDays:\s*deduction\?\.absent_days,\s*liveConfiguredRate:\s*payrollRates\.absentDeduction\s*\}\)\)\}/
+      /Absent:\s*\{snapshot\?\.absenceDays \?\? attendance\?\.absentDays \?\? 0\}\s*×\s*\{formatKwacha\(snapshot\?\.absenceRate \?\? getHistoricalSafeAbsentRate\(\{\s*frozenAbsentDeduction:\s*deduction\?\.absent_deduction,\s*frozenAbsentDays:\s*deduction\?\.absent_days,\s*liveConfiguredRate:\s*payrollRates\.absentDeduction\s*\}\)\)\}/
     );
   });
 
@@ -109,9 +109,9 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('Payroll.tsx: the per-employee row breakdown derives its late-day rate via getHistoricalSafeLateRate, not the live rate directly, since this row can be an already-processed historical month', () => {
+  it('Payroll.tsx: the per-employee row breakdown derives its late-day rate via a verified snapshot\'s own frozen rate when one exists, else getHistoricalSafeLateRate, never the live rate directly, since this row can be an already-processed historical month', () => {
     expect(payrollSource).toMatch(
-      /Late:\s*\{attendance\?\.lateDays \|\| 0\}\s*×\s*\{formatKwacha\(getHistoricalSafeLateRate\(\{\s*frozenLateDeduction:\s*deduction\?\.late_deduction,\s*frozenLateDays:\s*deduction\?\.late_days,\s*liveConfiguredRate:\s*payrollRates\.lateDeduction\s*\}\)\)\}/
+      /Late:\s*\{snapshot\?\.lateDays \?\? attendance\?\.lateDays \?\? 0\}\s*×\s*\{formatKwacha\(snapshot\?\.lateRate \?\? getHistoricalSafeLateRate\(\{\s*frozenLateDeduction:\s*deduction\?\.late_deduction,\s*frozenLateDays:\s*deduction\?\.late_days,\s*liveConfiguredRate:\s*payrollRates\.lateDeduction\s*\}\)\)\}/
     );
   });
 

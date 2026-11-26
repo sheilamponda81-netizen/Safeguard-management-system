@@ -109,12 +109,45 @@
 --     processing entirely. Redesigning that precedence itself is out of
 --     scope here ("do not redesign the entire payroll engine").
 --
--- This table is additive and not yet read by any UI code in this PR --
--- Payroll.tsx/Payslips.tsx/payrollDeductionBreakdown.ts/payslipBreakdown.ts
--- are UNCHANGED and keep reading employee_deductions exactly as before.
--- Wiring the "Not itemized" UI to prefer this table once it has a few
--- months of real coverage is a natural follow-up, deliberately left out
--- of this round to keep this correction narrow.
+-- UPDATE (end-to-end completion pass): this table is now wired into
+-- Payroll.tsx and Payslips.tsx (see payrollDeductionSnapshotResolution.ts)
+-- -- a payroll row with a snapshot uses it as the highest-priority
+-- source, tied to that EXACT payroll_id (never mixed across runs); a
+-- payroll row with no snapshot (any month processed before this
+-- migration existed) falls back to the pre-existing employee_deductions-
+-- based logic unchanged; a payroll row with neither stays the existing
+-- honest "not itemized" fallback. See that TS module's own header.
+--
+-- UPDATE (end-to-end completion pass): the uniform category is no
+-- longer a blind remainder (submitted total minus the four evidenced
+-- categories) -- a remainder is not proof it is genuinely a uniform
+-- charge. It is now independently cross-checked against the employee's
+-- own uniform_deduction override and position.requires_uniform, BOTH
+-- read live in this same transaction and frozen into the snapshot (never
+-- re-read at display time, so this never becomes "today's settings
+-- explaining historical payroll"). Only when that independent figure
+-- agrees with the remainder is it recorded as 'uniform'; otherwise the
+-- leftover is recorded as 'unallocated' -- explicitly labeled unresolved
+-- evidence, never presented as a legitimate deduction type, and never
+-- silently absorbed into any other category. See the per-employee logic
+-- below for the exact rule.
+--
+-- UPDATE (end-to-end completion pass): the unrestricted "Super admins
+-- can delete payroll deduction snapshots" policy below has been REMOVED
+-- (see the DDL below). payroll_deduction_snapshots now has NO delete
+-- policy of any kind -- RLS defaults to deny for every role subject to
+-- it, so no ordinary UI/database access (super-admin included) can
+-- directly erase a snapshot row. The only deletion path left is the
+-- ON DELETE CASCADE fired when process_payroll_batch() deletes a
+-- NOT-YET-approved month's payroll row to reprocess it -- that statement
+-- runs inside this SECURITY DEFINER function as its owning role, which
+-- is exempt from RLS by default (RLS applies to the invoking role for an
+-- ordinary table, not to a SECURITY DEFINER function's owner, unless
+-- FORCE ROW LEVEL SECURITY is set, which this migration does not set),
+-- so the cascade needs no policy of its own -- and that DELETE is
+-- already unreachable for an approved month (the v_approved_count check
+-- earlier in this function). Verified empirically: see
+-- payrollDeductionSnapshotIntegration.test.ts's "K"/"L" cases.
 
 CREATE TABLE IF NOT EXISTS payroll_deduction_snapshots (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -122,7 +155,11 @@ CREATE TABLE IF NOT EXISTS payroll_deduction_snapshots (
   payroll_id UUID NOT NULL REFERENCES payroll(id) ON DELETE CASCADE,
   employee_id UUID NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
   month TEXT NOT NULL,
-  category TEXT NOT NULL CHECK (category IN ('uniform', 'absence', 'late', 'lecture', 'appearance')),
+  -- 'unallocated' is NOT a deduction type -- it is this snapshot's own
+  -- honest admission that part of the bundled total could not be
+  -- independently attributed to any evidenced category. See
+  -- 'unresolved_remainder' below and this migration's header.
+  category TEXT NOT NULL CHECK (category IN ('uniform', 'absence', 'late', 'lecture', 'appearance', 'unallocated')),
   amount NUMERIC NOT NULL,
   -- Day count for absence/late; NULL for uniform/lecture/appearance,
   -- which are not quantity x rate in this schema.
@@ -135,7 +172,7 @@ CREATE TABLE IF NOT EXISTS payroll_deduction_snapshots (
   -- Where this category's amount came from, for the drill-down UI to
   -- cite as evidence -- never invented wording, one of a fixed set.
   source TEXT NOT NULL CHECK (source IN (
-    'live_attendance_count', 'employee_deductions_row', 'uniform_rate_config', 'no_record_zero'
+    'live_attendance_count', 'employee_deductions_row', 'uniform_rate_config', 'no_record_zero', 'unresolved_remainder'
   )),
   calculation_context JSONB NOT NULL DEFAULT '{}'::JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -165,14 +202,20 @@ CREATE POLICY "payroll_deduction_snapshots_view_tenant_region_permitted"
     )
   );
 
--- No direct INSERT/UPDATE policy for any role: every row is written only
--- by process_payroll_batch() below (SECURITY DEFINER, bypasses RLS), so
--- this table can never be hand-edited to retroactively change a
--- payslip's explanation -- matching this migration's own "future changes
--- ... cannot alter historical payslip explanations" requirement.
-CREATE POLICY "Super admins can delete payroll deduction snapshots"
-  ON payroll_deduction_snapshots FOR DELETE
-  USING (is_super_admin() = true);
+-- No INSERT/UPDATE/DELETE policy of ANY kind, for ANY role -- every row
+-- is written only by process_payroll_batch() below (SECURITY DEFINER,
+-- exempt from RLS as the function's owning role), so this table can
+-- never be hand-edited, or hand-deleted, by ordinary UI/database access
+-- (including an otherwise-unrestricted super-admin DELETE grant, which
+-- an earlier draft of this migration had and which this completion pass
+-- removes) -- matching this migration's own "future changes... cannot
+-- alter historical payslip explanations" requirement, and "an approved
+-- payroll's financial explanation must not be independently erased or
+-- altered". The only path that ever removes a row is the ON DELETE
+-- CASCADE fired by process_payroll_batch() deleting a NOT-YET-approved
+-- month's own payroll row to reprocess it -- see this migration's header
+-- for why that path needs no RLS grant of its own, and is already
+-- unreachable for an approved month.
 
 CREATE OR REPLACE FUNCTION public.process_payroll_batch(p_month text, p_records jsonb, p_user_email text DEFAULT NULL::text, p_audit_context jsonb DEFAULT '{}'::jsonb)
  RETURNS jsonb
@@ -221,8 +264,10 @@ DECLARE
   -- ===== NEW (this migration): deduction snapshot capture =====
   v_absent_rate_raw TEXT;
   v_late_rate_raw TEXT;
+  v_uniform_default_raw TEXT;
   v_live_absent_rate NUMERIC;
   v_live_late_rate NUMERIC;
+  v_live_uniform_rate NUMERIC;
   v_month_start DATE;
   v_month_end DATE;
   v_submitted_uniform_total NUMERIC;
@@ -236,6 +281,13 @@ DECLARE
   v_uniform_only NUMERIC;
   v_category_sum NUMERIC;
   v_snapshot_conflicts JSONB := '[]'::JSONB;
+  -- Uniform-remainder verification (see this migration's header) --
+  -- never trust a bare remainder as proof of a genuine uniform charge.
+  v_employee_uniform_override NUMERIC;
+  v_position_requires_uniform BOOLEAN;
+  v_live_uniform_only NUMERIC;
+  v_unallocated NUMERIC;
+  v_unresolved_uniform JSONB := '[]'::JSONB;
 BEGIN
   IF v_caller_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
@@ -266,10 +318,11 @@ BEGIN
     MAX(CASE WHEN key = 'paye_threshold' THEN value END),
     MAX(CASE WHEN key = 'pension_employee_rate' THEN value END),
     MAX(CASE WHEN key = 'absent_day_deduction' THEN value END),
-    MAX(CASE WHEN key = 'late_day_deduction' THEN value END)
-  INTO v_paye_rate_raw, v_paye_threshold_raw, v_pension_rate_raw, v_absent_rate_raw, v_late_rate_raw
+    MAX(CASE WHEN key = 'late_day_deduction' THEN value END),
+    MAX(CASE WHEN key = 'uniform_deduction_default' THEN value END)
+  INTO v_paye_rate_raw, v_paye_threshold_raw, v_pension_rate_raw, v_absent_rate_raw, v_late_rate_raw, v_uniform_default_raw
   FROM system_settings
-  WHERE tenant_id = v_tenant_id AND key IN ('paye_rate', 'paye_threshold', 'pension_employee_rate', 'absent_day_deduction', 'late_day_deduction');
+  WHERE tenant_id = v_tenant_id AND key IN ('paye_rate', 'paye_threshold', 'pension_employee_rate', 'absent_day_deduction', 'late_day_deduction', 'uniform_deduction_default');
 
   IF v_paye_rate_raw IS NULL OR v_paye_threshold_raw IS NULL OR v_pension_rate_raw IS NULL THEN
     RAISE EXCEPTION 'Refusing to process payroll: PAYE/pension rate settings have not been configured for this tenant (paye_rate, paye_threshold, and pension_employee_rate must all be set -- an explicit 0 is a valid configured value). An authorized user must configure them in Settings first.';
@@ -294,6 +347,7 @@ BEGIN
   -- the EXPLANATION, never on the payroll itself; see below).
   v_live_absent_rate := CASE WHEN v_absent_rate_raw ~ '^[0-9]+(\.[0-9]+)?$' THEN v_absent_rate_raw::NUMERIC ELSE NULL END;
   v_live_late_rate := CASE WHEN v_late_rate_raw ~ '^[0-9]+(\.[0-9]+)?$' THEN v_late_rate_raw::NUMERIC ELSE NULL END;
+  v_live_uniform_rate := CASE WHEN v_uniform_default_raw ~ '^[0-9]+(\.[0-9]+)?$' THEN v_uniform_default_raw::NUMERIC ELSE NULL END;
 
   IF (SELECT COUNT(*) FROM jsonb_array_elements(p_records) AS r) <>
      (SELECT COUNT(DISTINCT r->>'employee_id') FROM jsonb_array_elements(p_records) AS r)
@@ -500,7 +554,55 @@ BEGIN
           v_employee_id, v_absent_deduction, v_late_deduction, v_lecture_deduction, v_appearance_deduction, p_month, v_category_sum, v_submitted_uniform_total;
       END IF;
 
-      v_uniform_only := GREATEST(0, v_submitted_uniform_total - v_category_sum);
+      -- Uniform verification: a bare remainder (submitted bundled total
+      -- minus the four evidenced categories) is NOT by itself proof that
+      -- the leftover is genuinely a uniform charge -- see this
+      -- migration's header. Cross-check it against the employee's own
+      -- uniform_deduction override and the eligibility of their position
+      -- (positions.requires_uniform), BOTH read live, right now, inside
+      -- this same transaction -- the exact inputs calculateLivePayroll()
+      -- itself would have used to build the bundled total just
+      -- committed. Frozen here, so a later change to either can never
+      -- retroactively relabel this month's explanation ("today's
+      -- settings explaining historical payroll").
+      SELECT e.uniform_deduction, COALESCE(pos.requires_uniform, true)
+        INTO v_employee_uniform_override, v_position_requires_uniform
+      FROM employees e
+      LEFT JOIN positions pos ON pos.name = e.position AND pos.tenant_id = e.tenant_id
+      WHERE e.id = v_employee_id;
+
+      v_live_uniform_only := CASE
+        WHEN NOT COALESCE(v_position_requires_uniform, true) THEN 0
+        WHEN v_employee_uniform_override IS NOT NULL THEN v_employee_uniform_override
+        WHEN v_live_uniform_rate IS NOT NULL THEN v_live_uniform_rate
+        ELSE NULL -- no override on record and no tenant default configured -- cannot determine
+      END;
+
+      v_unallocated := GREATEST(0, v_submitted_uniform_total - v_category_sum);
+
+      IF v_unallocated <= 1 THEN
+        -- Nothing left over to explain either way -- the four evidenced
+        -- categories alone already account for the bundled total.
+        v_uniform_only := 0;
+        v_unallocated := 0;
+      ELSIF v_live_uniform_only IS NOT NULL AND ABS(v_live_uniform_only - v_unallocated) <= 1 THEN
+        -- The independently-derived figure agrees with the leftover --
+        -- safe to record as a genuine, verified Uniform charge.
+        v_uniform_only := v_live_uniform_only;
+        v_unallocated := 0;
+      ELSE
+        -- Cannot independently verify this remainder is genuinely
+        -- uniform (no determinable live figure, or it disagrees with the
+        -- leftover beyond rounding) -- record it honestly as unresolved.
+        -- NEVER labeled Uniform, and never silently absorbed into any
+        -- other category.
+        v_uniform_only := 0;
+        v_unresolved_uniform := v_unresolved_uniform || jsonb_build_object(
+          'employee_id', v_employee_id,
+          'unallocatedAmount', v_unallocated,
+          'liveUniformOnly', v_live_uniform_only
+        );
+      END IF;
 
       -- A pre-existing employee_deductions row's own absent/late figures
       -- can legitimately differ from what was just counted live -- see
@@ -520,7 +622,13 @@ BEGIN
 
       INSERT INTO payroll_deduction_snapshots (tenant_id, payroll_id, employee_id, month, category, amount, quantity, rate, source, calculation_context)
       VALUES
-        (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'uniform', v_uniform_only, NULL, NULL, 'uniform_rate_config', jsonb_build_object('bundledTotal', v_submitted_uniform_total)),
+        (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'uniform', v_uniform_only, NULL, NULL, 'uniform_rate_config',
+          jsonb_build_object(
+            'bundledTotal', v_submitted_uniform_total,
+            'employeeOverride', v_employee_uniform_override,
+            'positionRequiresUniform', v_position_requires_uniform,
+            'liveDefaultRate', v_live_uniform_rate
+          )),
         (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'absence', v_absent_deduction, v_live_absent_days, v_live_absent_rate, 'live_attendance_count', jsonb_build_object('rateSettingKey', 'absent_day_deduction')),
         (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'late', v_late_deduction, v_live_late_days, v_live_late_rate, 'live_attendance_count', jsonb_build_object('rateSettingKey', 'late_day_deduction')),
         (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'lecture', v_lecture_deduction, NULL, NULL,
@@ -529,6 +637,15 @@ BEGIN
         (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'appearance', v_appearance_deduction, NULL, NULL,
           CASE WHEN v_existing_deduction.employee_id IS NOT NULL THEN 'employee_deductions_row' ELSE 'no_record_zero' END,
           '{}'::JSONB);
+
+      -- 'unallocated' is written ONLY when there is genuinely unresolved
+      -- money left over -- never a zero-value row (nothing to flag) and
+      -- never folded into 'uniform' above.
+      IF v_unallocated > 1 THEN
+        INSERT INTO payroll_deduction_snapshots (tenant_id, payroll_id, employee_id, month, category, amount, quantity, rate, source, calculation_context)
+        VALUES (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'unallocated', v_unallocated, NULL, NULL, 'unresolved_remainder',
+          jsonb_build_object('reason', 'remainder could not be independently verified as a genuine uniform charge'));
+      END IF;
     END IF;
 
     IF v_refund_amount > 0 THEN
@@ -550,14 +667,16 @@ BEGIN
       'month', p_month, 'employeeCount', array_length(v_employee_ids, 1),
       'recordsSaved', v_inserted_count, 'salaryAdvanceDeductionsApplied', v_advance_deductions_applied,
       'status', 'pending_approval',
-      'employeeDeductionSnapshotConflicts', v_snapshot_conflicts
+      'employeeDeductionSnapshotConflicts', v_snapshot_conflicts,
+      'employeeDeductionSnapshotUnresolvedUniform', v_unresolved_uniform
     )
   );
 
   RETURN jsonb_build_object(
     'success', true, 'month', p_month, 'deletedCount', v_deleted_count,
     'insertedCount', v_inserted_count, 'advanceDeductionsApplied', v_advance_deductions_applied,
-    'employeeDeductionSnapshotConflicts', v_snapshot_conflicts
+    'employeeDeductionSnapshotConflicts', v_snapshot_conflicts,
+    'employeeDeductionSnapshotUnresolvedUniform', v_unresolved_uniform
   );
 END;
 $function$;
