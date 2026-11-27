@@ -74,8 +74,8 @@ describe('HikCentralImport: importing automatically calculates and applies atten
 
   it('shows a distinct failure state when raw import succeeds but automatic processing fails -- never folded into one blanket success banner', () => {
     expect(source).toMatch(/Automatic attendance processing failed/);
-    expect(source).toMatch(/Raw events were saved\\. Automatic attendance processing is not yet complete/);
-    expect(source).toMatch(/Processed \\{retryProgress\\.completed\\} of \\{retryProgress\\.total\\} calendar days/);
+    expect(source).toContain('Raw events were saved. Automatic attendance processing is not yet complete');
+    expect(source).toContain('Processed {retryProgress.completed} of {retryProgress.total} calendar days');
   });
 
   it('offers a retry path for automatic processing alone (reprocessing), without re-importing raw events', () => {
