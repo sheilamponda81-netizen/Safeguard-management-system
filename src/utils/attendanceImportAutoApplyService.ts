@@ -685,7 +685,7 @@ function isNeedsOverrideReasonRpcResponse(data: unknown): data is NeedsOverrideR
  * through each employee's own assigned-terminal coverage -- see
  * employee_hikcentral_terminals / set_employee_hikcentral_terminals).
  */
-export async function processHikCentralImportBatch(params: {
+async function processHikCentralImportBatchSingle(params: {
   importBatchId: string;
   accessPoints: string[];
   periodFromDate: string;
@@ -775,4 +775,86 @@ export async function processHikCentralImportBatch(params: {
       error: 'Network error while processing automatic attendance for this import. Please try again.',
     };
   }
+}
+
+/**
+ * Long (e.g. 1-27 November) automatic attendance runs can exceed
+ * PostgreSQL's statement timeout. Run each calendar date in its own
+ * transaction while preserving the SAME full, human-confirmed coverage
+ * window and imported-batch identity.
+ *
+ * The server deliberately rechecks the preceding date for overnight
+ * shifts. Repeated results are real evaluations, not extra attendance
+ * writes: the existing attendance_write_one RPC is idempotent. The
+ * aggregate below counts actual writes across transactions; unchanged/
+ * skipped are processing outcomes and may include those overlap checks.
+ */
+export function splitAttendanceProcessingDays(from: string, to: string): string[] {
+  function parse(value: string): Date {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error('Invalid attendance date');
+    const d = new Date(value + 'T00:00:00.000Z');
+    if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== value) throw new Error('Invalid attendance date');
+    return d;
+  }
+  const fromDay = parse(from), toDay = parse(to);
+  if (fromDay > toDay) throw new Error('Invalid reversed attendance date range');
+  const days: string[] = [];
+  for (let time = fromDay.getTime(); time <= toDay.getTime(); time += 86_400_000) {
+    days.push(new Date(time).toISOString().slice(0, 10));
+    if (days.length > 370) throw new Error('Attendance date range exceeds 370 days');
+  }
+  return days;
+}
+
+export async function processHikCentralImportBatch(
+  params: Parameters<typeof processHikCentralImportBatchSingle>[0] & {
+    onProgress?: (completedDays: number, totalDays: number) => void;
+  }
+): Promise<ProcessImportBatchResult> {
+  let days: string[];
+  try { days = splitAttendanceProcessingDays(params.dateFrom, params.dateTo); }
+  catch (e) {
+    return { success: false, outcome: 'unexpected_response', error: e instanceof Error ? e.message : 'Invalid date range' };
+  }
+  let completed = 0;
+  let confirmationId: string | undefined;
+  let employeeCount = 0, appliedCount = 0, unchangedCount = 0, skippedCount = 0;
+  let failedCount = 0;
+  const outcomeBreakdown: Partial<Record<ImportApplyOutcomeCode, number>> = {};
+  const needsConfig = new Map<string, NeedsTerminalConfigurationEmployee>();
+
+  for (const day of days) {
+    const result = await processHikCentralImportBatchSingle({
+      ...params,
+      dateFrom: day,
+      dateTo: day,
+    });
+    if (!result.success) {
+      if (completed === 0) return result;
+      return {
+        ...result,
+        error: `Processing stopped after ${completed} of ${days.length} days. Those earlier days were committed. ${result.error || 'An error occurred'}. You can retry safely without reimporting fingerprint records.`,
+        confirmationId, employeeCount, appliedCount, unchangedCount, skippedCount, failedCount,
+        outcomeBreakdown, needsTerminalConfiguration: Array.from(needsConfig.values()),
+      };
+    }
+    confirmationId = result.confirmationId || confirmationId;
+    employeeCount = Math.max(employeeCount, result.employeeCount || 0);
+    appliedCount += result.appliedCount || 0;
+    unchangedCount += result.unchangedCount || 0;
+    skippedCount += result.skippedCount || 0;
+    failedCount += result.failedCount || 0;
+    for (const [code, count] of Object.entries(result.outcomeBreakdown || {})) {
+      const k = code as ImportApplyOutcomeCode;
+      outcomeBreakdown[k] = (outcomeBreakdown[k] || 0) + count;
+    }
+    for (const e of result.needsTerminalConfiguration || []) needsConfig.set(e.employeeId, e);
+    completed++;
+    params.onProgress?.(completed, days.length);
+  }
+  return {
+    success: true, outcome: 'success', confirmationId, employeeCount,
+    appliedCount, unchangedCount, skippedCount, failedCount,
+    outcomeBreakdown, needsTerminalConfiguration: Array.from(needsConfig.values()),
+  };
 }
