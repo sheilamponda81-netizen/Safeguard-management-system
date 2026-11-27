@@ -214,7 +214,7 @@ describe('processHikCentralImportBatch', () => {
       periodFromDate: '2026-10-01',
       periodToDate: '2026-10-04',
       dateFrom: '2026-10-01',
-      dateTo: '2026-10-04',
+      dateTo: '2026-10-01',
     });
 
     expect(rpcMock).toHaveBeenCalledWith('attendance_process_import_batch', {
@@ -223,7 +223,7 @@ describe('processHikCentralImportBatch', () => {
       p_covers_from: '2026-09-30T22:00:00.000Z',
       p_covers_through: '2026-10-04T21:59:00.000Z',
       p_date_from: '2026-10-01',
-      p_date_to: '2026-10-04',
+      p_date_to: '2026-10-01',
       p_notes: null,
       p_workstations: null,
       p_override_reason: null,
