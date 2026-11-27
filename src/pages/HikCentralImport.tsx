@@ -396,6 +396,7 @@ export default function HikCentralImportPage() {
   }, [parseResult, selectedFile, userProfile, canProcessScope, summary, periodFrom, periodTo, alertStatusFilter, reloadCoverageTimeline, reloadSiteAlerts]);
 
   const [retrying, setRetrying] = useState(false);
+  const [retryProgress, setRetryProgress] = useState<{ completed: number; total: number } | null>(null);
 
   // Retries ONLY the automatic processing step (not a re-import of raw
   // events -- those are already durably stored) for the same batch and
@@ -407,8 +408,10 @@ export default function HikCentralImportPage() {
   const handleRetryAutoApply = useCallback(async () => {
     if (!importResult?.batchId || !summary) return;
     setRetrying(true);
+    setRetryProgress(null);
     try {
       const autoApply = await processHikCentralImportBatch({
+        onProgress: (completed, total) => setRetryProgress({ completed, total }),
         importBatchId: importResult.batchId,
         periodFromDate: periodFrom,
         periodToDate: periodTo,
@@ -745,11 +748,16 @@ export default function HikCentralImportPage() {
                       ) : (
                         <>
                           <p className="text-sm text-red-700">
-                            Raw events were imported successfully, but attendance was NOT calculated or applied: {autoApplyResult.error}
+                            Raw events were saved. Automatic attendance processing is not yet complete: {autoApplyResult.error}
                           </p>
                           <Button onClick={handleRetryAutoApply} disabled={retrying} className="mt-2">
-                            {retrying ? 'Retrying...' : 'Retry Attendance Processing'}
+                            {retrying ? 'Processing saved fingerprint records...' : 'Retry Attendance Processing'}
                           </Button>
+                          {retrying && retryProgress && (
+                            <p className="mt-2 text-sm text-slate-600" role="status">
+                              Processed {retryProgress.completed} of {retryProgress.total} calendar days.
+                            </p>
+                          )}
                         </>
                       )}
                     </div>
