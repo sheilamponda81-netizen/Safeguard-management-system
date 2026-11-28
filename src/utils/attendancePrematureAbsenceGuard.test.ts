@@ -31,7 +31,7 @@ describe.skipIf(!available && !required)('Attendance: premature absence evidence
   });
 
   it('resolver refuses an absence where the coverage was confirmed before checkout closed', () => {
-    const tenant = randomUUID(),actor=randomUUID(),emp=randomUUID(),mapping=randomUUID(),batch=randomUUID();
+    const tenant = randomUUID(),actor=randomUUID(),emp=randomUUID(),mapping=randomUUID();
     const terminal='TEST-'+randomUUID().slice(0,8);
     run(`insert into tenants(id,name,code) values('${tenant}','Premature guard tenant','PG-${tenant.slice(0,6)}')`);
     run(`insert into auth.users(id) values('${actor}')`);
