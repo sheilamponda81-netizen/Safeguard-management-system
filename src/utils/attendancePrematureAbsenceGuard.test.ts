@@ -26,7 +26,7 @@ describe.skipIf(!available && !required)('Attendance: premature absence evidence
   });
 
   it('one check-in before shift completion is only provisional under incomplete coverage', () => {
-    const status = run("select status from attendance_engine_calculate('2026-11-27'::date,'day',array['2026-11-27 04:20:00+00'::timestamptz],'confirmed_complete','2026-11-27 21:59:00+00','2026-11-27 09:33:00+00')");
+    const status = run("select status from attendance_engine_calculate('2026-11-27'::date,'day',array['2026-11-27 04:10:00+00'::timestamptz],'confirmed_complete','2026-11-27 21:59:00+00','2026-11-27 09:33:00+00')");
     expect(status).toBe('present');
   });
 
