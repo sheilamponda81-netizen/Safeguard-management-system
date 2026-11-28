@@ -489,3 +489,26 @@ SELECT tenant_id, employee_id, date, status, NULL,
        calculation_basis, NULL, NULL, 'automatic',
        '2026-11-28 controlled reversal: Nov 27 attendance was finalized Absent from a coverage declaration made before that shift checkout window closed. Pending until a later complete export; original audit rows retained.'
 FROM invalidated;
+
+-- The same premature writes opened two site absence alerts on November 27.
+-- Close ONLY still-open alerts created in the incident minute, and ONLY
+-- when the remaining verified Absent count is below the six-person threshold.
+-- The original alert remains in place with a transparent closure reason.
+UPDATE public.attendance_site_absence_alerts a
+SET status = 'closed',
+    closed_at = clock_timestamp(),
+    closed_by = NULL,
+    closed_note = 'System correction (2026-11-28): premature Nov 27 automatic absences were invalidated because the export was confirmed before checkout ended. Await complete shift evidence.'
+WHERE a.tenant_id = 'deaeb8c9-20d1-47e3-8631-513108f6bb17'::uuid
+  AND a.alert_date = DATE '2026-11-27'
+  AND a.status = 'open'
+  AND a.created_at >= TIMESTAMPTZ '2026-11-27 09:30:00+00'
+  AND a.created_at < TIMESTAMPTZ '2026-11-27 09:40:00+00'
+  AND (
+    SELECT count(*) FROM public.attendance r
+    JOIN public.employees e ON e.id = r.employee_id AND e.tenant_id = a.tenant_id
+    WHERE r.tenant_id = a.tenant_id
+      AND r.date = a.alert_date
+      AND r.status = 'A'
+      AND upper(btrim(regexp_replace(COALESCE(e.workstation, ''), '\\s+', ' ', 'g'))) = a.site
+  ) < 6;
