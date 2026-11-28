@@ -16,14 +16,23 @@ import path from 'node:path';
 // MK 0, an explicit, valid configured rate -- see the October payroll
 // hotfix's own "explicit 0 is valid" principle), so the three late-arrival
 // labels below are now fixed the same way the absence ones already were.
-// Unlike the absence fix, this round does NOT add a getHistoricalSafeLateRate
-// equivalent -- the per-employee row breakdown's late rate now reads the LIVE
-// payrollRates.lateDeduction directly, which (like the absence rate before
-// this investigation) can mislabel an already-processed historical month if
-// the rate has since changed. This is a known, narrower residual gap,
-// documented rather than fixed in this round to keep the change narrowly
-// scoped; closing it fully would mean adding a late-day counterpart to
-// getHistoricalSafeAbsentRate.
+// That round deliberately left the per-employee/per-payslip late rate
+// reading the LIVE payrollRates.lateDeduction (Payroll.tsx) or a hardcoded
+// "MK4,200" literal (Payslips.tsx) directly, documented as "a known,
+// narrower residual gap... closing it fully would mean adding a late-day
+// counterpart to getHistoricalSafeAbsentRate".
+//
+// SAFEGUARD -- Salary Advances + Payroll & Payslip Financial Transparency
+// audit: that gap is now closed. getHistoricalSafeLateRate() (mirroring
+// getHistoricalSafeAbsentRate exactly -- see its own tests in
+// payrollCalculations.test.ts) now backs the per-employee row breakdown in
+// Payroll.tsx and the per-record absence/late breakdown in Payslips.tsx, so
+// neither can mislabel an already-processed historical month's late
+// deduction with today's rate (or a stale literal) if late_day_deduction has
+// since changed. The page-level/generic explainers this file's own header
+// already exempts for the absence rate (a banner or confirmation modal that
+// only ever describes the CURRENT month about to be processed) remain
+// exempt here too, and still read payrollRates.lateDeduction directly.
 //
 // A second regression is pinned here too: a per-employee/per-payslip absence
 // display (which can render an already-processed HISTORICAL month) must use
@@ -73,9 +82,9 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('Payroll.tsx: the per-employee row breakdown derives its absent-day rate via getHistoricalSafeAbsentRate, not the live rate directly, since this row can be an already-processed historical month', () => {
+  it('Payroll.tsx: the per-employee row breakdown derives its absent-day rate via a verified snapshot\'s own frozen rate when one exists, else getHistoricalSafeAbsentRate, never the live rate directly, since this row can be an already-processed historical month', () => {
     expect(payrollSource).toMatch(
-      /Absent:\s*\{attendance!\.absentDays\}\s*×\s*\{formatKwacha\(getHistoricalSafeAbsentRate\(\{\s*frozenAbsentDeduction:\s*deduction\?\.absent_deduction,\s*frozenAbsentDays:\s*deduction\?\.absent_days,\s*liveConfiguredRate:\s*payrollRates\.absentDeduction\s*\}\)\)\}/
+      /Absent:\s*\{snapshot\?\.absenceDays \?\? attendance\?\.absentDays \?\? 0\}\s*×\s*\{formatKwacha\(snapshot\?\.absenceRate \?\? getHistoricalSafeAbsentRate\(\{\s*frozenAbsentDeduction:\s*deduction\?\.absent_deduction,\s*frozenAbsentDays:\s*deduction\?\.absent_days,\s*liveConfiguredRate:\s*payrollRates\.absentDeduction\s*\}\)\)\}/
     );
   });
 
@@ -95,9 +104,15 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(payrollSource).not.toMatch(/Late:\s*\{attendance!\.lateDays\}\s*×\s*MK4,?200/);
   });
 
-  it('Payroll.tsx: the late-arrival labels now derive from the configured payrollRates.lateDeduction rate (live, not a historical-safe wrapper -- see this file\'s header)', () => {
+  it('Payroll.tsx: the generic (non-employee-specific) late-arrival labels use formatKwacha(payrollRates.lateDeduction) directly -- the deduction-summary banner\'s live-month branch and the Process/Reprocess Payroll modal (which only ever describe the current month)', () => {
     const matches = payrollSource.match(/formatKwacha\(payrollRates\.lateDeduction\)/g) || [];
-    expect(matches.length).toBeGreaterThanOrEqual(3);
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('Payroll.tsx: the per-employee row breakdown derives its late-day rate via a verified snapshot\'s own frozen rate when one exists, else getHistoricalSafeLateRate, never the live rate directly, since this row can be an already-processed historical month', () => {
+    expect(payrollSource).toMatch(
+      /Late:\s*\{snapshot\?\.lateDays \?\? attendance\?\.lateDays \?\? 0\}\s*×\s*\{formatKwacha\(snapshot\?\.lateRate \?\? getHistoricalSafeLateRate\(\{\s*frozenLateDeduction:\s*deduction\?\.late_deduction,\s*frozenLateDays:\s*deduction\?\.late_days,\s*liveConfiguredRate:\s*payrollRates\.lateDeduction\s*\}\)\)\}/
+    );
   });
 
   it('Payroll.tsx: the deduction-summary banner falls back to non-numeric wording for Late Arrival too on a historical/past month', () => {
@@ -119,9 +134,15 @@ describe('Absence-deduction display derives from configured payroll rate, not a 
     expect(payslipsSource).not.toMatch(/formatKwacha\(payrollRates\.absentDeduction\)/);
   });
 
-  it('Payslips.tsx: the late-arrival rate is left untouched (still MK4,200)', () => {
-    const matches = payslipsSource.match(/Late \(\$\{lateDays\} × MK4,200\)/g) || [];
-    expect(matches.length).toBeGreaterThanOrEqual(2);
+  it('Payslips.tsx: no remaining hardcoded "MK4,200" late-arrival literal', () => {
+    expect(payslipsSource).not.toMatch(/MK4,200/);
+  });
+
+  it('Payslips.tsx: late breakdown derives its rate via getHistoricalSafeLateRate (never a hardcoded literal or the live rate directly), since a payslip can be for an already-processed historical month', () => {
+    const matches = payslipsSource.match(
+      /formatKwacha\(getHistoricalSafeLateRate\(\{\s*frozenLateDeduction:\s*p\.late_deduction,\s*frozenLateDays:\s*p\.late_days,\s*liveConfiguredRate:\s*payrollRates\.lateDeduction\s*\}\)\)/g
+    ) || [];
+    expect(matches.length).toBeGreaterThanOrEqual(3);
   });
 
   it('UserManual.tsx: no remaining stale fixed absence rate text', () => {

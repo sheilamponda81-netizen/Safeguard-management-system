@@ -83,3 +83,23 @@ export function getHistoricalSafeAbsentRate(inputs: HistoricalSafeAbsentRateInpu
   }
   return liveConfiguredRate;
 }
+
+export interface HistoricalSafeLateRateInputs {
+  // Same recovery as getHistoricalSafeAbsentRate above, for late_deduction/
+  // late_days -- late_day_deduction is independently configurable from
+  // absent_day_deduction and can change after a month was processed
+  // (system_settings), so the per-day rate LABEL shown alongside an
+  // already-frozen late_deduction dollar amount must be recovered from
+  // that same frozen row, never hardcoded or read from today's config.
+  frozenLateDeduction?: number | null;
+  frozenLateDays?: number | null;
+  liveConfiguredRate: number;
+}
+
+export function getHistoricalSafeLateRate(inputs: HistoricalSafeLateRateInputs): number {
+  const { frozenLateDeduction, frozenLateDays, liveConfiguredRate } = inputs;
+  if (frozenLateDeduction != null && frozenLateDays != null && frozenLateDays > 0) {
+    return frozenLateDeduction / frozenLateDays;
+  }
+  return liveConfiguredRate;
+}
