@@ -485,10 +485,20 @@ INSERT INTO public.attendance_audit_log (
   tenant_id, employee_id, attendance_date, old_status, new_status,
   old_calculation_basis, new_calculation_basis, changed_by, change_source, reason
 )
-SELECT tenant_id, employee_id, date, status, 'pending',
-       calculation_basis, NULL, NULL, 'automatic',
+SELECT i.tenant_id, i.employee_id, i.date, i.status, 'pending',
+       i.calculation_basis, NULL,
+       (SELECT l.changed_by
+        FROM public.attendance_audit_log l
+        WHERE l.tenant_id = i.tenant_id AND l.employee_id = i.employee_id
+          AND l.attendance_date = i.date
+          AND l.change_source = 'automatic' AND l.new_status = 'A'
+          AND l.old_status IS NULL
+          AND l.changed_at >= TIMESTAMPTZ '2026-11-27 09:30:00+00'
+          AND l.changed_at < TIMESTAMPTZ '2026-11-27 09:40:00+00'
+        ORDER BY l.changed_at DESC, l.id DESC LIMIT 1),
+       'automatic',
        '2026-11-28 controlled reversal: Nov 27 attendance was finalized Absent from a coverage declaration made before that shift checkout window closed. Pending until a later complete export; original audit rows retained.'
-FROM invalidated;
+FROM invalidated i;
 
 -- The same premature writes opened two site absence alerts on November 27.
 -- Close ONLY still-open alerts created in the incident minute, and ONLY
