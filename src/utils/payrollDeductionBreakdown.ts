@@ -129,6 +129,16 @@ export interface PayrollDeductionBreakdownEmployeeInput {
    *  path instead, which keeps the original remainder-as-uniform
    *  behavior unchanged. */
   verifiedUniform?: { uniformDeduction: number; unallocatedAmount: number } | null;
+  /** Set when this employee HAS payroll_deduction_snapshots rows for
+   *  their exact payroll_id, but resolveDeductionSnapshot() rejected
+   *  them (missing/duplicate category, negative/non-finite amount,
+   *  wrong payroll_id, or a total that doesn't reconcile). Distinct
+   *  from `itemized === null` on its own: that also covers an employee
+   *  with NO snapshot and no employee_deductions row at all (genuinely
+   *  never recorded). This one means evidence EXISTS but failed
+   *  validation -- never silently treated as equivalent to "nothing was
+   *  ever recorded", and never used as if it were valid. */
+  integrityWarningReason?: string | null;
 }
 
 export interface PayrollDeductionBreakdownTotals {
@@ -157,8 +167,17 @@ export interface PayrollDeductionBreakdownTotals {
   /** Count of employees with a verified snapshot that still has a
    *  non-zero unallocated amount. */
   employeesWithUnresolvedUniform: number;
-  /** Sum of every category above, including the unitemized and
-   *  unallocated buckets. */
+  /** Bundled uniform/attendance total for employees whose snapshot
+   *  EXISTS but FAILED validation -- never silently merged into
+   *  unitemizedUniformAndAttendanceTotal (which means "nothing was ever
+   *  recorded"), and never guessed at. A non-zero figure here means a
+   *  real data-integrity problem needing investigation, not an absence
+   *  of evidence. */
+  integrityWarningTotal: number;
+  /** Count of employees whose snapshot exists but failed validation. */
+  employeesWithIntegrityWarning: number;
+  /** Sum of every category above, including the unitemized, unallocated,
+   *  and integrity-warning buckets. */
   categorizedTotal: number;
   /** paye + pension + uniformAndAttendanceTotal + salaryAdvanceDeduction
    *  summed across every employee -- the same formula the page's
@@ -188,6 +207,8 @@ export function buildPayrollDeductionBreakdown(
   let employeesWithoutItemizedBreakdown = 0;
   let unallocatedTotal = 0;
   let employeesWithUnresolvedUniform = 0;
+  let integrityWarningTotal = 0;
+  let employeesWithIntegrityWarning = 0;
   let grandTotal = 0;
 
   for (const e of inputs) {
@@ -196,7 +217,13 @@ export function buildPayrollDeductionBreakdown(
     salaryAdvanceTotal += e.salaryAdvanceDeduction;
     grandTotal += e.paye + e.pension + e.uniformAndAttendanceTotal + e.salaryAdvanceDeduction;
 
-    if (e.itemized) {
+    if (e.integrityWarningReason) {
+      // Evidence EXISTS but failed validation -- never merged into the
+      // ordinary "not itemized" bucket (which means no evidence was
+      // ever recorded at all), and never itemized as if it were valid.
+      integrityWarningTotal += e.uniformAndAttendanceTotal;
+      if (e.uniformAndAttendanceTotal > 0) employeesWithIntegrityWarning += 1;
+    } else if (e.itemized) {
       absenceTotal += e.itemized.absenceDeduction;
       lateTotal += e.itemized.lateDeduction;
       lectureTotal += e.itemized.lectureDeduction;
@@ -217,7 +244,7 @@ export function buildPayrollDeductionBreakdown(
   }
 
   const categorizedTotal =
-    payeTotal + pensionTotal + uniformOnlyTotal + absenceTotal + lectureTotal + appearanceTotal + lateTotal + salaryAdvanceTotal + unitemizedUniformAndAttendanceTotal + unallocatedTotal;
+    payeTotal + pensionTotal + uniformOnlyTotal + absenceTotal + lectureTotal + appearanceTotal + lateTotal + salaryAdvanceTotal + unitemizedUniformAndAttendanceTotal + unallocatedTotal + integrityWarningTotal;
 
   return {
     payeTotal,
@@ -232,6 +259,8 @@ export function buildPayrollDeductionBreakdown(
     employeesWithoutItemizedBreakdown,
     unallocatedTotal,
     employeesWithUnresolvedUniform,
+    integrityWarningTotal,
+    employeesWithIntegrityWarning,
     categorizedTotal,
     grandTotal,
     reconciles: Math.abs(categorizedTotal - grandTotal) <= TOLERANCE,

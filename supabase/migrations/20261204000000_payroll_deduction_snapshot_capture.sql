@@ -287,6 +287,12 @@ DECLARE
   v_position_requires_uniform BOOLEAN;
   v_live_uniform_only NUMERIC;
   v_unallocated NUMERIC;
+  -- Preserves the remainder exactly as first computed, before either
+  -- tolerance branch below resets it to 0 -- so a sub-tolerance amount
+  -- is still independently auditable in calculation_context even though
+  -- it is, by design, too small to itemize on its own. Never used for
+  -- any committed amount; audit-trail only.
+  v_raw_remainder NUMERIC;
   v_unresolved_uniform JSONB := '[]'::JSONB;
 BEGIN
   IF v_caller_id IS NULL THEN
@@ -579,6 +585,7 @@ BEGIN
       END;
 
       v_unallocated := GREATEST(0, v_submitted_uniform_total - v_category_sum);
+      v_raw_remainder := v_unallocated;
 
       IF v_unallocated <= 1 THEN
         -- Nothing left over to explain either way -- the four evidenced
@@ -627,7 +634,16 @@ BEGIN
             'bundledTotal', v_submitted_uniform_total,
             'employeeOverride', v_employee_uniform_override,
             'positionRequiresUniform', v_position_requires_uniform,
-            'liveDefaultRate', v_live_uniform_rate
+            'liveDefaultRate', v_live_uniform_rate,
+            -- Audit trail only -- never a committed amount. The raw
+            -- remainder as first computed, before either tolerance
+            -- branch above reset it. Lets a reviewer confirm a
+            -- sub-1-Kwacha amount was genuinely negligible rounding and
+            -- not quietly lost: it is always visible here even on the
+            -- two paths (v_unallocated<=1, or it agreed with
+            -- v_live_uniform_only within tolerance) that do not write a
+            -- separate 'unallocated' row for it.
+            'rawRemainderBeforeTolerance', v_raw_remainder
           )),
         (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'absence', v_absent_deduction, v_live_absent_days, v_live_absent_rate, 'live_attendance_count', jsonb_build_object('rateSettingKey', 'absent_day_deduction')),
         (v_tenant_id, v_new_payroll_id, v_employee_id, p_month, 'late', v_late_deduction, v_live_late_days, v_live_late_rate, 'live_attendance_count', jsonb_build_object('rateSettingKey', 'late_day_deduction')),

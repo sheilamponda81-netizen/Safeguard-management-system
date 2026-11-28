@@ -103,6 +103,14 @@ interface ExtendedPayrollRecord extends PayrollRecord {
   // never folded into uniform_amount. Always 0 for the legacy
   // employee_deductions-based path.
   unallocated_amount?: number;
+  // Set only when a payroll_deduction_snapshots row set EXISTS for this
+  // payroll_id but failed validation (missing/duplicate category,
+  // negative/non-finite amount, wrong payroll_id, or a total that
+  // doesn't reconcile -- see payrollDeductionSnapshotResolution.ts).
+  // Drives a distinct warning message, never silently treated as
+  // equivalent to "nothing was ever recorded" and never used as if it
+  // were valid.
+  integrity_warning_reason?: string | null;
 }
 
 // Raw Supabase row shapes -- match the exact columns each query below
@@ -430,7 +438,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             )
           : [];
         snapshotData.forEach(r => {
-          const row: PayrollDeductionSnapshotRow = { category: r.category, amount: r.amount, quantity: r.quantity, rate: r.rate, source: r.source };
+          const row: PayrollDeductionSnapshotRow = { payrollId: r.payroll_id, category: r.category, amount: r.amount, quantity: r.quantity, rate: r.rate, source: r.source };
           const list = snapshotRowsByPayrollId.get(r.payroll_id);
           if (list) list.push(row); else snapshotRowsByPayrollId.set(r.payroll_id, [row]);
         });
@@ -448,21 +456,37 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
 
           if (employee) {
             // Source order (highest priority first):
-            //   1. A verified payroll_deduction_snapshots row set for
+            //   1. A VALIDATED payroll_deduction_snapshots row set for
             //      this EXACT payroll.id -- see
-            //      payrollDeductionSnapshotResolution.ts's own header.
-            //   2. No snapshot for this payroll_id -- fall back to the
-            //      pre-existing employee_deductions-row-based logic
-            //      below, completely unchanged.
-            // Absent_deduction/late_deduction (either source) always
-            // come from a FROZEN figure (never recomputed from today's
-            // configured rate: payrollRates reflects system_settings AS
-            // OF NOW, which may have changed since this payroll was
-            // processed -- recomputing from it would silently relabel a
-            // past month's deduction with a rate that never applied to
-            // it). See buildItemizedAttendanceBreakdown()'s own header
-            // for the legacy path's exact rule.
-            const snapshot = resolveDeductionSnapshot(snapshotRowsByPayrollId.get(payroll.id) ?? null);
+            //      payrollDeductionSnapshotResolution.ts's own header
+            //      for exactly what is validated (all 5 required
+            //      categories present, no duplicates, finite/non-
+            //      negative amounts, every row's own payroll_id matches,
+            //      and the total reconciles with the committed bundled
+            //      deduction).
+            //   2. No snapshot rows at all for this payroll_id -- fall
+            //      back to the pre-existing employee_deductions-row-
+            //      based logic below, completely unchanged.
+            //   3. Snapshot rows exist but FAILED validation -- never
+            //      silently fall back to the legacy path here either
+            //      (that could show a DIFFERENT, conflicting
+            //      explanation for the same committed money); surface
+            //      an explicit integrity warning instead.
+            // Absent_deduction/late_deduction (either source 1 or 2)
+            // always come from a FROZEN figure (never recomputed from
+            // today's configured rate: payrollRates reflects
+            // system_settings AS OF NOW, which may have changed since
+            // this payroll was processed -- recomputing from it would
+            // silently relabel a past month's deduction with a rate
+            // that never applied to it). See
+            // buildItemizedAttendanceBreakdown()'s own header for the
+            // legacy path's exact rule.
+            const resolution = resolveDeductionSnapshot(snapshotRowsByPayrollId.get(payroll.id) ?? null, {
+              payrollId: payroll.id,
+              bundledTotal: payroll.uniform_deduction || 0,
+            });
+            const snapshot = resolution.status === 'available' ? resolution.snapshot : null;
+            const integrityWarningReason = resolution.status === 'invalid' ? resolution.reason : null;
             const attendanceBreakdown = buildItemizedAttendanceBreakdown(deduction);
             const absentDays = snapshot ? (snapshot.absenceDays ?? 0) : attendanceBreakdown.absentDays;
             const lateDays = snapshot ? (snapshot.lateDays ?? 0) : attendanceBreakdown.lateDays;
@@ -481,7 +505,10 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
               ? snapshot.uniformDeduction
               : deriveUniformOnlyAmount(payroll.uniform_deduction || 0, attendanceBreakdown, lectureDeduction, appearanceDeduction);
             const unallocatedAmount = snapshot?.unallocatedAmount || 0;
-            const breakdownAvailable = snapshot ? true : attendanceBreakdown.available;
+            // integrityWarningReason (status 'invalid') is NOT "available" --
+            // it must render its own distinct warning, never the ordinary
+            // itemized breakdown AND never the plain "not available" wording.
+            const breakdownAvailable = integrityWarningReason ? false : (snapshot ? true : attendanceBreakdown.available);
 
             payslipData.push({
               employee,
@@ -510,7 +537,8 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
                 appearance_deduction: appearanceDeduction,
                 uniform_amount: uniformAmount,
                 attendance_breakdown_available: breakdownAvailable,
-                unallocated_amount: unallocatedAmount
+                unallocated_amount: unallocatedAmount,
+                integrity_warning_reason: integrityWarningReason
               } as ExtendedPayrollRecord,
               month: selectedMonth,
               year: selectedYear
@@ -618,6 +646,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
     const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
     const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
     const unallocatedAmount = p.unallocated_amount || 0;
+    const integrityWarningReason = p.integrity_warning_reason || null;
     const payePct = Math.round(payrollRates.payeRate * 100);
     const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
 
@@ -696,7 +725,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             <div class="row deduction-item"><span class="label">Pension (${pensionPct}%)</span><span class="amount">-${formatKwacha(p.pension)}</span></div>
             <div class="row deduction-item" style="border-bottom: none;"><span class="label">Uniform & Attendance</span><span class="amount">-${formatKwacha(totalUniformAtt)}</span></div>
             <div class="deduction-breakdown">
-              ${attendanceBreakdownAvailable ? `
+              ${integrityWarningReason ? `<div style="color:#b91c1c;">&#9888; Evidence integrity warning -- recorded snapshot failed validation, not used for this breakdown.</div>` : attendanceBreakdownAvailable ? `
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
               ${absentDays > 0 ? `<div>Absent (${absentDays} × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}): -${formatKwacha(absentDeduction)}</div>` : ''}
               ${lateDays > 0 ? `<div>Late (${lateDays} × ${formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: p.late_deduction, frozenLateDays: p.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}): -${formatKwacha(lateDeduction)}</div>` : ''}
@@ -748,6 +777,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
       const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
       const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
       const unallocatedAmount = p.unallocated_amount || 0;
+      const integrityWarningReason = p.integrity_warning_reason || null;
       const payePct = Math.round(payrollRates.payeRate * 100);
       const pensionPct = Math.round(payrollRates.pensionEmployeeRate * 100);
 
@@ -800,7 +830,7 @@ export function PayslipsPage({ onNavigate }: PayslipsPageProps = {}) {
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5;"><span style="color: #555;">Pension (${pensionPct}%)</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(p.pension)}</span></div>
             <div style="display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #f5f5f5; border-bottom: none;"><span style="color: #555;">Uniform & Attendance</span><span style="font-weight: 500; font-family: monospace; color: #dc2626;">-${formatKwacha(totalUniformAtt)}</span></div>
             <div style="font-size: 11px; color: #dc2626; padding-left: 20px; padding-bottom: 6px;">
-              ${attendanceBreakdownAvailable ? `
+              ${integrityWarningReason ? `<div style="color:#b91c1c;">&#9888; Evidence integrity warning -- recorded snapshot failed validation, not used for this breakdown.</div>` : attendanceBreakdownAvailable ? `
               ${uniformAmount > 0 ? `<div>Uniform Deduction: -${formatKwacha(uniformAmount)}</div>` : ''}
               ${absentDays > 0 ? `<div>Absent (${absentDays} × ${formatKwacha(getHistoricalSafeAbsentRate({ frozenAbsentDeduction: p.absent_deduction, frozenAbsentDays: p.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}): -${formatKwacha(absentDeduction)}</div>` : ''}
               ${lateDays > 0 ? `<div>Late (${lateDays} × ${formatKwacha(getHistoricalSafeLateRate({ frozenLateDeduction: p.late_deduction, frozenLateDays: p.late_days, liveConfiguredRate: payrollRates.lateDeduction }))}): -${formatKwacha(lateDeduction)}</div>` : ''}
@@ -1377,6 +1407,7 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
   const salaryAdvanceDeduction = p.salary_advance_deduction || 0;
   const attendanceBreakdownAvailable = p.attendance_breakdown_available !== false;
   const unallocatedAmount = p.unallocated_amount || 0;
+  const integrityWarningReason = p.integrity_warning_reason || null;
   const totalDeductions = p.paye + p.pension + p.uniform_deduction + salaryAdvanceDeduction;
 
   return (
@@ -1459,7 +1490,9 @@ function PayslipPDF({ payslip, month, year, template, payrollRates, onPrint, onD
                   <span className="font-mono text-red-600">-{formatKwacha(v as number)}</span>
                 </div>
               ))}
-              {attendanceBreakdownAvailable ? (
+              {integrityWarningReason ? (
+                <p className="pl-3 text-[11px] text-red-600" title={integrityWarningReason}>⚠ Evidence integrity warning -- recorded snapshot failed validation, not used for this breakdown.</p>
+              ) : attendanceBreakdownAvailable ? (
                 <div className="pl-3 space-y-1 text-[11px] text-red-500">
                   {uniformAmount > 0 && <div className="flex justify-between"><span>Uniform Deduction</span><span className="font-mono">-{formatKwacha(uniformAmount)}</span></div>}
                   {absentDays > 0 && (

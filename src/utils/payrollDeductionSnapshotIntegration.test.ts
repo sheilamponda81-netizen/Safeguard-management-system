@@ -340,6 +340,65 @@ describe.skipIf(!dbAvailable && !dbRequired)('process_payroll_batch: deduction s
     expect(snapshotByCategory(rows, 'unallocated')).toMatchObject({ amount: 1000, source: 'unresolved_remainder' });
   });
 
+  it('rounding (instruction #10): a sub-1-Kwacha remainder is discarded as negligible but never vanishes without a trace -- it stays visible in the uniform row\'s own calculation_context', () => {
+    const fixture = createFixture();
+    // No override and no tenant default -- the remainder cannot be
+    // independently verified either way, so without this audit trail it
+    // would otherwise disappear leaving zero evidence it ever existed.
+    exec(`DELETE FROM system_settings WHERE tenant_id = '${fixture.tenantId}' AND key = 'uniform_deduction_default'`);
+    const employeeId = createEmployee(fixture, 'Sub-Tolerance Remainder Employee', null);
+    // Bundle is 0.60 more than the zero evidenced categories -- within
+    // the 1-Kwacha tolerance, so no 'unallocated' row is written.
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 0.6 }]);
+
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const rows = getSnapshotRows(payroll.id);
+    expect(snapshotByCategory(rows, 'uniform')).toMatchObject({ amount: 0 });
+    expect(rows.find(r => r.category === 'unallocated')).toBeUndefined();
+
+    const uniformContext = queryScalar(`SELECT calculation_context->>'rawRemainderBeforeTolerance' FROM payroll_deduction_snapshots WHERE payroll_id = '${payroll.id}' AND category = 'uniform'`);
+    expect(Number(uniformContext)).toBeCloseTo(0.6, 5);
+  });
+
+  it('rounding (instruction #10): when the remainder agrees with the live-verified uniform figure within tolerance, the recorded amount is the verified figure, and the true pre-tolerance remainder is still independently auditable', () => {
+    const fixture = createFixture();
+    // Tenant default is 4200; the submitted bundle leaves 4200.4 unaccounted
+    // for (0.4 off from the live-verified figure, within tolerance).
+    const employeeId = createEmployee(fixture, 'Within-Tolerance Verified Employee', null);
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200.4 }]);
+
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const rows = getSnapshotRows(payroll.id);
+    // Recorded as the independently-verified live figure (4200), not the
+    // raw 4200.4 remainder -- this is the deliberate "trust the verified
+    // source over the bare leftover" rule, never a fabrication beyond
+    // the shared 1-Kwacha tolerance.
+    expect(snapshotByCategory(rows, 'uniform')).toMatchObject({ amount: 4200 });
+    expect(rows.find(r => r.category === 'unallocated')).toBeUndefined();
+
+    const uniformContext = queryScalar(`SELECT calculation_context->>'rawRemainderBeforeTolerance' FROM payroll_deduction_snapshots WHERE payroll_id = '${payroll.id}' AND category = 'uniform'`);
+    expect(Number(uniformContext)).toBeCloseTo(4200.4, 5);
+  });
+
+  it('rounding (instruction #10): a remainder beyond the tolerance is always fully recorded as unallocated -- nothing beyond 1 Kwacha is ever silently dropped or folded into uniform', () => {
+    const fixture = createFixture();
+    exec(`DELETE FROM system_settings WHERE tenant_id = '${fixture.tenantId}' AND key = 'uniform_deduction_default'`);
+    const employeeId = createEmployee(fixture, 'Beyond-Tolerance Remainder Employee', null);
+    // 2.50 is beyond the 1-Kwacha tolerance -- must be fully preserved as
+    // 'unallocated', not clamped, rounded away, or partially dropped.
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 2.5 }]);
+
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const rows = getSnapshotRows(payroll.id);
+    expect(snapshotByCategory(rows, 'uniform')).toMatchObject({ amount: 0 });
+    expect(snapshotByCategory(rows, 'unallocated')).toMatchObject({ amount: 2.5, source: 'unresolved_remainder' });
+
+    // The sum of every recorded category row reconciles EXACTLY with the
+    // committed bundled total -- nothing lost, nothing double-counted.
+    const total = rows.reduce((sum, r) => sum + r.amount, 0);
+    expect(total).toBeCloseTo(2.5, 5);
+  });
+
   it('uniform-verified + rate change: a verified uniform snapshot keeps its frozen amount even after the employee\'s own override later changes', () => {
     const fixture = createFixture();
     const employeeId = createEmployee(fixture, 'Uniform Rate Change Employee', 3000);
@@ -573,5 +632,147 @@ describe.skipIf(!dbAvailable && !dbRequired)('process_payroll_batch: deduction s
     // being no DELETE policy granting that directly.
     processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
     expect(queryRows(`SELECT id FROM payroll_deduction_snapshots WHERE payroll_id = '${payroll.id}'`)).toHaveLength(0);
+  });
+});
+
+// ===== RLS under the REAL `authenticated` role (instruction #9) =====
+// Every other test in this file -- and, per bootstrap_stub.sql's own
+// header, every other integration test in this repo -- connects as the
+// bootstrap's own Postgres superuser, which bypasses RLS entirely
+// regardless of policy content (true of K2 above too, which could only
+// verify the *policy catalog*, not actual enforcement). This block is
+// the one place that genuinely switches the acting Postgres role to
+// `authenticated` mid-session and exercises the real RLS engine against
+// it, closing that gap directly.
+function grantAuthenticatedBlanketPrivileges(): void {
+  // A real Supabase project grants blanket SELECT/INSERT/UPDATE/DELETE
+  // on every public-schema table to the `authenticated` role automatically,
+  // OUTSIDE of any migration file -- RLS is the actual access-control
+  // layer, not the GRANT. supabase/ci/bootstrap_stub.sql deliberately does
+  // NOT replicate this platform default (see its own header), so without
+  // this, every query below would fail at the GRANT layer and never
+  // reach RLS at all -- this simulates exactly what production already
+  // does, it does not loosen anything beyond that.
+  exec('GRANT SELECT, INSERT, UPDATE, DELETE ON payroll_deduction_snapshots TO authenticated');
+  exec('GRANT SELECT ON payroll TO authenticated');
+}
+
+/**
+ * Runs `sql` as the real `authenticated` Postgres role, not the
+ * bootstrap's own superuser. set_caller() and SET ROLE MUST be sent in
+ * the SAME psql invocation as `sql` (hence the one semicolon-joined -c
+ * string) -- each separate execFileSync('psql', ...) call opens a brand
+ * new connection, so a role switch (or set_caller's effect, which is
+ * itself connection-local only insofar as it's committed -- it IS
+ * committed, but the role switch is not) made in one call never carries
+ * over to the next. set_caller() is called here while still the
+ * superuser, since in production an ordinary authenticated role has no
+ * reason to be grantable write access to this test-only table either.
+ */
+function execAsAuthenticated(callerId: string, sql: string): string {
+  const combined = `SELECT set_caller('${callerId}'); SET ROLE authenticated; ${sql}; RESET ROLE;`;
+  const out = execFileSync('psql', ['-t', '-A', '-c', combined], { encoding: 'utf-8' });
+  // Strips the SET/RESET command-tag lines and the blank line the void
+  // set_caller() call prints in tuples-only mode, leaving just `sql`'s
+  // own output -- the only thing any caller here actually wants.
+  return out.split('\n').map(l => l.trim()).filter(l => l.length > 0 && l !== 'SET' && l !== 'RESET').join('\n');
+}
+
+function execAsAuthenticatedExpectError(callerId: string, sql: string): string {
+  const combined = `SELECT set_caller('${callerId}'); SET ROLE authenticated; ${sql}; RESET ROLE;`;
+  try {
+    execFileSync('psql', ['-v', 'ON_ERROR_STOP=1', '-c', combined], { stdio: ['ignore', 'pipe', 'pipe'] });
+    throw new Error('Expected this statement to fail under the authenticated role, but it succeeded: ' + sql);
+  } catch (err) {
+    const stderr = (err as { stderr?: Buffer }).stderr;
+    return stderr ? stderr.toString('utf-8') : String(err);
+  }
+}
+
+describe.skipIf(!dbAvailable && !dbRequired)('payroll_deduction_snapshots RLS under the real `authenticated` role (not the bootstrap superuser)', () => {
+  beforeAll(() => {
+    grantAuthenticatedBlanketPrivileges();
+  });
+
+  it('an authorized super-admin reading as `authenticated` sees the rows their own policy grants -- genuine RLS enforcement, not a superuser bypass', () => {
+    const fixture = createFixture();
+    const employeeId = createEmployee(fixture, 'RLS Authorized Super-Admin Employee');
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
+    const payroll = getPayrollRow(employeeId, '2026-11');
+
+    const count = execAsAuthenticated(fixture.callerId, `SELECT count(*) FROM payroll_deduction_snapshots WHERE payroll_id = '${payroll.id}'`);
+    expect(Number(count)).toBeGreaterThan(0);
+  });
+
+  it('an unauthorized same-tenant viewer (role_level 5, no payroll.view permission) reading as `authenticated` sees zero rows for payroll they have no business viewing', () => {
+    const fixture = createFixture();
+    const employeeId = createEmployee(fixture, 'RLS Unauthorized Viewer Employee');
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
+    const payroll = getPayrollRow(employeeId, '2026-11');
+
+    const restrictedViewerId = randomUUID();
+    exec(`INSERT INTO auth.users (id) VALUES ('${restrictedViewerId}')`);
+    exec(`INSERT INTO profiles (id, tenant_id, is_super_admin, is_active, role_level) VALUES ('${restrictedViewerId}', '${fixture.tenantId}', false, true, 5)`);
+
+    const count = execAsAuthenticated(restrictedViewerId, `SELECT count(*) FROM payroll_deduction_snapshots WHERE payroll_id = '${payroll.id}'`);
+    expect(Number(count)).toBe(0);
+  });
+
+  it('tenant isolation holds even for a role_level <=2 viewer that bypasses the permission check -- a different tenant\'s rows are still zero', () => {
+    const fixtureA = createFixture();
+    const employeeA = createEmployee(fixtureA, 'RLS Tenant A Employee');
+    processBatch('2026-11', [{ employee_id: employeeA, basic_salary: 100000, uniform_deduction: 4200 }]);
+    const payrollA = getPayrollRow(employeeA, '2026-11');
+
+    const fixtureB = createFixture();
+    const viewerInTenantB = randomUUID();
+    exec(`INSERT INTO auth.users (id) VALUES ('${viewerInTenantB}')`);
+    // role_level 2 bypasses the has_permission('payroll.view') check
+    // entirely ("current_user_role_level() <= 2 OR has_permission(...)")
+    // -- the tenant_id equality check is the ONLY thing standing between
+    // this profile and tenant A's rows, so this specifically proves that
+    // check still holds under the real role, not merely in the policy text.
+    exec(`INSERT INTO profiles (id, tenant_id, is_super_admin, is_active, role_level) VALUES ('${viewerInTenantB}', '${fixtureB.tenantId}', false, true, 2)`);
+
+    const count = execAsAuthenticated(viewerInTenantB, `SELECT count(*) FROM payroll_deduction_snapshots WHERE payroll_id = '${payrollA.id}'`);
+    expect(Number(count)).toBe(0);
+  });
+
+  it('INSERT as `authenticated` is rejected by RLS even for an otherwise-fully-authorized super-admin -- there is no write path except process_payroll_batch()', () => {
+    const fixture = createFixture();
+    const employeeId = createEmployee(fixture, 'RLS Insert Rejection Employee');
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
+    const payroll = getPayrollRow(employeeId, '2026-11');
+
+    const stderr = execAsAuthenticatedExpectError(
+      fixture.callerId,
+      `INSERT INTO payroll_deduction_snapshots (tenant_id, payroll_id, employee_id, month, category, amount, source) VALUES ('${fixture.tenantId}', '${payroll.id}', '${employeeId}', '2026-11', 'unallocated', 99999, 'uniform_rate_config')`
+    );
+    expect(stderr).toContain('row-level security policy');
+  });
+
+  it('UPDATE as `authenticated` affects zero rows, even for a super-admin, and the row\'s original values are left exactly as committed', () => {
+    const fixture = createFixture();
+    const employeeId = createEmployee(fixture, 'RLS Update Rejection Employee');
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const before = getSnapshotRows(payroll.id);
+
+    const result = execAsAuthenticated(fixture.callerId, `UPDATE payroll_deduction_snapshots SET amount = 1 WHERE payroll_id = '${payroll.id}'`);
+    expect(result).toBe('UPDATE 0');
+    expect(getSnapshotRows(payroll.id)).toEqual(before);
+  });
+
+  it('DELETE as `authenticated` affects zero rows, even for a super-admin, and every row survives untouched', () => {
+    const fixture = createFixture();
+    const employeeId = createEmployee(fixture, 'RLS Delete Rejection Employee');
+    processBatch('2026-11', [{ employee_id: employeeId, basic_salary: 100000, uniform_deduction: 4200 }]);
+    const payroll = getPayrollRow(employeeId, '2026-11');
+    const before = getSnapshotRows(payroll.id);
+    expect(before.length).toBeGreaterThan(0);
+
+    const result = execAsAuthenticated(fixture.callerId, `DELETE FROM payroll_deduction_snapshots WHERE payroll_id = '${payroll.id}'`);
+    expect(result).toBe('DELETE 0');
+    expect(getSnapshotRows(payroll.id)).toEqual(before);
   });
 });

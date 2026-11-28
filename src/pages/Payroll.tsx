@@ -60,7 +60,7 @@ import {
 import { buildTerminalDuePaymentsCsv, computeTerminalDueExportTotal, TerminalDueExportRecord } from '../utils/terminalDuesPayrollExport';
 import { buildOrdinaryPayrollPaymentsCsv, buildAccountsReconciliationSummaryCsv, computeOrdinaryPayrollPaymentTotals, OrdinaryPayrollPaymentRecord } from '../utils/accountsReconciliationExport';
 import { buildPayrollDeductionBreakdown, deriveItemizedAttendanceDeduction, PayrollDeductionBreakdownEmployeeInput, ItemizedAttendanceDeductionAmounts } from '../utils/payrollDeductionBreakdown';
-import { resolveDeductionSnapshot, PayrollDeductionSnapshotRow, ResolvedDeductionSnapshot } from '../utils/payrollDeductionSnapshotResolution';
+import { resolveDeductionSnapshot, PayrollDeductionSnapshotRow, ResolvedDeductionSnapshot, SnapshotResolution } from '../utils/payrollDeductionSnapshotResolution';
 
 interface Employee {
   id: string;
@@ -181,7 +181,7 @@ interface SnapshotRow {
 // (see payrollDeductionSnapshotResolution.ts) is NOT a deduction type --
 // it is a verified snapshot's own honest admission that part of its
 // bundled total could not be independently attributed to any category.
-type DeductionCategory = 'paye' | 'pension' | 'absence' | 'late' | 'lecture' | 'appearance' | 'uniform' | 'salaryAdvance' | 'unitemized' | 'unallocated';
+type DeductionCategory = 'paye' | 'pension' | 'absence' | 'late' | 'lecture' | 'appearance' | 'uniform' | 'salaryAdvance' | 'unitemized' | 'unallocated' | 'integrityWarning';
 
 interface DeductionDrilldownRow {
   employeeId: string;
@@ -202,6 +202,7 @@ const DEDUCTION_CATEGORY_LABELS: Record<DeductionCategory, string> = {
   salaryAdvance: 'Salary Advances',
   unitemized: 'Not Itemized',
   unallocated: 'Unresolved',
+  integrityWarning: 'Evidence Integrity Warning',
 };
 
 export function PayrollPage() {
@@ -1362,33 +1363,69 @@ export function PayrollPage() {
   const snapshotRowsByPayrollId = useMemo(() => {
     const map = new Map<string, PayrollDeductionSnapshotRow[]>();
     snapshotRows.forEach(r => {
-      const row: PayrollDeductionSnapshotRow = { category: r.category, amount: r.amount, quantity: r.quantity, rate: r.rate, source: r.source };
+      const row: PayrollDeductionSnapshotRow = { payrollId: r.payroll_id, category: r.category, amount: r.amount, quantity: r.quantity, rate: r.rate, source: r.source };
       const list = map.get(r.payroll_id);
       if (list) list.push(row); else map.set(r.payroll_id, [row]);
     });
     return map;
   }, [snapshotRows]);
 
-  // Null for an employee whose committed payroll row has no snapshot at
-  // all (any month processed before this migration existed, or where
-  // the snapshot step was itself skipped) -- itemizedByEmployeeId below
-  // then falls through to the pre-existing employee_deductions-based
-  // logic, completely unchanged, exactly as this task's own "preserve
-  // the current honest fallback" instruction requires.
-  const snapshotByEmployeeId = useMemo(() => {
-    const map = new Map<string, ResolvedDeductionSnapshot | null>();
+  // The full 3-way resolution per employee -- 'none' (no snapshot rows
+  // for this exact payroll_id), 'available' (validated, reconciled), or
+  // 'invalid' (rows exist but failed validation -- see
+  // payrollDeductionSnapshotResolution.ts's own header for exactly what
+  // that validates and why an invalid snapshot must never be silently
+  // treated as equivalent to "nothing was ever recorded" nor used as if
+  // it were valid). An employee with no committed payroll row yet
+  // (live preview, not processed) trivially resolves to 'none' -- there
+  // is no payroll_id to look snapshot rows up by.
+  const snapshotResolutionByEmployeeId = useMemo(() => {
+    const map = new Map<string, SnapshotResolution>();
     employees.forEach(emp => {
       const existingRecord = payrollByEmployee.get(emp.id);
-      const rows = existingRecord ? snapshotRowsByPayrollId.get(existingRecord.id) : undefined;
-      map.set(emp.id, resolveDeductionSnapshot(rows ?? null));
+      if (!existingRecord) {
+        map.set(emp.id, { status: 'none' });
+        return;
+      }
+      const rows = snapshotRowsByPayrollId.get(existingRecord.id);
+      map.set(emp.id, resolveDeductionSnapshot(rows ?? null, {
+        payrollId: existingRecord.id,
+        bundledTotal: existingRecord.uniform_deduction || 0,
+      }));
     });
     return map;
   }, [employees, payrollByEmployee, snapshotRowsByPayrollId]);
 
+  // Convenience view: the validated snapshot itself, only when
+  // available -- null for both 'none' and 'invalid' (an invalid
+  // snapshot's own figures are never exposed as if they were usable).
+  const snapshotByEmployeeId = useMemo(() => {
+    const map = new Map<string, ResolvedDeductionSnapshot | null>();
+    employees.forEach(emp => {
+      const resolution = snapshotResolutionByEmployeeId.get(emp.id);
+      map.set(emp.id, resolution?.status === 'available' ? resolution.snapshot : null);
+    });
+    return map;
+  }, [employees, snapshotResolutionByEmployeeId]);
+
+  // Convenience view: the integrity-warning reason, only when the
+  // snapshot existed but failed validation -- drives a distinct warning
+  // message in the UI, never conflated with the ordinary "itemized
+  // breakdown not available" fallback.
+  const snapshotIntegrityWarningByEmployeeId = useMemo(() => {
+    const map = new Map<string, string>();
+    employees.forEach(emp => {
+      const resolution = snapshotResolutionByEmployeeId.get(emp.id);
+      if (resolution?.status === 'invalid') map.set(emp.id, resolution.reason);
+    });
+    return map;
+  }, [employees, snapshotResolutionByEmployeeId]);
+
   const itemizedByEmployeeId = useMemo(() => {
     const map = new Map<string, ItemizedAttendanceDeductionAmounts | null>();
     employees.forEach(emp => {
-      // A verified snapshot (tied to this employee's EXACT payroll_id)
+      const resolution = snapshotResolutionByEmployeeId.get(emp.id);
+      // A VALIDATED snapshot (tied to this employee's EXACT payroll_id)
       // is the highest-priority source -- its own absence/late/lecture/
       // appearance figures supersede the legacy derivation below
       // entirely, since it is the authoritative record of what was
@@ -1397,16 +1434,29 @@ export function PayrollPage() {
       // the legacy path below could since have been edited by HR,
       // which must never retroactively change an already-processed
       // month's own explanation).
-      const snapshot = snapshotByEmployeeId.get(emp.id);
-      if (snapshot) {
+      if (resolution?.status === 'available') {
         map.set(emp.id, {
-          absenceDeduction: snapshot.absenceDeduction,
-          lateDeduction: snapshot.lateDeduction,
-          lectureDeduction: snapshot.lectureDeduction,
-          appearanceDeduction: snapshot.appearanceDeduction,
+          absenceDeduction: resolution.snapshot.absenceDeduction,
+          lateDeduction: resolution.snapshot.lateDeduction,
+          lectureDeduction: resolution.snapshot.lectureDeduction,
+          appearanceDeduction: resolution.snapshot.appearanceDeduction,
         });
         return;
       }
+      if (resolution?.status === 'invalid') {
+        // Evidence EXISTS but failed validation -- never fall back to
+        // the legacy employee_deductions path here, which could show a
+        // DIFFERENT, conflicting explanation for the same committed
+        // money. Treated as "not itemized" for the arithmetic (null);
+        // snapshotIntegrityWarningByEmployeeId drives the actual,
+        // more specific warning message shown instead of the generic
+        // "itemized breakdown not available" wording.
+        map.set(emp.id, null);
+        return;
+      }
+      // status === 'none' -- no snapshot at all for this payroll_id (or
+      // not yet processed) -- fall through to the pre-existing
+      // employee_deductions-based logic, completely unchanged.
       const deduction = getEmployeeDeduction(emp.id);
       const isProcessed = payrollByEmployee.has(emp.id);
       map.set(emp.id, deriveItemizedAttendanceDeduction({
@@ -1427,12 +1477,13 @@ export function PayrollPage() {
       }));
     });
     return map;
-  }, [employees, snapshotByEmployeeId, getEmployeeDeduction, payrollByEmployee, attendanceCounts, payrollRates]);
+  }, [employees, snapshotResolutionByEmployeeId, getEmployeeDeduction, payrollByEmployee, attendanceCounts, payrollRates]);
 
   const deductionBreakdown = useMemo(() => {
     const inputs: PayrollDeductionBreakdownEmployeeInput[] = employees.map(emp => {
       const p = getDisplayPayroll(emp);
       const snapshot = snapshotByEmployeeId.get(emp.id);
+      const integrityWarningReason = snapshotIntegrityWarningByEmployeeId.get(emp.id) ?? null;
       return {
         paye: p.paye,
         pension: p.pension,
@@ -1440,10 +1491,11 @@ export function PayrollPage() {
         salaryAdvanceDeduction: p.salary_advance_deduction || 0,
         itemized: itemizedByEmployeeId.get(emp.id) ?? null,
         verifiedUniform: snapshot ? { uniformDeduction: snapshot.uniformDeduction, unallocatedAmount: snapshot.unallocatedAmount } : null,
+        integrityWarningReason,
       };
     });
     return buildPayrollDeductionBreakdown(inputs);
-  }, [employees, getDisplayPayroll, itemizedByEmployeeId, snapshotByEmployeeId]);
+  }, [employees, getDisplayPayroll, itemizedByEmployeeId, snapshotByEmployeeId, snapshotIntegrityWarningByEmployeeId]);
 
   // Part 5/6 drill-down: per-employee rows for whichever Deductions
   // Breakdown category card was clicked, built from the exact same
@@ -1459,6 +1511,7 @@ export function PayrollPage() {
       const p = getDisplayPayroll(emp);
       const itemized = itemizedByEmployeeId.get(emp.id) ?? null;
       const snapshot = snapshotByEmployeeId.get(emp.id);
+      const integrityWarningReason = snapshotIntegrityWarningByEmployeeId.get(emp.id) ?? null;
       const attendance = attendanceCounts.get(emp.id);
       const deduction = getEmployeeDeduction(emp.id);
       let amount = 0;
@@ -1512,7 +1565,7 @@ export function PayrollPage() {
           amount = p.salary_advance_deduction || 0;
           break;
         case 'unitemized':
-          if (!itemized && (p.uniform_deduction || 0) > 0) {
+          if (!itemized && !integrityWarningReason && (p.uniform_deduction || 0) > 0) {
             amount = p.uniform_deduction || 0;
             detail = 'No employee_deductions row recorded for this employee/month -- composition cannot be itemized.';
           }
@@ -1521,6 +1574,12 @@ export function PayrollPage() {
           amount = snapshot?.unallocatedAmount || 0;
           if (amount > 0) {
             detail = 'Verified snapshot could not independently confirm this remainder as a genuine Uniform charge -- recorded as unresolved, not a deduction type.';
+          }
+          break;
+        case 'integrityWarning':
+          if (integrityWarningReason && (p.uniform_deduction || 0) > 0) {
+            amount = p.uniform_deduction || 0;
+            detail = `Snapshot evidence exists but failed validation: ${integrityWarningReason}`;
           }
           break;
       }
@@ -1535,7 +1594,7 @@ export function PayrollPage() {
       }
     });
     return rows.sort((a, b) => b.amount - a.amount);
-  }, [deductionDrilldownCategory, employees, getDisplayPayroll, itemizedByEmployeeId, snapshotByEmployeeId, attendanceCounts, getEmployeeDeduction, payrollRates]);
+  }, [deductionDrilldownCategory, employees, getDisplayPayroll, itemizedByEmployeeId, snapshotByEmployeeId, snapshotIntegrityWarningByEmployeeId, attendanceCounts, getEmployeeDeduction, payrollRates]);
 
   // True only when at least one CURRENTLY DISPLAYED figure is actually a
   // live calculation built on a failed/unavailable attendance-count fetch
@@ -2971,6 +3030,21 @@ export function PayrollPage() {
                   <span className="font-medium text-amber-700">{formatKwacha(deductionBreakdown.unallocatedTotal)}</span>
                 </button>
               )}
+              {/* A failed-validation snapshot is a genuine data-integrity
+                  problem, never conflated with "Not itemized" (no
+                  evidence was ever recorded) or silently treated as if
+                  the evidence were usable -- see
+                  payrollDeductionSnapshotResolution.ts's own header. */}
+              {deductionBreakdown.integrityWarningTotal > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setDeductionDrilldownCategory('integrityWarning')}
+                  className="flex justify-between w-full text-left text-sm mt-2 pt-2 border-t border-slate-100 hover:bg-red-50 rounded px-1 -mx-1"
+                >
+                  <span className="text-red-600">⚠ Evidence Integrity Warning ({deductionBreakdown.employeesWithIntegrityWarning} employee{deductionBreakdown.employeesWithIntegrityWarning === 1 ? '' : 's'})</span>
+                  <span className="font-medium text-red-700">{formatKwacha(deductionBreakdown.integrityWarningTotal)}</span>
+                </button>
+              )}
               <div className="flex justify-between text-sm mt-2 pt-2 border-t border-slate-200 font-semibold">
                 <span className="text-slate-700">Total Deductions</span>
                 <span className="text-slate-900">{formatKwacha(deductionBreakdown.grandTotal)}</span>
@@ -3094,6 +3168,7 @@ export function PayrollPage() {
                 // decides what the sub-breakdown below shows.
                 const itemized = itemizedByEmployeeId.get(emp.id) ?? null;
                 const snapshot = snapshotByEmployeeId.get(emp.id);
+                const integrityWarningReason = snapshotIntegrityWarningByEmployeeId.get(emp.id) ?? null;
                 // A verified snapshot already resolved its own uniform-
                 // only amount (never a bare remainder -- see
                 // payrollDeductionSnapshotResolution.ts); only fall back
@@ -3299,7 +3374,9 @@ export function PayrollPage() {
                           {formatKwacha(p.uniform_deduction || 0)}
                           {hasAnyDeduction && (
                             <div className="text-[10px] text-red-400 space-y-0.5">
-                              {itemized ? (
+                              {integrityWarningReason ? (
+                                <div className="text-red-600" title={integrityWarningReason}>⚠ Evidence integrity warning -- snapshot failed validation, not used.</div>
+                              ) : itemized ? (
                                 <>
                                   {uniformOnlyAmount > 0 && <div>Uniform: {formatKwacha(uniformOnlyAmount)}</div>}
                                   {itemized.absenceDeduction > 0 && <div>Absent: {snapshot?.absenceDays ?? attendance?.absentDays ?? 0} × {formatKwacha(snapshot?.absenceRate ?? getHistoricalSafeAbsentRate({ frozenAbsentDeduction: deduction?.absent_deduction, frozenAbsentDays: deduction?.absent_days, liveConfiguredRate: payrollRates.absentDeduction }))}</div>}
