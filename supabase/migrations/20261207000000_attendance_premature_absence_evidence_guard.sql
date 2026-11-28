@@ -152,7 +152,7 @@ BEGIN
     END IF;
   END IF;
 END;
-$function$
+$function$;
 
 
 CREATE OR REPLACE FUNCTION public.attendance_resolve_and_calculate(p_employee_id uuid, p_shift_date date)
@@ -258,7 +258,7 @@ BEGIN
 
   RETURN QUERY SELECT * FROM attendance_engine_calculate(p_shift_date, v_resolved_shift, v_event_times, v_coverage_status, v_coverage_through, clock_timestamp());
 END;
-$function$
+$function$;
 
 
 CREATE OR REPLACE FUNCTION public.attendance_coverage_explain(p_employee_ids uuid[], p_date_from date, p_date_to date)
@@ -444,7 +444,7 @@ BEGIN
     END LOOP;
   END LOOP;
 END;
-$function$
+$function$;
 
 
 -- Undo ONLY demonstrably premature automated November 27 absences:
