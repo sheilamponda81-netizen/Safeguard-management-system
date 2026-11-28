@@ -485,7 +485,7 @@ INSERT INTO public.attendance_audit_log (
   tenant_id, employee_id, attendance_date, old_status, new_status,
   old_calculation_basis, new_calculation_basis, changed_by, change_source, reason
 )
-SELECT tenant_id, employee_id, date, status, NULL,
+SELECT tenant_id, employee_id, date, status, 'pending',
        calculation_basis, NULL, NULL, 'automatic',
        '2026-11-28 controlled reversal: Nov 27 attendance was finalized Absent from a coverage declaration made before that shift checkout window closed. Pending until a later complete export; original audit rows retained.'
 FROM invalidated;
