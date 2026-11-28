@@ -40,7 +40,7 @@ describe.skipIf(!available && !required)('Attendance: premature absence evidence
     run(`insert into employees(id,tenant_id,employee_number,full_name,status,is_deleted,workstation) values('${emp}','${tenant}','G-${emp.slice(0,8)}','Test Guard','Active',false,'TEST SITE')`);
     run(`insert into hikcentral_person_mappings(id,tenant_id,hikcentral_person_no,employee_id,match_method,is_active,fingerprint_attendance_enabled) values('${mapping}','${tenant}','P${emp.slice(0,8)}','${emp}','manual',true,true)`);
     run(`insert into roster_shift_patterns(tenant_id,employee_id,shift_type,effective_from,is_active,assigned_by) values('${tenant}','${emp}','day','2026-11-01',true,'${actor}')`);
-    run(`insert into employee_hikcentral_terminals(tenant_id,employee_id,access_point,is_active) values('${tenant}','${emp}','${terminal}',true)`);
+    run(`insert into employee_hikcentral_terminals(tenant_id,employee_id,access_point,is_active,assigned_by) values('${tenant}','${emp}','${terminal}',true,'${actor}')`);
     run(`insert into fingerprint_coverage_confirmations(tenant_id,confirmed_by,workstations,access_points,covers_from,covers_through,latest_observed_event_at,confirmed_at) values('${tenant}','${actor}',array[]::text[],array['${terminal}'],'2026-11-01 00:00+00','2026-11-27 21:59+00','2026-11-27 05:11+00','2026-11-27 09:33+00')`);
     const before = run(`select status from attendance_resolve_and_calculate('${emp}'::uuid,'2026-11-27'::date)`);
     expect(before).toBe('pending');
